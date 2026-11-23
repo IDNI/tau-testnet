@@ -44,6 +44,15 @@ def get_args():
             "generated without it stays byte-identical."
         ),
     )
+    parser.add_argument(
+        "--faucet-amount", type=int, default=0,
+        help=(
+            "Coins that each new account receives one time, at the first "
+            "applied transaction that touches it. Fixed for the life of the "
+            "network. 0 (default) turns the faucet off and keeps the genesis "
+            "byte-identical to one generated without this option."
+        ),
+    )
     parser.add_argument("--out", type=str, default="data/genesis.json", help="Output path for genesis.json")
     parser.add_argument(
         "--base-fee", type=int, default=10,
@@ -104,6 +113,10 @@ def get_args():
     _m_err = validate_eligibility_mode(args.eligibility_mode)
     if _m_err:
         parser.error(f"--eligibility-mode {_m_err}")
+    from consensus.faucet import validate_faucet_amount
+    _f_err = validate_faucet_amount(args.faucet_amount)
+    if _f_err:
+        parser.error(f"--faucet-amount {_f_err}")
     if not args.validator_key and not args.validator_privkey:
         parser.error("at least one --validator-key or --validator-privkey is required")
     return args
@@ -305,6 +318,7 @@ def main():
     mech_meta = build_mechanism_metadata(
         args.vote_quorum, args.eligibility_mode, args.fee_beneficiary,
         approval_slots_active=bool(getattr(args, "approval_slots", False)),
+        faucet_amount=args.faucet_amount,
     )
     consensus_meta = {
         "proof_scheme": "bls_header_sig",

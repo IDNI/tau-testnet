@@ -37,14 +37,14 @@ import chain_state
 import db
 import tau_manager
 from errors import TauEngineCrash
-from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 from commands import sendtx, createblock
 
 GENESIS_TAU = os.path.join(project_root, "genesis.tau")
 TRANSFER_RULE_PATH = os.path.join(project_root, "rules", "04_handle_valid_transfer.tau")
 
 
-RECIPIENT = "c" * 96
+RECIPIENT = pubkey_hex(SK_CAROL)
 
 
 class _NativeFeeE2EBase(unittest.TestCase):
@@ -83,8 +83,6 @@ class _NativeFeeE2EBase(unittest.TestCase):
 
         self.sender = pubkey_hex(SK_ALICE)
         chain_state._balances[self.sender] = 100000
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
         # The local miner proposes every block here, so it must be the (sole)
         # active validator: in-set for the W1 proposer gate, and the single
         # voter that reaches a 1-of-1 governance quorum in the fee-change tests.
@@ -109,9 +107,7 @@ class _NativeFeeE2EBase(unittest.TestCase):
         # is real (conftest defaults it to "1" for the legacy suite).
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
 
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
         patch("commands.createblock._BLS_AVAILABLE", True).start()
-        patch("commands.createblock._validate_signature", return_value=True).start()
         patch("block.bls_signing_available", return_value=True).start()
         patch("consensus.engine.TauConsensusEngine.verify_block_header", return_value=True).start()
         patch("consensus.engine.TauConsensusEngine.query_eligibility", return_value=True).start()
@@ -120,7 +116,6 @@ class _NativeFeeE2EBase(unittest.TestCase):
         patch.stopall()
         tau_manager.tau_ready.clear()
         tau_manager.tau_direct_interface = None
-        config.TESTNET_AUTO_FAUCET = self.original_faucet
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None

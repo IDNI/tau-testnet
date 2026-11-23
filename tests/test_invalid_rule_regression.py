@@ -70,7 +70,7 @@ class TestInvalidRuleRegression(unittest.TestCase):
                 import tau_native
                 # The isolated compile reports the rule as invalid (non-None
                 # error string) -> queue_transaction returns TX_REJECTED.
-                with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)), \
+                with patch('commands.sendtx.validate_bls_pubkey', return_value=None), \
                      patch.object(
                          tau_native,
                          'compile_revisions_isolated_subprocess',

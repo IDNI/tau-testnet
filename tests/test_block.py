@@ -130,9 +130,6 @@ class TestBlockCreation(unittest.TestCase):
         self.chain_tau_patcher = unittest.mock.patch('chain_state.tau_manager', self.mock_tau)
         self.chain_tau_patcher.start()
         
-        # Mock Signature Validation
-        self.sig_patcher = unittest.mock.patch('commands.createblock._validate_signature', return_value=True)
-        self.sig_patcher.start()
         self.verify_patcher = unittest.mock.patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
         self.verify_patcher.start()
         
@@ -144,7 +141,6 @@ class TestBlockCreation(unittest.TestCase):
         self.tau_patcher.stop()
         self.engine_tau_patcher.stop()
         self.chain_tau_patcher.stop()
-        self.sig_patcher.stop()
         self.verify_patcher.stop()
         clear_mempool()
         # Close the connection if it's open, to release file lock on Windows

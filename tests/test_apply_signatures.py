@@ -22,7 +22,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import config
 import tau_allocator as alloc
 import tau_defs
 import tau_journal as tj
@@ -32,7 +31,9 @@ from block import Block
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, SK_MALLORY, pubkey_hex, sign_payload
 from consensus.approvals import STATUS_FAILED, ApprovalRequest
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
+from consensus import sender_policy
 from consensus.governance import ConsensusLifecycleManager, ConsensusRuleUpdate
+from consensus.policy_mock import MockPolicyEvaluator
 from consensus.retractable import KIND_HEIGHT, RetractableEntry
 from consensus.rule_offers import STATUS_REJECTED, RuleOffer
 from consensus.state import TauStateSnapshot
@@ -62,11 +63,6 @@ GUARDED_RULE = (
 GOV_RULE = "always ( o6[t]:bv[16] = { 0 }:bv[16] )."
 
 _TX_SEQ = itertools.count()
-
-
-@pytest.fixture(autouse=True)
-def _no_faucet(monkeypatch):
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
 
 
 def tier_body(approver):
@@ -205,8 +201,6 @@ def _apply(txs, lm, *, replay_mode=False, fee=FEE):
     block = Block.create(block_number=HEIGHT, previous_hash="00" * 32, transactions=txs,
                          proposer_pubkey=MALLORY, timestamp=1234567890)
 
-    # The live o5 composite: seeded from the registry, then whatever the block feeds.
-    fed = [lm.rule_offers.composite_for_stream(5) or ""]
     persisted = []
     multi_calls = []
     single_calls = []
@@ -214,8 +208,6 @@ def _apply(txs, lm, *, replay_mode=False, fee=FEE):
     def _single(**kw):
         single_calls.append(kw)
         text = str(kw.get("rule_text") or "")
-        if "always" in text:
-            fed.append(text)
         if text and kw.get("apply_rules_update"):
             persisted.append(text.strip())
         return "T"
@@ -224,9 +216,14 @@ def _apply(txs, lm, *, replay_mode=False, fee=FEE):
         multi_calls.append(kw)
         vals = kw.get("input_stream_values") or {}
         amount = int(str(vals.get(1, "0")) or 0)
-        guarded = ALICE in str(vals.get(12, "")) and ALICE in fed[-1]
-        blocked = guarded and amount > TIER_1 and AUTH not in str(vals.get(18, "0"))
-        return {1: str(amount), 8: "0", 9: str(fee), 5: "0" if blocked else "1"}
+        return {1: str(amount), 8: "0", 9: str(fee), 5: "1"}
+
+    def _tier_verdict(body, inputs):
+        amount = int(str(inputs.get("i1", "0")) or 0)
+        gated = "i18" in body and amount > TIER_1 and AUTH not in str(inputs.get("i18", "0"))
+        return "0" if gated else "1"
+
+    sender_policy.set_evaluator("apply", MockPolicyEvaluator(decide=_tier_verdict))
 
     with patch("tau_manager.communicate_with_tau", side_effect=_single), \
          patch("tau_manager.communicate_with_tau_multi", side_effect=_multi), \
@@ -234,8 +231,11 @@ def _apply(txs, lm, *, replay_mode=False, fee=FEE):
                side_effect=lambda: "\n".join(persisted)), \
          patch("tau_manager.tau_ready") as ready:
         ready.is_set.return_value = True
-        result = TauConsensusEngine().apply_block(
-            view, block, parent, replay_mode=replay_mode)
+        try:
+            result = TauConsensusEngine().apply_block(
+                view, block, parent, replay_mode=replay_mode)
+        finally:
+            sender_policy.set_evaluator("apply", None)
     return Applied(result, result.next_snapshot.metadata["lifecycle_manager"],
                    multi_calls, single_calls)
 
@@ -411,10 +411,10 @@ SCENARIOS = [
         SK_ALICE,
     ),
     Scenario(
-        "rule-before-activation",
+        "routed-o5-register-before-activation",
         lambda: _lifecycle(active=False),
         lambda: [],
-        lambda sk: rule_tx(GUARDED_RULE, sk),
+        lambda sk: rule_tx("always ( %s )." % tier_body(AUTH), sk),
         SK_ALICE,
     ),
 ]
@@ -836,7 +836,7 @@ def _golden_block():
     return lm, txs
 
 
-GOLDEN_STATE_HASH = "dc94e9ac7a10ea8928575836a993dbc69bc6d2dc462fb3265a0678dcf62adab8"
+GOLDEN_STATE_HASH = "67173557fe8137ccef43622a0dba4b480c2ed498b3920533555c53523eb520a7"
 
 
 def test_a_block_of_genuine_policy_txs_reaches_the_pinned_state():

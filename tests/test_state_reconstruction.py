@@ -18,6 +18,7 @@ if project_root not in sys.path:
 from chain_state import rebuild_state_from_blockchain, get_balance, get_sequence_number, GENESIS_BALANCE
 from block import Block
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
+from conftest import stop_tau_manager_thread
 from db import init_db, add_block, clear_mempool
 import config
 import chain_state
@@ -37,13 +38,16 @@ class TestStateReconstruction(unittest.TestCase):
         self.tau_thread.start()
         ready = tau_manager.tau_ready.wait(timeout=60)
         if not ready:
+            self.stop_tau()
             self.fail("Tau process failed to become ready within 60 seconds.")
 
     def stop_tau(self):
         """Request Tau shutdown and wait for the background thread to exit."""
-        tau_manager.request_shutdown()
         if hasattr(self, 'tau_thread'):
-            self.tau_thread.join(timeout=10)
+            if not stop_tau_manager_thread(self.tau_thread):
+                raise AssertionError("the Tau manager thread did not stop")
+        else:
+            tau_manager.request_shutdown()
         # start_and_manage_tau_process leaves tau_test_mode=True after a
         # TAU_FORCE_TEST run; reset it so later tests (e.g. sendtx's isolated
         # compile path) don't see stale test-mode state.
@@ -84,9 +88,6 @@ class TestStateReconstruction(unittest.TestCase):
         chain_state._genesis_accounts_state = {self.addr1: GENESIS_BALANCE}
         chain_state._balances[self.addr1] = GENESIS_BALANCE
         
-        # Disable auto-faucet for these tests to ensure strict balance checks
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
         
         from unittest.mock import patch
         self.verify_patch = patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
@@ -94,12 +95,12 @@ class TestStateReconstruction(unittest.TestCase):
     
     def tearDown(self):
         """Clean up the temporary database."""
-        # Restore auto-faucet setting
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         self.verify_patch.stop()
 
-        # Ensure Tau process is stopped between tests
-        if tau_manager.tau_ready.is_set():
+        # A live manager thread reads the database that this tearDown closes.
+        if hasattr(self, 'tau_thread'):
+            self.stop_tau()
+        elif tau_manager.tau_ready.is_set():
             try:
                 tau_manager.request_shutdown()
             except Exception:
@@ -144,6 +145,12 @@ class TestStateReconstruction(unittest.TestCase):
             "fee_limit": "0",
         }, self._sk[sender_pubkey])
     
+    def test_a_failed_start_leaves_no_manager_thread(self):
+        with patch.object(tau_manager.tau_ready, "wait", return_value=False):
+            with self.assertRaises(self.failureException):
+                self.start_tau()
+        self.assertFalse(self.tau_thread.is_alive())
+
     def test_reconstruction_empty_blockchain(self):
         """Test state reconstruction when no blocks exist."""
         print("\n=== Testing state reconstruction with empty blockchain ===")
@@ -365,8 +372,9 @@ class TestStateReconstruction(unittest.TestCase):
         self.assertEqual(get_balance(self.addr2), 5)
         self.assertEqual(get_balance(self.addr3), 0)  # Invalid transfers should be ignored
         
-        # All sequence numbers should be incremented (even for failed transactions)
-        self.assertEqual(get_sequence_number(self.addr1), 3)  # All 3 transactions attempted
+        # The failed transfer uses its sequence number. Apply refuses the
+        # transaction with the malformed amount, so that one uses none.
+        self.assertEqual(get_sequence_number(self.addr1), 2)
     
     def test_reconstruction_preserves_state_consistency(self):
         """Test that reconstruction produces the same state as live processing."""
@@ -425,7 +433,8 @@ class TestStateReconstruction(unittest.TestCase):
         # --- Start Tau ---
         self.start_tau()
         try:
-            rule_text = "o12[t] = i1[t]."
+            # start_tau loads no builtin rules, so an untyped i1 here would be typed :tau before rule 02.
+            rule_text = "o12[t]:bv[24] = i1[t]:bv[24]."
 
             # Create a transaction containing both the rule and a transfer
             tx1 = self.create_test_transaction(

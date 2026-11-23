@@ -51,14 +51,6 @@ class TauSettings:
     program_file: str = 'genesis.tau'
     ready_signal: str = "Execution step: 0"
     comm_debug_path: Optional[str] = None
-    # Eval-only shrinking of long equality-only bitvectors (see tau_shrink.py).
-    # Consensus-safe: the state hash commits to canonical raw application-rule text
-    # (chain_state accumulation), never the interpreter's shrunk composed spec, so
-    # the node-local shrink width is invisible to consensus. ON by default.
-    shrink_enabled: bool = True
-    # Force-exclude input stream indices from shrinking (safety override; the
-    # usage classifier is the primary gate).
-    shrink_stream_exclude: frozenset = field(default_factory=frozenset)
 
     def validate(self) -> None:
         if not self.program_file:
@@ -206,9 +198,6 @@ class AuthoritySettings:
     # max_rule_txs_per_block bound into the state hash. Kept separate so an
     # operator can be more conservative than consensus requires.
     block_max_rule_txs: int = 8
-    # Credit unseen accounts with this balance on first use (testnet convenience).
-    auto_faucet: bool = True
-    auto_faucet_amount: int = 100000
 
     def validate(self) -> None:
         if self.mining_enabled:
@@ -249,8 +238,6 @@ class AuthoritySettings:
             raise ConfigurationError(
                 "Authority validator_vote_quorum must be 'supermajority' or 'majority'."
             )
-        if self.auto_faucet_amount <= 0:
-            raise ConfigurationError("Authority auto_faucet_amount must be positive.")
 
 
 @dataclass
@@ -327,7 +314,6 @@ ENVIRONMENT_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "authority": {
             "miner_pubkey_path": os.path.join(DATA_LOCAL_DIR, "test_miner.pub"),
             "miner_privkey_path": os.path.join(DATA_LOCAL_DIR, "test_miner.key"),
-            "auto_faucet": False,
         },
         "network": {
             "bootstrap_peers": [],
@@ -352,12 +338,6 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_PROGRAM_FILE": ("tau", "program_file", str),
     "TAU_READY_SIGNAL": ("tau", "ready_signal", str),
     "TAU_COMM_DEBUG_PATH": ("tau", "comm_debug_path", str),
-    "TAU_SHRINK_ENABLED": ("tau", "shrink_enabled", lambda v: v.lower() in ("true", "1", "yes")),
-    "TAU_SHRINK_STREAM_EXCLUDE": (
-        "tau",
-        "shrink_stream_exclude",
-        lambda value: frozenset(int(x) for x in value.split(",") if x.strip()),
-    ),
     "TAU_PROCESS_TIMEOUT": ("timeouts", "process_timeout", int),
     "TAU_COMM_TIMEOUT": ("timeouts", "comm_timeout", int),
     "TAU_ADMISSION_BUDGET": ("timeouts", "admission_budget", int),
@@ -415,12 +395,6 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
         "allow_remote_createblock",
         lambda v: v.lower() in ("true", "1", "yes"),
     ),
-    "TAU_AUTO_FAUCET": (
-        "authority",
-        "auto_faucet",
-        lambda v: v.lower() in ("true", "1", "yes"),
-    ),
-    "TAU_AUTO_FAUCET_AMOUNT": ("authority", "auto_faucet_amount", int),
 }
 
 
@@ -578,7 +552,7 @@ def load_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]]
 
 def _sync_legacy_exports(current: Settings) -> None:
     global HOST, PORT, BUFFER_SIZE, MAX_RPC_COMMAND_BYTES
-    global TAU_PROGRAM_FILE, TAU_READY_SIGNAL, COMM_DEBUG_PATH, TAU_SHRINK_ENABLED, TAU_SHRINK_STREAM_EXCLUDE
+    global TAU_PROGRAM_FILE, TAU_READY_SIGNAL, COMM_DEBUG_PATH
     global PROCESS_TIMEOUT, COMM_TIMEOUT, CLIENT_WAIT_TIMEOUT, SHUTDOWN_TIMEOUT, ADMISSION_BUDGET
     global MINING_BUDGET, VALIDATION_CEILING
     global STRING_DB_PATH
@@ -589,7 +563,6 @@ def _sync_legacy_exports(current: Settings) -> None:
     global OPEN_GOVERNANCE_ADMISSION
     global MAX_MEMPOOL_TXS, MEMPOOL_RULE_LANE_MAX_FRACTION, BLOCK_MAX_RULE_TXS
     global REORG_RESTORE_MAX_VERIFY
-    global TESTNET_AUTO_FAUCET, TESTNET_AUTO_FAUCET_AMOUNT
 
     HOST = current.server.host
     PORT = current.server.port
@@ -599,8 +572,6 @@ def _sync_legacy_exports(current: Settings) -> None:
     TAU_PROGRAM_FILE = current.tau.program_file
     TAU_READY_SIGNAL = current.tau.ready_signal
     COMM_DEBUG_PATH = current.tau.comm_debug_path
-    TAU_SHRINK_ENABLED = current.tau.shrink_enabled
-    TAU_SHRINK_STREAM_EXCLUDE = current.tau.shrink_stream_exclude
 
     PROCESS_TIMEOUT = current.timeouts.process_timeout
     COMM_TIMEOUT = current.timeouts.comm_timeout
@@ -633,8 +604,6 @@ def _sync_legacy_exports(current: Settings) -> None:
     REORG_RESTORE_MAX_VERIFY = current.authority.reorg_restore_max_verify
     MEMPOOL_RULE_LANE_MAX_FRACTION = current.authority.mempool_rule_lane_max_fraction
     BLOCK_MAX_RULE_TXS = current.authority.block_max_rule_txs
-    TESTNET_AUTO_FAUCET = current.authority.auto_faucet
-    TESTNET_AUTO_FAUCET_AMOUNT = current.authority.auto_faucet_amount
 
 
 def reload_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Settings:
@@ -677,8 +646,6 @@ __all__ = [
     "TAU_PROGRAM_FILE",
     "TAU_READY_SIGNAL",
     "COMM_DEBUG_PATH",
-    "TAU_SHRINK_ENABLED",
-    "TAU_SHRINK_STREAM_EXCLUDE",
     "PROCESS_TIMEOUT",
     "COMM_TIMEOUT",
     "CLIENT_WAIT_TIMEOUT",
@@ -706,8 +673,6 @@ __all__ = [
     "REORG_RESTORE_MAX_VERIFY",
     "MEMPOOL_RULE_LANE_MAX_FRACTION",
     "BLOCK_MAX_RULE_TXS",
-    "TESTNET_AUTO_FAUCET",
-    "TESTNET_AUTO_FAUCET_AMOUNT",
     "MAX_BLOCK_FUTURE_DRIFT_SECONDS",
     "BLOCK_PRODUCTION_LOCK_TIMEOUT",
     "CHAIN_INGEST_LOCK_TIMEOUT",

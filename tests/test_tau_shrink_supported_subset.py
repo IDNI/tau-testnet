@@ -123,7 +123,7 @@ def test_an_unparsed_occurrence_disqualifies_rather_than_disappears(temp_databas
 
 
 def test_unannotated_stream_is_unresolved_not_invented(temp_database):
-    p = ts.prepare_rule(_rule(f"i12[t] = {{ #x{HEX96} }}:bv[384]"))
+    p = ts.prepare_rule(_rule("i12[t] = i13[t]"))
     assert 12 not in p.shrunk_streams
 
 

@@ -90,7 +90,7 @@ class TestSendTxValidation(unittest.TestCase):
         # Signatures are verified for real; fund the signing sender.
         chain_state._balances[SENDER] = 1000
         # Patch pubkey validation to bypass format checks for basic validation tests
-        patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
+        patch('commands.sendtx.validate_bls_pubkey', return_value=None).start()
 
     def tearDown(self):
         patch.stopall()

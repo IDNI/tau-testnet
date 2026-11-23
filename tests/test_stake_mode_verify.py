@@ -154,13 +154,11 @@ def test_derive_active_consensus_no_lifecycle_manager_defaults_validator_set():
 # --- get_committed_balance --------------------------------------------------
 
 def test_get_committed_balance_no_faucet(monkeypatch):
-    import config
     import chain_state
     with chain_state._balance_lock:
         chain_state._balances.clear()
         chain_state._balances["known"] = 42
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", True, raising=False)
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000, raising=False)
+    monkeypatch.setattr(chain_state._lifecycle_manager, "faucet_amount", 100000)
     # Unknown address returns 0 (NOT the faucet amount get_balance would mint).
     assert chain_state.get_committed_balance("missing") == 0
     assert chain_state.get_balance("missing") == 100000

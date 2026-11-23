@@ -11,7 +11,12 @@ import trio
 
 from network import service as service_mod
 from network.config import NetworkConfig
-from network.libp2p_compat import StreamTooLarge, read_until_eof
+from network.libp2p_compat import (
+    StreamReadTimeout,
+    StreamTooLarge,
+    read_until_eof,
+    reset_stream_on_error,
+)
 from network.service import NetworkService
 
 pytestmark = pytest.mark.trio
@@ -75,6 +80,69 @@ async def test_read_until_eof_propagates_other_errors():
 
     with pytest.raises(ConnectionResetError):
         await read_until_eof(Resetting(), 1024)
+
+
+async def test_read_until_eof_raises_when_mplex_reports_reset_as_eof():
+    from libp2p.network.stream.exceptions import StreamReset
+
+    stream = ChunkedStream(b"x" * 1000, eof="raise", frame=300)
+    stream.muxed_stream = MagicMock(spec=["event_reset"])
+    stream.muxed_stream.event_reset = trio.Event()
+    stream.muxed_stream.event_reset.set()
+    with pytest.raises(StreamReset):
+        await read_until_eof(stream, 4096)
+
+
+async def test_read_until_eof_ignores_reset_attributes_of_a_mock():
+    stream = ChunkedStream(b"x" * 1000, eof="raise", frame=300)
+    stream.muxed_stream = MagicMock()
+    assert await read_until_eof(stream, 4096) == b"x" * 1000
+
+
+async def test_read_until_eof_times_out_when_peer_never_closes():
+    class Hanging:
+        async def read(self, n=None):
+            await trio.sleep_forever()
+
+    with pytest.raises(StreamReadTimeout):
+        await read_until_eof(Hanging(), 1024, read_timeout=0.05)
+
+
+# --------------------------------------------------------------------------
+# reset_stream_on_error
+# --------------------------------------------------------------------------
+
+
+class RecordingStream:
+    def __init__(self):
+        self.resets = 0
+
+    async def reset(self):
+        await trio.sleep(0)
+        self.resets += 1
+
+
+async def test_reset_stream_on_error_resets_and_reraises():
+    stream = RecordingStream()
+    with pytest.raises(StreamTooLarge):
+        async with reset_stream_on_error(stream):
+            raise StreamTooLarge("too big")
+    assert stream.resets == 1
+
+
+async def test_reset_stream_on_error_resets_when_cancelled():
+    stream = RecordingStream()
+    with trio.move_on_after(0.01):
+        async with reset_stream_on_error(stream):
+            await trio.sleep_forever()
+    assert stream.resets == 1
+
+
+async def test_reset_stream_on_error_keeps_stream_on_success():
+    stream = RecordingStream()
+    async with reset_stream_on_error(stream):
+        pass
+    assert stream.resets == 0
 
 
 # --------------------------------------------------------------------------
@@ -255,6 +323,281 @@ async def test_sync_guard_released_after_failure(service, monkeypatch):
     service.host.new_stream = boom
     assert await service._sync_and_ingest_from_peer("peerA", chain.locator()) == 0
     assert not service._syncing_peers
+
+
+MiB = 1024 * 1024
+
+
+class LargeBlockChain(FakeChain):
+    """FakeChain whose block `i` carries `sizes[i]` bytes of transaction data."""
+
+    def __init__(self, sizes: List[int]):
+        super().__init__(len(sizes))
+        self.sizes = sizes
+        self.block_request_sizes: List[int] = []
+
+    def _respond(self, req: Dict[str, Any]) -> bytes:
+        if req["type"] == "get_headers":
+            return super()._respond(req)
+        self.block_requests += 1
+        self.block_request_sizes.append(len(req["hashes"]))
+        blocks = [
+            {
+                "block_hash": h,
+                "header": {"block_number": int(h[1:])},
+                "transactions": ["x" * self.sizes[int(h[1:])]],
+            }
+            for h in req["hashes"]
+        ]
+        return json.dumps({"blocks": blocks}).encode()
+
+    async def new_stream(self, peer_id, protocols):
+        chain = self
+
+        class _S:
+            payload = b""
+            offset = 0
+
+            async def write(self, data):
+                self.payload = chain._respond(json.loads(data.decode()))
+
+            async def read(self, n=None):
+                take = min(FRAME, n or FRAME)
+                out = self.payload[self.offset : self.offset + take]
+                self.offset += len(out)
+                if not out:
+                    raise EOFError()
+                return out
+
+            async def close(self):
+                pass
+
+            async def reset(self):
+                pass
+
+        return _S()
+
+
+async def test_fetch_block_chunk_refetches_after_a_short_reply(service, monkeypatch):
+    from network.protocols import TAU_PROTOCOL_BLOCKS
+
+    opens: List[int] = []
+
+    class ShortReplyStream:
+        def __init__(self):
+            self.payload = b""
+            self.offset = 0
+
+        async def write(self, data):
+            req = json.loads(data.decode())
+            hashes = req["hashes"]
+            blocks = [
+                {"block_hash": h, "header": {"block_number": i}}
+                for i, h in enumerate(hashes)
+            ]
+            short = blocks[:2] if len(blocks) > 2 else blocks
+            self.payload = json.dumps({"blocks": short}).encode()
+            self.offset = 0
+
+        async def read(self, n=None):
+            take = min(FRAME, n or FRAME)
+            out = self.payload[self.offset : self.offset + take]
+            self.offset += len(out)
+            if not out:
+                raise EOFError()
+            return out
+
+        async def close(self):
+            pass
+
+        async def reset(self):
+            pass
+
+    async def new_stream(peer_id, protocols):
+        assert TAU_PROTOCOL_BLOCKS in protocols
+        opens.append(1)
+        return ShortReplyStream()
+
+    service.host.new_stream = new_stream
+    hashes = [f"h{i}" for i in range(6)]
+    got = await service._fetch_block_chunk("peerA", hashes)
+    assert len(got) == 6
+    assert len(opens) == 3
+
+
+class _RepliesFromRequest:
+    def __init__(self, reply_for_hashes):
+        self.reply_for_hashes = reply_for_hashes
+        self.payload = b""
+
+    async def write(self, data):
+        hashes = json.loads(data.decode())["hashes"]
+        self.payload = json.dumps({"blocks": self.reply_for_hashes(hashes)}).encode()
+
+    async def read(self, n=None):
+        out, self.payload = self.payload, b""
+        if not out:
+            raise EOFError()
+        return out
+
+    async def close(self):
+        pass
+
+    async def reset(self):
+        pass
+
+
+def _serve_blocks(service, reply_for_hashes) -> List[List[str]]:
+    requests: List[List[str]] = []
+
+    def recording(hashes):
+        requests.append(hashes)
+        return reply_for_hashes(hashes)
+
+    async def new_stream(peer_id, protocols):
+        return _RepliesFromRequest(recording)
+
+    service.host.new_stream = new_stream
+    return requests
+
+
+async def test_fetch_block_chunk_stops_on_an_empty_reply(service):
+    requests = _serve_blocks(service, lambda hashes: [])
+    with trio.fail_after(5):
+        assert await service._fetch_block_chunk("peerA", ["h0", "h1"]) == []
+    assert requests == [["h0", "h1"]]
+
+
+async def test_fetch_block_chunk_stops_when_the_peer_lacks_the_rest(service):
+    known = {"h0": {"block_hash": "h0", "header": {"block_number": 0}}}
+    requests = _serve_blocks(
+        service, lambda hashes: [known[h] for h in hashes if h in known]
+    )
+    with trio.fail_after(5):
+        got = await service._fetch_block_chunk("peerA", ["h0", "h1", "h2"])
+    assert got == [known["h0"]]
+    assert requests == [["h0", "h1", "h2"], ["h1", "h2"]]
+
+
+async def test_fetch_block_chunk_keeps_blocks_before_an_over_cap_block(
+    service, monkeypatch
+):
+    from network.service import BlockOverReplyCap
+
+    monkeypatch.setattr("network.service.SYNC_BLOCKS_REPLY_CAP", 1000)
+    small = {"block_hash": "h0", "header": {"block_number": 0}}
+    big = {"block_hash": "h1", "header": {"block_number": 1}, "padding": "x" * 5000}
+
+    def reply(hashes):
+        return [small] if hashes[0] == "h0" else [big]
+
+    _serve_blocks(service, reply)
+    with pytest.raises(BlockOverReplyCap) as err:
+        await service._fetch_block_chunk("peerA", ["h0", "h1"])
+    assert err.value.block_hash == "h1"
+    assert err.value.fetched == [small]
+
+
+async def test_sync_splits_a_block_chunk_over_the_reply_cap(service, monkeypatch):
+    chain = LargeBlockChain([MiB] * 30)
+    _wire(service, chain, monkeypatch)
+    total = await service._sync_and_ingest_from_peer("peerA", chain.locator())
+    assert total == 30
+    assert chain.head == 29
+    assert chain.block_request_sizes == [30, 15, 15]
+
+
+async def test_sync_ingests_up_to_a_single_block_over_the_reply_cap(service, monkeypatch, caplog):
+    chain = LargeBlockChain([1024, 1024, 1024, 21 * MiB, 1024, 1024])
+    _wire(service, chain, monkeypatch)
+    with caplog.at_level("ERROR"):
+        total = await service._sync_and_ingest_from_peer("peerA", chain.locator())
+    assert total == 3
+    assert chain.head == 2
+    assert chain.block_request_sizes == [6, 3, 3, 1]
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "h3" in errors[0] and "reply cap" in errors[0]
+
+
+class SyncStream:
+    """One sync stream that replies with `reply` and records how it ends."""
+
+    def __init__(self, reply: bytes, *, hang: bool = False, close_error: bool = False):
+        self.reply = reply
+        self.hang = hang
+        self.close_error = close_error
+        self.closed = 0
+        self.resets = 0
+
+    async def write(self, data):
+        pass
+
+    async def read(self, n=None):
+        if self.hang:
+            await trio.sleep_forever()
+        take = min(FRAME, n or FRAME)
+        out, self.reply = self.reply[:take], self.reply[take:]
+        if not out:
+            raise EOFError()
+        return out
+
+    async def close(self):
+        self.closed += 1
+        if self.close_error:
+            raise RuntimeError("close failed")
+
+    async def reset(self):
+        self.resets += 1
+
+
+def _wire_sync_streams(service, streams: List[SyncStream], monkeypatch):
+    import db
+
+    pending = list(streams)
+
+    async def new_stream(peer_id, protocols):
+        return pending.pop(0)
+
+    service.host.new_stream = new_stream
+    service._ingest_blocks = lambda blocks, peer_id: len(blocks)
+    monkeypatch.setattr(db, "get_block_by_hash", lambda h: None)
+
+
+def _headers_reply(count: int) -> bytes:
+    headers = [{"block_number": i, "block_hash": f"h{i}"} for i in range(count)]
+    return json.dumps({"headers": headers}).encode()
+
+
+def _blocks_reply(count: int) -> bytes:
+    blocks = [{"block_hash": f"h{i}", "header": {"block_number": i}} for i in range(count)]
+    return json.dumps({"blocks": blocks}).encode()
+
+
+async def test_sync_resets_header_stream_over_cap(service, monkeypatch):
+    stream = SyncStream(b"x" * (2 * 1024 * 1024 + 1))
+    _wire_sync_streams(service, [stream], monkeypatch)
+    assert await service._sync_and_ingest_from_peer("peerA", ["genesis_local"]) == 0
+    assert stream.resets == 1
+    assert stream.closed == 0
+
+
+async def test_sync_resets_block_stream_when_peer_never_closes(service, monkeypatch):
+    monkeypatch.setattr(service_mod, "SYNC_READ_TIMEOUT", 0.05)
+    headers = SyncStream(_headers_reply(3))
+    blocks = SyncStream(b"", hang=True)
+    _wire_sync_streams(service, [headers, blocks], monkeypatch)
+    assert await service._sync_and_ingest_from_peer("peerA", ["genesis_local"], limit=10) == 0
+    assert headers.closed == 1 and headers.resets == 0
+    assert blocks.resets == 1 and blocks.closed == 0
+
+
+async def test_sync_keeps_reply_when_close_fails(service, monkeypatch):
+    headers = SyncStream(_headers_reply(3), close_error=True)
+    blocks = SyncStream(_blocks_reply(3), close_error=True)
+    _wire_sync_streams(service, [headers, blocks], monkeypatch)
+    assert await service._sync_and_ingest_from_peer("peerA", ["genesis_local"], limit=10) == 3
+    assert headers.resets == 0 and blocks.resets == 0
 
 
 # --------------------------------------------------------------------------

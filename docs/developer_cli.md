@@ -63,9 +63,10 @@ Error codes emitted by the node, by origin:
 |---|---|
 | Server dispatch (`server.py`) | `UNKNOWN_COMMAND`, `RATE_LIMITED`, `FORBIDDEN`, `TIMEOUT`, `INTERNAL_ERROR` |
 | Argument / payload parsing (every command) | `INVALID_PARAMS`, `PARSE_ERROR` |
-| `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `BLS_UNAVAILABLE`, `TX_REJECTED` |
-| `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL` |
-| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `CLAUSE_REGISTRY_FULL`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED` |
+| `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_REJECTED` |
+| `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL`, `ESTIMATE_BUSY` (`checktx estimate` only) |
+| `sendtx` approval request | `APPROVAL_NOT_NEEDED`: the policy of the sender allows the transfer with no votes, so send it as an ordinary transfer. Only admission gives it, because block apply drops such a request. |
+| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED`, `RULE_CHANGE_NEEDS_APPROVAL`, `INVALID_RULE_CHANGE_REQUEST`, `INVALID_RULE_CHANGE_CANCEL`, `NOT_REQUEST_SENDER` |
 | `createblock` | `MEMPOOL_EMPTY`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED` |
 | Governance / rule / approval reads | `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `REQUEST_UNKNOWN`, `FEATURE_INACTIVE`, `TAU_UNAVAILABLE`, `TAU_ERROR` |
 
@@ -102,11 +103,14 @@ The WebSocket listener scans `65433`–`65442` for the first free port, so on a
 host already running a node the browser wallet may need a port other than the
 default. The node binds its libp2p listener first, and both scans (the TCP
 one from `65432`) skip its ports: a p2p port inside either range moves the
-WebSocket or TCP listener, never the p2p one. It also enforces an `Origin` allowlist: missing/`null` origins and
-anything containing `localhost` or `127.0.0.1` pass, otherwise the origin must
+WebSocket or TCP listener, never the p2p one. It also enforces an `Origin` allowlist: a missing origin and
+the hosts `localhost`, `127.0.0.1` and `::1` pass, otherwise the origin must
 match an entry in the comma-separated `TAU_WS_ALLOWED_ORIGINS` (`*` allows
-all). A rejected connection gets the plain-text `error disallowed_origin` and
-is then closed.
+all). An entry with a scheme must match scheme, host and port. A bare entry
+is a host only (no port or path in the entry) and must match the host exactly.
+`Origin: null` (a sandboxed frame or a `file:` page) is refused unless
+`TAU_WS_ALLOWED_ORIGINS` contains `null`. A rejected connection gets HTTP 403
+with the body `error disallowed_origin`.
 
 ### Connection lifecycle
 
@@ -148,7 +152,7 @@ The full registry (28 names, `app/container.py`):
 | Command | Grammar |
 |---|---|
 | `sendtx` | `sendtx <json_payload>` |
-| `checktx` | `checktx <json_payload>` — admission dry-run, no mempool write |
+| `checktx` | `checktx [estimate] <json_payload>` — admission dry-run, no mempool write. The plain form answers `admissible: null`, `fee_checked: false`; `estimate` also runs the Tau steps and answers `estimated_fee`, `fee_limit`, `admissible: true\|false`. `tau_evaluated` and `fee_checked` are true only when a Tau step ran and a fee was estimated; a fee-exempt type answers `fee_checked: false` and a `fee_exempt` note |
 | `createblock` | `createblock [allow-empty]` — **local-only**, see below |
 | `getmempool` | `getmempool` |
 | `gettimestamp` | `gettimestamp` |
@@ -171,7 +175,7 @@ The full registry (28 names, `app/container.py`):
 | `getapprovalrequest` | `getapprovalrequest <request_id>` |
 | `getrequestid` | `getrequestid <json_payload>` |
 | `getapprovalslots` | `getapprovalslots <address>` — advisory, node-local |
-| `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local |
+| `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local; `"request_type":"rule_change"` previews a policy change |
 | `getretractable` | `getretractable <retractable_id>` — 64 hex chars |
 | `getretractables` | `getretractables <address> [in\|out\|all]` (default `all`) |
 | `getretractableid` | `getretractableid <json_payload>` |
@@ -182,6 +186,66 @@ its own name: a `getcurrenttimestamp` request comes back with
 
 The five approval commands return `FEATURE_INACTIVE` unless the co-signature
 slots are reserved at the tip.
+
+### `checktx`: admission dry-run
+
+`checktx` tells if `sendtx` would accept a transaction. It does not write the
+mempool, it does not broadcast, and it charges nothing. The verdict comes from
+the `sendtx` code path. A refusal has the same `code` and `details` as `sendtx`.
+
+**Plain form.** `checktx <json_payload>` runs no Tau step. On the in-process
+path, a Tau step interns addresses into SQLite and advances the logical time of
+the live interpreter. An RPC with no fee must not do that. The plain form
+checks the JSON shape, the fields, the BLS signature, the sequence, the
+admission screens, the transfers and the custom inputs. The consensus-revision
+compile also runs, in a separate process that the node can stop.
+A success gives `admissible: null` and `fee_checked: false`, because no fee was
+evaluated. `checks_skipped` holds `tau_eval` and `fee_limit`. The answer has no
+`estimated_fee`. A wallet that used "0" as `fee_limit` would get a refusal at
+submit.
+
+**Estimate form.** `checktx estimate <json_payload>` also runs the Tau steps,
+in an isolated admission context on its own single slot.
+
+- It never uses the in-process path. A node with no isolated context gives
+  `ADMISSION_UNAVAILABLE`.
+- When another estimate runs, it gives `ESTIMATE_BUSY` at once.
+- Each sender key has a budget of slot time: 0.5 seconds at most, and 0.25 seconds more each second.
+  The node deducts the time of each estimate from the budget of its key, so one key holds the
+  slot for at most about a quarter of the time. A key with no budget left gets `ESTIMATE_BUSY`
+  before the node takes the slot. An estimate that finds the slot busy costs nothing.
+  Many funded keys can still share the slot, but each of them needs funds.
+- It gives `estimated_fee` for every fee-bearing type. The `fee_limit` of the
+  payload does not change the estimate. A wallet can sign a draft with any
+  `fee_limit`, ask, and sign again with the estimate.
+- `admissible` is true only when the `fee_limit` of the payload covers the
+  estimate. When no fee step ran for a fee-bearing type (`TAU_FORCE_TEST`),
+  `admissible` is null, as in the plain form.
+- The node checks the sequence and the balance before it takes the estimate
+  slot. A sender whose balance does not exceed the sum of its transfers gets
+  `INSUFFICIENT_FUNDS` with no Tau step. This floor assumes a fee of at least 1.
+  On a network with no fee rule, give `--fee 0`.
+- After the Tau steps, a sender that cannot pay the transfers plus the
+  estimated fee gets `INSUFFICIENT_FUNDS` and no estimate.
+
+**Flags.** `tau_evaluated` is true only when the admission context ran a Tau
+step. `fee_checked` is true only when the node estimated the fee of a
+fee-bearing type. A fee-exempt type (an approval vote, a retract, a governance
+vote) runs no fee step. It gives `fee_checked: false`, `fee_limit` in
+`checks_skipped` (and `tau_eval` when no step ran), and a `note` that starts
+with `fee_exempt`. A refusal has `tau_evaluated`, `checks_skipped` and
+`fee_checked` in `details`, with the same meaning.
+
+`checktx` never gives `MEMPOOL_FULL`. A full mempool is a fact about the node
+now, not a verdict about the transaction.
+
+**Tau workers.** Each admission context is one process that holds a native
+interpreter. Admission uses at most four contexts at a time, plus one standby
+context. The estimate slot adds one more process, so admission can hold six
+processes at the same time. The estimate does not count in the four admission
+slots, so a burst of estimates cannot block `sendtx`. On a short chain, one
+process uses about 55 MB of resident memory. The memory grows with the
+committed specification.
 
 ### Locality: `createblock`
 
@@ -369,22 +433,44 @@ tau-testnet tx raw-sign --privkey 0xabc... --payload tx.json > signed_tx.json
 tau-testnet tx raw-submit --file signed_tx.json
 ```
 
+A rule that writes `o5` is registered as the sender's own policy clause, so it
+carries no `i12` guard and cannot share a transaction with transfers
+(`RULE_WITH_TRANSFERS`); send it on its own. Fee rules that write `o8` must
+reference `i12` or `i3` (`UNSCOPED_USER_RULE`).
+
 `tx send` exits `1` when the node returns a `{"status":"error",...}`
 envelope (any `error.code`, e.g. `INVALID_SIGNATURE`, `INVALID_SEQUENCE`,
 `TX_REJECTED`), `4` for bad amounts/empty operations/missing inputs, `3` on
 connection/timeout errors.
 
+### Fee limit
+
+`--fee <n>` sets `fee_limit`. Without `--fee`, a fee-bearing command (`tx send`,
+`rule offer|accept|reject`, `approval request`, `retractable send`) signs a
+draft with `fee_limit` 0, asks the node with `checktx estimate`, and signs the
+transaction again with the estimate as `fee_limit`. The estimate does not
+depend on the draft's `fee_limit`. On `ESTIMATE_BUSY`, the CLI asks again up to
+3 times. It waits 0.5, 1 and 2 seconds before these attempts. When the node
+gives no estimate (`ESTIMATE_BUSY` after the last attempt,
+`ADMISSION_UNAVAILABLE`, or any rejection), the CLI stops before the final
+signature, prints the node error, and exits `1`. Give `--fee` in that case.
+A sender that cannot pay the estimated fee gets `INSUFFICIENT_FUNDS` and no
+estimate, even with `--fee`. Fund the sender first.
+
+The fee-exempt commands have no `--fee`: `approval approve`, `approval decline`,
+`retractable retract`, `gov propose` and `gov vote`. They sign `fee_limit` 0.
+
 ## Rule sharing
 
 Send a Tau rule to another user; they check its conflict status and then accept
-it into their own specification or reject it.
+it as their own policy clause or reject it.
 
 ```bash
 # Offer a rule. --expire-in N gives it N blocks to land, counted from the next
 # block (expire_at_height = tip + 1 + N);
 # --expire-at-height sets an absolute height instead.
 tau-testnet rule offer --key alice --to <bob_pubkey> --rule-file policy.tau
-tau-testnet rule offer --key alice --to <bob_pubkey> --rule 'always ( o5[t]:bv[24] = { #x000000 }:bv[24] ).' \
+tau-testnet rule offer --key alice --to <bob_pubkey> --rule 'always ( (i1[t]:bv[24] > { #x002710 }:bv[24]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).' \
     --expire-at-height 5000
 
 # Inspect. `list` defaults to the --key owner's address; --role filters direction.
@@ -414,11 +500,35 @@ Underlying RPCs: `getruleoffers <address> [in|out|all]`, `getruleoffer <offer_id
 `getruleconflict <offer_id>`, `getofferid '<json>'`.
 
 The conflict report is **advisory and node-local** and never gates a
-transaction. It does not check satisfiability — tau-lang exposes
+transaction. Its layers are `shape`, `reserved_domains`, `registry_collision`,
+`bv_widths`, `compile` (whether the clause builds) and `unrealizable`. It does
+not check satisfiability — tau-lang exposes
 `sat`/`unsat`/`valid`/`unrealizable` in C++ but not through its Python
 bindings — so a clean result means no conflict was *observed*. See the
-[Rule sharing](../README.md#rule-sharing) section for the composite-rule model
-and why an accepted rule is composed rather than appended.
+[Rule sharing](../README.md#rule-sharing) section for the per-account clause
+registry and the screens a clause must pass.
+
+## Policy guard
+
+Guard your own `o5` policy so that changing it needs co-signers. Semantics, kinds
+and limits are in [approvals.md](approvals.md#guarding-policy-changes).
+
+```bash
+tau-testnet policy guard set --key alice --file guard.tau --approver 18=<xpub>
+tau-testnet policy guard revoke --key alice
+tau-testnet policy guard show <address>
+tau-testnet policy change request --key alice --kind set --file policy.tau --approver 18=<xpub>
+tau-testnet policy change request --key alice --kind revoke --approver 18=<xpub>
+tau-testnet policy change request --key alice --kind accept --offer-id <offer_id>
+tau-testnet policy change cancel --key alice --request-id <request_id>
+```
+
+`guard set` and `guard revoke` are rule-change requests of kind 4 and 5; `change
+request --kind` is `set`, `revoke` or `accept`. All request commands take `--body`
+in place of `--file`, `--fee`, `--expire-in N` (default 2000 blocks, so the
+1000-block time escape can apply), `--expire-at-height`, `--preview` (ask the node,
+send nothing) and `--dry-run`, and print the request id. `cancel` is feeless.
+They exit like the other transaction commands.
 
 ## Retractable transfers
 

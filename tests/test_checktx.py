@@ -32,7 +32,7 @@ from py_ecc.bls import G2Basic as _bls
 
 SK_SENDER = _bls.KeyGen(b"checktx_sender")
 SENDER = _bls.SkToPk(SK_SENDER).hex()
-RECIPIENT = "c" * 96
+RECIPIENT = _bls.SkToPk(_bls.KeyGen(b"checktx_recipient")).hex()
 
 
 def _mock_tau_multi_ok(*args, **kwargs):
@@ -54,7 +54,7 @@ class TestChecktx(unittest.TestCase):
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
+        patch("commands.sendtx.validate_bls_pubkey", return_value=None).start()
         patch("commands.sendtx.tau_manager.communicate_with_tau_multi", _mock_tau_multi_ok).start()
         chain_state._balances[SENDER] = 1000
 
@@ -87,11 +87,13 @@ class TestChecktx(unittest.TestCase):
         return json.loads(checktx.execute(f"checktx {json.dumps(tx)}", None))
 
     # --- purity ----------------------------------------------------------
-    def test_valid_tx_is_admissible_and_never_enters_the_mempool(self):
+    def test_valid_tx_is_not_judged_and_never_enters_the_mempool(self):
         before = db.count_mempool_txs()
         env = self._check(self._tx())
         self.assertEqual(env["status"], "ok", msg=env)
-        self.assertTrue(env["data"]["admissible"])
+        # No fee was evaluated, so the plain form gives no verdict.
+        self.assertIsNone(env["data"]["admissible"])
+        self.assertFalse(env["data"]["fee_checked"])
         self.assertEqual(len(env["data"]["tx_hash"]), 64)
         self.assertEqual(db.count_mempool_txs(), before)
 
@@ -163,10 +165,10 @@ class TestChecktx(unittest.TestCase):
         self.assertIsNotNone(c, "reserved stream was admitted")
         self.assertEqual(c, s)
 
-    def test_parity_unscoped_policy_rule(self):
-        """The #24 sender-scope screen reaches checktx too, so a wallet learns
+    def test_parity_unscoped_fee_rule(self):
+        """The sender-scope screen reaches checktx too, so a wallet learns
         before signing rather than at submit."""
-        tx = self._tx(operations={"0": "always (o5[t]:bv[24] = { #x000000 }:bv[24])."})
+        tx = self._tx(operations={"0": "always (o8[t]:bv[24] = { #x000003 }:bv[24])."})
         c, s = self._codes_for(tx)
         self.assertEqual(c, "UNSCOPED_USER_RULE")
         self.assertEqual(c, s)
@@ -180,6 +182,7 @@ class TestChecktx(unittest.TestCase):
     def test_rejection_details_say_tau_was_not_evaluated(self):
         env = self._check(self._tx(sequence_number=999))
         self.assertFalse(env["error"]["details"]["tau_evaluated"])
+        self.assertFalse(env["error"]["details"]["fee_checked"])
 
     def test_mempool_full_is_never_reported(self):
         """A capacity fact about the node, not a verdict about this tx."""

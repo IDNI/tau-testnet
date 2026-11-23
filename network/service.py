@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import itertools
 from collections import OrderedDict
 import logging
 import sys
@@ -15,6 +16,7 @@ from .host import HostManager, NetworkListenError
 from .dht_manager import DHTManager
 from .discovery import DiscoveryManager
 from .gossip import GossipManager
+from .protocols import REQUEST_READ_TIMEOUT
 from commands import sendtx
 
 logger = logging.getLogger(__name__)
@@ -23,8 +25,70 @@ logger = logging.getLogger(__name__)
 MAX_HANDSHAKE_PROVIDERS = 50
 # Hard bound on header pages pulled in one sync call.
 MAX_SYNC_PAGES = 50
+# A peer that never closes a sync reply must not hold the sync forever.
+SYNC_READ_TIMEOUT = 120.0
+# Handshake and ping payloads are small; a silent peer must not block forever.
+HANDSHAKE_READ_TIMEOUT = 30.0
+PING_READ_TIMEOUT = 10.0
+SYNC_BLOCKS_REPLY_CAP = 20 * 1024 * 1024
+SYNC_BLOCKS_CHUNK = 128
+BLOCKS_REQUEST_MAX_BYTES = 1024 * 1024
+BLOCKS_HASH_LIMIT = 2000
+# Sync clients open the stream before the request is ready; wait long enough
+# that a slow round trip still delivers the locator.
+SYNC_REQUEST_EMPTY_TIMEOUT = 10.0
 # Bound on remembered peers that failed the genesis gate.
 MAX_GENESIS_REJECTED_PEERS = 1024
+
+
+class BlockOverReplyCap(Exception):
+    """One block is larger than the get_blocks reply cap, so no request can fetch it."""
+
+    def __init__(self, block_hash: str, fetched: List[Dict[str, Any]]):
+        super().__init__(block_hash)
+        self.block_hash = block_hash
+        self.fetched = fetched
+
+
+def _capped_block_reply(
+    stored: Iterable[Optional[Dict[str, Any]]], reply_cap: int
+) -> List[Dict[str, Any]]:
+    """Collect blocks in order until the JSON reply would exceed the byte cap.
+
+    A first block over the cap stays in the reply, so the client can report it.
+    """
+    import json
+
+    blocks: List[Dict[str, Any]] = []
+    size = len(json.dumps({"blocks": []}).encode())
+    for blk in stored:
+        if not blk:
+            continue
+        extra = len(json.dumps(blk).encode()) + (2 if blocks else 0)
+        if blocks and size + extra > reply_cap:
+            break
+        blocks.append(blk)
+        size += extra
+    return blocks
+
+
+def _remaining_hashes_after_partial(
+    hashes: List[str], blocks: List[Dict[str, Any]]
+) -> List[str]:
+    """Hashes after the last block returned for a capped get_blocks reply."""
+    # An empty reply gives no progress, so asking again could never end.
+    if not blocks:
+        return []
+    bi = 0
+    hi = 0
+    while hi < len(hashes) and bi < len(blocks):
+        if blocks[bi].get("block_hash") == hashes[hi]:
+            bi += 1
+        hi += 1
+    if bi != len(blocks):
+        return []
+    return hashes[hi:]
+
 
 # Install the libp2p shims (QUIC cleanup race, AutoConnector backoff overflow) at
 # module load. Their bodies live in `network/libp2p_compat.py`; calling them here
@@ -84,10 +148,9 @@ class NetworkService:
         
         # Metrics
         self._metric_timestamps: Dict[str, float] = {}
-        # Track peers we've already processed a "connected" event for to avoid
-        # duplicate handshakes/subscription spam when libp2p emits multiple
-        # connected notifications for the same peer.
-        self._connected_peer_ids: Set[str] = set()
+        # Keyed by connection: libp2p can deliver the disconnect event of an old
+        # connection after the connect event of a redial to the same peer.
+        self._peer_connections: Dict[str, Set[Any]] = {}
         # Peers whose handshake failed the genesis gate. Survives disconnects so a
         # rejected peer that reconnects cannot trigger syncs through gossip.
         self._genesis_rejected_peers: "OrderedDict[str, None]" = OrderedDict()
@@ -106,10 +169,11 @@ class NetworkService:
     async def _on_peer_connected(self, conn: Any) -> None:
         peer_id = conn.muxed_conn.peer_id
         peer_key = str(peer_id)
-        if peer_key in self._connected_peer_ids:
+        conns = self._peer_connections.setdefault(peer_key, set())
+        if conn in conns:
             logger.debug("Duplicate peer connected event ignored: %s", peer_id)
             return
-        self._connected_peer_ids.add(peer_key)
+        conns.add(conn)
         logger.info("Peer connected: %s", peer_id)
         
         # Manually add peer address to peerstore for inbound connections
@@ -155,10 +219,19 @@ class NetworkService:
 
     async def _on_peer_disconnected(self, conn: Any) -> None:
         try:
-            peer_id = conn.muxed_conn.peer_id
-            self._connected_peer_ids.discard(str(peer_id))
+            peer_key = str(conn.muxed_conn.peer_id)
         except Exception:
-            pass
+            return
+        conns = self._peer_connections.get(peer_key)
+        if conns is None:
+            return
+        conns.discard(conn)
+        if not conns:
+            del self._peer_connections[peer_key]
+
+    def _peer_has_open_connection(self, peer_id: Any) -> bool:
+        conns = self._peer_connections.get(str(peer_id), ())
+        return any(getattr(c, "is_closed", False) is not True for c in conns)
 
     async def _perform_handshake(self, peer_id: Any) -> None:
         """Handshake with retry. The first attempt races connection setup (the
@@ -177,7 +250,7 @@ class NetworkService:
                                 peer_id, attempt)
                 return
             except Exception:
-                if str(peer_id) not in self._connected_peer_ids:
+                if not self._peer_has_open_connection(peer_id):
                     logger.debug("Handshake retry abandoned; %s disconnected",
                                  peer_id)
                     return
@@ -202,14 +275,21 @@ class NetworkService:
 
     async def _handshake_once(self, peer_id: Any) -> None:
         from .protocols import TAU_PROTOCOL_HANDSHAKE
-        from .libp2p_compat import read_until_eof
+        from .libp2p_compat import (
+            close_stream_safely,
+            read_until_eof,
+            reset_stream_on_error,
+        )
         import json
+        stream = None
         try:
             stream = await self.host.new_stream(peer_id, [TAU_PROTOCOL_HANDSHAKE])
             payload = self._build_handshake_payload()
             await stream.write(json.dumps(payload).encode())
-            data = await read_until_eof(stream, 65535)
-            await stream.close()
+            async with reset_stream_on_error(stream):
+                data = await read_until_eof(
+                    stream, 65535, read_timeout=HANDSHAKE_READ_TIMEOUT
+                )
             
             # Process response
             if data:
@@ -326,6 +406,9 @@ class NetworkService:
                     logger.debug("Handshake-triggered sync failed to schedule", exc_info=True)
         except Exception:
             raise  # retry policy (backoff, attempt cap) lives in _perform_handshake
+        finally:
+            if stream is not None:
+                await close_stream_safely(stream)
 
     def _self_advertised_addrs(self) -> List[str]:
         """Addrs we tell peers to dial: configured announce addrs (NAT/public)
@@ -648,6 +731,47 @@ class NetworkService:
         if self._nursery:
             self._nursery.start_soon(self._head_reannounce_loop)
 
+        # Bootstrap re-dial while peerless (see _bootstrap_redial_loop)
+        if self._nursery:
+            self._nursery.start_soon(self._bootstrap_redial_loop)
+
+    async def _bootstrap_redial_loop(self) -> None:
+        """Dial the configured bootstrap peers again while we have no peer.
+
+        _connect_to_bootstrap_peer runs once per peer at start (5 attempts),
+        so a node that later loses every connection, e.g. because the
+        bootnode stops accepting peers for a while, stays at 0 peers with a
+        stale head until it is restarted. Every interval this checks the
+        connected peers and, only when there are none, runs the normal
+        bootstrap dial again. Interval via TAU_BOOTSTRAP_REDIAL_INTERVAL
+        seconds (default 60; <= 0 disables)."""
+        import os
+
+        try:
+            interval = float(os.environ.get("TAU_BOOTSTRAP_REDIAL_INTERVAL", "60"))
+        except ValueError:
+            interval = 60.0
+        if interval <= 0:
+            return
+        while not self._runner_stop.is_set():
+            await trio.sleep(interval)
+            try:
+                await self._bootstrap_redial_once()
+            except Exception:
+                logger.debug("Bootstrap re-dial failed", exc_info=True)
+
+    async def _bootstrap_redial_once(self) -> bool:
+        """One re-dial pass. Returns True when bootstrap peers were dialed."""
+        if self.get_connected_peers():
+            return False
+        bootstraps = list(self._config.bootstrap_peers or []) + list(getattr(self._config, "dht_bootstrap_peers", []) or [])
+        if not bootstraps:
+            return False
+        logger.info("No connected peer; dialing %d bootstrap peer(s) again", len(bootstraps))
+        for peer_cfg in bootstraps:
+            await self._connect_to_bootstrap_peer(peer_cfg)
+        return True
+
     async def _head_reannounce_loop(self) -> None:
         """Periodically re-announce our canonical head over block gossip.
 
@@ -936,7 +1060,12 @@ class NetworkService:
         import json
         import multiaddr
         import db
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import (
+            StreamTooLarge,
+            close_stream_safely,
+            read_json_object,
+            reset_stream_on_error,
+        )
 
         # Prepare response (default)
         resp = {
@@ -959,7 +1088,16 @@ class NetworkService:
 
         try:
             # Read payload
-            data = await bounded_stream_read(stream, 65535)
+            data = b""
+            async with reset_stream_on_error(stream):
+                try:
+                    data = await read_json_object(
+                        stream, 65535, read_timeout=HANDSHAKE_READ_TIMEOUT
+                    )
+                except StreamTooLarge:
+                    raise
+                except ValueError:
+                    data = b""
             if logger.isEnabledFor(logging.DEBUG):
                  # Log length only to confirm receipt without flooding raw bytes
                  logger.debug("Handshake received %d bytes", len(data))
@@ -1106,9 +1244,16 @@ class NetworkService:
     async def _handle_ping(self, stream) -> None:
         import json
         import time
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import (
+            close_stream_safely,
+            read_json_object,
+            reset_stream_on_error,
+        )
         try:
-            data = await bounded_stream_read(stream, 65535)
+            async with reset_stream_on_error(stream):
+                data = await read_json_object(
+                    stream, 65535, read_timeout=PING_READ_TIMEOUT
+                )
             req = json.loads(data.decode())
             resp = {
                 "nonce": req.get("nonce"),
@@ -1127,8 +1272,10 @@ class NetworkService:
         try:
             # Some callers (tests/debug tools) may "send" an empty request by writing b"".
             # libp2p streams won't deliver that as data, so a naive read() would block forever.
-            # bounded_stream_read's empty_timeout returns b"" if no bytes arrive in 0.25s.
-            data = await bounded_stream_read(stream, 65535, empty_timeout=0.25)
+            # bounded_stream_read's empty_timeout returns b"" if no bytes arrive in time.
+            data = await bounded_stream_read(
+                stream, 65535, empty_timeout=SYNC_REQUEST_EMPTY_TIMEOUT
+            )
             req: Dict[str, Any] = {}
             if data:
                 if data.strip() == b"get_headers":
@@ -1209,9 +1356,25 @@ class NetworkService:
     async def _handle_blocks(self, stream) -> None:
         import json
         import db
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import (
+            StreamTooLarge,
+            close_stream_safely,
+            read_json_object,
+            reset_stream_on_error,
+        )
         try:
-            data = await bounded_stream_read(stream, 10 * 1024 * 1024)
+            data = b""
+            async with reset_stream_on_error(stream):
+                try:
+                    data = await read_json_object(
+                        stream,
+                        BLOCKS_REQUEST_MAX_BYTES,
+                        read_timeout=REQUEST_READ_TIMEOUT,
+                    )
+                except StreamTooLarge:
+                    raise
+                except ValueError:
+                    data = b""
             req: Dict[str, Any] = {}
             if data:
                 try:
@@ -1224,10 +1387,10 @@ class NetworkService:
             # Back-compat: older internal client used {"block_hashes":[...]}
             if isinstance(req, dict) and isinstance(req.get("block_hashes"), list):
                 hashes = [str(h) for h in req.get("block_hashes") if h]
-                for h in hashes:
-                    blk = db.get_block_by_hash(h)
-                    if blk:
-                        blocks.append(blk)
+                hashes = hashes[:BLOCKS_HASH_LIMIT]
+                blocks = _capped_block_reply(
+                    map(db.get_block_by_hash, hashes), SYNC_BLOCKS_REPLY_CAP
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1240,10 +1403,10 @@ class NetworkService:
             # By hashes
             if isinstance(req.get("hashes"), list):
                 hashes = [str(h) for h in req["hashes"] if h]
-                for h in hashes:
-                    blk = db.get_block_by_hash(h)
-                    if blk:
-                        blocks.append(blk)
+                hashes = hashes[:BLOCKS_HASH_LIMIT]
+                blocks = _capped_block_reply(
+                    map(db.get_block_by_hash, hashes), SYNC_BLOCKS_REPLY_CAP
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1265,10 +1428,12 @@ class NetworkService:
                     except Exception:
                         start_number = 0
 
-                for blk in db.get_canonical_blocks_at_or_after_height(start_number):
-                    blocks.append(blk)
-                    if len(blocks) >= limit:
-                        break
+                blocks = _capped_block_reply(
+                    itertools.islice(
+                        db.get_canonical_blocks_at_or_after_height(start_number), limit
+                    ),
+                    SYNC_BLOCKS_REPLY_CAP,
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1285,10 +1450,12 @@ class NetworkService:
                     limit = 1
                 limit = max(1, min(limit, 2000))
 
-                for blk in db.get_canonical_blocks_at_or_after_height(start_number):
-                    blocks.append(blk)
-                    if len(blocks) >= limit:
-                        break
+                blocks = _capped_block_reply(
+                    itertools.islice(
+                        db.get_canonical_blocks_at_or_after_height(start_number), limit
+                    ),
+                    SYNC_BLOCKS_REPLY_CAP,
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1302,9 +1469,13 @@ class NetworkService:
 
     async def _handle_tx(self, stream) -> None:
         import json
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import close_stream_safely, read_json_object, reset_stream_on_error
+        from .protocols import TAU_STREAM_REQUEST_MAX_BYTES
         try:
-            data = await bounded_stream_read(stream, 65535)
+            async with reset_stream_on_error(stream):
+                data = await read_json_object(
+                    stream, TAU_STREAM_REQUEST_MAX_BYTES, read_timeout=REQUEST_READ_TIMEOUT
+                )
             req = json.loads(data.decode())
             # Submit tx off the event loop -- see the note in
             # _process_gossip_payload; admission can block for seconds.
@@ -1320,9 +1491,13 @@ class NetworkService:
 
     async def _handle_gossip_stream(self, stream) -> None:
         import json
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import close_stream_safely, read_json_object, reset_stream_on_error
+        from .protocols import TAU_STREAM_REQUEST_MAX_BYTES
         try:
-            data = await bounded_stream_read(stream, 65535)
+            async with reset_stream_on_error(stream):
+                data = await read_json_object(
+                    stream, TAU_STREAM_REQUEST_MAX_BYTES, read_timeout=REQUEST_READ_TIMEOUT
+                )
             req = json.loads((data or b"{}").decode())
 
             sender_pid = req.get("peer_id")
@@ -1854,8 +2029,8 @@ class NetworkService:
         self, pid_obj: Any, peer_id: Any, locator: List[str], stop: Optional[str], limit: int
     ) -> "tuple[int, bool]":
         """Fetch and ingest one header page. Returns (ingested, peer_may_have_more)."""
-        from .protocols import TAU_PROTOCOL_SYNC, TAU_PROTOCOL_BLOCKS
-        from .libp2p_compat import read_until_eof
+        from .protocols import TAU_PROTOCOL_SYNC
+        from .libp2p_compat import close_stream_safely, read_until_eof, reset_stream_on_error
         import json
         import db
 
@@ -1864,9 +2039,12 @@ class NetworkService:
         try:
             req = {"type": "get_headers", "locator": list(locator), "stop": stop, "limit": limit}
             stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_SYNC])
-            await stream.write(json.dumps(req).encode())
-            resp_raw = await read_until_eof(stream, 2 * 1024 * 1024)
-            await stream.close()
+            async with reset_stream_on_error(stream):
+                await stream.write(json.dumps(req).encode())
+                resp_raw = await read_until_eof(
+                    stream, 2 * 1024 * 1024, read_timeout=SYNC_READ_TIMEOUT
+                )
+            await close_stream_safely(stream)
             resp = json.loads((resp_raw or b"{}").decode())
             headers = resp.get("headers") or []
         except Exception:
@@ -1904,17 +2082,21 @@ class NetworkService:
 
         # 3) Fetch missing blocks by hash
         blocks: List[Dict[str, Any]] = []
-        chunk_size = 128
-        for i in range(0, len(missing_hashes), chunk_size):
-            chunk = missing_hashes[i : i + chunk_size]
+        for i in range(0, len(missing_hashes), SYNC_BLOCKS_CHUNK):
+            chunk = missing_hashes[i : i + SYNC_BLOCKS_CHUNK]
             try:
-                req = {"type": "get_blocks", "hashes": chunk}
-                stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_BLOCKS])
-                await stream.write(json.dumps(req).encode())
-                resp_raw = await read_until_eof(stream, 20 * 1024 * 1024)
-                await stream.close()
-                resp = json.loads((resp_raw or b"{}").decode())
-                blocks.extend(resp.get("blocks") or [])
+                blocks.extend(await self._fetch_block_chunk(pid_obj, chunk))
+            except BlockOverReplyCap as exc:
+                logger.error(
+                    "Block %s from %s is larger than the reply cap of %d bytes; "
+                    "the sync stops before this block",
+                    exc.block_hash,
+                    peer_id,
+                    SYNC_BLOCKS_REPLY_CAP,
+                )
+                blocks.extend(exc.fetched)
+                more = False
+                break
             except Exception:
                 logger.warning("Failed to fetch block bodies from %s", peer_id, exc_info=True)
                 break
@@ -1942,6 +2124,54 @@ class NetworkService:
         except Exception:
             logger.warning("Failed to ingest blocks from %s", peer_id, exc_info=True)
             return 0, False
+
+    async def _fetch_block_chunk(self, pid_obj: Any, hashes: List[str]) -> List[Dict[str, Any]]:
+        """Fetch `hashes` with get_blocks, in halves when a reply exceeds the cap.
+
+        Raises `BlockOverReplyCap` with the blocks fetched before the block
+        that no request can carry.
+        """
+        from .protocols import TAU_PROTOCOL_BLOCKS
+        from .libp2p_compat import (
+            StreamTooLarge,
+            close_stream_safely,
+            read_until_eof,
+            reset_stream_on_error,
+        )
+        import json
+
+        try:
+            req = {"type": "get_blocks", "hashes": hashes}
+            stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_BLOCKS])
+            async with reset_stream_on_error(stream):
+                await stream.write(json.dumps(req).encode())
+                resp_raw = await read_until_eof(
+                    stream, SYNC_BLOCKS_REPLY_CAP, read_timeout=SYNC_READ_TIMEOUT
+                )
+            await close_stream_safely(stream)
+        except StreamTooLarge:
+            if len(hashes) == 1:
+                raise BlockOverReplyCap(hashes[0], [])
+        else:
+            resp = json.loads((resp_raw or b"{}").decode())
+            blocks = list(resp.get("blocks") or [])
+            remaining = _remaining_hashes_after_partial(hashes, blocks)
+            if remaining:
+                try:
+                    blocks.extend(await self._fetch_block_chunk(pid_obj, remaining))
+                except BlockOverReplyCap as exc:
+                    exc.fetched = blocks + exc.fetched
+                    raise
+            return blocks
+
+        half = len(hashes) // 2
+        first = await self._fetch_block_chunk(pid_obj, hashes[:half])
+        try:
+            second = await self._fetch_block_chunk(pid_obj, hashes[half:])
+        except BlockOverReplyCap as exc:
+            exc.fetched = first + exc.fetched
+            raise
+        return first + second
 
     @staticmethod
     def _ingest_blocks(sorted_blocks: List[Dict[str, Any]], peer_id: Any) -> int:

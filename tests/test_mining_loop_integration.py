@@ -46,10 +46,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
         self.original_communicate_multi = tau_manager.communicate_with_tau_multi
         tau_manager.communicate_with_tau_multi = lambda **kwargs: {}
         
-        # Mock validation to accept dummy signature
         from commands import createblock
-        self.original_validate = createblock._validate_signature
-        createblock._validate_signature = lambda p: True
         # Also mock BLS availability check if needed, but the loop checks availability.
         # If BLS is improperly installed, it fails.
         # Let's force _BLS_AVAILABLE to be True in createblock?
@@ -57,9 +54,9 @@ class TestMiningLoopIntegration(unittest.TestCase):
         # createblock.py imports _BLS_AVAILABLE. We can patch it.
         createblock._BLS_AVAILABLE = True
 
-        from py_ecc.bls import G2Basic
-        self.original_verify = G2Basic.Verify
-        G2Basic.Verify = lambda *args, **kwargs: True
+        from consensus import bls
+        self.original_verify = bls.verify
+        bls.verify = lambda *args, **kwargs: True
 
         from consensus.engine import TauConsensusEngine
         self.original_query = TauConsensusEngine.query_eligibility
@@ -82,8 +79,8 @@ class TestMiningLoopIntegration(unittest.TestCase):
         from consensus.engine import TauConsensusEngine
         TauConsensusEngine.query_eligibility = self.original_query
 
-        from py_ecc.bls import G2Basic
-        G2Basic.Verify = self.original_verify
+        from consensus import bls
+        bls.verify = self.original_verify
 
         shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.MINER_PRIVKEY = self.original_key
@@ -109,22 +106,6 @@ class TestMiningLoopIntegration(unittest.TestCase):
             "operations": {"1": []}, # Empty transfer list is valid
             "fee_limit": 1000,
         }, SK_ALICE)
-        # In test env, BLS might not be available or mocked, but structure is checked.
-        # queue_transaction in sendtx.py validates BLS if available. 
-        # But we are injecting directly into DB mempool, bypassing queue_transaction logic?
-        # No, createblock re-validates! So we need to ensure createblock accepts it.
-        # If BLS is missing in test env, it logs warning but accepts?
-        # createblock.py: _validate_signature returns False if BLS avail but checks fail.
-        # If no BLS lib, it returns False? No wait.
-        # createblock.py line 37: if not _BLS_AVAILABLE: return False.
-        # WAIT. If BLS is NOT available, _validate_signature returns False?
-        # Then createblock loop: if not _BLS_AVAILABLE: print ERROR... continue.
-        # So we NEED BLS available OR we need to patch createblock to think it's not needed?
-        # Actually, let's look at createblock.py again.
-        # Line 107: if not _BLS_AVAILABLE: print ERROR... continue.
-        # So mining REQUIRES BLS in the current code unless strictly disabled?
-        # But we are in a test environment. 
-        # Let's mock createblock._validate_signature to return True.
         
         tx_blob = json.dumps(tx)
         db.add_mempool_tx(tx_blob, "msg_id_1", int(time.time()*1000))

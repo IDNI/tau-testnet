@@ -21,7 +21,7 @@ import tau_authority
 import tau_manager
 from chain_state import GENESIS_ADDRESS, GENESIS_BALANCE
 from block import Block, BlockHeader, compute_merkle_root, compute_tx_hash, sha256_hex
-from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload, sign_tx
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_header, sign_payload, sign_tx
 from consensus.engine import TauConsensusEngine
 
 SENDER = pubkey_hex(SK_ALICE)
@@ -365,8 +365,6 @@ class ChainTestCase(unittest.TestCase):
         chain_state._genesis_accounts_state = {GENESIS_ADDRESS: GENESIS_BALANCE}
         chain_state._balances[GENESIS_ADDRESS] = GENESIS_BALANCE
 
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
 
         self.verify_patch = patch(
             'consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
@@ -376,7 +374,6 @@ class ChainTestCase(unittest.TestCase):
         self.genesis_hash = db.get_genesis_hash()
 
     def tearDown(self):
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         self.wait_patch.stop()
         self.verify_patch.stop()
         config.set_database_path(self.original_db_path)
@@ -390,10 +387,13 @@ class ChainTestCase(unittest.TestCase):
         return db.get_canonical_head()['block_hash']
 
     def make(self, number, txs, previous_hash=None, proposer=SENDER):
-        return Block.create(
+        blk = Block.create(
             block_number=number, previous_hash=previous_hash or self.genesis_hash,
             transactions=txs, proposer_pubkey=proposer, timestamp=BASE_TS + number,
         )
+        if proposer == SENDER:
+            blk.consensus_proof = sign_header(blk.header, SK_ALICE)
+        return blk
 
     def tampered_copy(self, block):
         """The same block as a relayer would alter it: an extra transaction, header
@@ -586,7 +586,6 @@ class TestMinedBlocksReverify(ChainTestCase):
             patch('commands.createblock.tau_manager', self.mock_tau),
             patch('consensus.engine.tau_manager', self.mock_tau),
             patch('chain_state.tau_manager', self.mock_tau),
-            patch('commands.createblock._validate_signature', return_value=True),
         ]
         for p in self.patches:
             p.start()

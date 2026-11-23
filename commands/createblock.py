@@ -36,47 +36,6 @@ except ImportError:
     _BLS_AVAILABLE = False
 
 
-def _validate_signature(payload: Dict) -> bool:
-    """
-    Validates the BLS signature of the transaction.
-    """
-    # Strict BLS: if library missing, cannot validate -> fail.
-    # We expect _BLS_AVAILABLE to be checked by caller too, but good to be safe.
-    if not _BLS_AVAILABLE:
-        return False 
-        
-    sender_pubkey = payload.get('sender_pubkey')
-    signature = payload.get('signature')
-    
-    if not sender_pubkey or not signature:
-        return False
-        
-    try:
-        # Reconstruct signing message
-        signing_dict = {
-            "sender_pubkey": sender_pubkey,
-            "sequence_number": payload.get('sequence_number'),
-            "expiration_time": payload.get('expiration_time'),
-            "operations": payload.get('operations'),
-            "fee_limit": payload.get('fee_limit'),
-        }
-        msg_bytes = json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
-        msg_hash = import_hashlib().sha256(msg_bytes).digest()
-        
-        pubkey_bytes = bytes.fromhex(sender_pubkey)
-        sig_bytes = bytes.fromhex(signature)
-        
-        return G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes)
-    except Exception:
-        return False
-
-def import_hashlib():
-    import hashlib
-    return hashlib
-
-
-
-
 def execute_batch(transactions: List[Dict], reserved_ids: List[int], block_timestamp: int):
     """
     Compatibility helper used by tests to simulate a batch over the current
@@ -343,9 +302,10 @@ def _speculative_proposal(candidate_rules=()):
     import tau_proposal
     import tau_reconstruction
     try:
-        plan = tau_reconstruction.plan_representation(
-            history_rules=units, candidate_rules=list(candidate_rules),
-        )
+        with tau_manager.reexec_on_width_overflow():
+            plan = tau_reconstruction.plan_representation(
+                history_rules=units, candidate_rules=list(candidate_rules),
+            )
     except Exception as exc:
         logger.warning("createblock: could not plan a representation (%s); "
                        "simulating in-process", exc)

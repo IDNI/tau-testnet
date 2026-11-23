@@ -255,7 +255,7 @@ async def test_sync_valid_get_headers(service):
 @pytest.mark.trio
 async def test_sync_empty_request_handled_via_move_on_after(service):
     # Empty bytes simulate "client wrote nothing then closed" — handler must
-    # not block. Current impl uses trio.move_on_after(0.25); since AsyncMock
+    # not block. Current impl uses SYNC_REQUEST_EMPTY_TIMEOUT; since AsyncMock
     # returns immediately we exercise the b"" branch directly.
     with _patch_db():
         stream = _make_stream(b"")

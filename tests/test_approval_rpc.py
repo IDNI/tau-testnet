@@ -16,6 +16,7 @@ import pytest
 from unittest.mock import patch
 
 import api_response
+import chain_state
 import db
 import tau_admission
 import tau_defs
@@ -26,6 +27,7 @@ from commands import (
     getapprovalslots,
     getrequestid,
 )
+from consensus.governance import ConsensusLifecycleManager
 from consensus.approvals import (
     MAX_PREVIEW_SLOTS,
     STATUS_EXECUTED,
@@ -48,8 +50,15 @@ CLAUSE = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _tip_lifecycle(monkeypatch):
+    monkeypatch.setattr(chain_state, "_lifecycle_manager", ConsensusLifecycleManager())
+
+
 def _activate(on=True):
     db.set_chain_state_value("approval_slots_active", "1" if on else "0")
+    if on:
+        chain_state._lifecycle_manager.activate_approval_slots()
 
 
 def _request(amount=200000, seq=1, approvers=None, customs=None, sender=A):

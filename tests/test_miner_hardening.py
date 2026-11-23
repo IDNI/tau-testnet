@@ -73,9 +73,6 @@ class TestMinerHardening(unittest.TestCase):
         from consensus.governance import ConsensusLifecycleManager
         chain_state._lifecycle_manager = ConsensusLifecycleManager()
 
-        # Disable auto-faucet for strict balance testing
-        self.original_faucet = config.TESTNET_AUTO_FAUCET
-        config.TESTNET_AUTO_FAUCET = False
         
         # Pre-seed the overspender's balance
         self.overspender = pubkey_hex(SK_BOB)
@@ -86,7 +83,6 @@ class TestMinerHardening(unittest.TestCase):
         config.MINER_PRIVKEY = "0" * 63 + "1"
 
     def tearDown(self):
-        config.TESTNET_AUTO_FAUCET = self.original_faucet
         config.MINER_PRIVKEY = self.original_miner_key
         
         if db._db_conn:
@@ -121,9 +117,8 @@ class TestMinerHardening(unittest.TestCase):
         
         print("[TEST] Stale reservation released and re-reserved.")
 
-    @patch('commands.createblock._validate_signature')
     @patch('consensus.engine.tau_manager')
-    def test_intra_transaction_overspend(self, mock_tau, mock_sig):
+    def test_intra_transaction_overspend(self, mock_tau):
         print("\n[TEST] Verifying Intra-Transaction Overspend Rejection...")
         mock_tau.tau_ready.is_set.return_value = True
         
@@ -141,8 +136,6 @@ class TestMinerHardening(unittest.TestCase):
             val = tau_side_effect(**{**kwargs, 'target_output_stream_index': 1})
             return {1: val}
         mock_tau.communicate_with_tau_multi.side_effect = tau_multi_side_effect
-        
-        mock_sig.return_value = True
         
         # Setup: Account with 100 coins (done in setUp)
         
@@ -198,9 +191,8 @@ class TestMinerHardening(unittest.TestCase):
         
         print("[TEST] Strict BLS passed (refused to mine).")
 
-    @patch('commands.createblock._validate_signature')
     @patch('consensus.engine.tau_manager')
-    def test_faucet_safety_no_negative_balance(self, mock_tau, mock_sig):
+    def test_faucet_safety_no_negative_balance(self, mock_tau):
         print("\n[TEST] Verifying No Negative Balance (seeded funds)...")
 
         # Configure mock_tau to distinguish calls
@@ -224,8 +216,6 @@ class TestMinerHardening(unittest.TestCase):
         mock_tau.communicate_with_tau_multi.side_effect = tau_multi_side_effect
         mock_tau.tau_ready.is_set.return_value = True
         
-        mock_sig.return_value = True
-        
         # Seed the user explicitly — there is no auto-faucet anymore.
         user_addr = pubkey_hex(SK_ALICE)
         chain_state._balances[user_addr] = 1000
@@ -241,7 +231,7 @@ class TestMinerHardening(unittest.TestCase):
             "expiration_time": int(time.time() + 3600),
             "expire_at_height": 5000,
             "operations": {
-                "1": [[user_addr, "Bob", str(transfer_amount)]]
+                "1": [[user_addr, pubkey_hex(SK_BOB), str(transfer_amount)]]
             }
         }, SK_ALICE))
         db.add_mempool_tx(payload, "hash_faucet", 1000)

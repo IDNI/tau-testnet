@@ -23,12 +23,21 @@ OTHER = "bb" * 48
 TIP = 7
 
 
+# The node's answer to `checktx estimate`, which every fee-bearing send asks
+# when no --fee is given. It is answered here, so the canned lists stay in the
+# order of the other commands.
+ESTIMATED_FEE = "13"
+
+
 def _run_cli(argv, *, send_responses=None, recorded=None):
     responses = list(send_responses or [])
 
     def fake_send(command, host, port, *, timeout=10.0, max_bytes=None):
         if recorded is not None:
             recorded.append(command)
+        if command.startswith("checktx estimate "):
+            return json.dumps({"status": "ok", "command": "checktx",
+                               "data": {"estimated_fee": ESTIMATED_FEE}})
         if not responses:
             raise AssertionError(f"no canned response for command: {command!r}")
         return responses.pop(0)
@@ -394,3 +403,44 @@ def test_id_rejects_a_malformed_pubkey():
          "--sequence", "0", "--release-at-time", "9"])
     assert rc == cli.EXIT_LOCAL
     assert "96" in err
+
+
+def _estimate_drafts(recorded):
+    drafts = [c for c in recorded if c.startswith("checktx estimate ")]
+    return [json.loads(c[len("checktx estimate "):].strip("'")) for c in drafts]
+
+
+def test_send_without_fee_signs_with_the_node_estimate(alice):
+    rc, _, err, recorded = _send(
+        ["retractable", "send", "--key", "alice", "--to", OTHER, "--amount", "12",
+         "--release-in", "5"])
+    assert rc == 0, err
+    (draft,) = _estimate_drafts(recorded)
+    assert draft["fee_limit"] == "0" and verify_tx_signature(draft)[0]
+    payload = _sent_payload(recorded)
+    assert payload["fee_limit"] == ESTIMATED_FEE
+    assert verify_tx_signature(payload)[0]
+    assert recorded.index(next(c for c in recorded if c.startswith("checktx"))) \
+        < recorded.index(next(c for c in recorded if c.startswith("sendtx")))
+
+
+def test_send_with_fee_asks_for_no_estimate(alice):
+    rc, _, err, recorded = _send(
+        ["retractable", "send", "--key", "alice", "--to", OTHER, "--amount", "12",
+         "--release-in", "5", "--fee", "40"])
+    assert rc == 0, err
+    assert _estimate_drafts(recorded) == []
+    assert _sent_payload(recorded)["fee_limit"] == "40"
+
+
+def test_retract_has_no_fee_flag():
+    with redirect_stderr(io.StringIO()), pytest.raises(SystemExit) as exc:
+        cli.build_parser().parse_args(
+            ["retractable", "retract", "--key", "k", RID, "--fee", "5"])
+    assert exc.value.code == 2
+
+
+def test_retract_asks_for_no_estimate(alice):
+    rc, _, err, recorded = _send(["retractable", "retract", "--key", "alice", RID])
+    assert rc == 0, err
+    assert _estimate_drafts(recorded) == []

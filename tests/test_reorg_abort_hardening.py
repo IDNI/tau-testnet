@@ -67,8 +67,6 @@ class TestReorgAbortHardening(unittest.TestCase):
         chain_state._genesis_accounts_state = {FUNDED_ACCOUNT: GENESIS_BALANCE}
         chain_state._balances[FUNDED_ACCOUNT] = GENESIS_BALANCE
 
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
 
         # Mock header verification: the abort under test must come from the
         # state-hash invariant check, not from header verification.
@@ -100,7 +98,6 @@ class TestReorgAbortHardening(unittest.TestCase):
         db.add_block(self.b2)
 
     def tearDown(self):
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         self.verify_patch.stop()
         config.set_database_path(self.original_db_path)
         if getattr(db, '_db_conn', None) is not None:

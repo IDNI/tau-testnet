@@ -14,7 +14,6 @@ from unittest.mock import patch
 import pytest
 from py_ecc.bls import G2Basic
 
-import config
 import consensus.retractable as retractable
 from block import Block
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
@@ -45,11 +44,6 @@ SK_MALLORY, MALLORY = _key(66666)
 PROPOSER = "d4" * 48
 
 _TX_SEQ = itertools.count()
-
-
-@pytest.fixture(autouse=True)
-def _no_faucet(monkeypatch):
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
 
 
 def _sign(tx: dict, sk: int) -> dict:
@@ -612,7 +606,7 @@ def test_a_release_that_skips_its_credit_breaks_conservation():
     oracle = Oracle(_balances())
     _parked(ch, oracle, at_height=HEIGHT + 2)
 
-    def lossy(lm, balances, height, timestamp):
+    def lossy(lm, balances, sequences, height, timestamp):
         lm.retractable_transfers.release_due(int(height), int(timestamp))
         return []
 

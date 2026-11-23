@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from consensus.tx_signing import verify_tx_signature
 from tau_testnet_cli import cli, keys as keys_mod, tx as tx_mod
 
 RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
@@ -22,12 +23,21 @@ OTHER = "bb" * 48
 TIP = 7
 
 
+# The node's answer to `checktx estimate`, which every fee-bearing send asks
+# when no --fee is given. It is answered here, so the canned lists stay in the
+# order of the other commands.
+ESTIMATED_FEE = "13"
+
+
 def _run_cli(argv, *, send_responses=None, recorded=None):
     responses = list(send_responses or [])
 
     def fake_send(command, host, port, *, timeout=10.0, max_bytes=None):
         if recorded is not None:
             recorded.append(command)
+        if command.startswith("checktx estimate "):
+            return json.dumps({"status": "ok", "command": "checktx",
+                               "data": {"estimated_fee": ESTIMATED_FEE}})
         if not responses:
             raise AssertionError(f"no canned response for command: {command!r}")
         return responses.pop(0)
@@ -311,3 +321,42 @@ def test_rule_accept_reports_conflict_layers(alice):
     assert rc == 0
     assert "registry_collision: warn" in out
     assert "REPLACES" in out
+
+
+# --- fee limit ------------------------------------------------------------------
+
+def _estimate_drafts(recorded):
+    drafts = [c for c in recorded if c.startswith("checktx estimate ")]
+    return [json.loads(c[len("checktx estimate "):].strip("'")) for c in drafts]
+
+
+def test_rule_offer_without_fee_signs_with_the_node_estimate(alice):
+    recorded = []
+    rc, _, err = _run_cli(
+        ["rule", "offer", "--key", "alice", "--to", OTHER, "--rule", RULE,
+         "--expire-at-height", "500"],
+        send_responses=[_ok({"sequence_number": 3, "tip_height": TIP}),
+                        _ok({"tx_hash": "deadbeef"})],
+        recorded=recorded,
+    )
+    assert rc == 0, err
+    (draft,) = _estimate_drafts(recorded)
+    assert draft["fee_limit"] == "0"
+    payload = _sent_payload(recorded)
+    assert payload["fee_limit"] == ESTIMATED_FEE
+    assert {k: v for k, v in draft.items() if k not in ("fee_limit", "signature")} \
+        == {k: v for k, v in payload.items() if k not in ("fee_limit", "signature")}
+    assert verify_tx_signature(payload)[0]
+
+
+def test_rule_reject_with_fee_asks_for_no_estimate(alice):
+    recorded = []
+    rc, _, err = _run_cli(
+        ["rule", "reject", "--key", "alice", OFFER_ID, "--fee", "25"],
+        send_responses=[_ok({"sequence_number": 1, "tip_height": TIP}),
+                        _ok({"tx_hash": "deadbeef"})],
+        recorded=recorded,
+    )
+    assert rc == 0, err
+    assert _estimate_drafts(recorded) == []
+    assert _sent_payload(recorded)["fee_limit"] == "25"

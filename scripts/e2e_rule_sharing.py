@@ -6,10 +6,10 @@ a live node over its TCP RPC with the NATIVE engine, so it exercises the parts
 that only exist at runtime: real rule compilation, the live interpreter, the
 restore plan on restart, and actual transfer admission under an accepted policy.
 
-It found the accumulation bug that the mocked test could not see: composites
-were appended to the application-rules spec instead of being derived from the
-clause registry, so the spec grew one composite per acceptance and the net
-policy depended on replay order.
+It found the accumulation bug that the mocked test could not see: clauses
+were appended to the application-rules spec instead of being held in the
+clause registry, so the spec grew with every acceptance and the net policy
+depended on replay order.
 
 USAGE
     # 1. Provision an isolated node directory (its own data/, keys, genesis)
@@ -43,8 +43,14 @@ import subprocess
 import sys
 import time
 
-BLOCK_RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
-ALLOW_RULE = "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
+# A clause must read an input stream, so the policies condition on the amount:
+# BLOCK_RULE refuses every positive amount, ALLOW_RULE only amounts above one
+# million (more than any account here holds).
+BLOCK_RULE = ("always ( (i1[t]:bv[24] > { #x000000 }:bv[24]) ? "
+              "(o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).")
+ALLOW_RULE = ("always ( (i1[t]:bv[24] > { #x0f4240 }:bv[24]) ? "
+              "(o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).")
+ALLOW_MARK = "#x0f4240"
 ACTORS = ("miner", "alice", "bob", "carol")
 
 FAILED = []
@@ -199,7 +205,7 @@ class Node:
         res = self.transfer(name, to, amount, expect_ok=False)
         if res.get("status") == "ok":
             return "allowed"
-        return "blocked" if "user policy" in str(res.get("error", {})) else "error"
+        return "blocked" if "own policy clause blocked" in str(res.get("error", {})) else "error"
 
     def offer_and_accept(self, frm, to, rule):
         expire = self.height() + 1000
@@ -217,6 +223,7 @@ class Node:
 
 def scenario_offer_accept_isolation(n: Node):
     say("== baseline: everyone can transfer ==")
+    units0 = n.units0 = len(n.spec_units())
     b0, c0 = n.bal("bob"), n.bal("carol")
     n.transfer("bob", "alice", 5)
     n.transfer("carol", "alice", 7)
@@ -249,10 +256,11 @@ def scenario_offer_accept_isolation(n: Node):
     n.decide("bob", oid, True, BLOCK_RULE)
     n.mine()
     check("bob has one clause", len(n.clauses("bob")) == 1)
-    # The composite is derived from the registry, never appended.
-    check("accumulation carries no composite",
-          not any("i12" in u for u in n.spec_units()),
-          f"{len(n.spec_units())} units")
+    # A registered clause lives in the registry, never in the shared interpreter.
+    check("the shared interpreter carries no clause",
+          len(n.spec_units()) == units0
+          and BLOCK_RULE not in "\n".join(n.spec_units()),
+          f"{units0} -> {len(n.spec_units())} units")
 
     say("== isolation: only the acceptor is affected ==")
     vb, vc = n.verdict("bob"), n.verdict("carol")
@@ -264,8 +272,8 @@ def scenario_offer_accept_isolation(n: Node):
 def scenario_second_acceptor(n: Node):
     say("== a second acceptor must not disturb the first ==")
     n.offer_and_accept("alice", "carol", BLOCK_RULE)
-    check("accumulation still carries no composite",
-          not any("i12" in u for u in n.spec_units()), f"{len(n.spec_units())} units")
+    check("the shared interpreter still carries no clause",
+          len(n.spec_units()) == n.units0, f"{n.units0} -> {len(n.spec_units())} units")
     check("bob has one clause", len(n.clauses("bob")) == 1)
     check("carol has one clause", len(n.clauses("carol")) == 1)
     vb, vc, va = n.verdict("bob"), n.verdict("carol"), n.verdict("alice", to="bob")
@@ -284,13 +292,13 @@ def scenario_second_acceptor(n: Node):
     check("offer status is rejected",
           n.rpc(f"getruleoffer {oid}")["data"]["status"] == "rejected")
     body = n.clauses("bob")[0]["clause_body"]
-    check("bob's clause unchanged by the rejection", "#x000000" in body, body)
+    check("bob's clause unchanged by the rejection", ALLOW_MARK not in body, body)
 
     say("== accepting again replaces the acceptor's own clause ==")
     n.offer_and_accept("alice", "bob", ALLOW_RULE)
     clauses = n.clauses("bob")
     check("still exactly one clause", len(clauses) == 1)
-    check("clause replaced with ALLOW", "#x000001" in clauses[0]["clause_body"])
+    check("clause replaced with ALLOW", ALLOW_MARK in clauses[0]["clause_body"])
     vb, vc = n.verdict("bob"), n.verdict("carol")
     n.mine()
     check("bob can transfer again", vb == "allowed", vb)
@@ -312,7 +320,7 @@ def snapshot(n: Node, path):
 
 
 def scenario_after_restart(n: Node, path):
-    say("== after restart: the composite must be rebuilt from the registry ==")
+    say("== after restart: the clauses must be restored from the registry ==")
     snap = json.load(open(path))
     blocks = n.rpc("getblocks")["data"]["blocks"]
     tip = max(blocks, key=lambda b: int(b["header"]["block_number"]))
@@ -337,7 +345,8 @@ def scenario_rejections(n: Node):
                + " }:bv[384]) && o5[t]:bv[24] = { #x000001 }:bv[24] ).")
     cases = [
         ("writes reserved o9", "alice", "bob", "always ( o9[t]:bv[24] = { #x000001 }:bv[24] ).", expire),
-        ("reads mocked i2", "alice", "bob", "always ( o5[t]:bv[24] = i2[t]:bv[24] ).", expire),
+        ("reads reserved i13", "alice", "bob",
+         "always ( o5[t]:bv[24] = i13[t]:bv[24] ).", expire),
         ("two rule units", "alice", "bob", "always ( o5[t] = 1 ). always ( o5[t] = 0 ).", expire),
         ("self offer", "alice", "alice", ALLOW_RULE, expire),
         ("references i12", "alice", "bob", guarded, expire),

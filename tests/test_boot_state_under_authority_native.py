@@ -14,6 +14,7 @@ import pytest
 from py_ecc.bls import G2Basic as bls
 from unittest.mock import patch
 
+from bls_keys import SK_CAROL, pubkey_hex
 import chain_state
 import db
 import tau_authority as auth
@@ -23,6 +24,7 @@ from commands import createblock, sendtx
 from commands.sendtx import _get_signing_message_bytes
 from consensus.engine import TauConsensusEngine
 
+TRANSFER_PEER = pubkey_hex(SK_CAROL)
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GENESIS = "data/genesis.json"
 
@@ -85,7 +87,7 @@ def chain(node_state, monkeypatch):
     (sk_a, pk_a), (sk_b, pk_b) = [_genesis_sender("boot_a"), _genesis_sender("boot_b")]
     assert _submit(sk_a, pk_a, {"0": HISTORY_RULE}).get("ok")
     _mine()
-    assert _submit(sk_b, pk_b, {"1": [[pk_b, "aa" * 48, "4"]]}).get("ok")
+    assert _submit(sk_b, pk_b, {"1": [[pk_b, TRANSFER_PEER, "4"]]}).get("ok")
     _mine()
     # A production chain always has validators persisted; without them boot under
     # authority refuses, which is not what the other cases are testing.

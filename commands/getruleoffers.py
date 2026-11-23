@@ -9,6 +9,7 @@ import json
 
 import api_response
 import db
+import tau_defs
 from consensus.rule_offers import (
     ALLOWED_TARGET_STREAMS,
     STATUS_OFFERED,
@@ -119,19 +120,29 @@ def execute(raw_command: str, container):
         elif (row.get("offerer_pubkey") or "").lower() == address:
             outgoing.append(entry)
 
+    own = [
+        clause for clause in clauses
+        if (clause.get("acceptor_pubkey") or "").lower() == address
+    ]
+    guard_index = tau_defs.RULE_CHANGE_GUARD_INDEX
     accepted = [
         {
             "target_stream": clause["target_stream"],
             "clause_body": clause["clause_body"],
         }
-        for clause in clauses
-        if (clause.get("acceptor_pubkey") or "").lower() == address
+        for clause in own
+        if int(clause["target_stream"]) != guard_index
     ]
+    guard = next(
+        (c["clause_body"] for c in own if int(c["target_stream"]) == guard_index),
+        None,
+    )
 
     data = {
         "address": address,
         "pending_incoming": sum(1 for e in incoming if e["status"] == STATUS_OFFERED),
         "accepted_clauses": accepted,
+        "rule_change_guard": guard,
         "supported_target_streams": sorted(ALLOWED_TARGET_STREAMS),
         "mempool": _mempool_offers(address),
     }

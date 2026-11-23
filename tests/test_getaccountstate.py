@@ -49,7 +49,7 @@ def test_no_pending_matches_getbalance(temp_database, container):
     assert data["pending_txs"] == []
     # getbalance response is unchanged (regression).
     bal = json.loads(getbalance.execute(f"getbalance {SENDER}", container))
-    assert bal["data"] == {"address": SENDER, "balance": "1000"}
+    assert bal["data"] == {"address": SENDER, "balance": "1000", "faucet_pending": False}
 
 
 def test_outgoing_with_fee(temp_database, container):
@@ -177,3 +177,30 @@ def test_unspendable_identity_holds_when_clamped(temp_database, container):
         int(data["chain_balance"]),
         int(data["pending_outgoing"]) + int(data["pending_fees"]),
     )
+
+
+@pytest.mark.parametrize("balances,sequences,balance,pending", [
+    ({}, {}, "100000", True),
+    ({SENDER: 0}, {}, "0", False),
+    ({}, {SENDER: 2}, "0", False),
+    ({SENDER: 7}, {SENDER: 1}, "7", False),
+])
+def test_balance_includes_the_pending_faucet_grant(temp_database, container, monkeypatch,
+                                                  balances, sequences, balance, pending):
+    monkeypatch.setattr(chain_state._lifecycle_manager, "faucet_amount", 100000)
+    monkeypatch.setattr(chain_state, "_balances", dict(balances))
+    monkeypatch.setattr(chain_state, "_sequence_numbers", dict(sequences))
+    bal = json.loads(getbalance.execute(f"getbalance {SENDER}", container))["data"]
+    assert bal == {"address": SENDER, "balance": balance, "faucet_pending": pending}
+    data = _state(container, SENDER)
+    assert data["chain_balance"] == balance
+    assert data["available_balance"] == balance
+    assert data["faucet_pending"] is pending
+
+
+def test_no_faucet_means_nothing_pending(temp_database, container, monkeypatch):
+    monkeypatch.setattr(chain_state._lifecycle_manager, "faucet_amount", 0)
+    monkeypatch.setattr(chain_state, "_balances", {})
+    monkeypatch.setattr(chain_state, "_sequence_numbers", {})
+    bal = json.loads(getbalance.execute(f"getbalance {SENDER}", container))["data"]
+    assert bal == {"address": SENDER, "balance": "0", "faucet_pending": False}

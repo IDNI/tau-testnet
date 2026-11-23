@@ -326,7 +326,7 @@ def _classify_report(report, msg: str, node_generated: bool):
             )
             return TauSpecIntegrationError(msg)
         logger.warning("Tau refused the supplied rule/value: %s", msg)
-        return TauSpecRejected(msg)
+        return TauSpecRejected(msg, codes=(int(c) for c in report.codes))
     filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
     if filepath:
         logger.error(f"Dumped Tau crash log to {filepath}")

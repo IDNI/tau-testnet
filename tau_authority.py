@@ -313,10 +313,12 @@ class AuthoritativeTauOwner:
             latest = getter()
         if latest is None or not latest.get("plan_json"):
             # Nothing committed yet: plan over the (empty or genesis) history.
-            return tau_reconstruction.plan_representation(
-                history_rules=[e.rule_text for e in journal.entries()
-                               if e.kind == tau_journal.REVISION and e.rule_text],
-            )
+            import tau_manager
+            with tau_manager.reexec_on_width_overflow():
+                return tau_reconstruction.plan_representation(
+                    history_rules=[e.rule_text for e in journal.entries()
+                                   if e.kind == tau_journal.REVISION and e.rule_text],
+                )
         plan = tau_reconstruction.RepresentationPlan.from_json(latest["plan_json"])
         if latest.get("plan_id") and plan.plan_id != latest["plan_id"]:
             self.mark_unavailable(
@@ -368,9 +370,11 @@ class AuthoritativeTauOwner:
         if lent is not None:
             plan = lent.plan
         else:
-            plan = tau_reconstruction.plan_representation(
-                history_rules=history, candidate_rules=list(candidate_rules),
-            )
+            import tau_manager
+            with tau_manager.reexec_on_width_overflow():
+                plan = tau_reconstruction.plan_representation(
+                    history_rules=history, candidate_rules=list(candidate_rules),
+                )
         snapshot = tau_allocator.DbMappingSnapshot()
         allocator = tau_allocator.Allocator(snapshot, width=plan.width,
                                             label="proposal")
@@ -457,8 +461,10 @@ class AuthoritativeTauOwner:
             if self.descriptor is None or self.descriptor.journal_head_hash != head:
                 return None
             if candidate_rules:
-                needs = tau_reconstruction.plan_representation(
-                    candidate_rules=list(candidate_rules))
+                import tau_manager
+                with tau_manager.reexec_on_width_overflow():
+                    needs = tau_reconstruction.plan_representation(
+                        candidate_rules=list(candidate_rules))
                 if set(needs.plain) & set(plan.interned):
                     return None
             self._session = None
@@ -649,8 +655,10 @@ class AuthoritativeTauOwner:
 
         units = [u for u in chain_state.get_tau_restore_plan(use_persisted_state=True)
                  if str(u.get("text") or "").strip()]
-        plan = tau_reconstruction.plan_representation(
-            history_rules=[u["text"] for u in units])
+        import tau_manager
+        with tau_manager.reexec_on_width_overflow():
+            plan = tau_reconstruction.plan_representation(
+                history_rules=[u["text"] for u in units])
         snapshot = tau_allocator.DbMappingSnapshot()
         allocator = tau_allocator.Allocator(snapshot, width=plan.width, label="genesis")
         journal = tau_journal.Journal(authoritative=False)

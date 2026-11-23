@@ -81,7 +81,7 @@ class TestCustomInputs(unittest.TestCase):
                 "fee_limit": 100,
             }
             json_blob = _signed(payload)
-            with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
+            with patch('commands.sendtx.validate_bls_pubkey', return_value=None):
                 with patch('commands.sendtx.db.add_mempool_tx'):
                     result = sendtx.queue_transaction(json_blob, propagate=False)
             self.assertFalse(result["ok"])
@@ -99,7 +99,7 @@ class TestCustomInputs(unittest.TestCase):
             "operations": {"12": "deadbeef"},
             "fee_limit": 100,
         }
-        with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
+        with patch('commands.sendtx.validate_bls_pubkey', return_value=None):
             with patch('commands.sendtx.db.add_mempool_tx'):
                 result = sendtx.queue_transaction(_signed(payload), propagate=False)
         self.assertFalse(result["ok"])
@@ -117,7 +117,7 @@ class TestCustomInputs(unittest.TestCase):
                 "operations": {key: "5"},
                 "fee_limit": 100,
             }
-            with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
+            with patch('commands.sendtx.validate_bls_pubkey', return_value=None):
                 with patch('commands.sendtx.db.add_mempool_tx'):
                     result = sendtx.queue_transaction(_signed(payload), propagate=False)
             self.assertFalse(result["ok"], msg=f"key {key} accepted")
@@ -155,7 +155,7 @@ class TestCustomInputs(unittest.TestCase):
         }
         
         # Mock validators to pass structure checks
-        with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
+        with patch('commands.sendtx.validate_bls_pubkey', return_value=None):
              with patch('commands.sendtx.db.add_mempool_tx'):
                 result = sendtx.queue_transaction(_signed(payload), propagate=False)
         
@@ -193,7 +193,7 @@ class TestCustomInputs(unittest.TestCase):
             "fee_limit": 100,
         }
 
-        with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
+        with patch('commands.sendtx.validate_bls_pubkey', return_value=None):
              with patch('commands.sendtx.db.add_mempool_tx'):
                  with patch('tau_manager.reset_tau_state') as mock_reset:
                     result = sendtx.queue_transaction(_signed(payload), propagate=False)
@@ -327,7 +327,7 @@ class TestCustomInputUnification(unittest.TestCase):
             return json.dumps(tx_dict)
         self._sign = _sign
 
-        patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
+        patch('commands.sendtx.validate_bls_pubkey', return_value=None).start()
         # Rule (op "0") validation goes through the isolated compile; None == OK.
         patch('tau_native.compile_revisions_isolated_subprocess', return_value=None).start()
         # Other test modules can leave TAU_FORCE_TEST / tau_test_mode on, which

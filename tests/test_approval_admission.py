@@ -30,12 +30,14 @@ from consensus.approvals import (
     validate_request_shape,
 )
 
-A = "1a" * 48          # sender
-B = "2b" * 48          # recipient
-AUTH = "aa" * 48
-SCAN = "bb" * 48
-PARTNER = "cc" * 48
-STRANGER = "de" * 48
+from bls_keys import pubkey_hex
+
+A = pubkey_hex(0x1A)          # sender
+B = pubkey_hex(0x2B)          # recipient
+AUTH = pubkey_hex(0xAA)
+SCAN = pubkey_hex(0xBB)
+PARTNER = pubkey_hex(0xCC)
+STRANGER = pubkey_hex(0xDE)
 NEXT_HEIGHT = 50
 EXPIRE = 500
 
@@ -362,7 +364,6 @@ def test_an_unguarded_o5_clause_reading_a_slot_is_accepted(tip_view):
             "? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
             ": (o5[t]:bv[24] = { #x000001 }:bv[24]) ) ).")
     tip_view.clause_for.return_value = None
-    tip_view.clause_author_count.return_value = 0
     result = validate_user_tx_reserved_domains(_user_tx(operations={"0": rule}), tip_view)
     assert result.is_valid is True, result.error
     assert result.data["o5_clause_action"] == "declare"
@@ -452,17 +453,14 @@ def test_every_vote_field_is_signed():
 
 # --- o5/o8 reject-unless-annotated bv[24] -----------------------------------
 
-SCOPE = "i12[t]:bv[384] = { #x" + A + " }:bv[384]"
-
-
-def _scoped(body):
-    return f"always (({SCOPE}) -> ({body}))."
+def _unit(body):
+    return f"always ( {body} )."
 
 
 def test_bv16_policy_rule_is_refused_at_admission(tip_view):
     tip_view.approval_slots_active = False
     result = validate_user_tx_reserved_domains(
-        _user_tx(operations={"0": _scoped("o5[t]:bv[16] = { #x000001 }:bv[16]")}),
+        _user_tx(operations={"0": _unit("o5[t]:bv[16] = { #x000001 }:bv[16]")}),
         tip_view,
     )
     assert result.is_valid is False
@@ -475,16 +473,16 @@ def test_bv16_policy_rule_is_refused_at_admission(tip_view):
 def test_untyped_o5_is_refused_at_admission(tip_view):
     tip_view.approval_slots_active = False
     result = validate_user_tx_reserved_domains(
-        _user_tx(operations={"0": _scoped("o5[t] = 1")}), tip_view)
+        _user_tx(operations={"0": _unit("o5[t] = 1")}), tip_view)
     assert result.is_valid is False
     assert result.code == "WIDTH_MISMATCH"
     assert result.details["found"] == "untyped"
 
 
-def test_bv24_scoped_unit_is_admitted(tip_view):
+def test_bv24_unit_is_admitted(tip_view):
     tip_view.approval_slots_active = False
     result = validate_user_tx_reserved_domains(
-        _user_tx(operations={"0": _scoped("o5[t]:bv[24] = { #x000001 }:bv[24]")}),
+        _user_tx(operations={"0": _unit("o5[t]:bv[24] = { #x000001 }:bv[24]")}),
         tip_view,
     )
     assert result.is_valid is True, result.error
@@ -507,7 +505,6 @@ def test_clause_body_bv16_is_refused_by_routing(tip_view):
             "? (o5[t]:bv[16] = { #x000000 }:bv[16]) "
             ": (o5[t]:bv[16] = { #x000001 }:bv[16]) ) ).")
     tip_view.clause_for.return_value = None
-    tip_view.clause_author_count.return_value = 0
     result = validate_user_tx_reserved_domains(_user_tx(operations={"0": rule}), tip_view)
     assert result.is_valid is False
     assert result.code == "WIDTH_MISMATCH"

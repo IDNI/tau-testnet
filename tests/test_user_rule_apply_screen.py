@@ -16,6 +16,8 @@ from consensus.governance import ConsensusLifecycleManager
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
 
+pytestmark = pytest.mark.usefixtures("mock_policy_evaluators")
+
 HEIGHT = 20
 TX_ID = "tx"
 FUNDS = 100000
@@ -43,7 +45,7 @@ REASON_TO_CODE = {
     "reserved_output_stream": "TX_REJECTED",
     "fee_reads_balance": "TX_REJECTED",
     "reserved_input_stream": "TX_REJECTED",
-    "unsatisfiable_sender_conjunction": "TX_REJECTED",
+    "special_stream": "TX_REJECTED",
     "reserved_operation_key": "TX_REJECTED",
     "temporal_reference": "TEMPORAL_REFERENCE",
     "unscoped_user_rule": "UNSCOPED_USER_RULE",
@@ -72,6 +74,13 @@ GUARDED_O8_I1 = (
     f"always ( {GUARD} ? (o8[t]:bv[24] = i1[t]:bv[24]) : (o8[t]:bv[24] = {ZERO}) )."
 )
 GUARDED_O5 = f"always ( {GUARD} -> (o5[t]:bv[24] = {ZERO}) )."
+U_RULE = "always u[t] = 0."
+THIS_READ = "always ( o13[t]:bv[24] = this[t] )."
+UNKNOWN_STREAM = "always ( foo[t] = 0 )."
+ROUTED_O5_WRITING_U = (
+    "always ( o5[t]:bv[24] = i1[t]:bv[24] && "
+    "u[t] = { o5[t]:bv[24] = { #x000002 }:bv[24] }:tau )."
+)
 
 TRANSFER = {"1": [[ALICE, MALLORY, "10"]]}
 
@@ -87,9 +96,12 @@ REFUSED_RULES = [
     pytest.param(I25, "slots_on", "reserved_input_stream", id="i25-bv384"),
     pytest.param(O8_READS_I2, "slots_off", "fee_reads_balance", id="o8-reads-i2-slots-off"),
     pytest.param(O8_READS_I2, "slots_on", "fee_reads_balance", id="o8-reads-i2-slots-on"),
-    pytest.param(UNSCOPED_O5, "slots_off", "unscoped_user_rule", id="unscoped-o5"),
     pytest.param(UNSCOPED_O8, "slots_off", "unscoped_user_rule", id="unscoped-o8-slots-off"),
     pytest.param(UNSCOPED_O8, "slots_on", "unscoped_user_rule", id="unscoped-o8-slots-on"),
+    pytest.param(U_RULE, "slots_off", "special_stream", id="u-rule-slots-off"),
+    pytest.param(U_RULE, "slots_on", "special_stream", id="u-rule-slots-on"),
+    pytest.param(THIS_READ, "slots_off", "special_stream", id="this-read"),
+    pytest.param(UNKNOWN_STREAM, "slots_off", "special_stream", id="unknown-stream"),
 ]
 
 # Every shape the parity matrix runs in every context: (rule or None, extra operations).
@@ -105,6 +117,9 @@ MATRIX_ROWS = {
     "unscoped_o8": (UNSCOPED_O8, {}),
     "mixed_o5_o8": (MIXED_O5_O8, {}),
     "routed_with_transfer": (ROUTED_O5, TRANSFER),
+    "u_rule": (U_RULE, {}),
+    "this_read": (THIS_READ, {}),
+    "unknown_stream": (UNKNOWN_STREAM, {}),
     "opkey_18": (None, {"18": "5"}),
     "opkey_18_with_rule": (FREE_I1, {"18": "5"}),
     "ctl_free_i1": (FREE_I1, {}),
@@ -121,8 +136,6 @@ def _tip(slots, mode):
     view.eligibility_mode = mode
     view.approval_slots_active = slots
     view.clause_for.return_value = None
-    view.clause_author_count.return_value = 0
-    view.clauses_for_stream.return_value = {}
     return view
 
 
@@ -229,10 +242,11 @@ def test_apply_keeps_a_scoped_fee_rule_and_a_free_stream_rule(context):
         assert any(rule in text for text in fed)
 
 
-def test_apply_keeps_a_scoped_o5_rule_while_routing_is_off():
-    result, _, fed, _ = _apply(_tx(GUARDED_O5), "slots_off")
-    assert result.accepted_tx_ids == [TX_ID]
-    assert any(GUARDED_O5 in text for text in fed)
+@pytest.mark.parametrize("context", ["slots_off", "slots_on"])
+def test_apply_never_accumulates_a_guarded_o5_rule(context):
+    result, post, fed, _ = _apply(_tx(GUARDED_O5), context)
+    _assert_refused_untouched(result, fed, "rule_not_applied")
+    assert post.rule_offers.clause_for(ALICE, 5) is None
 
 
 def test_apply_keeps_a_custom_input_read_that_is_not_reserved():
@@ -243,22 +257,36 @@ def test_apply_keeps_a_custom_input_read_that_is_not_reserved():
 
 # --- routed o5 clause ---------------------------------------------------------
 
+@pytest.mark.parametrize("context", ["slots_off", "slots_on"])
 @pytest.mark.parametrize("replay_mode", [False, True])
 @pytest.mark.parametrize("rule,extra,reason", [
     pytest.param(MIXED_O5_O8, {}, "mixed_output_rule", id="mixed-o5-o8"),
     pytest.param(ROUTED_O5, TRANSFER, "rule_with_transfers", id="rule-with-transfers"),
 ])
-def test_apply_refuses_a_routed_clause_admission_refuses(rule, extra, reason, replay_mode):
-    result, post, fed, steps = _apply(_tx(rule, extra), "slots_on", replay_mode=replay_mode)
+def test_apply_refuses_a_routed_clause_admission_refuses(rule, extra, reason, replay_mode, context):
+    result, post, fed, steps = _apply(_tx(rule, extra), context, replay_mode=replay_mode)
     _assert_refused_untouched(result, fed, reason)
     assert post.rule_offers.clause_for(ALICE, 5) is None
     assert steps == []
 
 
-def test_apply_registers_a_routed_clause_that_passes_the_screen():
-    result, post, _, _ = _apply(_tx(ROUTED_O5), "slots_on")
+@pytest.mark.parametrize("context", ["slots_off", "slots_on"])
+@pytest.mark.parametrize("replay_mode", [False, True])
+def test_apply_refuses_a_routed_clause_that_writes_the_update_stream(replay_mode, context):
+    result, post, fed, steps = _apply(
+        _tx(ROUTED_O5_WRITING_U), context, replay_mode=replay_mode)
+    assert TX_ID in result.invalid_tx_ids
+    assert fed == []
+    assert post.rule_offers.clause_for(ALICE, 5) is None
+    assert steps == []
+
+
+@pytest.mark.parametrize("context", list(CONTEXTS))
+def test_apply_registers_a_routed_clause_that_passes_the_screen(context):
+    result, post, fed, _ = _apply(_tx(ROUTED_O5), context)
     assert result.accepted_tx_ids == [TX_ID]
     assert post.rule_offers.clause_for(ALICE, 5) is not None
+    assert not any("o5[t]" in text for text in fed)
 
 
 # --- operation keys -----------------------------------------------------------

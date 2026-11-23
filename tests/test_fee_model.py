@@ -20,14 +20,15 @@ import config
 import chain_state
 import db
 import tau_defs
-from bls_keys import SK_ALICE, pubkey_hex, sign_payload, sign_tx
+from bls_keys import SK_ALICE, SK_CAROL, pubkey_hex, sign_payload, sign_tx
 from consensus import fees
 from consensus.engine import TauConsensusEngine
 from consensus.fees import FeeRuleError
+from consensus.governance import ConsensusLifecycleManager, ConsensusRuleUpdate
 from consensus.state import TauStateSnapshot
 
 SENDER = pubkey_hex(SK_ALICE)
-RECIPIENT = "c" * 96
+RECIPIENT = pubkey_hex(SK_CAROL)
 PROPOSER = "b" * 96
 
 
@@ -105,11 +106,6 @@ class EngineFeeBase(unittest.TestCase):
         self.mock_comm = self.comm_patcher.start()
         self.addCleanup(self.comm_patcher.stop)
 
-        # Fee settlement reads plain balances; the faucet shim would mask
-        # insufficiency cases.
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
-        self.addCleanup(lambda: setattr(config, "TESTNET_AUTO_FAUCET", self.original_faucet))
 
         mock_store = MagicMock()
         mock_store.commit.side_effect = lambda snap: snap
@@ -246,16 +242,20 @@ class TestEngineFeeCharging(EngineFeeBase):
 
     def test_governance_tx_exempt(self):
         self.mock_multi.return_value = {1: "1", 9: "10"}
-        lifecycle = MagicMock()
-        lifecycle.can_admit_vote.return_value = True
-        lifecycle.submit_vote.return_value = True
+        lifecycle = ConsensusLifecycleManager(active_validators=[SENDER])
+        update = ConsensusRuleUpdate(
+            rule_revisions=["always ( o6[t]:bv[16] = { 0 }:bv[16] )."],
+            activate_at_height=100,
+            proposer_pubkey=SENDER,
+        )
+        self.assertTrue(lifecycle.submit_update(update))
         balances = {}  # zero-balance validator
         tx = sign_tx({
             "tx_id": "gov1",
             "tx_type": "consensus_rule_vote",
             "sender_pubkey": SENDER,
             "fee_limit": "0",
-            "update_id": "ab" * 32,
+            "update_id": update.update_id_hex,
             "approve": True,
         })
         result = self.engine.apply(
@@ -267,6 +267,10 @@ class TestEngineFeeCharging(EngineFeeBase):
             block_height=1,
         )
         self.assertEqual(len(result.accepted_transactions), 1)
+        self.assertIn(
+            "Vote accepted for update " + update.update_id_hex,
+            result.receipts["gov1"]["logs"],
+        )
         self.assertEqual(balances, {})  # no fee writes
 
     def test_sender_equals_proposer_nets_zero(self):
@@ -307,13 +311,12 @@ class TestEngineFeeCharging(EngineFeeBase):
         rule-only tx from it is queued. Proposal-mode apply (the production
         path) reads plain target_balances, and refused the same tx as
         insufficient_funds_for_fee: "need 10, have 0"."""
-        config.TESTNET_AUTO_FAUCET = True
-        amount = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+        amount = 100000
         session = MagicMock(is_speculative=True)
         session.ready.return_value = True
         session.evaluate.return_value = {9: "10"}
         proposal = MagicMock(session=session, label="test")
-        proposal.lifecycle = MagicMock(approval_slots_active=False)
+        proposal.lifecycle = MagicMock(approval_slots_active=False, faucet_amount=amount)
         balances = {}
         tx = sign_tx({
             "tx_id": "tx_fresh",
@@ -431,7 +434,7 @@ class TestAdmissionFees(unittest.TestCase):
         _cs._balances[SENDER] = 1_000_000
 
         self.pub_patcher = patch(
-            "commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)
+            "commands.sendtx.validate_bls_pubkey", return_value=None
         )
         self.pub_patcher.start()
         self.addCleanup(self.pub_patcher.stop)
@@ -520,16 +523,21 @@ class TestAdmissionFees(unittest.TestCase):
             self.assertFalse(result["ok"], msg=f"stream {stream} not screened")
             self.assertIn(stream, result["message"])
 
-    # o5/o8 rule text must carry a sender scope (#24 ask 3). These tests target
-    # the other screens, so they wrap their body in the guard; the unscoped form
-    # is covered by TestUserRuleSenderScope in test_launch_hardening.py.
+    # o8 rule text must carry a sender scope. These tests target the other
+    # screens, so they wrap their body in the guard; the unscoped form is covered
+    # by TestUserRuleSenderScope in test_launch_hardening.py.
     _SCOPE = "i12[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]"
 
     def _scoped(self, body: str) -> str:
         return f"always (({self._SCOPE}) -> ({body}))."
 
     def test_benign_rule_text_passes_screen(self):
-        rule = self._scoped("o5[t]:bv[24] = { #x000001 }:bv[24]")
+        from consensus import sender_policy
+        from consensus.policy_mock import MockPolicyEvaluator
+
+        sender_policy.set_evaluator("admission", MockPolicyEvaluator(pool="admission"))
+        self.addCleanup(sender_policy.set_evaluator, "admission", None)
+        rule = "always (o5[t]:bv[24] = i1[t]:bv[24])."
         result, _ = self.queue(self.payload(operations={"0": rule}))
         self.assertTrue(result["ok"], msg=f"benign rule rejected: {result}")
 
@@ -697,9 +705,6 @@ class TestApplyBlockFeeE2E(unittest.TestCase):
         self.comm_patcher.start()
         self.addCleanup(self.comm_patcher.stop)
 
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
-        self.addCleanup(lambda: setattr(config, "TESTNET_AUTO_FAUCET", self.original_faucet))
 
     def _parent_snapshot(self, balances):
         from consensus.governance import ConsensusLifecycleManager

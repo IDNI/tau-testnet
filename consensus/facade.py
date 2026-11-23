@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import Optional, Set
 
 import config
@@ -176,37 +177,21 @@ class TipAdmissionView:
             row = cur.fetchone()
         return row[0] if row else None
 
-    def clauses_for_stream(self, target_stream: int) -> dict:
-        """acceptor pubkey -> clause body, for composing a stream's rule."""
-        with db._db_lock:
-            cur = db._db_conn.cursor()
-            cur.execute(
-                "SELECT acceptor_pubkey, clause_body FROM rule_clauses_v1 "
-                "WHERE target_stream = ?",
-                (int(target_stream),),
-            )
-            return {row[0]: row[1] for row in cur.fetchall()}
-
     # --- Co-signature approvals -------------------------------------------
     #
-    # Read from the persisted tables and chain_state values rather than the
-    # in-memory lifecycle manager, for the same reason rule sharing does:
-    # admission runs on RPC/gossip threads while block apply mutates the
-    # manager, and the tip tables are the same view every node has.
+    # Request and vote rows come from the persisted tables, as rule sharing
+    # does: the tip tables are the same view every node has.
 
     @property
     def approval_slots_active(self) -> bool:
         """Whether i18..i25 are reserved and fed at the canonical tip.
 
-        Consensus state, never a module global: block apply deep-copies the
-        lifecycle manager per candidate block, so a global would leak across
-        candidate simulation, rollback and reorg.
+        Read from the canonical lifecycle manager, the source block apply reads,
+        so admission refuses what apply refuses. Apply mutates only a copy and
+        publishes it by swapping the reference, so this read sees one tip.
         """
-        try:
-            value = db.get_chain_state_value("approval_slots_active", "0")
-        except Exception:
-            return False
-        return str(value) == "1"
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        return getattr(lm, "approval_slots_active", False) is True
 
     def get_approval_request(self, request_id: str) -> Optional[dict]:
         """The full request row, or None. Includes the recorded votes."""
@@ -270,7 +255,65 @@ class TipAdmissionView:
                 (sender_pubkey.lower(), STATUS_OPEN),
             )
             row = cur.fetchone()
-        return int(row[0]) if row else 0
+            cur.execute(
+                "SELECT COUNT(*) FROM rule_change_requests_v1 "
+                "WHERE sender_pubkey = ? AND status = ?",
+                (sender_pubkey.lower(), STATUS_OPEN),
+            )
+            rule_row = cur.fetchone()
+        return (int(row[0]) if row else 0) + (int(rule_row[0]) if rule_row else 0)
+
+    def get_rule_change_request(self, request_id: str) -> Optional[dict]:
+        """The rule-change request row, or None. Any status."""
+        import json as _json
+
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT request_id, sender_pubkey, kind, body, offer_id, "
+                "approvers_json, voted_json, declined_json, ready, created_height, "
+                "expire_at_height, status FROM rule_change_requests_v1 "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+
+        def _imap(raw):
+            try:
+                parsed = _json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                return {}
+            out = {}
+            for k, v in (parsed.items() if isinstance(parsed, dict) else ()):
+                try:
+                    out[int(k)] = v
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        def _slots(raw):
+            try:
+                parsed = _json.loads(raw or "[]")
+            except (TypeError, ValueError):
+                return []
+            return sorted(s for s in parsed if isinstance(s, int)) if isinstance(parsed, list) else []
+
+        return {
+            "request_id": row[0],
+            "sender_pubkey": row[1],
+            "kind": int(row[2]),
+            "body": row[3],
+            "offer_id": row[4],
+            "approvers": _imap(row[5]),
+            "voted": _imap(row[6]),
+            "declined": _slots(row[7]),
+            "ready": bool(row[8]),
+            "created_height": int(row[9] or 0),
+            "expire_at_height": int(row[10] or 0),
+            "status": int(row[11] or 0),
+        }
 
     def open_requests_for_approver(self, approver_pubkey: str) -> int:
         """Open requests naming this account as an approver.
@@ -289,6 +332,11 @@ class TipAdmissionView:
                 (STATUS_OPEN,),
             )
             rows = cur.fetchall()
+            cur.execute(
+                "SELECT approvers_json FROM rule_change_requests_v1 WHERE status = ?",
+                (STATUS_OPEN,),
+            )
+            rows += cur.fetchall()
         count = 0
         for (blob,) in rows:
             if target in (blob or "").lower():
@@ -328,6 +376,34 @@ class TipAdmissionView:
                     out.append(row)
         return out
 
+    def open_rule_changes_naming(self, approver_pubkey: str) -> list:
+        """Open rule-change request rows naming this account as an approver."""
+        import json as _json
+        from consensus.approvals import STATUS_OPEN
+
+        target = approver_pubkey.lower()
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT request_id, approvers_json FROM rule_change_requests_v1 "
+                "WHERE status = ? ORDER BY request_id",
+                (STATUS_OPEN,),
+            )
+            rows = cur.fetchall()
+        out = []
+        for request_id, blob in rows:
+            try:
+                approvers = _json.loads(blob or "{}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(approvers, dict) and target in {
+                str(v).lower() for v in approvers.values()
+            }:
+                row = self.get_rule_change_request(request_id)
+                if row:
+                    out.append(row)
+        return out
+
     # --- Retractable transfers ---------------------------------------------
     #
     # Persisted rows, not the in-memory manager, for the same reason as the
@@ -341,6 +417,13 @@ class TipAdmissionView:
             return int(head["header"]["timestamp"]) if head else 0
         except Exception:
             return 0
+
+    @property
+    def next_block_timestamp(self) -> int:
+        """Best guess of the next block's timestamp, for admission checks only."""
+        # The tip lags the next block, and the genesis tip has timestamp 0.
+        # Apply judges on the real block timestamp, so the clock cannot split nodes.
+        return max(self.tip_timestamp, int(time.time()))
 
     def _retractable_scalar(self, sql: str, params: tuple = ()) -> int:
         try:
@@ -396,18 +479,3 @@ class TipAdmissionView:
             "WHERE recipient_pubkey = ?",
             (pubkey,),
         )
-
-    def clause_author_count(self, target_stream: int) -> int:
-        """How many principals hold a registered clause on this stream.
-
-        Bounds the derived composite, and with it interpreter rebuild cost: every
-        additional author multiplies it by roughly eight.
-        """
-        with db._db_lock:
-            cur = db._db_conn.cursor()
-            cur.execute(
-                "SELECT COUNT(*) FROM rule_clauses_v1 WHERE target_stream = ?",
-                (int(target_stream),),
-            )
-            row = cur.fetchone()
-        return int(row[0]) if row else 0

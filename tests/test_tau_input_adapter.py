@@ -142,9 +142,7 @@ def test_a_wide_rule_against_a_pinned_stream_is_refused_not_dispatched(temp_data
     """Falling back to full width is correct at process start and fatal after the
     stream is typed: the engine commits a width on the first ACCEPTED revision and
     never re-types it (measured in W0), so neither form can be dispatched."""
-    import config
     import tau_shrink
-    monkeypatch.setattr(config, "TAU_SHRINK_ENABLED", True, raising=False)
     monkeypatch.setattr(tau_manager, "_runtime_shrunk_streams", frozenset({12}))
     # an ordering use of i12: canonically valid, outside the optimizer's fragment
     wide = f"always ( i12[t]:bv[384] > {{ #x{HEX96} }}:bv[384] )."
@@ -154,8 +152,6 @@ def test_a_wide_rule_against_a_pinned_stream_is_refused_not_dispatched(temp_data
 
 
 def test_no_conflict_when_the_stream_was_never_pinned(temp_database, monkeypatch):
-    import config
-    monkeypatch.setattr(config, "TAU_SHRINK_ENABLED", True, raising=False)
     monkeypatch.setattr(tau_manager, "_runtime_shrunk_streams", frozenset())
     wide = f"always ( i12[t]:bv[384] > {{ #x{HEX96} }}:bv[384] )."
     prep = tau_manager._prepare_rule_for_tau(wide)
@@ -174,10 +170,8 @@ def test_a_whole_rule_fallback_is_checked_against_commitments(temp_database, mon
     back to full width -- and i3 is already committed narrow, so the fallback is
     exactly what this process cannot type. Checking only the offending stream, or
     not checking the fallback at all, would dispatch it."""
-    import config
     import db as db_mod
     import tau_shrink
-    monkeypatch.setattr(config, "TAU_SHRINK_ENABLED", True, raising=False)
     monkeypatch.setattr(tau_manager, "_runtime_shrunk_streams", frozenset({3}))
     monkeypatch.setattr(db_mod, "get_shrink_id",
                         lambda key: (_ for _ in ()).throw(RuntimeError("db down")))
@@ -191,9 +185,7 @@ def test_a_restore_is_checked_against_commitments(temp_database, monkeypatch):
     """`restore_full_tau_spec` builds its own preparation and rebuilds the
     interpreter -- but the engine's type commitments are process-global and
     survive that rebuild, so the restore needs the same gate."""
-    import config
     import tau_shrink
-    monkeypatch.setattr(config, "TAU_SHRINK_ENABLED", True, raising=False)
     monkeypatch.setattr(tau_manager, "tau_test_mode", False)
     iface = MagicMock()
     iface.preprocess_spec_text.side_effect = lambda text: text

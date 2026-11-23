@@ -146,7 +146,10 @@ def cmd_rpc(args: argparse.Namespace) -> int:
 
 
 def _simple_query(args: argparse.Namespace, command: str) -> int:
-    response = _send(args, command)
+    return _simple_query_response(args, _send(args, command))
+
+
+def _simple_query_response(args: argparse.Namespace, response: str) -> int:
     if rpc_mod.is_error_response(response):
         if args.json:
             print_result({"error": response}, json_mode=True)
@@ -397,6 +400,37 @@ def cmd_keys_delete(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 
+FEE_HELP = (
+    "Fee limit (string-encoded integer). Default: the node's fee estimate "
+    "from 'checktx estimate'"
+)
+
+
+def _sign_with_fee(args: argparse.Namespace, payload: dict, sk_int) -> dict:
+    """Sign with --fee, or with the node's fee estimate when --fee is absent.
+
+    The estimate does not depend on fee_limit, so a draft signed with 0 gets
+    the fee of the final transaction. A command with no --fee keeps its 0.
+    """
+    fee = getattr(args, "fee", None)
+    if fee is None and hasattr(args, "fee"):
+        payload["fee_limit"] = "0"
+        tx_mod.sign_tx(payload, sk_int)
+        fee = tx_mod.estimate_fee(
+            payload, host=args.host, port=args.port, timeout=args.timeout
+        )
+    if fee is not None:
+        payload["fee_limit"] = str(fee)
+    return tx_mod.sign_tx(payload, sk_int)
+
+
+def _no_fee_estimate(exc: RuntimeError) -> int:
+    print_error(
+        f"the node gave no fee estimate ({exc}); give the fee limit with --fee"
+    )
+    return EXIT_APP_ERROR
+
+
 def cmd_tx_send(args: argparse.Namespace) -> int:
     try:
         sk_int, sender_pubkey = _resolve_signing_key(args)
@@ -428,15 +462,17 @@ def cmd_tx_send(args: argparse.Namespace) -> int:
         print_error(str(exc))
         return EXIT_APP_ERROR
 
-    payload = tx_mod.build_and_sign_user_tx(
-        private_key=sk_int,
+    payload = tx_mod.build_user_tx(
         sender_pubkey=sender_pubkey,
         sequence_number=sequence_number,
-        operations=operations,
+        expiration_time=int(_now()) + int(args.expiry),
         expire_at_height=_resolve_expire_at_height(args, tip=tip),
-        fee_limit=args.fee,
-        expiry_seconds=args.expiry,
+        operations=operations,
     )
+    try:
+        _sign_with_fee(args, payload, sk_int)
+    except RuntimeError as exc:
+        return _no_fee_estimate(exc)
 
     response = tx_mod.submit_tx(
         payload, host=args.host, port=args.port, timeout=args.timeout
@@ -570,7 +606,6 @@ def cmd_gov_propose(args: argparse.Namespace) -> int:
             rule_revisions=rule_revisions or [],
             activate_at_height=activate_at_height or 0,
             host_contract_patch=host_contract_patch,
-            fee_limit=args.fee,
         )
     except (ValueError, TypeError) as exc:
         print_error(str(exc))
@@ -616,7 +651,6 @@ def cmd_gov_vote(args: argparse.Namespace) -> int:
         expire_at_height=_resolve_expire_at_height(args, tip=tip),
         update_id=args.update_id,
         approve=True,
-        fee_limit=args.fee,
     )
     tx_mod.sign_tx(payload, sk_int)
     response = tx_mod.submit_tx(
@@ -689,7 +723,13 @@ def _submit_rule_tx(args: argparse.Namespace, build, *, pass_tip: bool = False) 
         print_error(str(exc))
         return EXIT_LOCAL
 
-    tx_mod.sign_tx(payload, sk_int)
+    try:
+        _sign_with_fee(args, payload, sk_int)
+    except RuntimeError as exc:
+        return _no_fee_estimate(exc)
+    if getattr(args, "dry_run", False):
+        print_result(payload, json_mode=True)
+        return EXIT_OK
     response = tx_mod.submit_tx(
         payload, host=args.host, port=args.port, timeout=args.timeout
     )
@@ -719,7 +759,6 @@ def cmd_rule_offer(args: argparse.Namespace) -> int:
             recipient_pubkey=args.to,
             rule_text=rule_text,
             expire_at_height=height,
-            fee_limit=args.fee,
         ),
     )
 
@@ -806,7 +845,6 @@ def cmd_rule_accept(args: argparse.Namespace) -> int:
             expire_at_height=height,
             offer_id=args.offer_id,
             rule_text=rule_text,
-            fee_limit=args.fee,
         ),
     )
 
@@ -820,7 +858,6 @@ def cmd_rule_reject(args: argparse.Namespace) -> int:
             expiration_time=int(_now()) + args.expiry,
             expire_at_height=height,
             offer_id=args.offer_id,
-            fee_limit=args.fee,
         ),
     )
 
@@ -1180,6 +1217,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_gov_subparsers(sub)
     _add_rule_subparsers(sub)
     _add_approval_subparsers(sub)
+    _add_policy_subparsers(sub)
     _add_retractable_subparsers(sub)
     _add_node_subparsers(sub)
 
@@ -1433,11 +1471,7 @@ def _add_tx_subparsers(sub) -> None:
         default=None,
         help="Path to a JSON file whose object overrides the operations dict",
     )
-    p_send.add_argument(
-        # Default matches the genesis consensus fee rule (o9); keep in sync
-        # with the network's active fee rule.
-        "--fee", default="10", help="Fee limit (string-encoded integer; default '10')"
-    )
+    p_send.add_argument("--fee", default=None, help=FEE_HELP)
     p_send.add_argument(
         "--expiry",
         type=int,
@@ -1648,7 +1682,6 @@ def cmd_approval_request(args: argparse.Namespace) -> int:
             expire_at_height=expire_at_height,
             approvers=approvers,
             custom_inputs=customs,
-            fee_limit=args.fee,
         )
 
     return _submit_rule_tx(args, _build)
@@ -1694,11 +1727,88 @@ def cmd_approval_list(args: argparse.Namespace) -> int:
         print_error(str(exc))
         return EXIT_LOCAL
     role = getattr(args, "role", "all")
-    return _simple_query(args, f"getapprovalrequests {address} {role}")
+    return _approval_query(args, f"getapprovalrequests {address} {role}")
 
 
 def cmd_approval_show(args: argparse.Namespace) -> int:
-    return _simple_query(args, f"getapprovalrequest {args.request_id}")
+    return _approval_query(args, f"getapprovalrequest {args.request_id}")
+
+
+BODY_INLINE_LIMIT = 500
+
+
+def _is_rule_change_row(row) -> bool:
+    return isinstance(row, dict) and row.get("request_type") == "rule_change"
+
+
+def render_rule_change_row(row: dict, indent: str = "") -> list[str]:
+    """Readable lines for one rule-change request row."""
+    lines = [
+        f"{indent}rule change {row.get('request_id', '?')}",
+        f"{indent}  kind: {row.get('kind_name', '?')} ({row.get('kind', '?')})",
+        f"{indent}  requester: {row.get('sender_pubkey') or row.get('sender', '?')}",
+        f"{indent}  status: {row.get('status', '?')}"
+        + (" (ready to release)" if row.get("ready") else ""),
+    ]
+    body = row.get("body") or ""
+    if row.get("offer_id"):
+        lines.append(f"{indent}  offer: {row['offer_id']}")
+    if body and len(body) <= BODY_INLINE_LIMIT:
+        lines.append(f"{indent}  body: {body}")
+    elif body:
+        lines.append(
+            f"{indent}  body: {len(body)} chars, hash {row.get('body_hash', '?')}"
+        )
+    lines.append(
+        f"{indent}  created at height {row.get('created_height', '?')}, "
+        f"time escape at height {row.get('escape_height', '?')}, "
+        f"expires at height {row.get('expire_at_height', '?')}"
+    )
+    approvers = row.get("approvers") or {}
+    if approvers:
+        lines.append(f"{indent}  approvers:")
+        for slot, info in approvers.items():
+            if isinstance(info, dict):
+                lines.append(
+                    f"{indent}    i{slot}: {info.get('pubkey', '?')} "
+                    f"[{info.get('state', '?')}]"
+                )
+            else:
+                lines.append(f"{indent}    i{slot}: {info}")
+    else:
+        lines.append(f"{indent}  approvers: none (releases at the time escape)")
+    return lines
+
+
+def _approval_query(args: argparse.Namespace, command: str) -> int:
+    """_simple_query, but rule-change rows print as readable text."""
+    response = _send(args, command)
+    if rpc_mod.is_error_response(response) or args.json:
+        return _simple_query_response(args, response)
+    parsed = parse_json_response(response)
+    data = (parsed or {}).get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, dict):
+        return _simple_query_response(args, response)
+
+    if _is_rule_change_row(data):
+        extra = {k: data[k] for k in ("awaiting_slots", "all_answered") if k in data}
+        print("\n".join(render_rule_change_row(data)))
+        if extra:
+            print(f"  awaiting slots: {extra.get('awaiting_slots')}, "
+                  f"all answered: {extra.get('all_answered')}")
+        return EXIT_OK
+
+    sections = [k for k in ("incoming", "outgoing") if isinstance(data.get(k), list)]
+    if not any(_is_rule_change_row(r) for k in sections for r in data[k]):
+        return _simple_query_response(args, response)
+    for key in sections:
+        print(f"{key}: {len(data[key])}")
+        for row in data[key]:
+            if _is_rule_change_row(row):
+                print("\n".join(render_rule_change_row(row, "  ")))
+            else:
+                print(json.dumps(row, indent=2, default=str))
+    return EXIT_OK
 
 
 def cmd_approval_slots(args: argparse.Namespace) -> int:
@@ -1763,8 +1873,9 @@ def _add_approval_subparsers(sub) -> None:
         src.add_argument("--key", help="Logical name of a saved key")
         src.add_argument("--privkey", help="Private key (hex or decimal)")
 
-    def _tx_flags(parser):
-        parser.add_argument("--fee", default="0", help="Fee limit (default '0')")
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
         parser.add_argument(
             "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
             help="Seconds until expiration_time (default: %(default)s)",
@@ -1812,7 +1923,8 @@ def _add_approval_subparsers(sub) -> None:
     _key_group(p_ok)
     p_ok.add_argument("request_id", help="Request id (64 hex)")
     p_ok.add_argument("--code", help="TOTP code -- goes to the BOT, never on chain")
-    _tx_flags(p_ok)
+    # Votes are fee-exempt: an approver needs no funds and no fee strategy.
+    _tx_flags(p_ok, fee=False)
     p_ok.set_defaults(func=lambda a: cmd_approval_vote(a, approve=True))
 
     p_no = asub.add_parser(
@@ -1822,7 +1934,7 @@ def _add_approval_subparsers(sub) -> None:
     _key_group(p_no)
     p_no.add_argument("request_id", help="Request id (64 hex)")
     p_no.add_argument("--reason", default="", help="Note for the sender (<=256 bytes)")
-    _tx_flags(p_no)
+    _tx_flags(p_no, fee=False)
     p_no.set_defaults(func=lambda a: cmd_approval_vote(a, approve=False))
 
     # --- reads ---
@@ -1864,6 +1976,336 @@ def _add_approval_subparsers(sub) -> None:
     p_rid.add_argument("--expire-at-height", required=True, type=int)
     p_rid.add_argument("--approver", action="append", metavar="SLOT=PUBKEY")
     p_rid.set_defaults(func=cmd_approval_request_id)
+
+
+# --- Policy guard and rule-change requests ---------------------------------
+
+
+_KIND_BY_NAME = {"set": 1, "revoke": 2, "accept": 3}
+_KIND_GUARD_SET = 4
+_KIND_GUARD_REVOKE = 5
+
+
+def _read_policy_body(args: argparse.Namespace) -> str:
+    if getattr(args, "body", None):
+        return args.body
+    path = getattr(args, "file", None)
+    if not path:
+        raise _PayloadError("one of --file or --body is required")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise _PayloadError(f"cannot read {path}: {exc}") from exc
+
+
+def _fetch_offer_text(args: argparse.Namespace, offer_id: str) -> str:
+    raw = _send(args, f"getruleoffer {offer_id}")
+    if rpc_mod.is_error_response(raw):
+        raise _PayloadError(f"cannot read offer {offer_id}: {raw}")
+    try:
+        text = parse_json_response(raw)["data"]["rule_text"]
+    except Exception:
+        raise _PayloadError("node returned an unreadable offer")
+    if not text:
+        raise _PayloadError(
+            "this node no longer has the offer text (it is node-local); ask a "
+            "node that does"
+        )
+    return text
+
+
+def _print_rule_change_preview(data: dict) -> None:
+    print(f"kind: {data.get('kind_name', '?')}")
+    print(f"guard on this account: {'yes' if data.get('has_guard') else 'no'}")
+    screen = data.get("screen") or {}
+    if screen and not screen.get("ok", True):
+        print(f"screen: REFUSED -- {screen.get('error')}")
+    elif screen:
+        print("screen: ok")
+    if not data.get("available", True):
+        print(f"preview unavailable: {data.get('reason', 'unknown reason')}")
+        return
+    if data.get("executes_immediately"):
+        print("result: executes in the block that carries the request")
+    elif data.get("satisfiable"):
+        required = data.get("required_approvers") or {}
+        print("result: parks until approvers vote; fewest approvers needed:")
+        for slot, key in required.items():
+            print(f"  i{slot}: {key}")
+        extra = len(data.get("allowing_subsets") or []) - 1
+        if extra > 0:
+            print(f"  ({extra} other approving combination(s) also work)")
+    else:
+        print("result: no declared approvers would let the guard allow this")
+    delay = data.get("escape_delay_blocks")
+    if delay is not None:
+        print(f"time escape: releases {delay} blocks after the request is mined")
+
+
+def _preview_rule_change(args, sender, kind, rule_text, offer_id, approvers) -> int:
+    draft = {
+        "request_type": "rule_change",
+        "sender_pubkey": sender,
+        "kind": kind,
+        "rule_text": rule_text,
+        "offer_id": offer_id,
+        "approvers": {str(k): v for k, v in approvers.items()},
+    }
+    raw = _send(args, f"getapprovalpreview {json.dumps(draft)}")
+    if rpc_mod.is_error_response(raw):
+        if args.json:
+            print_result({"error": raw}, json_mode=True)
+        else:
+            print(raw)
+        return EXIT_APP_ERROR
+    if args.json:
+        print_result(parse_json_response(raw), json_mode=True)
+        return EXIT_OK
+    data = (parse_json_response(raw) or {}).get("data") or {}
+    _print_rule_change_preview(data)
+    return EXIT_OK
+
+
+def _submit_rule_change(
+    args: argparse.Namespace, kind: int, rule_text: str, offer_id: str
+) -> int:
+    import tau_defs
+    from consensus.approvals import (
+        MAX_APPROVAL_WINDOW_BLOCKS,
+        parse_rule_change_request_checked,
+    )
+
+    try:
+        approvers = _parse_kv_pairs(getattr(args, "approver", None), "approver")
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+
+    if getattr(args, "preview", False):
+        try:
+            _sk, sender = _resolve_signing_key(args)
+        except _PayloadError as exc:
+            print_error(str(exc))
+            return EXIT_LOCAL
+        return _preview_rule_change(args, sender, kind, rule_text, offer_id, approvers)
+
+    created = {}
+
+    def _build(sender_pubkey, sequence_number, expire_at_height, tip):
+        window = expire_at_height - (tip + 1)
+        if window > MAX_APPROVAL_WINDOW_BLOCKS:
+            raise _PayloadError(
+                f"the expiry is {window} blocks ahead; the most a request may "
+                f"ask for is {MAX_APPROVAL_WINDOW_BLOCKS}"
+            )
+        if window <= tau_defs.RULE_CHANGE_DELAY_BLOCKS:
+            print(
+                f"warning: this request expires {window} blocks from the next "
+                f"block, before the {tau_defs.RULE_CHANGE_DELAY_BLOCKS}-block "
+                "time escape, so it can only release through approvals.",
+                file=sys.stderr,
+            )
+        payload = tx_mod.build_rule_change_request_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            kind=kind,
+            rule_text=rule_text,
+            offer_id=offer_id,
+            approvers=approvers,
+        )
+        request, why = parse_rule_change_request_checked(payload)
+        if request is None:
+            raise _PayloadError(why)
+        created["id"] = request.request_id.hex()
+        return payload
+
+    status = _submit_rule_tx(args, _build, pass_tip=True)
+    if status == EXIT_OK and created.get("id"):
+        quiet = args.json or getattr(args, "dry_run", False)
+        print(f"request id: {created['id']}", file=sys.stderr if quiet else sys.stdout)
+    return status
+
+
+def cmd_policy_guard_set(args: argparse.Namespace) -> int:
+    try:
+        body = _read_policy_body(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _submit_rule_change(args, _KIND_GUARD_SET, body, "")
+
+
+def cmd_policy_guard_revoke(args: argparse.Namespace) -> int:
+    return _submit_rule_change(args, _KIND_GUARD_REVOKE, "", "")
+
+
+def cmd_policy_guard_show(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    raw = _send(args, f"getruleoffers {address} all")
+    if rpc_mod.is_error_response(raw):
+        if args.json:
+            print_result({"error": raw}, json_mode=True)
+        else:
+            print(raw)
+        return EXIT_APP_ERROR
+    data = (parse_json_response(raw) or {}).get("data") or {}
+    guard = data.get("rule_change_guard")
+    if args.json:
+        print_result({"address": address, "rule_change_guard": guard}, json_mode=True)
+    elif guard:
+        print(f"guard for {address}:\n{guard}")
+    else:
+        print(f"no rule-change guard on {address}")
+    return EXIT_OK
+
+
+def cmd_policy_change_request(args: argparse.Namespace) -> int:
+    kind = _KIND_BY_NAME[args.kind]
+    rule_text, offer_id = "", ""
+    try:
+        if kind == 1:
+            rule_text = _read_policy_body(args)
+        elif kind == 3:
+            if not args.offer_id:
+                raise _PayloadError("--kind accept needs --offer-id")
+            offer_id = args.offer_id.strip().lower()
+            rule_text = _fetch_offer_text(args, offer_id)
+        elif getattr(args, "body", None) or getattr(args, "file", None) \
+                or getattr(args, "offer_id", None):
+            raise _PayloadError("--kind revoke carries no body or offer id")
+        if kind != 3 and getattr(args, "offer_id", None):
+            raise _PayloadError("--offer-id only applies to --kind accept")
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _submit_rule_change(args, kind, rule_text, offer_id)
+
+
+def cmd_policy_change_cancel(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_rule_change_cancel_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            request_id=args.request_id,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def _add_policy_subparsers(sub) -> None:
+    """`tau-testnet policy ...` -- the rule-change guard and its requests."""
+    import tau_defs
+
+    p_pol = sub.add_parser(
+        "policy",
+        parents=[_GLOBAL_PARENT],
+        help="Guard your o5 policy with co-signers (guard, change requests)",
+    )
+    psub = p_pol.add_subparsers(dest="policy_command", required=True)
+    common = [_GLOBAL_PARENT]
+    default_expire = 2 * tau_defs.RULE_CHANGE_DELAY_BLOCKS
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _body_flags(parser, required):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--file", help="File containing the clause text")
+        src.add_argument("--body", help="Clause text")
+
+    def _request_flags(parser):
+        parser.add_argument(
+            "--approver", action="append", metavar="SLOT=PUBKEY",
+            help="Approver for one slot, e.g. --approver 18=<pubkey>. Repeatable.",
+        )
+        window = parser.add_mutually_exclusive_group()
+        window.add_argument(
+            "--expire-in", type=_block_count, default=default_expire,
+            help=(
+                "Blocks the request may land in, from the next one (default: "
+                f"%(default)s; at most {tau_defs.RULE_CHANGE_DELAY_BLOCKS} "
+                "expires it before the time escape)"
+            ),
+        )
+        window.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+        parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        parser.add_argument(
+            "--preview", action="store_true",
+            help="Ask the node what this request would need, and send nothing",
+        )
+        parser.add_argument(
+            "--dry-run", action="store_true",
+            help="Sign and print the transaction, and send nothing",
+        )
+
+    p_guard = psub.add_parser("guard", parents=common,
+                              help="Set, revoke or show the rule-change guard")
+    gsub = p_guard.add_subparsers(dest="guard_command", required=True)
+
+    p_gset = gsub.add_parser("set", parents=common,
+                             help="Install a guard clause (rule-change kind 4)")
+    _key_group(p_gset)
+    _body_flags(p_gset, required=True)
+    _request_flags(p_gset)
+    p_gset.set_defaults(func=cmd_policy_guard_set)
+
+    p_grev = gsub.add_parser("revoke", parents=common,
+                             help="Remove the guard (rule-change kind 5)")
+    _key_group(p_grev)
+    _request_flags(p_grev)
+    p_grev.set_defaults(func=cmd_policy_guard_revoke)
+
+    p_gshow = gsub.add_parser("show", parents=common,
+                              help="The guard clause on an account")
+    p_gshow.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_gshow, required=False)
+    p_gshow.set_defaults(func=cmd_policy_guard_show)
+
+    p_change = psub.add_parser("change", parents=common,
+                               help="Request or cancel a policy change")
+    csub = p_change.add_subparsers(dest="change_command", required=True)
+
+    p_creq = csub.add_parser(
+        "request", parents=common,
+        help="Request a policy change that the guard may park for co-signatures",
+    )
+    _key_group(p_creq)
+    p_creq.add_argument("--kind", required=True, choices=sorted(_KIND_BY_NAME),
+                        help="set (kind 1), revoke (kind 2) or accept an offer (kind 3)")
+    _body_flags(p_creq, required=False)
+    p_creq.add_argument("--offer-id", help="Offer to accept (64 hex), for --kind accept")
+    _request_flags(p_creq)
+    p_creq.set_defaults(func=cmd_policy_change_request)
+
+    p_ccan = csub.add_parser("cancel", parents=common,
+                             help="Cancel one of your parked requests (feeless)")
+    _key_group(p_ccan)
+    p_ccan.add_argument("--request-id", required=True, help="Request id (64 hex)")
+    p_ccan.add_argument(
+        "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+        help="Seconds until expiration_time (default: %(default)s)",
+    )
+    p_ccan.add_argument("--expire-in", type=_block_count, default=1000,
+                        help="Blocks the cancel may land in, from the next one")
+    p_ccan.add_argument("--expire-at-height", type=int,
+                        help="Absolute expiry height (overrides --expire-in)")
+    p_ccan.set_defaults(func=cmd_policy_change_cancel)
 
 
 # --- Retractable transfers --------------------------------------------------
@@ -1912,7 +2354,6 @@ def cmd_retractable_send(args: argparse.Namespace) -> int:
             expire_at_height=expire_at_height,
             recipient_pubkey=args.to,
             amount=int(args.amount),
-            fee_limit=args.fee,
             **_release_point(args, tip, now),
         )
         try:
@@ -1993,8 +2434,9 @@ def _add_retractable_subparsers(sub) -> None:
         src.add_argument("--key", help="Logical name of a saved key")
         src.add_argument("--privkey", help="Private key (hex or decimal)")
 
-    def _tx_flags(parser):
-        parser.add_argument("--fee", default="0", help="Fee limit (default '0')")
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
         parser.add_argument(
             "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
             help="Seconds until expiration_time (default: %(default)s)",
@@ -2029,7 +2471,8 @@ def _add_retractable_subparsers(sub) -> None:
     )
     _key_group(p_back)
     p_back.add_argument("retractable_id", help="Retractable id (64 hex)")
-    _tx_flags(p_back)
+    # A retract is fee-exempt, so a fee limit changes nothing.
+    _tx_flags(p_back, fee=False)
     p_back.set_defaults(func=cmd_retractable_retract)
 
     p_list = rsub.add_parser("list", parents=common,
@@ -2076,7 +2519,7 @@ def _add_rule_subparsers(sub) -> None:
         src.add_argument("--rule-file", help="File containing the Tau rule text")
 
     def _tx_flags(parser):
-        parser.add_argument("--fee", default="0", help="Fee limit (default '0')")
+        parser.add_argument("--fee", default=None, help=FEE_HELP)
         parser.add_argument(
             "--expiry",
             type=int,
@@ -2210,7 +2653,6 @@ def _add_gov_subparsers(sub) -> None:
         required=True,
         help="JSON file with rule_revisions / activate_at_height / host_contract_patch",
     )
-    p_propose.add_argument("--fee", default="0", help="Fee limit (default '0')")
     p_propose.add_argument(
         "--expiry",
         type=int,
@@ -2228,7 +2670,6 @@ def _add_gov_subparsers(sub) -> None:
     vsrc.add_argument("--key", help="Logical name of a saved key")
     vsrc.add_argument("--privkey", help="Private key (hex or decimal)")
     p_vote.add_argument("--update-id", required=True, help="Update id to vote on")
-    p_vote.add_argument("--fee", default="0", help="Fee limit (default '0')")
     p_vote.add_argument(
         "--expiry",
         type=int,

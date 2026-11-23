@@ -48,6 +48,10 @@ class AdmissionTimeout(AdmissionUnavailable):
     """The request ran out of its end-to-end budget and its worker was killed."""
 
 
+class EstimateBusy(AdmissionUnavailable):
+    """The fee estimate slot is taken. The caller retries; it does not queue."""
+
+
 from tau_session import StepRefused  # noqa: E402 - re-exported: the engine refused
 # one step's inputs. The same inputs against the same history are refused
 # wherever they run, so it is about the request, not the node.
@@ -62,6 +66,10 @@ STANDBY_BUDGET_FACTOR = 3
 #: so a burst of submissions must queue for a slot rather than fork without bound.
 MAX_CONCURRENT = 4
 _slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+#: Fee estimates run apart from admission, one at a time, so a burst of
+#: estimates cannot hold the slots or the standby that sendtx needs.
+_estimate_slot = threading.BoundedSemaphore(1)
 
 #: Counters for diagnostics and tests: what admission actually cost.
 stats = {"opened": 0, "replayed": 0, "standby_hits": 0, "disposed": 0}
@@ -231,8 +239,10 @@ def _conflicts(plan, candidate_rules) -> bool:
     test that decides whether the authority can be lent."""
     if not candidate_rules:
         return False
+    import tau_manager
     import tau_reconstruction
-    needs = tau_reconstruction.plan_representation(candidate_rules=list(candidate_rules))
+    with tau_manager.reexec_on_width_overflow():
+        needs = tau_reconstruction.plan_representation(candidate_rules=list(candidate_rules))
     return bool(set(needs.plain) & set(plan.interned))
 
 
@@ -257,9 +267,11 @@ def _plan_for(anchor, entries, candidate_rules):
             return committed
     history = [e.rule_text for e in entries
                if e.kind == tau_journal.REVISION and e.rule_text]
-    return tau_reconstruction.plan_representation(
-        history_rules=history, candidate_rules=list(candidate_rules or ()),
-    )
+    import tau_manager
+    with tau_manager.reexec_on_width_overflow():
+        return tau_reconstruction.plan_representation(
+            history_rules=history, candidate_rules=list(candidate_rules or ()),
+        )
 
 
 def _build(*, candidate_rules, label, deadline, cwd, env, store):
@@ -316,20 +328,31 @@ def _build(*, candidate_rules, label, deadline, cwd, env, store):
 
 
 def open_context(*, candidate_rules=(), budget=None, label="admission",
-                 cwd=None, env=None, store=None) -> AdmissionContext:
+                 cwd=None, env=None, store=None, estimate=False) -> AdmissionContext:
     """A fresh context at the committed head, for ONE request.
 
     `candidate_rules` are the revisions the request will offer: the plan has to
     see them before the worker is built, or the replay pins a representation the
     candidate cannot be typed under.
+
+    `estimate` takes the single estimate slot, or raises EstimateBusy at once.
+    An estimate always builds its own context: it never takes the standby and
+    never starts a refill, so it cannot delay the next sendtx.
     """
     deadline = _Deadline(default_budget() if budget is None else budget)
-    if not _slots.acquire(timeout=deadline.remaining()):
-        deadline.cancel()
-        raise AdmissionUnavailable("every admission context is busy")
-    release = _slots.release
+    if estimate:
+        if not _estimate_slot.acquire(blocking=False):
+            deadline.cancel()
+            raise EstimateBusy("another fee estimate is running")
+        release = _estimate_slot.release
+    else:
+        if not _slots.acquire(timeout=deadline.remaining()):
+            deadline.cancel()
+            raise AdmissionUnavailable("every admission context is busy")
+        release = _slots.release
     try:
-        standby = _standby.take(store=store, candidate_rules=candidate_rules)
+        standby = None if estimate else _standby.take(
+            store=store, candidate_rules=candidate_rules)
         if standby is not None:
             session, anchor, plan = standby
             try:
@@ -353,7 +376,8 @@ def open_context(*, candidate_rules=(), budget=None, label="admission",
     finally:
         if release is not None:
             release()
-        _standby.refill(store=store, cwd=cwd, env=env)
+        if not estimate:
+            _standby.refill(store=store, cwd=cwd, env=env)
 
 
 # --- a pre-built context, waiting --------------------------------------------------

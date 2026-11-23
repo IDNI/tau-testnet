@@ -13,6 +13,8 @@ import config
 import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
+from consensus.clause_registry import ClauseRegistry
+from consensus import faucet
 from consensus.fees import FeeRuleError
 from errors import DatabaseError
 from block import Block
@@ -492,6 +494,8 @@ _genesis_active_validators: list = []
 _genesis_vote_quorum: str = ""
 _genesis_eligibility_mode: str = ""
 _genesis_fee_beneficiary: str = ""
+_genesis_faucet_amount: int = 0
+_genesis_approval_slots_active: bool = False
 # Genesis rule text, re-seeded on full rebuild so the replayed state hash
 # matches the mined chain (the reorg path replays only the new suffix, not
 # the genesis block, so its rules would otherwise be lost).
@@ -598,9 +602,10 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         # tables holding the previous block's rows while memory moved on.
         quorum_policy=lm.quorum_policy,
         rule_offers=lm.rule_offers.snapshot_offers(),
-        rule_clauses=lm.rule_offers.snapshot_clauses(),
+        rule_clauses=lm.rule_offers.clause_plan(),
         max_rule_txs_per_block=lm.max_rule_txs_per_block,
         approval_requests=lm.approval_requests.snapshot_requests(),
+        rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
         approval_slots_active=lm.approval_slots_active,
         retractable_transfers=_retractable_state(lm),
         eligibility_mode=lm.eligibility_mode,
@@ -1153,6 +1158,9 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _lifecycle_manager.quorum_policy = _genesis_vote_quorum
             _lifecycle_manager.eligibility_mode = _genesis_eligibility_mode
             _lifecycle_manager.fee_beneficiary = _genesis_fee_beneficiary
+            _lifecycle_manager.faucet_amount = _genesis_faucet_amount
+            if _genesis_approval_slots_active:
+                _lifecycle_manager.activate_approval_slots()
             _lifecycle_manager.recompute_approval_threshold()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
@@ -1281,7 +1289,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             active_view = engine.derive_active_consensus(parent_snapshot, block_number)
             
             # 3. Verify Block Header
-            # proof_ok skips the cryptography re-checks (db integrity covers them); o6/o7 still run.
+            # proof_ok skips the signature re-check: ingest and process_new_block verified it before the row was stored.
+            # o6/o7 still run.
             # Under worker-backed authority they run on the advisory evaluator, so a down interpreter is no reason to skip.
             if _enabled:
                 if block_number == 0:
@@ -1494,7 +1503,8 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     # Remember the artifact's pre-funded accounts for rebuild/reorg seeding,
     # regardless of whether the DB is fresh or already provisioned.
     global _genesis_accounts_state, _genesis_active_validators, _genesis_vote_quorum
-    global _genesis_eligibility_mode, _genesis_fee_beneficiary
+    global _genesis_eligibility_mode, _genesis_fee_beneficiary, _genesis_faucet_amount
+    global _genesis_approval_slots_active
     global _genesis_application_rules, _genesis_consensus_rules
     _genesis_accounts_state = {
         k: int(v) for k, v in genesis_data.get("accounts_state", {}).items()
@@ -1504,6 +1514,16 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     _genesis_vote_quorum = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("vote_quorum", "")
     _genesis_eligibility_mode = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("eligibility_mode", "")
     _genesis_fee_beneficiary = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("fee_beneficiary", "")
+    from consensus.faucet import DEFAULT_FAUCET_AMOUNT, validate_faucet_amount
+    _faucet = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get(
+        "faucet_amount", DEFAULT_FAUCET_AMOUNT)
+    _faucet_err = validate_faucet_amount(_faucet)
+    if _faucet_err:
+        raise ValueError(f"FATAL: genesis faucet_amount {_faucet_err}: {_faucet!r}")
+    _genesis_faucet_amount = _faucet
+    _genesis_approval_slots_active = (
+        (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("approval_slots_active") is True
+    )
     _genesis_application_rules = genesis_data.get("application_rules", "")
     _genesis_consensus_rules = genesis_data.get("consensus_rules", "")
 
@@ -1552,16 +1572,14 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
             _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.fee_beneficiary = meta.get("mechanism_specific_metadata", {}).get("fee_beneficiary", "")
+            _lifecycle_manager.faucet_amount = _genesis_faucet_amount
             # A fresh chain may ship with co-signature approval slots already
             # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
             # this only ever turns it on.
-            if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
+            if _genesis_approval_slots_active:
                 _lifecycle_manager.activate_approval_slots()
-                # Persist immediately. TipAdmissionView reads this key, not the
-                # manager, so without it admission treats a genesis-activated
-                # chain as INACTIVE until the first block commits -- and rejects
-                # every co-signature policy in the meantime. Found by the
-                # live-node e2e.
+                # Persist immediately, so a restart before the first block
+                # still reads the flag back from the chain_state row.
                 try:
                     db.set_chain_state_value("approval_slots_active", "1")
                 except Exception:
@@ -1649,11 +1667,21 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
                 commit_state_to_db(_canonical_head_hash, good_num)
         
 def get_balance(address_hex: str) -> int:
-    """Returns the balance of the given address. Returns 0 if address not found."""
-    with _balance_lock:
-        if address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-            return int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
-        return _balances.get(address_hex, 0)
+    """The spendable balance: the stored balance, or the pending faucet grant
+    of an address with no account record."""
+    with _balance_lock, _sequence_lock:
+        return faucet.spendable(
+            _balances, _sequence_numbers, address_hex, faucet.amount(_lifecycle_manager)
+        )
+
+def get_balance_view(address_hex: str) -> tuple:
+    """(spendable balance, faucet_pending), read under one lock."""
+    with _balance_lock, _sequence_lock:
+        grant = faucet.amount(_lifecycle_manager)
+        return (
+            faucet.spendable(_balances, _sequence_numbers, address_hex, grant),
+            faucet.faucet_pending(_balances, _sequence_numbers, address_hex, grant),
+        )
 
 def get_committed_balance(address: str) -> int:
     """Raw committed balance lookup (no auto-faucet shim). Used for advisory
@@ -1672,18 +1700,18 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
         print(f"[WARN][chain_state] Attempted to update balance with non-positive amount: {amount}")
         return False # Should have been caught by Tau
 
-    with _balance_lock:
-        current_from_balance = _balances.get(from_address_hex, 0)
-
-        if from_address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-            current_from_balance = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+    grant = faucet.amount(_lifecycle_manager)
+    with _balance_lock, _sequence_lock:
+        current_from_balance = faucet.spendable(
+            _balances, _sequence_numbers, from_address_hex, grant)
 
         # Enforce sufficient funds during balance updates to avoid negative balances
         if current_from_balance < amount:
             print(f"[ERROR][chain_state] Insufficient funds for {from_address_hex[:10]}... to send {amount}. Has: {current_from_balance}.")
             return False
 
-        current_to_balance = _balances.get(to_address_hex, 0)
+        current_to_balance = faucet.spendable(
+            _balances, _sequence_numbers, to_address_hex, grant)
         
         _balances[from_address_hex] = current_from_balance - amount
         _balances[to_address_hex] = current_to_balance + amount
@@ -1712,7 +1740,11 @@ def get_sequence_number(address_hex: str) -> int:
 
 def increment_sequence_number(address_hex: str):
     """Increments the sequence number for the given address."""
-    with _sequence_lock:
+    grant = faucet.amount(_lifecycle_manager)
+    with _balance_lock, _sequence_lock:
+        # A record made by the nonce alone still gets the grant.
+        if grant and not faucet.has_account(_balances, _sequence_numbers, address_hex):
+            _balances[address_hex] = grant
         _sequence_numbers[address_hex] = _sequence_numbers.get(address_hex, 0) + 1
 
 
@@ -1822,8 +1854,7 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
         with _rules_lock:
             consensus_snapshot = _consensus_rules_state or ""
             application_snapshot = _application_rules_state or ""
-        return restore_plan_for(consensus_snapshot, application_snapshot,
-                                lifecycle=_lifecycle_manager)
+        return restore_plan_for(consensus_snapshot, application_snapshot)
     genesis_path = os.path.join(os.path.dirname(__file__), "data", "genesis.json")
     try:
         with open(genesis_path, "r", encoding="utf-8") as f:
@@ -1831,17 +1862,15 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
     except Exception:
         logger.exception("Failed to load genesis data from %s", genesis_path)
         return []
-    return restore_plan_for(genesis_data.get("consensus_rules", ""), "",
-                            lifecycle=None)
+    return restore_plan_for(genesis_data.get("consensus_rules", ""), "")
 
 
-def restore_plan_for(consensus_rules: str, application_rules: str, *,
-                     lifecycle=None) -> List[Dict[str, object]]:
+def restore_plan_for(consensus_rules: str, application_rules: str) -> List[Dict[str, object]]:
     """The restore plan for GIVEN rule state, not the module globals.
 
     A governance activation inside a proposal needs the POST-block plan -- the
-    newly activated consensus rules, the block's application rules, its clause
-    registry -- while the globals still describe the parent. Same construction as
+    newly activated consensus rules and the block's application rules -- while
+    the globals still describe the parent. Same construction as
     the startup plan, so a collapse at activation and a restart agree.
     """
     normalized_consensus = _preprocess_tau_spec_text(consensus_rules or "")
@@ -1876,36 +1905,7 @@ def restore_plan_for(consensus_rules: str, application_rules: str, *,
             "persist": True,
         })
 
-    if lifecycle is not None:
-        for label, text in _rule_composite_plan_entries(lifecycle):
-            plan.append({"label": label, "text": text, "persist": False})
-
     return plan
-
-
-def _rule_composite_plan_entries(lifecycle=None) -> List[tuple]:
-    """(label, text) for one composite per output stream with accepted clauses.
-
-    Ordered by stream index so every node replays them identically.
-    """
-    from consensus.rule_offers import ALLOWED_TARGET_STREAMS
-
-    entries: List[tuple] = []
-    manager = getattr(lifecycle if lifecycle is not None else _lifecycle_manager,
-                      "rule_offers", None)
-    if manager is None:
-        return entries
-    for stream in sorted(ALLOWED_TARGET_STREAMS):
-        try:
-            composite = manager.composite_for_stream(stream)
-        except Exception:
-            logger.warning(
-                "Could not compose the rule for o%s during restore", stream, exc_info=True
-            )
-            continue
-        if composite:
-            entries.append((f"rule_composite_o{stream}", composite))
-    return entries
 
 
 def replay_tau_restore_plan(plan: List[Dict[str, object]], *, source_prefix: str = "restore") -> bool:
@@ -1947,7 +1947,7 @@ def advisory_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, ob
     """The restore plan reduced to the consensus unit.
 
     The in-process interpreter is only a fallback for o6/o7 under worker-backed
-    authority; user rules and composites are the authority's business.
+    authority; user rules are the authority's business.
     """
     return [e for e in get_tau_restore_plan(use_persisted_state=use_persisted_state)
             if e.get("label") == "consensus_rules"]
@@ -2089,9 +2089,11 @@ def _restore_rule_offers(lm) -> None:
         else:
             resolved.add(offer_id)
 
-    clauses = {}
-    for row in db.load_rule_clauses():
-        clauses[(row["acceptor_pubkey"], int(row["target_stream"]))] = row["clause_body"]
+    clauses = ClauseRegistry({
+        (row["acceptor_pubkey"], int(row["target_stream"])): row["clause_body"]
+        for row in db.load_rule_clauses()
+    })
+    clauses.adopt_stored_token(db.load_rule_clauses_token())
 
     lm.rule_offers.offered = offered
     lm.rule_offers.resolved = resolved
@@ -2173,6 +2175,57 @@ def _restore_approvals(lm) -> None:
     lm.approval_requests.resolved = resolved
     lm.approval_requests.terminal_status = statuses
     lm.approval_requests.resolved_details = details
+
+
+def _restore_rule_change_requests(lm) -> None:
+    """Rebuild the rule-change book, terminal requests included: their status is
+    bound into the state root."""
+    from consensus.approvals import RuleChangeRequestEntry, STATUS_OPEN
+
+    def _index_map(raw):
+        try:
+            parsed = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            return {}
+        out = {}
+        for k, v in (parsed.items() if isinstance(parsed, dict) else ()):
+            try:
+                out[int(k)] = str(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _slot_set(raw):
+        try:
+            parsed = json.loads(raw or "[]")
+        except (TypeError, ValueError):
+            return set()
+        return {int(s) for s in parsed if isinstance(s, int)} if isinstance(parsed, list) else set()
+
+    entries = {}
+    for row in db.load_rule_change_requests():
+        try:
+            request_id = bytes.fromhex(row["request_id"])
+        except (TypeError, ValueError):
+            logger.warning("Skipping malformed rule-change request id %r", row.get("request_id"))
+            continue
+        if len(request_id) != 32:
+            logger.warning("Skipping rule-change request id of wrong width %r", row.get("request_id"))
+            continue
+        entries[request_id] = RuleChangeRequestEntry(
+            sender_pubkey=row.get("sender_pubkey") or "",
+            kind=int(row.get("kind") or 0),
+            body=row.get("body") or "",
+            offer_id=row.get("offer_id") or "",
+            approvers=_index_map(row.get("approvers_json")),
+            created_height=int(row.get("created_height") or 0),
+            expire_at_height=int(row.get("expire_at_height") or 0),
+            status=int(row.get("status") or STATUS_OPEN),
+            voted=_index_map(row.get("voted_json")),
+            declined=_slot_set(row.get("declined_json")),
+            ready=bool(row.get("ready")),
+        )
+    lm.approval_requests.rule_change_requests = entries
 
 
 def _restore_retractables(lm) -> None:
@@ -2299,6 +2352,8 @@ def load_state_from_db() -> bool:
         _lifecycle_manager.fee_beneficiary = (
             _genesis_fee_beneficiary if persisted_beneficiary == _MISSING else persisted_beneficiary
         )
+        # Never persisted: the genesis is the only source, on every load.
+        _lifecycle_manager.faucet_amount = _genesis_faucet_amount
         persisted_budget = db.get_chain_state_value("max_rule_txs_per_block", _MISSING)
         if persisted_budget != _MISSING:
             try:
@@ -2315,12 +2370,24 @@ def load_state_from_db() -> bool:
         # on the first block after a restart.
         _restore_rule_offers(_lifecycle_manager)
         _restore_approvals(_lifecycle_manager)
+        _restore_rule_change_requests(_lifecycle_manager)
         _restore_retractables(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
-        if persisted_slots is not _MISSING and str(persisted_slots) == "1":
+        # The genesis flag also counts: the flag is one-way, so a genesis that
+        # turns it on keeps it on at every height.
+        if _genesis_approval_slots_active or (
+            persisted_slots is not _MISSING and str(persisted_slots) == "1"
+        ):
             _lifecycle_manager.activate_approval_slots()
+            if str(persisted_slots) != "1":
+                try:
+                    db.set_chain_state_value("approval_slots_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist approval_slots_active from genesis",
+                        exc_info=True)
 
         for p in pending_updates:
             update = ConsensusRuleUpdate(
@@ -2365,9 +2432,12 @@ def commit_state_to_db(block_hash: str, block_number: int):
         # write as accounts: a node whose reloaded managers disagree with disk
         # computes a different state hash than a peer replaying from genesis.
         rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
-        rule_clauses_list = _lifecycle_manager.rule_offers.snapshot_clauses()
+        rule_clauses_list = _lifecycle_manager.rule_offers.clause_plan()
         max_rule_txs_snapshot = _lifecycle_manager.max_rule_txs_per_block
         approval_requests_list = _lifecycle_manager.approval_requests.snapshot_requests()
+        rule_change_requests_list = (
+            _lifecycle_manager.approval_requests.snapshot_rule_change_requests()
+        )
         approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
         retractable_snapshot = _retractable_state(_lifecycle_manager)
 
@@ -2385,6 +2455,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_clauses=rule_clauses_list,
         max_rule_txs_per_block=max_rule_txs_snapshot,
         approval_requests=approval_requests_list,
+        rule_change_requests=rule_change_requests_list,
         approval_slots_active=approval_slots_active_snapshot,
         retractable_transfers=retractable_snapshot,
     )
@@ -2600,6 +2671,13 @@ def ingest_block(block: Block) -> IngestResult:
             block.header.block_number, block.block_hash[:16], body_reason,
         )
         return IngestResult('invalid', f"Block body verification failed: {body_reason}")
+    # A fork that wins fork choice is replayed without re-checking proofs, so this is the only gate.
+    if not block.verify_consensus_proof():
+        logger.warning(
+            "[chain_state] Block #%s %s... not ingested: its consensus proof does not verify.",
+            block.header.block_number, block.block_hash[:16],
+        )
+        return IngestResult('invalid', "Block consensus proof verification failed")
     engine = TauConsensusEngine()
     # NOTE: legacy verify signature (no active_view): membership/stake gates and
     # the parent-state stake input do NOT run here. This pre-filter only checks
@@ -2849,7 +2927,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
             active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
             rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
-            rule_clauses_list = _lifecycle_manager.rule_offers.snapshot_clauses()
+            rule_clauses_list = _lifecycle_manager.rule_offers.clause_plan()
             head_num = db.get_block_by_hash(new_head_hash)['header']['block_number']
             db.save_canonical_state_atomically(
                 new_head_hash,
@@ -2872,6 +2950,9 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 rule_clauses=rule_clauses_list,
                 max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
                 approval_requests=_lifecycle_manager.approval_requests.snapshot_requests(),
+                rule_change_requests=(
+                    _lifecycle_manager.approval_requests.snapshot_rule_change_requests()
+                ),
                 approval_slots_active=_lifecycle_manager.approval_slots_active,
                 retractable_transfers=_retractable_state(_lifecycle_manager),
             )

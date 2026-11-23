@@ -261,6 +261,49 @@ def submit_tx(
     )
 
 
+#: Waits in seconds before each retry after ESTIMATE_BUSY: the node runs one
+#: estimate at a time, so the slot is often free again soon.
+ESTIMATE_BUSY_BACKOFF = (0.5, 1.0, 2.0)
+
+
+def estimate_fee(
+    payload: dict,
+    *,
+    host: str,
+    port: int,
+    timeout: float = rpc_mod.DEFAULT_TIMEOUT,
+    backoff: tuple = ESTIMATE_BUSY_BACKOFF,
+) -> str:
+    """The node's fee estimate for a signed draft, from ``checktx estimate``.
+
+    Raises RuntimeError with the node's own code and message when the node
+    gives no estimate.
+    """
+    blob = json.dumps(payload, separators=(",", ":"))
+    for delay in (*backoff, None):
+        response = rpc_mod.send_command(
+            f"checktx estimate '{blob}'", host, port, timeout=timeout
+        )
+        try:
+            parsed = json.loads(response)
+        except (ValueError, TypeError):
+            raise RuntimeError(f"unexpected checktx response: {response!r}")
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"unexpected checktx response: {response!r}")
+        if parsed.get("status") == "error":
+            err = parsed.get("error", {}) or {}
+            if err.get("code") == "ESTIMATE_BUSY" and delay is not None:
+                time.sleep(delay)
+                continue
+            raise RuntimeError(
+                f"{err.get('code', 'ERROR')} {err.get('message', '')}".strip()
+            )
+        fee = (parsed.get("data") or {}).get("estimated_fee")
+        if not isinstance(fee, str) or not fee.isdigit():
+            raise RuntimeError(f"no estimated_fee in the checktx response: {response!r}")
+        return fee
+
+
 def build_rule_offer_tx(
     *,
     sender_pubkey: str,
@@ -497,6 +540,91 @@ def build_approval_request_tx(
         "expire_at_height": expire_at_height,
         "approvers": normalized,
         "custom_inputs": customs,
+    }
+
+
+def build_rule_change_request_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    kind: int,
+    rule_text: str = "",
+    offer_id: str = "",
+    approvers: dict | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='rule_change_request'`` payload (without signature).
+
+    Kinds 1 and 4 carry the clause in ``rule_text``; kind 3 carries the exact
+    offered text and the offer id; kinds 2 and 5 carry neither. Zero approvers is
+    valid: the time escape alone can release the request.
+    """
+    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5):
+        raise ValueError("kind must be 1..5")
+    has_body = kind in (1, 3, 4)
+    if has_body and not (isinstance(rule_text, str) and rule_text.strip()):
+        raise ValueError("this kind needs a non-empty rule text")
+    if not has_body and rule_text:
+        raise ValueError("this kind carries no rule text")
+    if kind == 3:
+        if not isinstance(offer_id, str) or len(offer_id) != 64:
+            raise ValueError("offer_id must be a 64-character hex string")
+    elif offer_id:
+        raise ValueError("this kind carries no offer id")
+
+    normalized = {}
+    for slot, pubkey in (approvers or {}).items():
+        try:
+            idx = int(slot)
+        except (TypeError, ValueError):
+            raise ValueError(f"approver slot {slot!r} is not a stream index")
+        if not isinstance(pubkey, str) or len(pubkey) != 96:
+            raise ValueError(f"approver for slot {idx} must be a 96-hex public key")
+        normalized[str(idx)] = pubkey.lower()
+    if len(set(normalized.values())) != len(normalized):
+        raise ValueError("approvers must be distinct accounts")
+    if (sender_pubkey or "").lower() in set(normalized.values()):
+        raise ValueError("the sender may not be their own approver")
+
+    tx = {
+        "tx_type": "rule_change_request",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "kind": kind,
+        "approvers": normalized,
+    }
+    if rule_text:
+        tx["rule_text"] = rule_text
+    if offer_id:
+        tx["offer_id"] = offer_id.lower()
+    return tx
+
+
+def build_rule_change_cancel_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    request_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='rule_change_cancel'`` payload (without signature)."""
+    if not isinstance(request_id, str) or len(request_id) != 64:
+        raise ValueError("request_id must be a 64-character hex string")
+    return {
+        "tx_type": "rule_change_cancel",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "request_id": request_id.lower(),
     }
 
 

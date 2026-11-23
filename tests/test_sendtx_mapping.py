@@ -61,7 +61,7 @@ class TestSendTxMapping(unittest.TestCase):
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
+        patch("commands.sendtx.validate_bls_pubkey", return_value=None).start()
         patch("commands.sendtx.tau_manager.communicate_with_tau", _mock_tau_ok).start()
         patch("commands.sendtx.tau_manager.communicate_with_tau_multi", _mock_tau_multi_ok).start()
         # Signatures are verified for real; fund the signing sender.
@@ -104,8 +104,6 @@ class TestSendTxMapping(unittest.TestCase):
         sk = bls.KeyGen(b"mapping_seed_2")
         pk_hex = bls.SkToPk(sk).hex()
         tx = self._base_tx(sender_pubkey=pk_hex, signature="00" * 96)
-        sendtx._PY_ECC_AVAILABLE = True
-        sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(json.dumps(tx))
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "INVALID_SIGNATURE")
@@ -120,8 +118,6 @@ class TestSendTxMapping(unittest.TestCase):
         tx = self._base_tx(sender_pubkey=pk_hex, sequence_number=seq + 5)
         msg = sendtx._get_signing_message_bytes(tx)
         tx["signature"] = bls.Sign(sk, hashlib.sha256(msg).digest()).hex()
-        sendtx._PY_ECC_AVAILABLE = True
-        sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(json.dumps(tx))
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "INVALID_SEQUENCE")
@@ -180,17 +176,6 @@ class TestSendTxMapping(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "PARSE_ERROR")
 
-    # 9. BLS unavailable
-    def test_bls_unavailable(self):
-        prev = sendtx._PY_ECC_AVAILABLE
-        sendtx._PY_ECC_AVAILABLE = False
-        try:
-            env = sendtx.execute("sendtx {}", None)
-            parsed = json.loads(env)
-            self.assertEqual(parsed["status"], "error")
-            self.assertEqual(parsed["error"]["code"], "BLS_UNAVAILABLE")
-        finally:
-            sendtx._PY_ECC_AVAILABLE = prev
 
     # 10. Unexpected exception in queue_transaction (caught by outer try).
     # An unexpected (non-Native) error from the compile propagates to the outer

@@ -48,8 +48,9 @@ class PartnerBot(ApproverBot):
     name = "partner"
 
     def __init__(self, *args, webhook=None, auto_below=None, assume_yes=False,
-                 **kwargs):
+                 allow_rule_changes=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.allow_rule_changes = allow_rule_changes
         self.webhook = webhook
         self.auto_below = auto_below
         self.assume_yes = assume_yes
@@ -67,6 +68,19 @@ class PartnerBot(ApproverBot):
         except Exception as exc:
             logger.warning("webhook post failed: %s", exc)
 
+    def decide_rule_change(self, request: dict):
+        request_id = request["request_id"]
+        summary = self.show_rule_change(request)
+        if request_id not in self._notified:
+            self._notify(summary)
+            self._notified.add(request_id)
+
+        if not self.allow_rule_changes:
+            logger.debug("skipping rule change %s (--allow-rule-changes is off)",
+                        request_id[:16])
+            return None
+        return self._prompt(request_id)
+
     def decide(self, request: dict):
         request_id = request["request_id"]
         summary = _describe(request)
@@ -83,6 +97,9 @@ class PartnerBot(ApproverBot):
         if self.assume_yes:
             return True, "approved non-interactively (--yes)"
 
+        return self._prompt(request_id)
+
+    def _prompt(self, request_id: str):
         if not sys.stdin or not sys.stdin.isatty():
             # No terminal and no standing rule: defer rather than guess. The
             # request stays open, and a person can approve it later.
@@ -104,7 +121,12 @@ def main(argv=None):
     parser.add_argument("--auto-approve-below", type=int, dest="auto_below",
                         help="Standing approval under this amount (off by default)")
     parser.add_argument("--yes", action="store_true", dest="assume_yes",
-                        help="Approve without prompting (for scripted demos)")
+                        help="Approve transfers without prompting (for scripted "
+                             "demos); never applies to rule changes")
+    parser.add_argument("--allow-rule-changes", action="store_true",
+                        help="Ask a human at the terminal to confirm policy-change "
+                             "requests. Off by default (shown and skipped); never "
+                             "auto-approved, and ignored by --yes")
     args = parser.parse_args(argv)
     configure_logging(args.verbose)
 
@@ -112,7 +134,8 @@ def main(argv=None):
     client = NodeClient(args.host, args.port)
     bot = PartnerBot(client, signer, dry_run=args.dry_run, poll_seconds=args.poll,
                      webhook=args.webhook, auto_below=args.auto_below,
-                     assume_yes=args.assume_yes)
+                     assume_yes=args.assume_yes,
+                     allow_rule_changes=args.allow_rule_changes)
     return run_bot(bot, args.once)
 
 

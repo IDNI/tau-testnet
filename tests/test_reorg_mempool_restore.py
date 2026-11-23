@@ -30,12 +30,15 @@ import tau_manager
 from py_ecc.bls import G2Basic
 from block import Block, compute_tx_hash
 from commands import gettxstatus, sendtx
+from bls_keys import signed_block
 from consensus.lanes import LANE_FAST, LANE_SLOW
 from consensus.tx_signing import signing_message_bytes
+from bls_keys import ZERO_PUBKEY
 
 BASE_TS = 1_700_000_000
 
 SK_ALICE, SK_BOB, SK_STRANGER, SK_FUNDER = 11111, 22222, 55555, 77777
+PROPOSER_A, PROPOSER_B = SK_STRANGER, 66666
 ALICE = G2Basic.SkToPk(SK_ALICE).hex()
 BOB = G2Basic.SkToPk(SK_BOB).hex()
 CAROL = G2Basic.SkToPk(33333).hex()
@@ -108,8 +111,6 @@ class ReorgRestoreTestCase(unittest.TestCase):
         chain_state._genesis_accounts_state = {FUNDER: chain_state.GENESIS_BALANCE}
         chain_state._balances[FUNDER] = chain_state.GENESIS_BALANCE
 
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
         self.original_miner = config.MINER_PRIVKEY
         config.MINER_PRIVKEY = "11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"
 
@@ -126,14 +127,13 @@ class ReorgRestoreTestCase(unittest.TestCase):
         self.prefix = self.block(1, self.genesis_hash, [
             transfer(SK_FUNDER, ALICE, FUNDING, 0),
             transfer(SK_FUNDER, BOB, FUNDING, 1),
-        ], "a" * 96)
+        ], PROPOSER_A)
         self.ingest([self.prefix])
 
     def tearDown(self):
         for p in reversed(self.patches):
             p.stop()
         config.MINER_PRIVKEY = self.original_miner
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         config.set_database_path(self.original_db_path)
         if getattr(db, '_db_conn', None) is not None:
             db._db_conn.close()
@@ -143,8 +143,8 @@ class ReorgRestoreTestCase(unittest.TestCase):
 
     @staticmethod
     def block(number, prev, txs, proposer):
-        return Block.create(block_number=number, previous_hash=prev, transactions=txs,
-                            proposer_pubkey=proposer, timestamp=BASE_TS + number)
+        return signed_block(proposer, block_number=number, previous_hash=prev,
+                            transactions=txs, timestamp=BASE_TS + number)
 
     def ingest(self, blocks):
         for blk in blocks:
@@ -155,7 +155,7 @@ class ReorgRestoreTestCase(unittest.TestCase):
 
     def adopt_orphan_to_be(self, txs):
         """Make block 2, carrying `txs`, the canonical head."""
-        self.orphan = self.block(2, self.prefix.block_hash, txs, "a" * 96)
+        self.orphan = self.block(2, self.prefix.block_hash, txs, PROPOSER_A)
         self.ingest([self.orphan])
         with quiet():
             self.assertTrue(chain_state.maybe_update_canonical_head())
@@ -163,8 +163,8 @@ class ReorgRestoreTestCase(unittest.TestCase):
 
     def win_with(self, txs_in_b2=()):
         """Fork off block 1 with a longer branch; the node reorgs onto it."""
-        b2 = self.block(2, self.prefix.block_hash, list(txs_in_b2), "b" * 96)
-        b3 = self.block(3, b2.block_hash, [], "b" * 96)
+        b2 = self.block(2, self.prefix.block_hash, list(txs_in_b2), PROPOSER_B)
+        b3 = self.block(3, b2.block_hash, [], PROPOSER_B)
         self.ingest([b2, b3])
         with quiet():
             self.assertTrue(chain_state.maybe_update_canonical_head())
@@ -338,6 +338,18 @@ class TestOrphanedTransactionsAreReadmitted(ReorgRestoreTestCase):
 
 class TestReadmitDirectly(ReorgRestoreTestCase):
     """The function `reorg_to` calls, with no fork around it."""
+
+    def test_restore_drops_transfer_with_invalid_recipient_key(self):
+        bad = transfer(SK_ALICE, ZERO_PUBKEY, 1, 0)
+        good = transfer(SK_BOB, CAROL, 1, 0)
+        result = sendtx.readmit_orphaned_transactions([bad, good])
+        bad_hash = compute_tx_hash(bad)
+        good_hash = compute_tx_hash(good)
+        self.assertIn(bad_hash, result["dropped"])
+        self.assertEqual(result["dropped"][bad_hash], "TX_INVALID")
+        self.assertIn(good_hash, result["restored"])
+        self.assertFalse(self.in_mempool(bad))
+        self.assertTrue(self.in_mempool(good))
 
     def test_restored_rows_keep_their_fee_limit_and_lane(self):
         plain = transfer(SK_ALICE, CAROL, 1, 0, fee_limit="7")

@@ -7,6 +7,8 @@ import these instead of inlining their own listen-addr / connect / RPC helpers.
 from __future__ import annotations
 
 import errno
+import contextlib
+import importlib
 import os
 import sys
 import threading
@@ -61,6 +63,60 @@ def test_environment(tmp_path_factory) -> Iterator[None]:
         os.environ["TAU_ENV"] = original_env
         config.reload_settings(env=original_env)
 
+
+def tau_manager_threads() -> List[threading.Thread]:
+    """Live threads that run `tau_manager.start_and_manage_tau_process`."""
+    return [
+        t for t in threading.enumerate()
+        if t.name.endswith("(start_and_manage_tau_process)")
+    ]
+
+
+def stop_tau_manager_thread(thread: threading.Thread, timeout: float = 30.0) -> bool:
+    """Stop and join one manager thread. Return True when it ended."""
+    import tau_manager
+
+    tau_manager.request_shutdown()
+    deadline = time.monotonic() + timeout
+    # The manager clears the stop flag when it starts, so set it until the thread ends.
+    while thread.is_alive() and time.monotonic() < deadline:
+        tau_manager.server_should_stop.set()
+        thread.join(0.1)
+    return not thread.is_alive()
+
+
+def _fail_on_new_tau_manager_threads(before: set, where: str) -> None:
+    leaked = [t for t in tau_manager_threads() if t not in before]
+    if not leaked:
+        return
+    stuck = [t.name for t in leaked if not stop_tau_manager_thread(t)]
+    pytest.fail(
+        f"{where} left Tau manager threads alive: {[t.name for t in leaked]}"
+        + (f"; these did not stop: {stuck}" if stuck else ""),
+        pytrace=False,
+    )
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_tau_manager_thread(request) -> Iterator[None]:
+    """Fail a test that leaves a Tau manager thread alive.
+
+    A left-over manager reads the database that a later test closes, and
+    SQLite then crashes the whole process.
+    """
+    before = set(tau_manager_threads())
+    yield
+    _fail_on_new_tau_manager_threads(before, request.node.nodeid)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def no_leaked_tau_manager_thread_in_module(request) -> Iterator[None]:
+    """The same check for a manager that setUpClass or a module fixture starts."""
+    before = set(tau_manager_threads())
+    yield
+    _fail_on_new_tau_manager_threads(before, request.node.nodeid)
+
+
 @pytest.fixture(autouse=True)
 def reset_tau_stream_types() -> Iterator[None]:
     """Start every test from an engine that has typed no stream.
@@ -68,7 +124,7 @@ def reset_tau_stream_types() -> Iterator[None]:
     Stream types are process-global and the first spec that types a stream
     pins it, so without this a test's outcome depends on which tests ran
     before it in the same process: one that types o5 as bv[16] leaves
-    genesis.tau (o5 pinned at bv[24]) uncompilable for the rest of the run.
+    every later bv[24] o5 spec uncompilable for the rest of the run.
     Interpreters already built keep their own streams. Tau builds that
     predate reset_definitions() are left as they are.
     """
@@ -76,6 +132,39 @@ def reset_tau_stream_types() -> Iterator[None]:
     if reset is not None:
         reset()
     yield
+
+
+@pytest.fixture(autouse=True)
+def reset_estimate_limits() -> Iterator[None]:
+    """The estimate budget of each sender key is process-global."""
+    sendtx = sys.modules.get("commands.sendtx")
+    if sendtx is not None:
+        sendtx.reset_estimate_limits()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def restore_lifecycle_manager() -> Iterator[None]:
+    """Keep the validator set of one test out of later tests.
+
+    Tests rebind the manager or assign its fields in place. A left-over set
+    without the local miner makes block production refuse to propose.
+    """
+    import chain_state
+
+    manager = chain_state._lifecycle_manager
+    fields = dict(vars(manager))
+    yield
+    vars(manager).update(fields)
+    chain_state._lifecycle_manager = manager
+
+
+@pytest.fixture(autouse=True)
+def restore_genesis_approval_slots(monkeypatch):
+    """Keep the genesis slot flag of one test out of the next test."""
+    import chain_state
+    monkeypatch.setattr(chain_state, "_genesis_approval_slots_active",
+                        chain_state._genesis_approval_slots_active)
 
 
 @pytest.fixture(autouse=True)
@@ -252,6 +341,43 @@ def temp_database(tmp_path) -> Iterator[str]:
 
 
 @pytest.fixture
+def mock_policy_evaluators() -> Iterator[None]:
+    """Serve o5 clause verdicts from the mock in both pools, whatever TAU_FORCE_TEST says."""
+    from consensus import sender_policy
+    from consensus.policy_mock import MockPolicyEvaluator
+
+    pools = ("apply", "admission")
+    for pool in pools:
+        sender_policy.set_evaluator(pool, MockPolicyEvaluator(pool=pool))
+    yield
+    for pool in pools:
+        sender_policy.set_evaluator(pool, None)
+
+
+@contextlib.contextmanager
+def chain_state_maps_restored() -> Iterator[None]:
+    """Put the shared balance, sequence and transfer-time maps back as they were."""
+    import chain_state
+
+    maps = [getattr(chain_state, name)
+            for name in ("_balances", "_sequence_numbers", "_last_transfer_ts")]
+    saved = [dict(m) for m in maps]
+    try:
+        yield
+    finally:
+        for m, contents in zip(maps, saved):
+            m.clear()
+            m.update(contents)
+
+
+@pytest.fixture(autouse=True)
+def restore_chain_state_maps() -> Iterator[None]:
+    """A test that credits an address directly must not change what a later test reads."""
+    with chain_state_maps_restored():
+        yield
+
+
+@pytest.fixture
 def isolated_chain_state(monkeypatch) -> Iterator[None]:
     """Later modules read chain_state globals directly, so rebinds and refills must not leak."""
     import chain_state
@@ -282,6 +408,49 @@ def isolated_chain_state(monkeypatch) -> Iterator[None]:
     for d, contents in zip(shared_dicts, saved):
         d.clear()
         d.update(contents)
+
+
+@pytest.fixture
+def isolate_db(tmp_path) -> Iterator[None]:
+    """Give the test its own SQLite DB with the genesis state loaded."""
+    import chain_state as chain_state_module
+    import config as config_module
+    import db as db_module
+
+    orig_env = os.environ.get("TAU_DB_PATH")
+    os.environ["TAU_DB_PATH"] = str(tmp_path / "p2p_test.db")
+
+    # Close any existing connection before reloading to avoid leaks
+    if getattr(db_module, "_db_conn", None):
+        try:
+            db_module._db_conn.close()
+        except Exception:
+            pass
+
+    importlib.reload(config_module)
+    importlib.reload(db_module)
+    importlib.reload(chain_state_module)
+
+    db_module.init_db()
+    chain_state_module.load_genesis("data/genesis.json")
+
+    genesis_hash = db_module.get_genesis_hash()
+    db_module.save_canonical_state_atomically(genesis_hash, 0, {}, {}, "", "", "", [], [], [], [])
+    chain_state_module._canonical_head_hash = genesis_hash
+    yield
+
+    if getattr(db_module, "_db_conn", None):
+        try:
+            db_module._db_conn.close()
+        except Exception:
+            pass
+
+    if orig_env is None:
+        os.environ.pop("TAU_DB_PATH", None)
+    else:
+        os.environ["TAU_DB_PATH"] = orig_env
+    importlib.reload(config_module)
+    importlib.reload(db_module)
 
 
 # --------------------------------------------------------------------------
