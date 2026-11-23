@@ -40,6 +40,7 @@ SCENARIOS
 USAGE
     python scripts/e2e_rules_in_force.py provision --dir .local/e2e-rules-in-force
     python scripts/e2e_rules_in_force.py run --dir .local/e2e-rules-in-force
+    python scripts/e2e_rules_in_force.py forge --dir .local/e2e-rules-in-force [--db copy.db]
 
 The native binding comes from $TAU_NATIVE_PATH.
 """
@@ -369,6 +370,199 @@ def scenario_restart_and_follower(rig, st):
           on_b.get("sha256"))
 
 
+
+def forge(root: str, db_path: str | None = None) -> int:
+    """Two forgeries, one per layer that owns the defence.
+
+    Each forged copy is relinked end to end (every entry's prev/link is
+    recomputed, every block commit's journal_head is moved to the new link),
+    so the hash chain still verifies -- the forgery is only visible to a
+    replay that compares fingerprints.
+
+    Part 1 (read path): forge the PROBE_B revision's result_fp. The views
+    replay revision units and compare revision fingerprints, so every view
+    from the first block that includes the revision must refuse -- as
+    UNAVAILABLE with the replay divergence named, per the module's code
+    taxonomy -- while earlier blocks still answer.
+
+    Part 2 (restart path): forge a step's result_fp. The views replay only
+    revision units, so a step forgery does NOT change any answer and the
+    read path does not refuse it -- a measured layer split, not a missed
+    check: step fingerprints are verified by the authoritative
+    reconstruction at startup (WorkerSession.reconstruct, verify=True),
+    which replays every entry and compares every fingerprint. A node
+    started on the step-forged copy must refuse to start.
+    """
+    import json
+    import shutil
+    import sqlite3
+    import subprocess
+    import sys
+
+    src = os.path.join(root, "nodeA", "data", "node.db")
+    c = sqlite3.connect(src)
+    cols = [r[1] for r in c.execute("PRAGMA table_info(tau_journal_v1)")]
+    orig = [dict(zip(cols, r)) for r in c.execute("SELECT * FROM tau_journal_v1 ORDER BY seq")]
+    c.close()
+    try:
+        b_seq = next(r["seq"] for r in orig
+                     if r["kind"] == "revision" and (r["rule_text"] or "") == PROBE_B)
+        step_seq = next(r["seq"] for r in orig if r["kind"] == "step" and r["seq"] > b_seq)
+    except StopIteration:
+        check("the forged chain has a PROBE_B revision and a later step", False, "rows missing")
+        return 1
+
+    rev_copy = db_path or os.path.join(root, "forge-copy.db")
+    step_copy = os.path.join(root, "forge-step-copy.db")
+    # Point the process at the revision-forged copy BEFORE importing db (via
+    # tau_journal/tau_running_spec), so config binds to the copy, not the
+    # default database.
+    os.environ["TAU_DB_PATH"] = rev_copy
+    sys.path.insert(0, rig_mod.REPO)
+    import tau_journal
+
+    forged_fp = tau_journal.fingerprint(
+        tau_journal.semantic_result(outputs={"o1": "999"}))
+
+    def forge_copy(dst, victim_seq):
+        for suffix in ("", "-wal"):
+            if os.path.exists(src + suffix):
+                shutil.copy2(src + suffix, dst + suffix)
+        c = sqlite3.connect(dst)
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.close()
+        c = sqlite3.connect(dst)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(tau_journal_v1)")]
+        rows = [dict(zip(cols, r)) for r in c.execute("SELECT * FROM tau_journal_v1 ORDER BY seq")]
+        prev = None
+        for r in rows:
+            old_link = r["link"]
+            if r["seq"] == victim_seq:
+                r["result_fp"] = forged_fp
+            entry = tau_journal.JournalEntry(
+                seq=r["seq"], kind=r["kind"], phase=r["phase"], rule_text=r["rule_text"],
+                inputs=json.loads(r["inputs"] or "{}"), target=r["target"],
+                accumulate=bool(r["accumulate"]),
+                units=tuple(tuple(u) for u in json.loads(r["units"] or "[]")),
+                outcome=r["outcome"], result_fingerprint=r["result_fp"],
+                identity=json.loads(r["identity"]) if r["identity"] else None, prev=prev)
+            link = entry.compute_link()
+            c.execute("UPDATE tau_journal_v1 SET prev=?, link=?, result_fp=? WHERE seq=?",
+                      (prev, link, r["result_fp"], r["seq"]))
+            c.execute("UPDATE block_commits_v1 SET journal_head=? WHERE journal_head=?",
+                      (link, old_link))
+            prev = link
+        c.commit()
+        c.close()
+        c = sqlite3.connect(dst)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(tau_journal_v1)")]
+        fresh = [dict(zip(cols, r)) for r in c.execute("SELECT * FROM tau_journal_v1 ORDER BY seq")]
+        c.close()
+        # journal_from_rows wants deserialized columns, as db._journal_rows gives.
+        for r in fresh:
+            r["inputs"] = json.loads(r["inputs"] or "{}")
+            r["units"] = json.loads(r["units"] or "[]")
+            r["identity"] = json.loads(r["identity"]) if r["identity"] else None
+            # The column is result_fp; journal_from_rows wants result_fingerprint
+            # (db._journal_rows renames it -- raw sqlite rows do not).
+            r["result_fingerprint"] = r["result_fp"]
+        tau_journal.journal_from_rows(fresh).verify_chain()
+
+    # ---- Part 1: revision forgery, read path ----
+    forge_copy(rev_copy, b_seq)
+    import db
+    import tau_running_spec as rs
+
+    db.init_db()
+    tau_journal.journal_from_rows(db.committed_journal_entries()).verify_chain()
+    check("the revision-forged journal still passes the hash-chain check", True)
+
+    def head_seq(h):
+        hhash = db.get_block_hash_by_number(h)
+        if hhash is None:
+            return None
+        commit = db.get_block_commit(hhash)
+        if commit is None or commit.get("journal_head") is None:
+            return -1
+        for row in db.committed_journal_entries():
+            if row["link"] == commit["journal_head"]:
+                return row["seq"]
+        return None
+
+    heights = []
+    h = 0
+    while db.get_block_hash_by_number(h) is not None:
+        heights.append(h)
+        h += 1
+    forged_block = None
+    for h in heights:
+        if head_seq(h) is not None and head_seq(h) >= b_seq:
+            forged_block = h
+            break
+    check("a revision-forged block exists in this chain", forged_block is not None, forged_block)
+    if forged_block is None:
+        return 1
+    say(f"   PROBE_B revision seq {b_seq}; first forged block {forged_block} of {heights[-1]}")
+    for h in heights:
+        view = rs.running_spec_at(db, db.get_block_hash_by_number(h))
+        want = h < forged_block
+        if want:
+            ok = view.get("code") is None
+            detail = view.get("sha256")
+        else:
+            # A forged revision is caught by the replay, which reports it as
+            # an engine failure (UNAVAILABLE), not TAMPERED: TAMPERED is for
+            # journal rows that do not verify; a replay that diverges from the
+            # recorded fingerprints is an engine failure by the module's own
+            # taxonomy (see the running_spec_at docstring). The refusal must
+            # name the divergence.
+            ok = (view.get("code") == "UNAVAILABLE"
+                  and "replay diverged" in (view.get("unavailable") or ""))
+            detail = view.get("code") or view.get("sha256")
+        check(f"block {h}: {'answers' if want else 'refused (UNAVAILABLE, replay diverged)'}",
+              ok, detail)
+
+    # ---- Part 2: step forgery, restart path ----
+    forge_copy(step_copy, step_seq)
+    check("the step-forged journal still passes the hash-chain check", True)
+    say(f"   victim step seq {step_seq} (after the PROBE_B revision)")
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, " + repr(rig_mod.REPO) + ")\n"
+        "import tau_authority\n"
+        "try:\n"
+        "    tau_authority.owner().initialize(baseline=tau_authority.program_baseline())\n"
+        "except tau_authority.AuthorityMismatch as exc:\n"
+        "    if 'does not reconstruct' in str(exc):\n"
+        "        print('REFUSED: ' + str(exc)[:200])\n"
+        "        sys.exit(0)\n"
+        "    print('REFUSED-WRONG-REASON: ' + str(exc)[:200])\n"
+        "    sys.exit(2)\n"
+        "except Exception as exc:\n"
+        "    print('OTHER-ERROR: ' + type(exc).__name__ + ': ' + str(exc)[:200])\n"
+        "    sys.exit(3)\n"
+        "print('STARTED: forged journal accepted')\n"
+        "sys.exit(1)\n"
+    )
+    env = dict(os.environ)
+    env["TAU_DB_PATH"] = step_copy
+    env["PYTHONPATH"] = rig_mod.REPO
+    try:
+        proc = subprocess.run([sys.executable, "-c", script], env=env,
+                              capture_output=True, text=True, timeout=300)
+        out = (proc.stdout + proc.stderr).strip().splitlines()
+        say("   restart on step-forged copy: " + (out[-1] if out else f"exit {proc.returncode}"))
+        check("a node started on the step-forged copy refuses to start",
+              proc.returncode == 0, out[-1] if out else f"exit {proc.returncode}")
+    except subprocess.TimeoutExpired:
+        check("a node started on the step-forged copy refuses to start", False, "timeout 300s")
+    if rig_mod.FAILED:
+        say(f"{len(rig_mod.FAILED)} check(s) FAILED: {rig_mod.FAILED}")
+        return 1
+    say("FORGERY REFUSED (both layers)")
+    return 0
+
+
 def run(root: str) -> int:
     rig = Rig(root)
     st: dict = {"txs": []}
@@ -392,12 +586,16 @@ def run(root: str) -> int:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("mode", choices=["provision", "run"])
+    parser.add_argument("mode", choices=["provision", "run", "forge"])
+    parser.add_argument("--db", default=None,
+                        help="forged-database copy for the forge mode")
     parser.add_argument("--dir", default=os.path.join(rig_mod.REPO, ".local",
                                                       "e2e-rules-in-force"))
     args = parser.parse_args(argv)
     if args.mode == "provision":
         return rig_mod.provision(args.dir, NETWORK_ID, ACTORS, approval_slots=True)
+    if args.mode == "forge":
+        return forge(args.dir, args.db)
     return run(args.dir)
 
 
