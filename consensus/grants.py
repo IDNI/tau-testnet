@@ -49,6 +49,19 @@ make two honest nodes disagree about admissibility, which forks.
 - A grant never supersedes another grant (the standing book's rule does
   not carry over): a grant holds money, and superseding one would strand
   the funds it holds. Version distinguishes otherwise-identical grants.
+- A grant may instead be a TAU CLAUSE (form 2, FIX 5): the release
+  schedule is the funder's own Tau clause, stepped by the node over a
+  node-built input map (the draw amount, the held amount, the parties,
+  the block timestamp, the total spent so far at i27); the clause names
+  the cumulative amount released, in o30, and the book re-checks that
+  answer against the declared schedule cap before any draw settles on
+  it — the clause can never release more than the signed schedule
+  allows, and the refund stays the book's own invariant (total - spent,
+  once), never a clause computation. The release grid for a clause-form
+  grant is anchored at the signed periods_from, not the install day:
+  the clause is written against that anchor, and the book's cap uses
+  it. The declared form (form 1) is byte-identical to before the clause
+  form existed: its id, its record bytes and its book root do not move.
 - Credit classes (the design's table): a draw is a grant_draw credit and
   the refund is a refund credit; neither ever triggers a receive route, a
   payout, or a standing payment.
@@ -72,6 +85,7 @@ from consensus.serialization import (
     compute_grant_book_root,
     compute_grant_id,
     compute_grant_shared_cap_id,
+    compute_grant_tau_id,
 )
 from consensus.standing_payments import (
     SCHEDULE_DAILY,
@@ -99,6 +113,26 @@ _FIXED_PERIOD_SECONDS = {
 MAX_INACTIVITY_SECONDS = 3660 * SECONDS_PER_DAY
 MAX_SHARED_CAP_PERIOD_SECONDS = 366 * SECONDS_PER_DAY
 
+# The two forms a grant may take (Bounty 01, FIX 5): the declared
+# program the stages 2-5 shipped, and the Tau clause form, in which the
+# funder's own Tau clause names the cumulative released amount. The
+# standing book's identical pair (consensus/standing_payments) is the
+# precedent; the values match it on purpose.
+FORM_DECLARED = 1
+FORM_TAU_CLAUSE = 2
+GRANT_FORMS = frozenset({FORM_DECLARED, FORM_TAU_CLAUSE})
+
+# A grant clause is no larger than a payout or standing clause (both
+# 8192 bytes), so a stage-1 clause is no larger than a stage-0 one.
+MAX_GRANT_CLAUSE_BYTES = 8192
+
+# The clause's one output stream: o30 is the cumulative amount the
+# grant has released by the draw's timestamp (grant_clause_inputs /
+# decode_clause_released below). The payout and standing forms share
+# the o30 count stream; a grant has one recipient, so it needs no leg
+# count and no candidate pairs — one number is the whole answer.
+GRANT_RELEASED_OUTPUT_STREAM = 30
+
 STATUS_PENDING = "pending"
 STATUS_ACTIVE = "active"
 STATUS_LOCKED = "locked"
@@ -116,7 +150,18 @@ class GrantShapeError(ValueError):
 
 @dataclass(frozen=True)
 class GrantEntry:
-    """The signed terms of one grant. Nothing here mutates."""
+    """The signed terms of one grant. Nothing here mutates.
+
+    `form` selects the release program: FORM_DECLARED (1) is the
+    per-period schedule the stages 2-5 shipped; FORM_TAU_CLAUSE (2)
+    hands the release decision to the funder's Tau clause
+    (`clause_text`), stepped over grant_clause_inputs at draw time.
+    `periods_from_ts` is the clause form's signed release anchor: the
+    period grid is counted from it, not from the grant's start — the
+    clause is written against that anchor. Both are 0 / empty on the
+    declared form, and the declared form's id is computed exactly as
+    before the clause form existed.
+    """
 
     funder_pubkey: str
     beneficiary_pubkey: str
@@ -131,9 +176,31 @@ class GrantEntry:
     window_end_ts: int
     inactivity_seconds: int
     version: int
+    form: int = FORM_DECLARED
+    clause_text: str = ""
+    periods_from_ts: int = 0
 
     @property
     def grant_id(self) -> bytes:
+        if self.form == FORM_TAU_CLAUSE:
+            return compute_grant_tau_id(
+                self.funder_pubkey,
+                self.beneficiary_pubkey,
+                self.total_amount,
+                self.release_per_period,
+                self.schedule_kind,
+                self.signed_day,
+                self.start_ts,
+                self.deadline_ts,
+                self.locked_until_ts,
+                self.window_start_ts,
+                self.window_end_ts,
+                self.inactivity_seconds,
+                self.version,
+                self.form,
+                self.clause_text,
+                self.periods_from_ts,
+            )
         return compute_grant_id(
             self.funder_pubkey,
             self.beneficiary_pubkey,
@@ -216,13 +283,30 @@ class _GrantProgress:
 # --- Schedule arithmetic (the standing book's, over the grant's anchor) -------
 
 
+def _release_anchor_ts(entry: GrantEntry) -> int:
+    """The timestamp the release grid is anchored at.
+
+    The declared form anchors at the grant's start; the Tau form anchors
+    at the signed periods_from — the anchor the funder's clause was
+    written against — so the release boundaries follow the clause, not
+    the install day. A clause-form anchor may predate the start, which
+    releases the elapsed periods at opening; it may postdate it, which
+    holds every release until the anchor. Either way the book's cap is
+    what it is: the clause can never release past it.
+    """
+    if entry.form == FORM_TAU_CLAUSE and entry.periods_from_ts:
+        return entry.periods_from_ts
+    return entry.start_ts
+
+
 def release_due_ts(entry: GrantEntry, period_index: int) -> int:
-    """When period `period_index` (0-based from the start) begins."""
+    """When period `period_index` (0-based from the anchor) begins."""
     if period_index < 0:
         raise ValueError("period_index must be >= 0")
+    anchor = _release_anchor_ts(entry)
     if entry.schedule_kind == SCHEDULE_MONTHLY:
-        return monthly_due_ts(entry.start_ts, entry.signed_day, period_index)
-    return entry.start_ts + period_index * _FIXED_PERIOD_SECONDS[entry.schedule_kind]
+        return monthly_due_ts(anchor, entry.signed_day, period_index)
+    return anchor + period_index * _FIXED_PERIOD_SECONDS[entry.schedule_kind]
 
 
 def period_bounds(entry: GrantEntry, period_index: int) -> Tuple[int, int]:
@@ -231,12 +315,13 @@ def period_bounds(entry: GrantEntry, period_index: int) -> Tuple[int, int]:
 
 
 def period_index_at(entry: GrantEntry, ts: int) -> int:
-    """Which period contains `ts`; -1 before the grant opens."""
+    """Which period contains `ts`; -1 before the release grid opens."""
+    anchor = _release_anchor_ts(entry)
     if entry.schedule_kind == SCHEDULE_MONTHLY:
-        return month_index_containing(entry.start_ts, entry.signed_day, ts)
-    if ts < entry.start_ts:
+        return month_index_containing(anchor, entry.signed_day, ts)
+    if ts < anchor:
         return -1
-    return (ts - entry.start_ts) // _FIXED_PERIOD_SECONDS[entry.schedule_kind]
+    return (ts - anchor) // _FIXED_PERIOD_SECONDS[entry.schedule_kind]
 
 
 def released_by(entry: GrantEntry, ts: int) -> int:
@@ -244,7 +329,10 @@ def released_by(entry: GrantEntry, ts: int) -> int:
 
     A pure function of the terms and the timestamp — min(total, release x
     periods begun) — so a period's release is counted exactly once however
-    the draws interleave, and unreleased funds are never spendable.
+    the draws interleave, and unreleased funds are never spendable. For a
+    Tau-form grant this is the cap the book holds the clause's answer
+    to: the clause names a released amount, and this function says how
+    much the signed schedule allows at this time.
     """
     period = period_index_at(entry, ts)
     if period < 0:
@@ -266,6 +354,102 @@ def shared_period_index_at(cap: GrantSharedCapEntry, ts: int) -> int:
     if ts < cap.period_anchor_ts:
         return -1
     return (ts - cap.period_anchor_ts) // cap.period_seconds
+
+
+# --- The Tau form: input map and output decoding ------------------------------
+
+
+_OUTPUT_VALUE_RE = re.compile(
+    r"^\{?\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}?(?::bv\[\d+\])?$"
+)
+
+
+def _parse_output_value(value: Any) -> Optional[int]:
+    """One clause output as an integer, or None when it is not one.
+
+    The worker reports outputs as Tau value strings; this reads them with
+    the same grammar tau_policy.parse_o5 reads o5 with (hex / binary /
+    decimal, optional braces and :bv[N] annotation) — the payout form's
+    identical reader, kept per book as this codebase keeps its small
+    helpers.
+    """
+    if value is None:
+        return None
+    match = _OUTPUT_VALUE_RE.match(str(value).strip())
+    if not match:
+        return None
+    hex_digits, bin_digits, dec_digits = match.groups()
+    if hex_digits is not None:
+        return int(hex_digits, 16)
+    if bin_digits is not None:
+        return int(bin_digits, 2)
+    return int(dec_digits)
+
+
+def grant_clause_inputs(
+    entry: GrantEntry,
+    drawer_pubkey: str,
+    amount: int,
+    ts: int,
+    held: int,
+    total_spent: int,
+) -> Dict[int, Any]:
+    """The input map a Tau-form draw steps the funder's clause over.
+
+    ONE definition, called by the engine at apply and by admission at
+    the tip with their own site values — the construction cannot drift
+    between them. The value formats mirror the transfer input map
+    (consensus/engine._transfer_input_map) exactly: amounts and the
+    timestamp as decimal strings, accounts as `{ #x.. }:bv[384]`
+    literals. The map is the payout form's map (i1..i5/i26) with the
+    grant meanings:
+
+    - i1: the draw's requested amount
+    - i2: the held amount (total - spent - refunded)
+    - i3: the funder's pubkey
+    - i4: the drawer's pubkey (anyone may submit a draw; the value can
+      only ever land on the grant's beneficiary)
+    - i5: the block timestamp
+    - i27 (tau_defs.GRANT_SPENT_STREAM_INDEX): what this grant has
+      already spent, from the book's recorded totals — the
+      release-schedule input a grant clause computes its cumulative
+      released amount from
+
+    Nothing in the map comes from the draw transaction beyond the
+    amount: the map is node-built, so no submitter can steer the clause
+    by writing a stream.
+    """
+    return {
+        1: str(int(amount)),
+        2: str(int(held)),
+        3: "{ #x" + str(entry.funder_pubkey) + " }:bv[384]",
+        4: "{ #x" + str(drawer_pubkey) + " }:bv[384]",
+        5: str(int(ts)),
+        tau_defs.GRANT_SPENT_STREAM_INDEX: str(int(total_spent)),
+    }
+
+
+def decode_clause_released(
+    entry: GrantEntry, outputs: Dict[str, Any]
+) -> Tuple[Optional[int], str]:
+    """The cumulative released amount a stepped clause named, or (None, why not).
+
+    The encoding (pinned in grant_capabilities): o30 is the cumulative
+    amount the grant has released by the draw's timestamp. A missing or
+    unreadable value means the clause named something the node cannot
+    settle: no released amount, and the draw settles nothing. The book
+    re-checks the value against the declared schedule cap before any
+    draw settles on it, so a clause that names more than the schedule
+    allows is refused at the spendable step, not here.
+    """
+    released = _parse_output_value(
+        outputs.get(f"o{GRANT_RELEASED_OUTPUT_STREAM}")
+    )
+    if released is None:
+        return None, "the grant's clause did not report a released amount"
+    if released < 0:
+        return None, "the grant's clause reported a negative released amount"
+    return released, ""
 
 
 # --- Parsing -------------------------------------------------------------------
@@ -296,6 +480,24 @@ def _id_field(tx: Dict[str, Any], name: str) -> bytes:
     return bytes.fromhex(value)
 
 
+def _form_field(tx: Dict[str, Any]) -> int:
+    value = tx.get("grant_form", FORM_DECLARED)
+    if not _is_int(value) or value not in GRANT_FORMS:
+        raise GrantShapeError(
+            "grant_form must be 1 (declared) or 2 (Tau clause)"
+        )
+    return value
+
+
+def _clause_field(tx: Dict[str, Any]) -> str:
+    value = tx.get("grant_clause", "")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise GrantShapeError("grant_clause must be a string")
+    return value
+
+
 def parse_create_grant(tx: Dict[str, Any]) -> GrantEntry:
     """Read a creation from ROOT fields only; a nested `payload` is unsigned data."""
     if not isinstance(tx, dict):
@@ -319,6 +521,9 @@ def parse_create_grant(tx: Dict[str, Any]) -> GrantEntry:
         window_end_ts=_u64_field(tx, "grant_window_end_ts"),
         inactivity_seconds=_u64_field(tx, "grant_inactivity_seconds"),
         version=_u64_field(tx, "grant_version", default=1),
+        form=_form_field(tx),
+        clause_text=_clause_field(tx),
+        periods_from_ts=_u64_field(tx, "grant_periods_from_ts"),
     )
 
 
@@ -359,11 +564,40 @@ def validate_grant_shape(entry: GrantEntry, now_ts: int) -> Optional[str]:
         return "grant_release_per_period must be in 1..MAX_TRANSFER_VALUE"
     if entry.schedule_kind not in SCHEDULE_KINDS:
         return "unknown schedule kind"
+    if entry.form not in GRANT_FORMS:
+        return "grant_form must be 1 (declared) or 2 (Tau clause)"
+    if entry.form == FORM_TAU_CLAUSE:
+        if not entry.clause_text or not entry.clause_text.strip():
+            return "a Tau-form grant must carry a clause"
+        if len(entry.clause_text.encode("utf-8")) > MAX_GRANT_CLAUSE_BYTES:
+            return (
+                f"a grant clause is at most {MAX_GRANT_CLAUSE_BYTES} bytes"
+            )
+        if not entry.periods_from_ts:
+            return "a Tau-form grant must carry a signed periods_from"
+    else:
+        if entry.clause_text:
+            return "a declared grant carries no clause"
+        if entry.periods_from_ts:
+            return "a declared grant carries no periods_from"
     if entry.schedule_kind == SCHEDULE_MONTHLY:
         if not 1 <= entry.signed_day <= 31:
             return "grant_signed_day must be in 1..31 for a monthly schedule"
-        anchor = datetime.fromtimestamp(entry.start_ts, tz=timezone.utc)
+        # The release grid's anchor is the start for the declared form
+        # and the signed periods_from for the Tau form: the monthly
+        # day-of-month check follows the grid, not the install day.
+        grid_anchor = (
+            entry.periods_from_ts
+            if entry.form == FORM_TAU_CLAUSE
+            else entry.start_ts
+        )
+        anchor = datetime.fromtimestamp(grid_anchor, tz=timezone.utc)
         if anchor.day != clamped_day(anchor.year, anchor.month, entry.signed_day):
+            if entry.form == FORM_TAU_CLAUSE:
+                return (
+                    "periods_from must be the first release date: its "
+                    "day-of-month must be the signed day clamped into its month"
+                )
             return (
                 "the start must be the first release date: its day-of-month "
                 "must be the signed day clamped into the start month"
@@ -413,7 +647,7 @@ def validate_shared_cap_shape(
 
 _EntryRow = Tuple[
     bytes, str, str, int, int, int, int, int, int, int, int, int, int, int,
-    int, int, int, int, int,
+    int, int, int, int, int, int, str, int,
 ]
 _CapRow = Tuple[bytes, str, int, int, int, int, Tuple[Tuple[int, int], ...]]
 
@@ -454,15 +688,23 @@ class GrantBook:
         rows: Iterable[_EntryRow],
         shared_caps: Iterable[_CapRow] = (),
     ) -> "GrantBook":
-        """Rebuild from stored rows; refuses any row whose id does not recompute."""
+        """Rebuild from stored rows; refuses any row whose id does not recompute.
+
+        The row carries the Tau form's signed fields (form, clause_text,
+        periods_from_ts) as trailing fields; the id recompute dispatches
+        on the form, so a stored clause-form grant rebuilds under its
+        Tau-domain id and a stored declared grant under its declared id.
+        """
         book = cls()
         for row in rows:
             (grant_id, funder, beneficiary, total, release, kind, day, start,
              deadline, locked, win_start, win_end, inactivity, version,
-             spent, last_draw, refunded, refunded_amount, refunded_ts) = row
+             spent, last_draw, refunded, refunded_amount, refunded_ts,
+             form, clause_text, periods_from_ts) = row
             entry = GrantEntry(
                 funder, beneficiary, total, release, kind, day, start,
                 deadline, locked, win_start, win_end, inactivity, version,
+                form, clause_text, periods_from_ts,
             )
             if entry.grant_id != bytes(grant_id):
                 raise ValueError(
@@ -531,6 +773,9 @@ class GrantBook:
                     int(progress.refunded),
                     progress.refunded_amount,
                     progress.refunded_ts,
+                    entry.form,
+                    entry.clause_text,
+                    entry.periods_from_ts,
                 )
             )
         return out
@@ -747,8 +992,26 @@ class GrantBook:
         progress: _GrantProgress,
         amount: int,
         ts: int,
+        clause_released: Optional[int] = None,
     ) -> GrantDrawDecision:
-        """Pure evaluation: the decision a draw would produce."""
+        """Pure evaluation: the decision a draw would produce.
+
+        For a Tau-form grant the caller steps the funder's clause over
+        the node-built input map first and passes the released amount it
+        named as `clause_released` — the book never steps a clause
+        itself, mirroring the payout book's evaluate_execution
+        (clause_legs=...). A clause-form evaluation without a stepped
+        value is refused outright, so a caller that forgot to step
+        cannot silently fall back to the declared schedule: admission
+        and apply step the same clause over the same map, and the book
+        is the enforcer that both must satisfy.
+        """
+        # The released amount refusals report: the declared schedule's
+        # answer until the clause's answer is validated, the clause's
+        # answer after — the closure reads the current value at call
+        # time, so a refusal before the clause step and one after it
+        # each report the amount that was actually in force.
+        released = released_by(entry, ts)
 
         def refuse(reason: str) -> GrantDrawDecision:
             shared_index = -1
@@ -762,7 +1025,7 @@ class GrantBook:
                     )
             return GrantDrawDecision(
                 False, reason, 0, period_index_at(entry, ts),
-                released_by(entry, ts) - progress.total_spent
+                released - progress.total_spent
                 if ts >= entry.start_ts else 0,
                 shared_index, shared_total,
             )
@@ -780,7 +1043,30 @@ class GrantBook:
         if entry.window_start_ts or entry.window_end_ts:
             if not entry.window_start_ts <= ts < entry.window_end_ts:
                 return refuse("the draw falls outside the grant's scheduled window")
-        spendable = released_by(entry, ts) - progress.total_spent
+        if entry.form == FORM_TAU_CLAUSE:
+            # The clause names the released amount; the book re-checks
+            # it against the declared schedule cap (released_by, counted
+            # from the signed periods_from) and the grant total. A clause
+            # that names more than the schedule allows settles nothing —
+            # the schedule is the guard, the clause is the voice.
+            if clause_released is None:
+                return refuse(
+                    "the grant's clause must be stepped before evaluation: "
+                    "no released amount was supplied"
+                )
+            if clause_released > entry.total_amount:
+                return refuse(
+                    f"the grant's clause released {clause_released}, "
+                    f"above the grant total {entry.total_amount}"
+                )
+            if clause_released > released_by(entry, ts):
+                return refuse(
+                    f"the grant's clause released {clause_released}, "
+                    f"above the declared schedule's {released_by(entry, ts)} "
+                    "at this time"
+                )
+            released = clause_released
+        spendable = released - progress.total_spent
         if amount > spendable:
             return refuse(
                 f"the draw {amount} exceeds the released-but-unspent "
@@ -808,13 +1094,23 @@ class GrantBook:
         )
 
     def evaluate_draw(
-        self, grant_id: bytes, amount: int, ts: int
+        self, grant_id: bytes, amount: int, ts: int,
+        clause_released: Optional[int] = None,
     ) -> GrantDrawDecision:
-        """What a draw at `ts` would do, without doing it."""
-        entry, progress = self._entry_and_progress(grant_id)
-        return self._evaluate_draw(entry, progress, amount, ts)
+        """What a draw at `ts` would do, without doing it.
 
-    def draw(self, grant_id: bytes, amount: int, ts: int) -> GrantDrawDecision:
+        For a Tau-form grant pass the stepped clause's released amount
+        (see _evaluate_draw): without it the evaluation refuses.
+        """
+        entry, progress = self._entry_and_progress(grant_id)
+        return self._evaluate_draw(
+            entry, progress, amount, ts, clause_released=clause_released
+        )
+
+    def draw(
+        self, grant_id: bytes, amount: int, ts: int,
+        clause_released: Optional[int] = None,
+    ) -> GrantDrawDecision:
         """Settle a draw, or settle nothing.
 
         On success exactly three writes happen: the grant's spent total
@@ -822,9 +1118,15 @@ class GrantBook:
         when a shared cap binds the draw — the funder's shared total for
         the draw's one shared period advances by the amount. That is what
         "counted exactly once" is made of. A refused draw changes no state.
+
+        For a Tau-form grant the caller passes the same stepped released
+        amount the branch evaluation used, so the settlement re-evaluates
+        to the staged decision by construction.
         """
         entry, progress = self._entry_and_progress(grant_id)
-        decision = self._evaluate_draw(entry, progress, amount, ts)
+        decision = self._evaluate_draw(
+            entry, progress, amount, ts, clause_released=clause_released
+        )
         if not decision.drawn:
             return decision
         progress.total_spent += amount
@@ -908,4 +1210,36 @@ def grant_capabilities() -> Dict[str, Any]:
             "(submitter pays); the sweep refund moves with no fee"
         ),
         "max_inactivity_seconds": MAX_INACTIVITY_SECONDS,
+        "tau_clause": {
+            "forms": {
+                "declared_program": FORM_DECLARED,
+                "tau_clause": FORM_TAU_CLAUSE,
+            },
+            "inputs": {
+                "i1": "the draw's requested amount",
+                "i2": "the held amount (total - spent - refunded)",
+                "i3": "the funder's pubkey",
+                "i4": "the drawer's pubkey",
+                "i5": "the block timestamp",
+                tau_defs.GRANT_SPENT_STREAM_INDEX: (
+                    "what this grant has already spent"
+                ),
+            },
+            "outputs": {
+                f"o{GRANT_RELEASED_OUTPUT_STREAM}": (
+                    "the cumulative amount released by the draw's timestamp"
+                ),
+            },
+            "max_clause_bytes": MAX_GRANT_CLAUSE_BYTES,
+            "release_cap": (
+                "the clause's released amount is re-checked against the "
+                "declared schedule (release x periods begun from the "
+                "signed periods_from, capped at the total); above it the "
+                "draw settles nothing"
+            ),
+            "refund": (
+                "the refund stays the book's invariant (total - spent, "
+                "once at the deadline), never a clause computation"
+            ),
+        },
     }
