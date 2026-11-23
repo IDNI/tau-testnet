@@ -921,6 +921,82 @@ def latest_block_commit():
     return dict(zip(keys, row))
 
 
+def canonical_block_hash_at_height(height: int) -> Optional[str]:
+    """The canonical block hash at `height`, or None when the node does
+    not hold it (height beyond the tip, or no canonical chain yet)."""
+    height = int(height)
+    if height < 0:
+        return None
+    genesis = get_genesis_hash()
+    if not genesis:
+        return None
+    if height == 0:
+        return genesis
+    tip = current_tip()
+    if not tip:
+        return None
+    try:
+        path = get_chain_path(tip, genesis)
+    except Exception:
+        return None
+    if height > len(path):
+        return None
+    return path[height - 1]
+
+
+def canonical_tip_height() -> Optional[int]:
+    """The height of the canonical tip, or None when there is no chain."""
+    tip = current_tip()
+    genesis = get_genesis_hash()
+    if not tip or not genesis:
+        return None
+    if tip == genesis:
+        return 0
+    try:
+        return len(get_chain_path(tip, genesis))
+    except Exception:
+        return None
+
+
+def block_commit_at_height(height: int) -> Optional[Dict]:
+    """The commit record of the canonical block at `height`, or None.
+
+    The record is what pins a height to the committed journal: its
+    `journal_head` is the link of the last journal entry that block
+    committed, so the journal cut at the height is every entry up to
+    that link. The dict also carries the block's hash and timestamp.
+    Genesis (height 0) has no commit record and returns None, as does
+    any height the node does not hold.
+    """
+    block_hash = canonical_block_hash_at_height(height)
+    if not block_hash or int(height) == 0:
+        return None
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT execution_id, tip, parent, journal_head, allocator_digest, '
+            'plan_id, plan_json, spec_revision, time_point, committed_at '
+            'FROM block_commits_v1 WHERE tip = ? '
+            'ORDER BY committed_at DESC, rowid DESC LIMIT 1',
+            (block_hash,),
+        )
+        row = cur.fetchone()
+        cur.execute('SELECT timestamp FROM blocks WHERE block_hash = ?',
+                    (block_hash,))
+        ts = cur.fetchone()
+    if row is None:
+        return None
+    keys = ("execution_id", "tip", "parent", "journal_head",
+            "allocator_digest", "plan_id", "plan_json", "spec_revision",
+            "time_point", "committed_at")
+    out = dict(zip(keys, row))
+    out["block_hash"] = block_hash
+    out["block_timestamp"] = int(ts[0]) if ts else None
+    return out
+
+
 def current_tip():
     """The canonical head hash, or None. Named for the commit protocol."""
     return get_chain_state_value("canonical_head_hash", "") or None
@@ -1869,6 +1945,125 @@ def get_all_spec_snapshots(upto_revision: Optional[int] = None) -> list:
                 (int(upto_revision),),
             )
         return [_spec_snapshot_row(row) for row in cur.fetchall()]
+
+
+# --- Accessors for consensus/active_rules.py (adopted with the
+# getpaymentconditions command, issue #42 stage 2) ---------------------
+#
+# The imported module speaks in snapshot dicts keyed
+# {spec_revision, height, spec_hash, spec_text}; this line's own view
+# accessors above key the same stored rows {canonical_text, sha256}.
+# The functions below are the module's seam: same `spec_snapshots`
+# table, the module's key names. Nothing here changes what is stored.
+
+
+def _spec_snapshot_dict(row) -> Optional[Dict]:
+    if not row:
+        return None
+    return {
+        "spec_revision": row[0],
+        "height": row[1],
+        "spec_hash": row[2],
+        "spec_text": row[3],
+    }
+
+
+def record_spec_snapshot(spec_revision: int, height: int, spec_text: str,
+                         spec_hash: str) -> None:
+    """Store the canonical spec text at a spec_revision (idempotent).
+
+    Singular counterpart of record_spec_snapshots for the imported
+    module's record path; the sha256 is the caller's, stored as given.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        with _db_conn:
+            _db_conn.execute(
+                "INSERT OR REPLACE INTO spec_snapshots "
+                "(spec_revision, height, canonical_text, sha256) "
+                "VALUES (?, ?, ?, ?)",
+                (int(spec_revision), int(height), spec_text, spec_hash),
+            )
+
+
+def get_spec_snapshot_at_or_before(height: int) -> Optional[Dict]:
+    """The newest snapshot committed at or before `height`, or None.
+
+    Same resolution as get_spec_snapshot_at_height, in the imported
+    module's key shape.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, sha256, canonical_text "
+            "FROM spec_snapshots WHERE height <= ? "
+            "ORDER BY spec_revision DESC LIMIT 1",
+            (int(height),),
+        )
+        return _spec_snapshot_dict(cur.fetchone())
+
+
+def get_earliest_spec_snapshot() -> Optional[Dict]:
+    """The snapshot with the lowest spec_revision, or None (module keys)."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, sha256, canonical_text "
+            "FROM spec_snapshots ORDER BY spec_revision ASC LIMIT 1"
+        )
+        return _spec_snapshot_dict(cur.fetchone())
+
+
+def list_spec_snapshots() -> List[Dict]:
+    """Every stored spec snapshot, oldest revision first (module keys)."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, sha256, canonical_text "
+            "FROM spec_snapshots ORDER BY spec_revision ASC"
+        )
+        return [_spec_snapshot_dict(r) for r in cur.fetchall()]
+
+
+def list_rule_outcomes() -> List[Dict]:
+    """Every recorded rule outcome, in apply order.
+
+    This line's `rule_outcomes` table stores the outcome text only --
+    the per-step revision interval the imported module's survival
+    ledger keys on is not recorded in this table here (revision
+    receipts live in the apply path), so `spec_revision_before` /
+    `spec_revision_after` come back None and the ledger derives no
+    units from them. The ledger is not served by any command on this
+    line; the rows are listed for completeness of the module's seam.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT tx_hash, block_hash, block_number, outcome "
+            "FROM rule_outcomes "
+            "ORDER BY block_number ASC, tx_hash ASC"
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "tx_hash": r[0],
+            "block_hash": r[1],
+            "block_number": r[2],
+            "outcome": r[3],
+            "spec_revision_before": None,
+            "spec_revision_after": None,
+        }
+        for r in rows
+    ]
 
 
 def get_canonical_confirmation(block_hash: str, block_number: int) -> tuple[bool, int]:
