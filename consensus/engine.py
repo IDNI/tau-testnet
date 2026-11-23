@@ -283,16 +283,27 @@ def _engine_revision(engine_receipt):
     a unit it accepted without a change (`ACCEPTED_NOOP`, for example one that
     is already implied). `spec_revision`: the engine's revision counter after
     the unit, as the evaluator that applied the block reports it. None when the
-    evaluator gave no receipt (the mock engine).
+    evaluator gave no receipt (the mock engine). When the receipt carries the
+    counter before the unit too, `spec_revision_before` / `spec_revision_after`
+    name both ends, so a wallet can see the unit moved the counter by exactly
+    one -- or by none, for a no-op. The before/after keys appear only when the
+    receipt carries them, so receipts that predate the counter keep the old
+    shape.
     """
     if not engine_receipt or not engine_receipt.get("outcome"):
         return None
     after = engine_receipt.get("spec_revision_after", engine_receipt.get("spec_revision"))
-    return {
+    before = engine_receipt.get("spec_revision_before")
+    out = {
         "taken": engine_receipt["outcome"] == "ACCEPTED_CHANGED",
         "engine_outcome": engine_receipt["outcome"],
         "spec_revision": int(after) if after is not None else None,
     }
+    if before is not None:
+        out["spec_revision_before"] = int(before)
+    if engine_receipt.get("spec_revision_after") is not None:
+        out["spec_revision_after"] = int(engine_receipt["spec_revision_after"])
+    return out
 
 
 def _note_accumulated_rule(receipt, sender, rule_text, engine_receipt=None) -> None:

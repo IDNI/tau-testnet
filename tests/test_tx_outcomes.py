@@ -442,7 +442,9 @@ def test_an_accumulated_rule_says_whether_the_engine_took_the_revision():
         "spec_revision_before": 4, "spec_revision_after": 5})
     assert effect["action"] == "accumulated"
     assert effect["revision"] == {"taken": True, "engine_outcome": "ACCEPTED_CHANGED",
-                                  "spec_revision": 5}
+                                  "spec_revision": 5,
+                                  "spec_revision_before": 4,
+                                  "spec_revision_after": 5}
 
 
 def test_a_rule_the_engine_already_implied_is_accepted_but_not_taken():
@@ -450,7 +452,9 @@ def test_a_rule_the_engine_already_implied_is_accepted_but_not_taken():
         "outcome": "ACCEPTED_NOOP", "accepted": True, "changed": False,
         "spec_revision_before": 5, "spec_revision_after": 5})
     assert effect["revision"] == {"taken": False, "engine_outcome": "ACCEPTED_NOOP",
-                                  "spec_revision": 5}
+                                  "spec_revision": 5,
+                                  "spec_revision_before": 5,
+                                  "spec_revision_after": 5}
 
 
 def test_a_clause_names_no_revision_even_beside_an_engine_receipt():

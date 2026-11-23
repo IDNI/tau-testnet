@@ -172,6 +172,7 @@ The full registry (29 names, `app/container.py`):
 | `getruleoffer` | `getruleoffer <offer_id>` — 64 hex chars |
 | `getruleconflict` | `getruleconflict <offer_id>` — advisory, node-local |
 | `getaccountrules` | `getaccountrules <address>` — everything in force for an account's rules, at one tip; see [rules_in_force.md](rules_in_force.md) |
+| `getrulesinforce` | `getrulesinforce [<block>\|<height>] [<address>]` — the spec the engine runs at one block, with its `spec_revision`; see [rules_in_force.md](rules_in_force.md) |
 | `getapprovalrequests` | `getapprovalrequests <address> [in\|out\|all]` (default `all`) |
 | `getapprovalrequest` | `getapprovalrequest <request_id>` |
 | `getrequestid` | `getrequestid <json_payload>` |
@@ -266,7 +267,7 @@ connection — reconnecting resets them.
 | Bucket | Burst | Refill | Applies to |
 |---|---|---|---|
 | general | 10 | 5/s | every command |
-| expensive | 2 | 0.5/s | `checktx`, `getaccountrules`, `getapprovalpreview`, `getapprovalslots` |
+| expensive | 2 | 0.5/s | `checktx`, `getaccountrules`, `getrulesinforce`, `getapprovalpreview`, `getapprovalslots` |
 
 An expensive command is charged to *both* buckets, so it cannot be used to
 dodge the general rate. `sendtx` is deliberately not in the expensive tier: it

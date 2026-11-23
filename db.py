@@ -844,6 +844,107 @@ def committed_rule_history():
     return (row[0] if row else None), entries
 
 
+class JournalTampered(RuntimeError):
+    """A commit record exists but the journal rows it names do not chain to it.
+
+    Tampering, never "not found": the block committed here, so its rows existed
+    when it committed. A missing commit record means the block never existed
+    here (or this node has not synced it); a present record with missing or
+    broken rows means the record was altered after the fact.
+    """
+
+
+def get_block_commit(tip: str) -> Optional[Dict]:
+    """The commit record for one block tip, or None when no block with that tip committed here."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        row = _db_conn.execute(
+            "SELECT execution_id, tip, parent, journal_head, allocator_digest, "
+            "plan_id, plan_json, spec_revision, time_point, committed_at "
+            "FROM block_commits_v1 WHERE tip = ? ORDER BY committed_at DESC LIMIT 1",
+            (tip,),
+        ).fetchone()
+    if row is None:
+        return None
+    keys = ("execution_id", "tip", "parent", "journal_head", "allocator_digest",
+            "plan_id", "plan_json", "spec_revision", "time_point", "committed_at")
+    return dict(zip(keys, row))
+
+
+def get_block_hash_by_number(number: int) -> Optional[str]:
+    """The canonical block hash at one height, or None when no canonical block is there."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            "SELECT block_hash FROM blocks WHERE block_number = ? ORDER BY rowid",
+            (int(number),),
+        ).fetchall()
+    for (block_hash,) in rows:
+        if get_canonical_confirmation(block_hash, int(number))[0]:
+            return block_hash
+    return None
+
+
+def committed_rule_history_at(block_hash: str):
+    """(commit record, rule entries) for one committed block, read as ONE.
+
+    Returns (None, None) when no commit record names this block: the block
+    never existed here or this node has not synced it (NOT_FOUND, not tamper).
+    Raises JournalTampered when the commit record exists but the journal rows
+    it names are gone or do not reach its journal_head: a commit record without
+    its rows is tampering, never "no commit record".
+
+    The entries are the RESET and REVISION rows the block had committed, in
+    order, without the step rows -- the same shape as committed_rule_history.
+    """
+    commit = get_block_commit(block_hash)
+    if commit is None:
+        return None, None
+    head_link = commit.get("journal_head")
+    if head_link is None:
+        return commit, []
+    rows = committed_journal_entries()
+    cut = None
+    for index, row in enumerate(rows):
+        if row["link"] == head_link:
+            cut = index
+            break
+    if cut is None:
+        raise JournalTampered(
+            f"commit record for block {block_hash} names journal head "
+            f"{head_link}, but no journal row carries that link: rows were "
+            f"deleted or the head was altered after commit"
+        )
+    entries = [{
+        "seq": int(r["seq"]), "kind": r["kind"], "rule_text": r["rule_text"],
+        "units": [tuple(u) for u in (r["units"] or [])],
+        "outcome": r["outcome"], "link": r["link"],
+    } for r in rows[:cut + 1] if r["kind"] in ("reset", "revision")]
+    return commit, entries
+
+
+def rule_clause_body(account: str, stream: int) -> Optional[str]:
+    """The stored body of one registry clause, or None when the account holds no such clause.
+
+    A POSITIVE check only: a body returned proves the clause is in the registry;
+    None proves nothing about what any transaction did -- only that the registry
+    does not hold that clause now (it may have been revoked since, or never
+    registered). Callers must report None as "not in the registry", never as
+    evidence for a clause claim.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        row = _db_conn.execute(
+            "SELECT clause_body FROM rule_clauses_v1 "
+            "WHERE acceptor_pubkey = ? AND target_stream = ?",
+            (str(account).lower(), int(stream)),
+        ).fetchone()
+    return row[0] if row else None
+
+
 def _journal_rows(cur, limit=None):
     """The committed journal, on a cursor the caller already holds the lock for."""
     sql = ('SELECT seq, kind, phase, rule_text, inputs, target, accumulate, '

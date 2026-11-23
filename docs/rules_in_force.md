@@ -15,8 +15,10 @@ is on":
 
 `gettxstatus` now carries the transaction's **outcome**, `getaccountrules`
 answers the second question from one tip, and `running_spec` (in
-`getaccountrules` and `getgovernance`) answers the third. Both are read-only, need no restart,
-no regenesis and no change to the state hash. Issue: #42.
+`getaccountrules` and `getgovernance`) answers the third. `getrulesinforce`
+answers the third question at any committed block, not just the head. All are
+read-only, need no restart, no regenesis and no change to the state hash.
+Issue: #42.
 
 Short reference: [README](../README.md#pending-aware-wallet-queries). CLI:
 [developer_cli.md](developer_cli.md#policy-guard). This guide is the long form.
@@ -75,9 +77,30 @@ the engine's own revision receipt when the block was applied:
 | `taken` | `true` when the engine's specification changed (`ACCEPTED_CHANGED`). `false` when the engine accepted the unit without a change (`ACCEPTED_NOOP`, a unit the specification already implies): the rule is stored, nothing new is in force. A unit the engine refuses is never included, so it has no effect at all. |
 | `engine_outcome` | The engine's outcome as it reported it. |
 | `spec_revision` | The engine's revision counter after the unit. It grows with every revision taken, so a wallet can order its rules. Nodes that applied the same blocks give the same number, and a restarted node, whose engine is rebuilt from the journal, continues it (both checked on two live nodes, scenario 7). |
+| `spec_revision_before` / `spec_revision_after` | The counter on both sides of the unit, when the receipt carries them. A taken unit moves it by exactly one; a no-op leaves it unchanged. |
 
 `revision` is absent when the evaluator gave no receipt (the mock engine of
 `TAU_FORCE_TEST`).
+
+### `rule_outcome` and the positive registry check
+
+A confirmed transaction's `outcome` also carries `rule_outcome`, so a wallet
+does not have to infer what a rule transaction did from the absence of an
+effect:
+
+| `rule_outcome` | Meaning |
+|---|---|
+| `{"engine_outcome": "ACCEPTED_CHANGED", "taken": true, "spec_revision_before": 4, "spec_revision_after": 5}` | The transaction's application rule, and what the engine did with it. `ACCEPTED_NOOP` with `taken: false` is a unit the engine accepted without changing anything. |
+| `{"status": "clause", "registry_confirmed": true}` | A clause-only transaction, with every clause effect confirmed against the registry (below). |
+| `{"status": "unmatched", "detail": "…"}` | The transaction carries a rule payload but no rule effect was recorded for it in this block. It is reported as unmatched, in its own words -- never labelled a clause-registry rule. Clause-ness is never inferred from absence. |
+
+A clause effect is annotated with `registry_confirmed`, a POSITIVE check
+against `rule_clauses_v1`: true only when the registry actually holds that
+account's clause on that stream with the stored body matching the effect's
+sha256 (for a revoke, true when the registry no longer holds it). A false
+says only "not in the registry now" -- a clause revoked since reads false
+too -- and is never evidence the effect did not happen. A plain transaction
+gets no `rule_outcome` at all.
 
 ### What is recorded where
 
@@ -214,6 +237,58 @@ taken, in order; `scripts/e2e_rules_in_force.py` (scenarios 6 and 7) on two live
 nodes, across a restart (a third rule, `o27 = {4}`, applied by the engine as
 rebuilt after it) and a follower's replay.
 
+### At one block (`getrulesinforce`)
+
+```bash
+tau-testnet policy rules-in-force [<block>|<height>] [<address>]
+tau-testnet rpc getrulesinforce [<block>|<height>] [<address>]
+```
+
+With no argument, the spec at the canonical head. With a block hash or a
+height, the spec that was in force at that block: the journal is replayed
+only up to the journal head the block's commit record names
+(`block_commits_v1.journal_head`), and `spec_revision` comes from the same
+record. The commit record is the anchor: a block with no commit record never
+existed here (or this node has not synced it) and answers `code "NOT_FOUND"`;
+a block whose record exists but whose journal rows are gone, or do not chain
+to its head, was altered after commit and answers `code "TAMPERED"`. A
+deletion is reported as tamper, never as "no commit record".
+
+Two further guarantees, both tested in
+`tests/test_rules_in_force_at_block.py`:
+
+- **The cache is re-verified before it is served.** A cached text is served
+  only after the journal rows behind its head are re-read and their hash
+  chain re-verified on that read. A node that cached a head refuses the next
+  read after the database is tampered, instead of serving the old text until
+  a restart or a new head.
+- **The replay is fingerprint-checked.** Each replayed revision is compared
+  with the semantic fingerprint the original execution recorded
+  (`tau_journal.compare`); a replay that computes something else diverges
+  and the read reports unavailable instead of serving a text nobody
+  committed. The same comparison the authoritative reconstruction runs with
+  `verify=True`.
+
+**Preview isolation.** The view is rebuilt in a fresh worker per rebuild and
+disposed after the read. It never reads the node's warm evaluator and never
+shares an evaluator with another read: the repo's own discriminator test
+proves one shared evaluator contaminates across requests, so a shared
+evaluator is not a permitted source for this view.
+
+**Step rows.** The view replays rule rows only, never steps. A step row
+forged without relinking its chain is caught by the chain verification
+(`TAMPERED`, nothing shown). A step row forged with the chain relinked cannot
+change the text this read answers, because steps are not inputs to it; the
+divergence check that catches a relinked step forgery is the full
+reconstruction's (`WorkerSession.reconstruct(..., verify=True)`, which
+replays steps), run by the authoritative path at restart -- not by this read.
+
+With an address, the account's registry clauses are added -- a positive
+registry read only: a clause is listed because `rule_clauses_v1` holds it.
+The registry and the application-rule units are current-tip state; at a
+historical block they are labelled `registry_as_of: "current tip"`, because
+no per-block registry snapshot exists. An `o5` clause names no revision.
+
 ### The rule-change release
 
 A guarded rule change is parked as a request and written later by the release
@@ -240,8 +315,9 @@ Both writes are best effort: a failure is logged and never reaches block commit.
 Both tables are created on start (`CREATE TABLE IF NOT EXISTS`); there is no
 migration. They grow with the chain; a full replay rewrites them idempotently.
 
-`getaccountrules` is in the expensive rate-limit tier: it takes the state locks
-and scans the mempool and the history.
+`getaccountrules` and `getrulesinforce` are in the expensive rate-limit
+tier: they take the state locks and scan the mempool and the history, and a
+`getrulesinforce` read that rebuilds the spec starts one engine worker.
 
 `running_spec` is cached per committed rule history. The first read after a
 journal reset or an accepted revision starts one engine worker, replays the rule
@@ -255,7 +331,11 @@ for it.
 - It does not prove anything to a wallet that does not trust its node. A light
   wallet that wants proof needs a receipts root committed by the block, which
   changes the header or the state hash and therefore needs a coordinated
-  restart.
+  restart. Light-client provability of the running-spec text is a documented
+  follow-up (its own gated change), not part of this change.
+- It does not verify step fingerprints in this read. See "Step rows" above:
+  the view replays rule rows only; step verification belongs to the full
+  reconstruction.
 - It does not change which transactions are valid or what they cost. Soft no-ops
   (an offer that lost a race, a duplicate request) still sit in the block and
   pay their fee; they are now visible as `skipped` with their `fee_charged`.

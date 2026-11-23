@@ -2248,6 +2248,50 @@ def cmd_policy_show(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _format_rules_in_force(data) -> str:
+    """Human summary of `getrulesinforce` (issue #42)."""
+    running = data.get("running_spec") or {}
+    lines = [f"rules in force at block {data.get('block_number')} "
+             f"({_short(data.get('block_hash'))})"]
+    if running.get("spec_revision") is not None or data.get("spec_revision") is not None:
+        lines.append(f"  spec_revision: {data.get('spec_revision')}")
+    if running.get("text") is None:
+        lines.append(f"  running spec: unavailable ({running.get('code')})")
+        lines.append(f"    {running.get('unavailable')}")
+    else:
+        lines.append(f"  running spec sha256: {running.get('sha256')}")
+        lines.append(f"    {running.get('text')}")
+    account = data.get("account")
+    if account is not None:
+        lines.append(f"  account {_short(account.get('address'), 16)} "
+                     f"(registry as of {account.get('registry_as_of')})")
+        for clause in account.get("clauses") or []:
+            lines.append(f"  {clause.get('name')} clause: sha256 {clause.get('sha256')}")
+            lines.append(f"    {clause.get('body')}")
+        guard = account.get("rule_change_guard")
+        lines.append("  rule-change guard: "
+                     + (f"sha256 {guard.get('sha256')}" if guard else "none"))
+        for unit in account.get("application_rules") or []:
+            lines.append(f"  application rule sha256 {unit.get('sha256')}")
+    return "\n".join(lines)
+
+
+def cmd_policy_rules_in_force(args: argparse.Namespace) -> int:
+    # The address is optional here and defaults to none (chain-wide spec),
+    # not to the signing key: a bare call must not need a key at all.
+    address = getattr(args, "address", None)
+    query = "getrulesinforce"
+    if args.block is not None:
+        query += f" {args.block}"
+    if address is not None:
+        query += f" {address}"
+    raw = _send(args, query)
+    if rpc_mod.is_error_response(raw) or args.json:
+        return _simple_query_response(args, raw)
+    print(_format_rules_in_force((parse_json_response(raw) or {}).get("data") or {}))
+    return EXIT_OK
+
+
 def cmd_policy_change_request(args: argparse.Namespace) -> int:
     kind = _KIND_BY_NAME[args.kind]
     rule_text, offer_id = "", ""
@@ -2343,6 +2387,15 @@ def _add_policy_subparsers(sub) -> None:
     p_pshow.add_argument("address", nargs="?", help="Address (default: your key's)")
     _key_group(p_pshow, required=False)
     p_pshow.set_defaults(func=cmd_policy_show)
+
+    p_prif = psub.add_parser(
+        "rules-in-force", parents=common,
+        help="The spec the engine runs at one block, with its spec_revision",
+    )
+    p_prif.add_argument("block", nargs="?", help="Block hash or height (default: head)")
+    p_prif.add_argument("address", nargs="?", help="Address (default: none)")
+    _key_group(p_prif, required=False)
+    p_prif.set_defaults(func=cmd_policy_rules_in_force)
 
     p_guard = psub.add_parser("guard", parents=common,
                               help="Set, revoke or show the rule-change guard")

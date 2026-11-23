@@ -18,6 +18,7 @@ from commands import checktx, createblock, getmempool, gettimestamp, sendtx, get
 from commands import getofferid, getruleoffers, getruleoffer, getruleconflict
 from commands import (
     getaccountrules,
+    getrulesinforce,
     getapprovalpreview,
     getapprovalrequest,
     getapprovalrequests,
@@ -80,6 +81,8 @@ class ServiceContainer:
             "getruleconflict": getruleconflict,
             # Issue #42: everything in force for one account, at one tip.
             "getaccountrules": getaccountrules,
+            # Issue #42: the spec in force at one block, for the chain or an account.
+            "getrulesinforce": getrulesinforce,
         # Co-signature approvals. `getapprovalrequests` is the approver inbox,
         # and its emptiness is meaningful: a request names only the approvers its
         # amount requires, so an approver who sees nothing is not needed.

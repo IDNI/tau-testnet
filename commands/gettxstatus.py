@@ -78,14 +78,125 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
         return {}
 
 
-def _outcome(db, tx_hash: str, block_hash: str) -> dict:
+# Transactions expected to write a rule effect at apply time: a user
+# transaction carrying a rule unit (operations "0"), and an offer accept (which
+# writes the accepted clause). A rule offer, a rule-change request or a cancel
+# writes nothing at apply -- the change lands at release or at accept -- so
+# they are NOT rule-bearing here: no effect for them is normal, not unmatched.
+_RULE_BEARING_TYPES = ("rule_offer_accept",)
+
+
+def _is_rule_bearing(tx) -> bool:
+    """Whether this transaction carries a rule payload apply is expected to act on."""
+    if not isinstance(tx, dict):
+        return False
+    tx_type = tx.get("tx_type") or "user_tx"
+    if tx_type in _RULE_BEARING_TYPES:
+        return True
+    if tx_type == "user_tx":
+        ops = tx.get("operations") if isinstance(tx.get("operations"), dict) else {}
+        return bool(str(ops.get("0") or "").strip())
+    return False
+
+
+def _annotate_effect(db, effect: dict) -> dict:
+    """A clause effect annotated with a POSITIVE registry check (issue #42).
+
+    `registry_confirmed` is true only when the clause is actually found in
+    `rule_clauses_v1` now, with the stored body matching the effect (or, for a
+    revoke, with the registry no longer holding it). A false says only "not
+    in the registry now" -- a clause revoked since reads false too -- and is
+    never evidence the effect did not happen. Clause-ness is never inferred
+    from absence: an effect is called a clause only because it was recorded
+    as one, and the check confirms it against the registry.
+    """
+    if (effect.get("kind") != "clause" or effect.get("stream") is None
+            or not effect.get("account")):
+        return effect
+    out = dict(effect)
+    try:
+        body = db.rule_clause_body(effect["account"], int(effect["stream"]))
+    except Exception:
+        logger.exception("Failed to check the registry for %s", effect.get("account"))
+        return out
+    import hashlib
+
+    if effect.get("action") == "revoked":
+        out["registry_confirmed"] = body is None
+    elif effect.get("sha256"):
+        out["registry_confirmed"] = (
+            body is not None
+            and hashlib.sha256(body.encode("utf-8")).hexdigest() == effect["sha256"])
+    else:
+        out["registry_confirmed"] = body is not None
+    return out
+
+
+def _rule_outcome_from_effects(effects) -> dict:
+    """What the engine did with the transaction's rule, read off its effects.
+
+    An application-rule effect carries the engine's revision receipt:
+    `engine_outcome` (`ACCEPTED_CHANGED` / `ACCEPTED_NOOP`), whether the
+    revision was `taken`, and the revision counter before/after the unit when
+    recorded. A clause-only transaction names its registry confirmation
+    instead. There is no third case here: a rule-bearing transaction with no
+    effect at all is reported as `unmatched` by `_outcome`, never as a clause.
+    """
+    for effect in effects:
+        if effect.get("kind") == "application_rule":
+            rev = effect.get("revision") or {}
+            if rev.get("engine_outcome"):
+                out = {"engine_outcome": rev["engine_outcome"],
+                       "taken": bool(rev.get("taken"))}
+                for key in ("spec_revision_before", "spec_revision_after",
+                            "spec_revision"):
+                    if rev.get(key) is not None:
+                        out[key] = rev[key]
+                return out
+    confirmed = [e.get("registry_confirmed") for e in effects
+                 if e.get("kind") == "clause" and "registry_confirmed" in e]
+    out = {"status": "clause"}
+    if confirmed:
+        out["registry_confirmed"] = all(confirmed)
+    return out
+
+
+def _block_tx(db, tx_hash: str, block_hash: str):
+    """The transaction dict for one confirmed hash, or None when unreadable."""
+    try:
+        block = db.get_block_by_hash(block_hash) or {}
+        txs = block.get("transactions") or []
+        ids = block.get("tx_ids") or []
+        if tx_hash in ids and len(ids) == len(txs):
+            return txs[ids.index(tx_hash)]
+    except Exception:
+        logger.exception("Failed to read block %s for %s", block_hash, tx_hash)
+    return None
+
+
+def _outcome(db, tx_hash: str, block_hash: str, tx=None) -> dict:
     """What the confirmed transaction did in its block (issue #42)."""
     try:
         recorded = db.get_tx_outcome(tx_hash, block_hash)
     except Exception:
         logger.exception("Failed to read outcome for %s", tx_hash)
         recorded = None
-    return recorded if recorded is not None else {"status": "not_recorded"}
+    if recorded is None:
+        return {"status": "not_recorded"}
+    effects = recorded.get("rule_effects") or []
+    if effects:
+        recorded["rule_effects"] = [_annotate_effect(db, e) for e in effects]
+        recorded["rule_outcome"] = _rule_outcome_from_effects(recorded["rule_effects"])
+    elif _is_rule_bearing(tx):
+        # A rule payload with no recorded effect: reported as unmatched, in
+        # its own words -- never labelled a clause-registry rule, which is
+        # what an absence-inferred label would do.
+        recorded["rule_outcome"] = {
+            "status": "unmatched",
+            "detail": ("this transaction carries a rule payload but no rule "
+                       "effect was recorded for it in this block"),
+        }
+    return recorded
 
 
 def execute(raw_command: str, container):
@@ -142,7 +253,9 @@ def execute(raw_command: str, container):
                     "block_number": loc["block_number"],
                     "confirmations": max(1, confirmations),
                 }
-                data["outcome"] = _outcome(db, tx_hash, loc["block_hash"])
+                data["outcome"] = _outcome(
+                    db, tx_hash, loc["block_hash"],
+                    _block_tx(db, tx_hash, loc["block_hash"]))
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 

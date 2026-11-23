@@ -65,6 +65,7 @@ _EXPENSIVE_REFILL_PER_SEC = 0.5
 _EXPENSIVE_COMMANDS = frozenset({
     "checktx",
     "getaccountrules",
+    "getrulesinforce",
     "getapprovalpreview",
     "getapprovalslots",
     "getblocks",
