@@ -65,6 +65,7 @@ _EXPENSIVE_COMMANDS = frozenset({
     "checktx",
     "getapprovalpreview",
     "getapprovalslots",
+    "getpaymentconditions",
     "getblocks",
     "getallaccounts",
     "gettaustate",
