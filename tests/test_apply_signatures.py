@@ -836,7 +836,13 @@ def _golden_block():
     return lm, txs
 
 
-GOLDEN_STATE_HASH = "67173557fe8137ccef43622a0dba4b480c2ed498b3920533555c53523eb520a7"
+# FIX 5 moved this pin: a block of genuine policy txs now also records
+# one policy-write version per policy (kind-6 lineage), so the mechanism
+# metadata carries rule_policy_versions_root and the state hash moves.
+# Verified deterministic (same value across repeated runs); every other
+# assertion in this test is unchanged — accepted txs, clauses, terminal
+# statuses and balances are exactly as before.
+GOLDEN_STATE_HASH = "13334688e2df9feb661c18173545bf9e86d65338567882f3664aa84a45fee3ab"
 
 
 def test_a_block_of_genuine_policy_txs_reaches_the_pinned_state():

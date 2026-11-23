@@ -302,9 +302,13 @@ class TestGrantsClauseNative(unittest.TestCase):
         now = int(time.time())
         anchor = now - 100
         # The clause names 2000 released in period 1; the declared
-        # schedule caps the release at 500. The book refuses.
+        # schedule caps the release at 500. The book refuses. The
+        # entry's own terms stay 500/week — the clause's 2000 is the
+        # over-cap claim, not the schedule (passing release=2000 here
+        # would raise the declared cap to 2000 and the draw would
+        # rightly be admitted).
         entry = self._seed_clause_grant(
-            anchor, release=2000,
+            anchor,
             clause=_grant_clause(anchor, release=2000))
         blob = self._draw_tx(entry.grant_id)
         before = self._balances(FUNDER, BENEFICIARY, SUBMITTER)

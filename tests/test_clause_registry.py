@@ -435,7 +435,13 @@ def test_the_meta_root_moves_on_registration_and_returns_on_revocation(apply_eva
 
     _r, revoked, _c = ap._apply([ap.rule_tx(NEUTRAL, seq=0)], lm=registered)
     assert revoked.rule_offers.clauses_root() == EMPTY_ROOT
-    assert revoked.consensus_meta_hash() == before
+    # The meta hash does NOT return: registering the rule wrote a policy,
+    # which bumped its version (FIX 5, kind-6 lineage), and versions are
+    # write-history — revoking the clause removes the clause, not the fact
+    # that it was written. The clauses root returning is the revocation
+    # guarantee; the versions root keeps the history.
+    assert revoked.consensus_meta_hash() != before
+    assert revoked.rule_offers.policy_versions_root() != b""
 
 
 def _proposal(lm):

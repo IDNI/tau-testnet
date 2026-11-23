@@ -28,6 +28,16 @@ CLAUSE = f"always ( o{STREAM}[t]:bv[24] = {{ #x000000 }}:bv[24] )."
 class _Offers:
     def __init__(self):
         self.accepted_clauses = {(SENDER.lower(), STREAM): "PREVIOUS POLICY"}
+        self.policy_versions = {}
+
+    def record_policy_write(self, sender_pubkey, stream=STREAM):
+        # The double must mirror the RuleOfferLifecycleManager interface
+        # the engine calls: every policy write counts toward the
+        # policy's version (FIX 5, kind 6 lineage).
+        key = (sender_pubkey, stream)
+        version = int(self.policy_versions.get(key, 0)) + 1
+        self.policy_versions[key] = version
+        return version
 
 
 class _Approvals:
