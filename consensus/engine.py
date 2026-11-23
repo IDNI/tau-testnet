@@ -3731,12 +3731,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     }
                 elif pending_payout_update is not None:
                     account, rule_id, terms = pending_payout_update
-                    _lifecycle_for_write().payout_rules.update(
+                    # update() returns (old, installed): the installed terms
+                    # carry version + 1, so their id is the one the book now
+                    # holds. The event names the installed rule and the version
+                    # it replaces, so gettxstatus can match both.
+                    _, updated = _lifecycle_for_write().payout_rules.update(
                         account, rule_id, terms,
                         terms.clock(int(block_height or 0), int(block_timestamp or 0)))
                     tx_receipt["payout_event"] = {
-                        "account_pubkey": terms.account_pubkey, "rule_id": terms.rule_id.hex(),
+                        "account_pubkey": updated.account_pubkey,
+                        "rule_id": updated.rule_id.hex(),
                         "outcome": "updated", "tx_id": tx_id,
+                        "replaces": rule_id.hex(),
                     }
                 elif pending_payout_revoke is not None:
                     account, rule_id = pending_payout_revoke

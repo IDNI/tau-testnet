@@ -1702,6 +1702,20 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+def _payout_evaluator_call(fn):
+    """Run one admission-pool payout evaluation, mapping evaluator trouble the
+    way every other admission-time Tau call maps it."""
+    import tau_admission
+    from tau_speculation import SpeculationError, WorkerLost, WorkerTimeout
+
+    try:
+        return fn(tau_admission.default_budget())
+    except WorkerTimeout as exc:
+        raise tau_admission.AdmissionTimeout(str(exc)) from exc
+    except (WorkerLost, SpeculationError) as exc:
+        raise tau_admission.AdmissionUnavailable(str(exc)) from exc
+
+
 def validate_payout_rule_set_payload(
     tx: Dict, tip_view: TipAdmissionView
 ) -> AdmissionResult:
@@ -1796,8 +1810,15 @@ def validate_payout_rule_update_payload(
     refusal = _rule_change_refusal(tip_view, sender, tau_defs.RULE_CHANGE_KIND_SET_PAYOUT)
     if refusal is not None:
         return refusal
+    # The node installs version + 1, so the rule id the book will hold is the
+    # signed terms with the next version, not the id as signed.
+    from dataclasses import replace as _dc_replace
+    old_terms = tip_view.payout_book().get(account, rule_id)
+    installed_id = (_dc_replace(terms, version=old_terms.version + 1).rule_id.hex()
+                    if old_terms is not None else terms.rule_id.hex())
     return success({
-        "rule_id": terms.rule_id.hex(),
+        "rule_id": installed_id,
+        "replaces": rule_id.hex(),
         "slots": list(terms.slots),
         "cap_per_execution": terms.cap_per_execution,
         "cap_per_period": terms.cap_per_period,

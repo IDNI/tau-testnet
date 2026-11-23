@@ -223,10 +223,11 @@ def test_a_second_rule_is_independent_and_an_update_supersedes_the_old_one(evs):
     assert book.current_id(bytes.fromhex(rid(first))) == new_id
     assert book.count_for(ALICE) == 2
     assert book.resolved_count == 1
-    # The event names the terms as signed (version 1); the book holds the
-    # version-2 rule under its own id (asserted above).
-    assert _events(ch)[0] == {"account_pubkey": ALICE, "rule_id": new_terms.rule_id.hex(),
-                              "outcome": "updated", "tx_id": upd["tx_id"]}
+    # The event names the rule the book now holds (version 2, asserted
+    # above) and the version it replaces.
+    assert _events(ch)[0] == {"account_pubkey": ALICE, "rule_id": new_id.hex(),
+                              "outcome": "updated", "tx_id": upd["tx_id"],
+                              "replaces": rid(first)}
     assert book.root() != root_one
     oracle.check(ch)
 
