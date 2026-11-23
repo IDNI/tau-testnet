@@ -24,6 +24,23 @@ make two honest nodes disagree about admissibility, which forks.
   exactly as the unrouted transfer would be. The split itself creates no
   second fee event (asserted by the named case-1 test at this level; the
   engine seam asserts it again where fees settle).
+- TWO FORMS (FIX 2, the stage-1 clause form): a route is either the
+  DECLARED form above — a fixed share in basis points — or the TAU
+  CLAUSE form: the owner's own Tau clause, stepped by the node through
+  the existing policy-evaluation path (sender_policy.clause_outputs)
+  over a node-built input map (route_clause_inputs), names the routed
+  legs under the stage's shared output encoding (o30 leg count, o31..
+  candidate/amount pairs). The clause decides the share; the book
+  re-checks every leg against the candidate set (the signed
+  destination) and the product cap, and the class check above stays
+  the book's and stays FIRST: a route output never triggers a route
+  in either form, because the clause is only ever stepped for a
+  triggering class. A clause that cannot be stepped, or names legs
+  the book refuses, routes nothing — the credit lands whole, so a
+  broken route clause can never block someone else's transfer. The
+  form is a signed field, inside the route id (a domain-separated id
+  for the clause form), so the form a credit runs under is the form
+  the owner signed.
 """
 from __future__ import annotations
 
@@ -35,6 +52,7 @@ import tau_defs
 from consensus.serialization import (
     compute_receive_route_book_root,
     compute_receive_route_id,
+    compute_receive_route_tau_id,
 )
 
 TX_TYPE_INSTALL_RECEIVE_ROUTE = "install_receive_route"
@@ -66,6 +84,28 @@ ROUTE_TRIGGER_CREDIT_CLASSES = frozenset(
 MAX_ROUTE_BPS = 10_000
 PRODUCT_CAP_BPS = 9_000
 
+# The two forms a route can take. The form is a signed field of the
+# route: it is inside the install signature and the route id, so the
+# form a credit runs under is the form the owner signed.
+FORM_DECLARED = 1
+FORM_TAU_CLAUSE = 2
+ROUTE_FORMS = frozenset({FORM_DECLARED, FORM_TAU_CLAUSE})
+
+# The Tau form's clause text bound, in UTF-8 bytes — the stage's shared
+# bound (consensus/payout_rules MAX_PAYOUT_CLAUSE_BYTES).
+MAX_ROUTE_CLAUSE_BYTES = 8192
+
+# The Tau form's output encoding — the stage's shared encoding, the
+# same one the payout-rule form pins: o30 carries the leg count, then
+# each leg is a (destination candidate index, amount) pair on
+# consecutive streams.
+ROUTE_OUTPUT_COUNT_STREAM = 30
+ROUTE_OUTPUT_FIRST_STREAM = 31
+
+# A clause names at most this many legs for one credit (the stage's
+# shared MAX_LEGS bound).
+MAX_CLAUSE_LEGS = 32
+
 _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
 _U64_MAX = 0xFFFFFFFFFFFFFFFF
 
@@ -76,6 +116,15 @@ class ReceiveRouteShapeError(ValueError):
 
 @dataclass(frozen=True)
 class ReceiveRouteEntry:
+    """The signed terms of one route version. Nothing here mutates.
+
+    `form` and `clause_text` default to the declared form, so every
+    entry constructed before the Tau form existed — and every
+    declared-form entry constructed now — is byte-identical to what
+    it was. A Tau-form route carries no share: its shape requires
+    bps 0, and its clause names the routed amount per credit.
+    """
+
     owner_pubkey: str
     destination_pubkey: str
     bps: int
@@ -84,9 +133,22 @@ class ReceiveRouteEntry:
     expiry_ts: int
     locked_until_ts: int
     version: int
+    form: int = FORM_DECLARED
+    clause_text: str = ""
 
     @property
     def route_id(self) -> bytes:
+        if self.form == FORM_TAU_CLAUSE:
+            return compute_receive_route_tau_id(
+                self.owner_pubkey,
+                self.destination_pubkey,
+                self.clause_text,
+                self.min_amount,
+                self.activation_ts,
+                self.expiry_ts,
+                self.locked_until_ts,
+                self.version,
+            )
         return compute_receive_route_id(
             self.owner_pubkey,
             self.destination_pubkey,
@@ -97,6 +159,16 @@ class ReceiveRouteEntry:
             self.locked_until_ts,
             self.version,
         )
+
+    @property
+    def candidates(self) -> Tuple[str, ...]:
+        """The destination candidate set a clause's legs index into.
+
+        A route has exactly one signed destination, so the set has one
+        member: candidate 0 is the destination, and any other index
+        names something the owner never signed.
+        """
+        return (self.destination_pubkey,)
 
 
 @dataclass(frozen=True)
@@ -132,6 +204,115 @@ def split_credit(gross: int, bps: int) -> Tuple[int, int]:
     return routed, gross - routed
 
 
+# --- The Tau form: input map and output decoding ------------------------------
+
+_OUTPUT_VALUE_RE = re.compile(
+    r"^\{?\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}?(?::bv\[\d+\])?$"
+)
+
+
+def _parse_output_value(value: Any) -> Optional[int]:
+    """One clause output as an integer, or None when it is not one.
+
+    The worker reports outputs as Tau value strings; this reads them
+    with the same grammar tau_policy.parse_o5 reads o5 with (hex /
+    binary / decimal, optional braces and :bv[N] annotation) — the
+    payout form's identical reader, kept per book as this codebase
+    keeps its small helpers.
+    """
+    if value is None:
+        return None
+    match = _OUTPUT_VALUE_RE.match(str(value).strip())
+    if not match:
+        return None
+    hex_digits, bin_digits, dec_digits = match.groups()
+    if hex_digits is not None:
+        return int(hex_digits, 16)
+    if bin_digits is not None:
+        return int(bin_digits, 2)
+    return int(dec_digits)
+
+
+def route_clause_inputs(
+    entry: ReceiveRouteEntry,
+    sender_pubkey: str,
+    gross: int,
+    ts: int,
+    owner_balance: int,
+) -> Dict[int, Any]:
+    """The input map a Tau-form split steps the owner's clause over.
+
+    ONE definition, called by the engine at the transfer seam with its
+    site values (routes have no execution transaction of their own, so
+    there is no second site to drift from). The value formats mirror
+    the transfer input map (consensus/engine._transfer_input_map)
+    exactly: amounts and the timestamp as decimal strings, accounts as
+    `{ #x.. }:bv[384]` literals. The map is the payout form's map
+    (i1..i5/i26) with the route meanings:
+
+    - i1: the gross credit amount being split
+    - i2: the receiving owner's balance before this credit
+    - i3: the receiving owner's pubkey
+    - i4: the credit sender's pubkey
+    - i5: the block timestamp
+    - i26 (tau_defs.PAYOUT_PERIOD_PAID_STREAM_INDEX): the route book
+      keeps no per-period paid total, so the stream is fed 0 — a
+      defined value a clause written against the shared map can read,
+      never an absent stream
+
+    Nothing in the map comes from the credit beyond its own amount and
+    sender: the map is node-built, so no sender can steer the clause
+    by writing a stream.
+    """
+    return {
+        1: str(int(gross)),
+        2: str(int(owner_balance)),
+        3: "{ #x" + str(entry.owner_pubkey) + " }:bv[384]",
+        4: "{ #x" + str(sender_pubkey) + " }:bv[384]",
+        5: str(int(ts)),
+        tau_defs.PAYOUT_PERIOD_PAID_STREAM_INDEX: "0",
+    }
+
+
+def decode_clause_legs(
+    entry: ReceiveRouteEntry, outputs: Dict[str, Any]
+) -> Tuple[Optional[Tuple[Tuple[str, int], ...]], str]:
+    """The legs a stepped clause named, or (None, why not).
+
+    The encoding (pinned in route_capabilities): o30 is the leg count;
+    leg k reads its destination candidate index — 0-based into the
+    entry's candidate set — from o(31+2k) and its amount from
+    o(32+2k). Zero-amount legs are dropped, as the payout form drops
+    them. A count above the bound, a missing or unreadable value, or
+    an index outside the candidate set means the clause named
+    something the node cannot settle: no legs, and the credit lands
+    whole.
+    """
+    count = _parse_output_value(outputs.get(f"o{ROUTE_OUTPUT_COUNT_STREAM}"))
+    if count is None:
+        return None, "the route's clause did not report a leg count"
+    if count < 0 or count > MAX_CLAUSE_LEGS:
+        return None, f"the route's clause reported {count} legs"
+    legs: List[Tuple[str, int]] = []
+    for k in range(count):
+        index = _parse_output_value(
+            outputs.get(f"o{ROUTE_OUTPUT_FIRST_STREAM + 2 * k}")
+        )
+        amount = _parse_output_value(
+            outputs.get(f"o{ROUTE_OUTPUT_FIRST_STREAM + 2 * k + 1}")
+        )
+        if index is None or amount is None:
+            return None, "the route's clause reported an unreadable leg"
+        if not 0 <= index < len(entry.candidates):
+            return None, (
+                "the route's clause named destination candidate "
+                f"{index}, outside the declared set"
+            )
+        if amount > 0:
+            legs.append((entry.candidates[index], amount))
+    return tuple(legs), ""
+
+
 # --- Parsing ------------------------------------------------------------------
 
 
@@ -153,10 +334,43 @@ def _u64_field(tx: Dict[str, Any], name: str, default: int = 0) -> int:
     return value
 
 
+def _form_field(tx: Dict[str, Any]) -> int:
+    value = tx.get("route_form", FORM_DECLARED)
+    if not _is_int(value) or value not in ROUTE_FORMS:
+        raise ReceiveRouteShapeError(
+            "route_form must be 1 (declared) or 2 (Tau clause)"
+        )
+    return int(value)
+
+
+def _clause_field(tx: Dict[str, Any]) -> str:
+    value = tx.get("route_clause", "")
+    if not isinstance(value, str):
+        raise ReceiveRouteShapeError("route_clause must be a string")
+    return value
+
+
 def parse_install_receive_route(tx: Dict[str, Any]) -> ReceiveRouteEntry:
-    """Read an installation from ROOT fields only; a nested `payload` is unsigned data."""
+    """Read an installation from ROOT fields only; a nested `payload` is unsigned data.
+
+    The form selects which fields carry the share decision, and the
+    two forms' fields are mutually exclusive (the payout form's parse
+    discipline): the Tau form reads `route_clause` and refuses a bps;
+    the declared form reads `route_bps` and refuses a clause.
+    """
     if not isinstance(tx, dict):
         raise ReceiveRouteShapeError("transaction must be an object")
+    form = _form_field(tx)
+    clause_text = _clause_field(tx)
+    if form == FORM_TAU_CLAUSE:
+        if not clause_text:
+            raise ReceiveRouteShapeError(
+                "a Tau-form receive route must carry route_clause"
+            )
+    elif clause_text:
+        raise ReceiveRouteShapeError(
+            "route_clause is only for the Tau form (route_form 2)"
+        )
     return ReceiveRouteEntry(
         owner_pubkey=_pubkey_field(tx, "sender_pubkey"),
         destination_pubkey=_pubkey_field(tx, "route_destination_pubkey"),
@@ -166,6 +380,8 @@ def parse_install_receive_route(tx: Dict[str, Any]) -> ReceiveRouteEntry:
         expiry_ts=_u64_field(tx, "route_expiry_ts"),
         locked_until_ts=_u64_field(tx, "route_locked_until_ts"),
         version=_u64_field(tx, "route_version", default=1),
+        form=form,
+        clause_text=clause_text,
     )
 
 
@@ -196,12 +412,23 @@ def validate_route_shape(route: ReceiveRouteEntry, now_ts: int) -> Optional[str]
             return "a locked route must carry an expiry"
         if route.locked_until_ts > route.expiry_ts:
             return "route_locked_until_ts must not exceed route_expiry_ts"
+    if route.form not in ROUTE_FORMS:
+        return "unknown receive route form"
+    if route.form == FORM_TAU_CLAUSE:
+        if route.bps != 0:
+            return "a Tau-form route carries no bps; its clause names the share"
+        if not route.clause_text:
+            return "a Tau-form receive route must carry a clause"
+        if len(route.clause_text.encode("utf-8")) > MAX_ROUTE_CLAUSE_BYTES:
+            return f"a route clause is at most {MAX_ROUTE_CLAUSE_BYTES} bytes"
+    elif route.clause_text:
+        return "a declared-form receive route carries no clause"
     return None
 
 
 # --- The book -----------------------------------------------------------------
 
-_Row = Tuple[bytes, str, str, int, int, int, int, int, int]
+_Row = Tuple[bytes, str, str, int, int, int, int, int, int, int, str]
 
 
 class ReceiveRouteBook:
@@ -230,8 +457,10 @@ class ReceiveRouteBook:
     def restore(cls, rows: Iterable[_Row]) -> "ReceiveRouteBook":
         """Rebuild from stored rows; refuses any row whose id does not recompute."""
         book = cls()
-        for stored_id, owner, dest, bps, min_amt, act, exp, lock, ver in rows:
-            entry = ReceiveRouteEntry(owner, dest, bps, min_amt, act, exp, lock, ver)
+        for stored_id, owner, dest, bps, min_amt, act, exp, lock, ver, form, clause_text in rows:
+            entry = ReceiveRouteEntry(
+                owner, dest, bps, min_amt, act, exp, lock, ver, form, clause_text
+            )
             if entry.route_id != bytes(stored_id):
                 raise ValueError(
                     f"stored route id does not match its fields: {entry.route_id.hex()}"
@@ -253,6 +482,8 @@ class ReceiveRouteBook:
                 e.expiry_ts,
                 e.locked_until_ts,
                 e.version,
+                e.form,
+                e.clause_text,
             )
             for e in self._routes.values()
         ]
@@ -354,13 +585,24 @@ class ReceiveRouteBook:
     # -- the split ----------------------------------------------------------------
 
     def apply_route(
-        self, owner_pubkey: str, gross: int, credit_class: str, ts: int
+        self,
+        owner_pubkey: str,
+        gross: int,
+        credit_class: str,
+        ts: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
     ) -> RouteApplication:
         """Present one credit to the book and learn its split.
 
         The class check comes first and is absolute: a credit that is not an
         ordinary transfer or a claimed payment never splits, whatever route
         the account holds — that is what makes routing single-hop.
+
+        `clause_legs` is the Tau form's leg source: the legs the caller
+        (the engine at the transfer seam) decoded from stepping the
+        owner's clause. Declared entries never consult it; Tau entries
+        REQUIRE it — None routes nothing, because stepping is the
+        caller's job, exactly as in the payout and standing books.
         """
         if gross < 0:
             raise ValueError("gross must be non-negative")
@@ -371,11 +613,55 @@ class ReceiveRouteBook:
             return RouteApplication(False, 0, gross, "no active route")
         if gross < entry.min_amount:
             return RouteApplication(False, 0, gross, "below the route minimum")
+        if entry.form == FORM_TAU_CLAUSE:
+            return self._apply_clause_route(entry, gross, clause_legs)
         routed, net = split_credit(gross, entry.bps)
         if routed == 0:
             return RouteApplication(False, 0, gross, "share rounds to zero")
         return RouteApplication(
             True, routed, net, "routed",
+            destination_pubkey=entry.destination_pubkey,
+            route_id=entry.route_id,
+        )
+
+    def _apply_clause_route(
+        self,
+        entry: ReceiveRouteEntry,
+        gross: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]],
+    ) -> RouteApplication:
+        """The Tau form's split of one credit.
+
+        What the clause named is re-checked here against everything
+        the owner signed: every leg must name the declared destination
+        (the candidate set), and the routed total may not exceed the
+        product cap's share of the gross — the same ceiling the
+        declared form's bps is held to, so a clause route can never
+        take a whole credit either. Any refusal routes nothing: the
+        credit lands whole.
+        """
+        if clause_legs is None:
+            return RouteApplication(
+                False, 0, gross, "the route's clause was not evaluated")
+        for recipient, leg_amount in clause_legs:
+            if recipient not in entry.candidates:
+                return RouteApplication(
+                    False, 0, gross,
+                    "the clause named a leg outside the declared set")
+            if leg_amount <= 0:
+                return RouteApplication(
+                    False, 0, gross, "the clause named a non-positive leg")
+        routed = sum(leg_amount for _, leg_amount in clause_legs)
+        if routed == 0:
+            return RouteApplication(
+                False, 0, gross, "the route's clause named no routed share")
+        cap = (gross * PRODUCT_CAP_BPS) // MAX_ROUTE_BPS
+        if routed > cap:
+            return RouteApplication(
+                False, 0, gross,
+                "the clause's routed share exceeds the product cap")
+        return RouteApplication(
+            True, routed, gross - routed, "routed",
             destination_pubkey=entry.destination_pubkey,
             route_id=entry.route_id,
         )
@@ -458,4 +744,28 @@ def route_capabilities() -> Dict[str, Any]:
         "product_cap_bps": PRODUCT_CAP_BPS,
         "locked_route_expiry": "mandatory",
         "single_hop": "route outputs never trigger a route",
+        "forms": {
+            "declared": FORM_DECLARED,
+            "tau_clause": FORM_TAU_CLAUSE,
+        },
+        "clause_form": {
+            "input_streams": {
+                "i1": "the gross credit amount",
+                "i2": "the receiving owner's balance before the credit",
+                "i3": "the receiving owner's pubkey",
+                "i4": "the credit sender's pubkey",
+                "i5": "the block timestamp",
+                "i26": "0 (the route book keeps no per-period paid total)",
+            },
+            "output_encoding": (
+                f"o{ROUTE_OUTPUT_COUNT_STREAM} leg count; leg k reads "
+                f"o{ROUTE_OUTPUT_FIRST_STREAM}+2k (candidate index) and "
+                f"o{ROUTE_OUTPUT_FIRST_STREAM + 1}+2k (amount)"
+            ),
+            "candidate_set": "the signed destination (candidate 0)",
+            "cap": "the routed total never exceeds the product cap's "
+                   "share of the gross",
+            "max_clause_bytes": MAX_ROUTE_CLAUSE_BYTES,
+            "max_legs": MAX_CLAUSE_LEGS,
+        },
     }
