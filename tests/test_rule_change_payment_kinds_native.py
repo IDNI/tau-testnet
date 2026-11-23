@@ -3,27 +3,33 @@ kinds 7..12 on the REAL Tau engine.
 
 Kept in its own file so the real-Tau CI job can register exactly this
 file (the pattern of the other Bounty 01 native suites): the guard
-verdicts below step REAL Tau clauses — the shipped wallet guard
-templates and a kind-selective clause — through the real
-policy-evaluation path, which needs the native bindings the mock job
-does not have. The skip is environment-driven.
+verdicts below step REAL Tau clauses through the real
+policy-evaluation path (sender_policy.rule_change_blocked with a live
+PolicyEvaluator), which needs the native bindings the mock job does
+not have. The skip is environment-driven.
+
+The clauses are written in the two forms the shipped wallet guard
+templates use — a co-signer slot read at bv[384], and kind selection
+on i1 at bv[24] (the forms test_rule_change_guard_native.py steps for
+kinds 1..6) — spelled out here because the standalone CI image does
+not carry web-wallet/app.js, where the template texts live.
 
 What this proves, with no mock anywhere in the file:
 
-1. The shipped "any change needs the co-signer" and "2 of 3" templates
-   judge every payment kind (7 set payout, 8 update payout, 9 revoke
-   payout, 10 set standing, 11 update standing, 12 cancel standing)
-   exactly as they judge kinds 1..6: blocked with no co-signer slot
-   filled, released by the named co-signer, still blocked by a
-   stranger or the right key in the wrong slot.
+1. A co-signer guard ("any change needs co-signer X", and a 2-of-3
+   variant) judges every payment kind (7 set payout, 8 update payout,
+   9 revoke payout, 10 set standing, 11 update standing, 12 cancel
+   standing) exactly as it judges the policy kinds: blocked with no
+   co-signer slot filled, released by the named co-signer(s), still
+   blocked by a stranger or the right key in the wrong slot.
 2. A kind-selective guard can name one payment kind: a clause that
    blocks only i1 = 8 blocks the payout update and lets the install,
    the revoke and every standing kind through — the granularity ST-3
    turns on.
-3. The shipped weaker template, which enumerates the kinds it blocks
-   (revokes 2 and 5), does NOT block the payment kinds: a guard is a
-   program, and it judges the kinds its author named. Widening a
-   deployed guard is itself a guarded change (kind 4).
+3. A guard that enumerates the kinds it blocks (revokes 2 and 5, the
+   shipped weaker template's shape) does NOT block the payment kinds:
+   a guard is a program, and it judges the kinds its author named.
+   Widening a deployed guard is itself a guarded change (kind 4).
 """
 import hashlib
 import os
@@ -35,7 +41,6 @@ import tau_defs
 import tau_policy
 from consensus import sender_policy
 from consensus.rule_offers import clause_body_v1
-from wallet_templates import live_rule, shipped_guard_templates
 
 
 def _native_available():
@@ -60,7 +65,6 @@ PAYMENT_KINDS = (
     tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING,
     tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING,
 )
-PLACEHOLDER_A, PLACEHOLDER_B, PLACEHOLDER_C = "a" * 96, "b" * 96, "c" * 96
 
 
 def _key(label):
@@ -72,10 +76,6 @@ def _key(label):
 
 
 X, Y, Z, OTHER, SENDER = (_key(n) for n in ("x", "y", "z", "other", "sender"))
-GUARDS = shipped_guard_templates()
-ANY = "Guard: Any policy change needs co-signer X"
-TWO_OF_THREE = "Guard: 2 of 3 co-signers for any policy change"
-REVOKE_ONLY = "Guard: Revoking needs a co-signer (weaker)"
 
 
 def _env():
@@ -96,12 +96,33 @@ def real():
     ev.close()
 
 
-def _guard_body(name, **keys):
-    text = GUARDS[name]
-    for placeholder, key in keys.items():
-        assert placeholder in text
-        text = text.replace(placeholder, key)
-    return clause_body_v1(text)
+def _bv384(h):
+    return "{ #x%s }:bv[384]" % h
+
+
+def _slot_eq(slot, key):
+    return "(i%d[t]:bv[384] = %s)" % (slot, _bv384(key))
+
+
+def _any_change_body():
+    """Blocked unless approval slot 18 holds co-signer X."""
+    return clause_body_v1(
+        "always ( ((!(%s)) ? (o5[t]:bv[24] = { #x000000 }:bv[24])"
+        " : (o5[t]:bv[24] = { #x000001 }:bv[24])) )." % _slot_eq(18, X))
+
+
+def _two_of_three_body():
+    """Blocked unless any two of slots 18/19/20 hold X/Y/Z respectively."""
+    pairs = " || ".join(
+        "(%s && %s)" % pair
+        for pair in (
+            (_slot_eq(18, X), _slot_eq(19, Y)),
+            (_slot_eq(18, X), _slot_eq(20, Z)),
+            (_slot_eq(19, Y), _slot_eq(20, Z)),
+        ))
+    return clause_body_v1(
+        "always ( ((%s) ? (o5[t]:bv[24] = { #x000001 }:bv[24])"
+        " : (o5[t]:bv[24] = { #x000000 }:bv[24])) )." % pairs)
 
 
 def _blocked(body, kind, voted=None):
@@ -110,13 +131,8 @@ def _blocked(body, kind, voted=None):
     return blocked
 
 
-def test_the_templates_build_with_the_payment_kinds_in_scope(real):
-    bodies = (
-        _guard_body(ANY, **{PLACEHOLDER_A: X}),
-        _guard_body(TWO_OF_THREE, **{PLACEHOLDER_A: X, PLACEHOLDER_B: Y, PLACEHOLDER_C: Z}),
-        _guard_body(REVOKE_ONLY, **{PLACEHOLDER_A: X}),
-    )
-    for body in bodies:
+def test_the_guard_forms_build_and_step_for_the_payment_kinds(real):
+    for body in (_any_change_body(), _two_of_three_body()):
         result = real.validate(body)
         assert result.ok, result.error
         for kind in PAYMENT_KINDS:
@@ -124,7 +140,7 @@ def test_the_templates_build_with_the_payment_kinds_in_scope(real):
 
 
 def test_any_change_needs_the_cosigner_for_every_payment_kind(real):
-    body = _guard_body(ANY, **{PLACEHOLDER_A: X})
+    body = _any_change_body()
     for kind in PAYMENT_KINDS:
         assert _blocked(body, kind), f"kind {kind} with empty slots"
         assert not _blocked(body, kind, {18: X}), f"kind {kind} with X"
@@ -133,7 +149,7 @@ def test_any_change_needs_the_cosigner_for_every_payment_kind(real):
 
 
 def test_two_of_three_needs_any_two_for_every_payment_kind(real):
-    body = _guard_body(TWO_OF_THREE, **{PLACEHOLDER_A: X, PLACEHOLDER_B: Y, PLACEHOLDER_C: Z})
+    body = _two_of_three_body()
     for kind in PAYMENT_KINDS:
         assert _blocked(body, kind), f"kind {kind} with empty slots"
         for single in ({18: X}, {19: Y}, {20: Z}):
@@ -148,7 +164,7 @@ def test_a_kind_selective_guard_blocks_only_the_payout_update(real):
     body = clause_body_v1(
         "always ( ((i1[t]:bv[24] = { #x000008 }:bv[24]) ? "
         "(o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])) ).")
-    assert real.validate(body).ok, live_rule(body)
+    assert real.validate(body).ok
     for kind in PAYMENT_KINDS:
         assert _blocked(body, kind) is (
             kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT), kind
@@ -156,12 +172,17 @@ def test_a_kind_selective_guard_blocks_only_the_payout_update(real):
     assert not _blocked(body, tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY)
 
 
-def test_the_weaker_template_judges_only_the_kinds_it_names(real):
-    body = _guard_body(REVOKE_ONLY, **{PLACEHOLDER_A: X})
-    # Sanity: the kinds it names are still blocked without the co-signer.
+def test_a_guard_judges_only_the_kinds_it_names(real):
+    # The shipped weaker template's shape: block exactly i1 in {2, 5}.
+    body = clause_body_v1(
+        "always ( (((i1[t]:bv[24] = { #x000002 }:bv[24])"
+        " || (i1[t]:bv[24] = { #x000005 }:bv[24])) ? "
+        "(o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])) ).")
+    assert real.validate(body).ok
+    # Sanity: the kinds it names are blocked.
     assert _blocked(body, tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY)
     assert _blocked(body, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD)
-    # The payment kinds are not named in this template, so it does not
+    # The payment kinds are not named in this guard, so it does not
     # block them: granularity is the guard author's expressed policy.
     for kind in PAYMENT_KINDS:
         assert not _blocked(body, kind), kind
