@@ -64,8 +64,8 @@ first period.
 
 `due_at`: a point on the rule's clock at which the node runs the rule itself,
 once, with no executor and no named recipient: in the first block whose clock
-reaches it, after the block's transactions and the standing-payment sweep, at
-most MAX_PAYOUT_DUE_RUNS_PER_BLOCK rules a block (the rest wait for the next
+reaches it, after the block's transactions, at most
+MAX_PAYOUT_DUE_RUNS_PER_BLOCK rules a block (the rest wait for the next
 blocks, earliest due point first). The run is an execution like any other (the
 rule is stepped once, all slots are paid or none, both caps and the balance
 hold) with three differences: i13 is 0, only fixed slots can be paid, and i2 is

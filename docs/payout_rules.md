@@ -397,8 +397,7 @@ period. It must be before `expires_at`.
 the future and before `expires_at`. In the first block whose clock reaches it,
 the node steps the rule once, with nobody sending a transaction:
 
-- It runs after the block's transactions and the standing-payment sweep, and
-  before expiries.
+- It runs after the block's transactions and before expiries.
 - There is no executor (`i13` is 0), no named recipient and no executor data
   (`i40+k` are 0). So only fixed slots can be paid, and a rule whose first line
   asks for a certain executor does not pay on that line.
@@ -414,8 +413,7 @@ the node steps the rule once, with nobody sending a transaction:
 - It costs nothing beyond the fee of the transaction that installed the rule.
 - At most 16 rules are run this way per block, earliest due point first; the
   rest follow in the next blocks, and a rule whose due point has not run yet is
-  kept past its end until it has. An idle chain seals a block for a due point
-  like it does for a due standing payment.
+  kept past its end until it has. An idle chain seals a block for a due point.
 
 A rule that pays per sale cannot carry a due point (the node names no sale),
 nor can a rule with only open slots. A node that takes the installing
@@ -524,7 +522,7 @@ Apply reasons in receipts: `payout_rule_not_set`, `payout_rule_not_revoked`,
 Every field above is in the signed bytes (`per_sale`, `periods_from`, `due_at` and `sale_id` when present). `recipients` keys are slot numbers,
 `data` keys are k for input `i40+k`. `genesis_hash` is the hash of block 0 of the
 network (`getsequence` returns it, the CLI fills it in): all three types are bound to
-one network like standing payments (`consensus/network_binding.py`), so a rule or an
+one network (`consensus/network_binding.py`), so a rule or an
 execution signed for another network is refused here.
 
 ## Consensus notes
@@ -540,7 +538,7 @@ execution signed for another network is refused here.
   nothing, and the state hash shows it.
 - Expiry runs after the block's transactions, before rule-change releases; an
   execution in the expiry block is refused by its clock check.
-- Due points run after the block's transactions and the standing-payment sweep,
+- Due points run after the block's transactions and the runs on arrival,
   before expiries, in the order (due point, account) with rules on the block
   clock first. Such a run reads the balance the block has reached, which every
   node has computed the same way by then.
@@ -605,6 +603,5 @@ replay could not run the rule; nothing moves, and the state hash says so.
 ## Not in this release
 
 - More than one rule per account.
-- Running a rule by itself more than once (a due point runs one time; a
-  payment that repeats is what standing payments are for).
+- Running a rule by itself more than once (a due point runs one time).
 - Executor data wider than `bv[24]`.

@@ -32,7 +32,7 @@ from consensus.payout import (
 )
 from consensus.policy_mock import MockPolicyEvaluator
 
-from tests.test_standing_apply import (
+from tests.chain_harness import (
     ALICE, BOB, CAROL, CLAUSE, FAR, HEIGHT, PROPOSER, SKS, TS, Chain, Oracle, _logs, _sign,
 )
 

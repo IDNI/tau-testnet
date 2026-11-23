@@ -50,8 +50,6 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
             return {}
         tx = txs[ids.index(tx_hash)]
         tx_type = tx.get("tx_type") if isinstance(tx, dict) else None
-        if tx_type in ("standing_payment_create", "standing_payment_cancel"):
-            return _standing_fields(tx)
         if tx_type in ("payout_rule_set", "payout_rule_revoke", "payout_execute"):
             return _payout_fields(tx, tx_hash, block_hash)
         if tx_type == "retract_transfer":
@@ -72,32 +70,6 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
     except Exception:
         logger.exception("Failed to resolve retractable detail for %s", tx_hash)
         return {}
-
-
-def _standing_fields(tx: dict) -> dict:
-    """`standing` for a confirmed create, `cancels` for a confirmed cancel.
-
-    `status` is the authorization's state now: waiting, due or retrying while it
-    is open, ended or cancelled once resolved, not_recorded when this node has
-    no record of how it ended.
-    """
-    if tx.get("tx_type") == "standing_payment_cancel":
-        return {"cancels": tx.get("standing_id")}
-    from commands.getstandingpayments import _tip
-    from consensus.standing import describe, parse_standing_payment_create
-    import db
-
-    sid = parse_standing_payment_create(tx).standing_id
-    _head, book = _tip()
-    if book.knows(sid):
-        status = describe(book.get(sid), book.progress[sid], sid)["status"]
-    else:
-        status = "not_recorded"
-        for event in db.get_canonical_standing_events(sid.hex()):
-            if event.get("outcome") in ("ended", "cancelled"):
-                status = event["outcome"]
-                break
-    return {"standing": {"id": sid.hex(), "status": status}}
 
 
 def _payout_fields(tx: dict, tx_hash: str, block_hash: str) -> dict:

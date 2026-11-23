@@ -480,26 +480,10 @@ class TipAdmissionView:
             (pubkey,),
         )
 
-    # --- Standing payments -------------------------------------------------
-
-    def standing_book(self):
-        """The standing-payment book of the canonical tip.
-
-        Read from the canonical lifecycle manager, the object block apply copies,
-        so admission judges against exactly what apply will. Apply mutates only a
-        copy and publishes it by swapping the reference, so this read sees one
-        tip. An empty book when the node has none yet.
-        """
-        from consensus.standing import StandingBook
-
-        lm = getattr(chain_state, "_lifecycle_manager", None)
-        book = getattr(lm, "standing_payments", None)
-        return book if isinstance(book, StandingBook) else StandingBook()
-
     # --- Payout rules ------------------------------------------------------
 
     def payout_book(self):
-        """The payout-rule book of the canonical tip, read like `standing_book`."""
+        """The payout-rule book of the canonical tip; an empty book when the node has none yet."""
         from consensus.payout import PayoutBook
 
         lm = getattr(chain_state, "_lifecycle_manager", None)

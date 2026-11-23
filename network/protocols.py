@@ -22,9 +22,6 @@ TAU_GOSSIP_TOPIC_APPROVALS = "tau/approvals/1.0.0"
 # Retractable transfers get their own topic: parks are floods, while a retract
 # is deadline-sensitive and must not queue behind them.
 TAU_GOSSIP_TOPIC_RETRACTABLE = "tau/retractable/1.0.0"
-# Standing payments get their own topic too: creates can arrive in bursts, and a
-# cancel is time-sensitive -- it must land before the next due point.
-TAU_GOSSIP_TOPIC_STANDING = "tau/standing/1.0.0"
 # Payout rules: installs carry rule text, executions are what moves the money.
 TAU_GOSSIP_TOPIC_PAYOUT = "tau/payout/1.0.0"
 TAU_GOSSIP_TOPIC_PEERS = "tau/peers/2.0.0"
@@ -61,10 +58,6 @@ TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS = 32
 TAU_MAX_RETRACTABLE_TRANSFER_BYTES = 4096
 TAU_MAX_RETRACT_TRANSFER_BYTES = 4096
 TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS = 32
-# A create carries two pubkeys and a few integers; a cancel carries one id.
-TAU_MAX_STANDING_PAYMENT_CREATE_BYTES = 4096
-TAU_MAX_STANDING_PAYMENT_CANCEL_BYTES = 4096
-TAU_MEMPOOL_SNAPSHOT_MAX_STANDING_TXS = 32
 # A rule set carries up to 4 KiB of Tau text and eight slots; an execution an id,
 # up to eight recipients and eight data values; a revoke the envelope.
 TAU_MAX_PAYOUT_RULE_SET_BYTES = 16384
