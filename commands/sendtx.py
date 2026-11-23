@@ -31,11 +31,6 @@ from consensus.payout import (
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_RULE_SET,
 )
-from consensus.standing import (
-    STANDING_TX_TYPES,
-    TX_TYPE_STANDING_PAYMENT_CANCEL,
-    TX_TYPE_STANDING_PAYMENT_CREATE,
-)
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -54,20 +49,18 @@ KNOWN_TX_TYPES = frozenset(
     | set(APPROVAL_TX_TYPES)
     | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
-    | set(STANDING_TX_TYPES)
     | set(PAYOUT_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
 # exempt like a governance vote -- approver bots would otherwise all need funding
 # and a fee strategy, and the vote is bounded by the request's declared approver
-# set instead. `standing_payment_create` pays once for every payment the sweep
-# later makes; `standing_payment_cancel` is free like `retract_transfer`.
+# set instead.
 # `payout_rule_set` pays for its build; `payout_execute` is paid by its executor;
 # `payout_rule_revoke` is free like a cancel.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_PAYMENT_CREATE,
+     TX_TYPE_RULE_CHANGE_REQUEST,
      TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
@@ -891,23 +884,6 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             return _qt_err(
                 "DUPLICATE_RETRACT",
                 "A retract for this retractable transfer is already pending.",
-                pending_tx_hash=rivals[0],
-            )
-
-    if tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
-        # One pending cancel per authorization, as for a retract: it is free.
-        own_hash, _ = _compute_transaction_message_id(payload)
-        rivals = [
-            h for h in db.pending_tx_hashes_naming(
-                sender_pubkey, TX_TYPE_STANDING_PAYMENT_CANCEL,
-                "standing_id", payload["standing_id"],
-            )
-            if h != own_hash
-        ]
-        if rivals:
-            return _qt_err(
-                "DUPLICATE_STANDING_CANCEL",
-                "A cancel for this standing payment is already pending.",
                 pending_tx_hash=rivals[0],
             )
 

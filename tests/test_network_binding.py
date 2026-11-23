@@ -3,8 +3,8 @@
 The types in `BOUND_TX_TYPES` sign `genesis_hash`, the hash of block 0 of the
 network they are for. These tests hold the three places that enforce it to the
 same answer: the signed bytes, mempool admission and block apply (through the
-real `apply_block`, against the full-state oracle of the standing payment
-tests). Every other type must keep the bytes it signed before.
+real `apply_block`, against the full-state oracle of the payout rule tests).
+Every other type must keep the bytes it signed before.
 """
 import hashlib
 import io
@@ -15,20 +15,33 @@ from unittest.mock import MagicMock, patch
 import pytest
 from py_ecc.bls import G2Basic
 
+import chain_state
 import db
 from commands import getsequence
-from consensus import network_binding
+from consensus import network_binding, sender_policy
 from consensus.admission import TipAdmissionView, validate_mempool_admission
 from consensus.network_binding import BOUND_TX_TYPES, FIELD, chain_genesis_hash, problem
-from consensus.standing import StandingBook
+from consensus.payout import PayoutBook
+from consensus.policy_mock import MockPolicyEvaluator
 from consensus.tx_checks import apply_tx_error
 from consensus.tx_signing import signing_message_bytes, verify_tx_signature
 from tau_testnet_cli import cli, keys as keys_mod, tx as tx_mod
 
-from tests.test_standing_apply import (
-    ALICE, BOB, HEIGHT, SK_ALICE, Chain, Oracle, _balances, _logs,
-    cancel_tx, create_tx, sid_of, spend_tx,
+from tests.chain_harness import (
+    ALICE, BOB, HEIGHT, SK_ALICE, TS, Chain, Oracle, _balances, _logs, spend_tx,
 )
+from tests.test_payout_apply import BODY, RULE, evs, rid, set_tx  # noqa: F401  (`evs` is a fixture)
+from tests.test_payout_apply import revoke_tx as _revoke_tx
+
+
+def create_tx():
+    """A payout rule install: the bound type every test below signs."""
+    return set_tx()
+
+
+def cancel_tx(_unused=None):
+    """A payout rule revoke, the other bound type a sender signs alone."""
+    return _revoke_tx()
 
 HERE = chain_genesis_hash()
 ELSEWHERE = "c3" * 32
@@ -171,10 +184,16 @@ def test_older_types_sign_exactly_what_they_signed_before():
 def tip_view():
     view = MagicMock(spec=TipAdmissionView)
     view.next_block_height = HEIGHT
-    view.tip_timestamp = 1_767_225_600
-    view.next_block_timestamp = 1_767_225_600
-    view.standing_book.return_value = StandingBook()
-    return view
+    view.tip_timestamp = TS
+    view.next_block_timestamp = TS
+    view.payout_book.return_value = PayoutBook()
+    view.clause_for.return_value = None
+    mock = MockPolicyEvaluator(pool="payout_admission")
+    mock.set_outputs(BODY, lambda inputs: {"o30": inputs.get("i40", "0")})
+    sender_policy.set_evaluator("payout_admission", mock)
+    with patch.dict(chain_state._balances, {ALICE: 1_000}):
+        yield view
+    sender_policy.set_evaluator("payout_admission", None)
 
 
 def _admit(tx, tip_view):
@@ -209,71 +228,74 @@ def test_admission_and_apply_agree_on_every_value(tip_view, value):
 
 # --- block apply ------------------------------------------------------------------
 
-def test_a_create_signed_for_another_network_stays_out_and_pays_nothing():
+def _rule(ch):
+    return ch.lm.payout_rules.get(ALICE)
+
+
+def test_an_install_signed_for_another_network_stays_out_and_pays_nothing(evs):
     ch, oracle = Chain(_balances(), fee=7), Oracle(_balances())
     result = ch.block([on_network(create_tx(), ELSEWHERE)])
     oracle.check(ch)                      # no fee, no sequence number used
-    assert ch.book.is_empty() and not ch.book.terms
+    assert _rule(ch) is None and ch.lm.payout_rules.is_empty()
     assert "another network" in _logs(result)
     assert [(o.status, o.reason) for o in result.outcomes] == [("invalid", "wrong_network")]
     assert result.accepted_tx_ids == []
 
 
-def test_the_same_create_for_this_network_is_applied():
+def test_the_same_install_for_this_network_is_applied(evs):
     ch, oracle = Chain(_balances(), fee=7), Oracle(_balances())
     tx = create_tx()
     ch.block([tx])
     oracle.create(tx, fee=7)
     oracle.check(ch)
-    assert ch.book.knows(bytes.fromhex(sid_of(tx)))
+    assert _rule(ch).rule_id.hex() == rid(tx)
 
 
 @pytest.mark.parametrize("value", [None, HERE.upper(), HERE[:-2]])
-def test_a_create_without_a_proper_network_stays_out(value):
+def test_an_install_without_a_proper_network_stays_out(evs, value):
     ch, oracle = Chain(_balances(), fee=7), Oracle(_balances())
     result = ch.block([on_network(create_tx(), value)])
     oracle.check(ch)
-    assert ch.book.is_empty()
+    assert ch.lm.payout_rules.is_empty()
     assert "must be the hash of block 0" in _logs(result)
 
 
-def test_a_create_moved_to_this_network_after_signing_stays_out():
+def test_an_install_moved_to_this_network_after_signing_stays_out(evs):
     ch, oracle = Chain(_balances(), fee=7), Oracle(_balances())
     moved = {**on_network(create_tx(), ELSEWHERE), FIELD: HERE}
     result = ch.block([moved])
     oracle.check(ch)
-    assert ch.book.is_empty()
+    assert ch.lm.payout_rules.is_empty()
     assert "signature" in _logs(result).lower()
 
 
-def test_a_cancel_signed_for_another_network_ends_nothing():
+def test_a_revoke_signed_for_another_network_ends_nothing(evs):
     ch, oracle = Chain(_balances(), fee=7), Oracle(_balances())
     tx = create_tx()
     ch.block([tx])
     oracle.create(tx, fee=7)
-    sid = sid_of(tx)
 
-    result = ch.block([on_network(cancel_tx(sid), ELSEWHERE)], height=HEIGHT + 1)
-    oracle.check(ch)                      # the cancel used no sequence number
-    assert ch.book.knows(bytes.fromhex(sid)) and ch.book.get(bytes.fromhex(sid)) is not None
+    result = ch.block([on_network(cancel_tx(), ELSEWHERE)], height=HEIGHT + 1)
+    oracle.check(ch)                      # the revoke used no sequence number
+    assert _rule(ch).rule_id.hex() == rid(tx)
     assert "another network" in _logs(result)
 
-    ch.block([cancel_tx(sid)], height=HEIGHT + 2)
+    ch.block([cancel_tx()], height=HEIGHT + 2)
     oracle.cancel(ALICE)
     oracle.check(ch)
-    assert ch.book.get(bytes.fromhex(sid)) is None
+    assert _rule(ch) is None
 
 
-def test_a_refused_transaction_does_not_hold_up_the_next_one_in_the_block():
+def test_a_refused_transaction_does_not_hold_up_the_next_one_in_the_block(evs):
     ch, oracle = Chain(_balances(), fee=7), Oracle(_balances())
     good = create_tx()
     ch.block([on_network(create_tx(), ELSEWHERE), good])
     oracle.create(good, fee=7)
     oracle.check(ch)
-    assert ch.book.knows(bytes.fromhex(sid_of(good)))
+    assert _rule(ch).rule_id.hex() == rid(good)
 
 
-def test_replay_gives_the_same_state_with_a_refused_transaction_in_the_block():
+def test_replay_gives_the_same_state_with_a_refused_transaction_in_the_block(evs):
     txs = [on_network(create_tx(), ELSEWHERE), create_tx()]
     fresh, again = Chain(_balances(), fee=7), Chain(_balances(), fee=7)
     fresh.block([dict(t) for t in txs])
@@ -284,13 +306,13 @@ def test_replay_gives_the_same_state_with_a_refused_transaction_in_the_block():
 # --- the CLI ----------------------------------------------------------------------
 
 def test_the_cli_names_the_network_only_where_it_is_signed():
-    bound = tx_mod.bind_to_network({"tx_type": "standing_payment_create"}, HERE)
+    bound = tx_mod.bind_to_network({"tx_type": "payout_rule_set"}, HERE)
     assert bound[FIELD] == HERE
     plain = tx_mod.bind_to_network({"tx_type": "user_tx"}, HERE)
     assert FIELD not in plain
     assert FIELD not in tx_mod.bind_to_network({"tx_type": "user_tx"}, "")
     with pytest.raises(ValueError, match="did not report its genesis hash"):
-        tx_mod.bind_to_network({"tx_type": "standing_payment_cancel"}, "")
+        tx_mod.bind_to_network({"tx_type": "payout_rule_revoke"}, "")
 
 
 def _run_cli(argv, sequence_answer):
@@ -322,23 +344,24 @@ def alice_key(tmp_path, monkeypatch):
     return json.loads((tmp_path / "alice.json").read_text())["public_key_hex"]
 
 
-STANDING_CREATE = ["standing", "create", "--key", "alice", "--to", BOB, "--amount", "25",
-                   "--every-blocks", "200", "--periods", "3", "--first-due-in", "20"]
+PAYOUT_SET = ["payout", "set", "--key", "alice", "--body", RULE, "--slot", BOB,
+              "--cap-per-execution", "25", "--cap-per-period", "50",
+              "--period-blocks", "10", "--ends-in", "200"]
 
 
-def test_cli_signs_a_standing_payment_for_the_network_the_node_reports(alice_key):
+def test_cli_signs_a_payout_rule_for_the_network_the_node_reports(alice_key):
     rc, sent, recorded, err = _run_cli(
-        STANDING_CREATE,
+        PAYOUT_SET,
         {"address": alice_key, "sequence_number": 2, "tip_height": 40, "genesis_hash": HERE},
     )
     assert rc == 0, err
     assert [c.split()[0] for c in recorded] == ["getsequence", "checktx", "sendtx"]
     (payload,) = sent
-    assert payload["tx_type"] == "standing_payment_create" and payload[FIELD] == HERE
+    assert payload["tx_type"] == "payout_rule_set" and payload[FIELD] == HERE
     assert verify_tx_signature(payload)[0] and problem(payload) is None
 
     rc, sent, _, err = _run_cli(
-        ["standing", "cancel", "--key", "alice", "ab" * 32],
+        ["payout", "revoke", "--key", "alice"],
         {"address": alice_key, "sequence_number": 3, "tip_height": 40, "genesis_hash": HERE},
     )
     assert rc == 0, err
@@ -347,7 +370,7 @@ def test_cli_signs_a_standing_payment_for_the_network_the_node_reports(alice_key
 
 def test_cli_sends_nothing_when_the_node_names_no_network(alice_key):
     rc, sent, recorded, err = _run_cli(
-        STANDING_CREATE,
+        PAYOUT_SET,
         {"address": alice_key, "sequence_number": 2, "tip_height": 40},   # an older node
     )
     assert rc != 0 and sent == []
@@ -367,6 +390,5 @@ def test_cli_leaves_a_plain_transfer_as_it_was(alice_key):
 def test_every_bound_type_is_a_type_the_node_knows():
     from commands.sendtx import _get_signing_message_bytes  # noqa: F401  (import check)
     from consensus.payout import PAYOUT_TX_TYPES
-    from consensus.standing import STANDING_TX_TYPES
 
-    assert set(STANDING_TX_TYPES) | set(PAYOUT_TX_TYPES) <= BOUND_TX_TYPES
+    assert set(PAYOUT_TX_TYPES) <= BOUND_TX_TYPES

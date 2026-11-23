@@ -401,8 +401,7 @@ period. It must be before `expires_at`.
 the future and before `expires_at`. In the first block whose clock reaches it,
 the node steps the rule once, with nobody sending a transaction:
 
-- It runs after the block's transactions and the standing-payment sweep, and
-  before expiries.
+- It runs after the block's transactions and before expiries.
 - There is no executor (`i13` is 0), no named recipient and no executor data
   (`i40+k` are 0). So only fixed slots can be paid, and a rule whose first line
   asks for a certain executor does not pay on that line.
@@ -418,8 +417,7 @@ the node steps the rule once, with nobody sending a transaction:
 - It costs nothing beyond the fee of the transaction that installed the rule.
 - At most 16 rules are run this way per block, earliest due point first; the
   rest follow in the next blocks, and a rule whose due point has not run yet is
-  kept past its end until it has. An idle chain seals a block for a due point
-  like it does for a due standing payment.
+  kept past its end until it has. An idle chain seals a block for a due point.
 
 A rule that pays per sale cannot carry a due point (the node names no sale),
 nor can a rule with only open slots. A node that takes the installing
@@ -467,7 +465,7 @@ has to ask it. There are three ways, and a rule is signed for the ones it wants:
 | A payment that arrives | `on_arrival` (with `per_sale`) | the payer, for its own payment only |
 
 None of the three knows what the rule is for. The node only decides when it asks
-and with which inputs; the answer is the rule's. So a standing payment and a
+and with which inputs; the answer is the rule's. So a recurring payment and a
 share routed from every incoming payment are payout rules like any other.
 
 ### The clock, again and again
@@ -550,9 +548,8 @@ paid 101 and the fee of its own transaction. The shop need not be online.
   what went to which slot: the gross, the shares and so the net.
 - A sale is a transfer someone signs to the account, as for every rule that
   pays per sale. A retractable transfer released to the account, a transfer
-  released by approvers and a standing payment are not sales.
-- Money the node moves is never a sale: a payout leg, a standing payment, a
-  released transfer. So a share one rule pays out is not shared again by the
+  released by approvers and a payment the node makes by a rule are not sales.
+- Money the node moves is never a sale: a payout leg, a released transfer. So a share one rule pays out is not shared again by the
   rule of the account that receives it. Only a payment someone signs is.
 - At most 16 runs a block. More than that wait in the rule's open sales for the
   next blocks, and an idle chain seals a block for them. No sale is turned
@@ -584,8 +581,7 @@ While a sealed rule is installed:
   charged and no sequence number is used;
 - the rule cannot be replaced or revoked, by a transaction or by a rule-change
   request that was already waiting;
-- transfers the account had parked for approval end as failed, and a standing
-  payment it signed earlier pays nothing (each attempt counts as blocked);
+- transfers the account had parked for approval end as failed;
 - money still comes in, and money leaves by the rule: executions others send,
   and the runs the node makes.
 
@@ -610,7 +606,7 @@ with its key, votes and approvals included.
 `tests/test_payout_triggers.py` pins all of this without an engine, including
 that every rule from before is byte for byte the rule it was;
 `tests/test_payout_triggers_native.py` runs the rules above on the real engine;
-`scripts/e2e_payout_triggers.py` runs a standing payment, a route and a sealed
+`scripts/e2e_payout_triggers.py` runs a recurring payment, a route and a sealed
 account on two live nodes.
 
 ## Inspecting
@@ -689,7 +685,7 @@ Apply reasons in receipts: `payout_rule_not_set`, `payout_rule_not_revoked`,
 Every field above is in the signed bytes (`per_sale`, `periods_from`, `due_at` and `sale_id` when present). `recipients` keys are slot numbers,
 `data` keys are k for input `i40+k`. `genesis_hash` is the hash of block 0 of the
 network (`getsequence` returns it, the CLI fills it in): all three types are bound to
-one network like standing payments (`consensus/network_binding.py`), so a rule or an
+one network (`consensus/network_binding.py`), so a rule or an
 execution signed for another network is refused here.
 
 ## Consensus notes
@@ -705,14 +701,14 @@ execution signed for another network is refused here.
   nothing, and the state hash shows it.
 - Expiry runs after the block's transactions, before rule-change releases; an
   execution in the expiry block is refused by its clock check.
-- Due points run after the block's transactions and the standing-payment sweep,
+- Due points run after the block's transactions and the runs on arrival,
   before expiries, in the order (due point, account) with rules on the block
   clock first. Such a run reads the balance the block has reached, which every
   node has computed the same way by then.
 - A rule with an optional term, or one that reads `i48` or `i49`, carries a
   second part in its book entry (the terms, the last paid clock, whether the
   due point has run). Every other rule hashes exactly as before.
-- Runs on arrival come after the standing-payment sweep and before the due
+- Runs on arrival come after the block's transactions and before the due
   points, in the order (position among the account's waiting sales, block that
   recorded the sale, account). A rule with `due_every`, `due_months`, `on_arrival` or
   `sealed` adds those terms and the number of its next due point to the second
@@ -783,6 +779,6 @@ replay could not run the rule; nothing moves, and the state hash says so.
 ## Not in this release
 
 - More than one rule per account.
-- A run on arrival for money the node itself moved (a payout leg, a standing
-  payment, a released transfer): only a signed payment is a sale.
+- A run on arrival for money the node itself moved (a payout leg, a released
+  transfer): only a signed payment is a sale.
 - Executor data wider than `bv[24]`.

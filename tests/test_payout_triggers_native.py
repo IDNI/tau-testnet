@@ -1,6 +1,6 @@
 """Three ways a payout rule is started, on the REAL Tau engine.
 
-A standing payment and a share routed from each incoming payment, each as ONE
+A recurring payment and a share routed from each incoming payment, each as ONE
 Tau rule on the payout path, with the node code of `consensus/payout.py` and
 nothing else. The node decides only when it asks the rule: at the signed due
 points, and when a payment arrives. What is paid, to whom and under which

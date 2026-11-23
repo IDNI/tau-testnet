@@ -3,7 +3,7 @@
 A payout rule is stepped when someone sends an execution. Two more ways, both
 signed with the rule and both generic: the clock (`due_at`, repeated by
 `due_every` or `due_months`) and an arriving payment (`on_arrival` on a rule
-that pays per sale). With them a standing payment and a share routed from each
+that pays per sale). With them a recurring payment and a share routed from each
 incoming payment are payout rules like any other: the Tau rule decides the
 amounts, the node only decides when it asks. `sealed` closes the account for
 its own key until the rule ends, so money leaves by the rule and by nothing
@@ -42,18 +42,18 @@ from tests.bls_keys import pubkey_hex
 from tests.test_payout_apply import _events, _reason, exec_tx, revoke_tx, rid, set_tx
 from tests.test_payout_options import NOW, NOW_TS, PACED, fields, seconds, terms
 from tests.test_payout_sales import _sale_id
-from tests.test_standing_apply import (
-    ALICE, BOB, CAROL, EVERY, HEIGHT, PROPOSER, SKS, TS, Chain, _sign, create_tx, spend_tx,
+from tests.chain_harness import (
+    ALICE, BOB, CAROL, HEIGHT, PROPOSER, SKS, TS, Chain, _sign, spend_tx,
 )
 
 A, B, C, D = pubkey_hex(0x1A), pubkey_hex(0x2B), pubkey_hex(0x3C), pubkey_hex(0x4D)
 DAY = 86_400
 STEP = MIN_DUE_EVERY_BLOCKS
 
-# A standing payment: 100 to slot 0 whenever the node itself runs the rule.
-STANDING = ("always ( (i13[t]:bv[384] = { 0 }:bv[384]) "
+# A recurring payment: 100 to slot 0 whenever the node itself runs the rule.
+RECURRING = ("always ( (i13[t]:bv[384] = { 0 }:bv[384]) "
             "? (o30[t]:bv[24] = { 100 }:bv[24]) : (o30[t]:bv[24] = { 0 }:bv[24]) ).")
-STANDING_BODY = payout_rule_body(STANDING)
+RECURRING_BODY = payout_rule_body(RECURRING)
 # A route: a fifth of every payment that arrives goes to slot 0.
 ROUTE = "always ( o30[t]:bv[24] = i27[t]:bv[24] / { 5 }:bv[24] )."
 ROUTE_BODY = payout_rule_body(ROUTE)
@@ -473,7 +473,7 @@ def evs():
         out[pool] = MockPolicyEvaluator(pool=pool)
         sender_policy.set_evaluator(pool, out[pool])
     pay = out["payout_apply"]
-    pay.set_outputs(STANDING_BODY, lambda i: {"o30": "100" if i.get("i13") == "0" else "0"})
+    pay.set_outputs(RECURRING_BODY, lambda i: {"o30": "100" if i.get("i13") == "0" else "0"})
     pay.set_outputs(ROUTE_BODY, lambda i: {"o30": str(int(i.get("i27", "0")) // 5)})
     pay.set_outputs(HALF_BODY, lambda i: {"o30": str(int(i.get("i27", "0")) // 2)})
     pay.set_outputs(payout_rule_body("always ( o30[t]:bv[24] = i40[t]:bv[24] )."),
@@ -487,12 +487,12 @@ def _bal(**over):
     return dict({ALICE: 1_000, BOB: 0, CAROL: 500, PROPOSER: 0}, **over)
 
 
-def _standing(fee=0, balances=None, **kw):
+def _recurring(fee=0, balances=None, **kw):
     kw.setdefault("due_at", HEIGHT + 5)
     kw.setdefault("due_every", STEP)
     kw.setdefault("expires_at", HEIGHT + 5 + 10 * STEP)
     ch = Chain(balances or _bal(), fee=fee)
-    tx = set_tx(rule=STANDING, cap_exec=100, cap_period=100, **kw)
+    tx = set_tx(rule=RECURRING, cap_exec=100, cap_period=100, **kw)
     ch.block([tx])
     assert ch.lm.payout_rules.get(ALICE) is not None, _reason(ch.last, tx)
     return ch, tx
@@ -502,8 +502,8 @@ def _outcomes(ch):
     return [e["outcome"] for e in _events(ch)]
 
 
-def test_a_standing_payment_as_a_rule_pays_once_at_each_due_point_and_nobody_pays_a_fee(evs):
-    ch, tx = _standing(fee=7)
+def test_a_recurring_payment_as_a_rule_pays_once_at_each_due_point_and_nobody_pays_a_fee(evs):
+    ch, tx = _recurring(fee=7)
     assert (ch.bal[ALICE], ch.bal[PROPOSER]) == (993, 7)   # the one fee: the install's
     ch.block([], height=HEIGHT + 4, ts=TS + 4)
     assert _events(ch) == []
@@ -524,8 +524,8 @@ def test_a_standing_payment_as_a_rule_pays_once_at_each_due_point_and_nobody_pay
     assert [i["i13"] for _, i in evs["payout_apply"].output_calls] == ["0", "0"]
 
 
-def test_nobody_can_execute_the_standing_rule_for_more_or_at_another_time(evs):
-    ch, tx = _standing()
+def test_nobody_can_execute_the_recurring_rule_for_more_or_at_another_time(evs):
+    ch, tx = _recurring()
     early = exec_tx(rule_id=rid(tx), data={"0": 100})
     ch.block([early], height=HEIGHT + 2, ts=TS + 2)
     assert _reason(ch.last, early) == "payout_not_executed"
@@ -533,7 +533,7 @@ def test_nobody_can_execute_the_standing_rule_for_more_or_at_another_time(evs):
 
 
 def test_an_unfunded_due_point_pays_nothing_owes_nothing_and_the_next_one_pays(evs):
-    ch, tx = _standing(balances=_bal(**{ALICE: 60}))
+    ch, tx = _recurring(balances=_bal(**{ALICE: 60}))
     ch.block([], height=HEIGHT + 5, ts=TS + 5)
     event, = _events(ch)
     assert event["outcome"] == "due_not_paid" and "holds 60" in event["reason"]
@@ -548,7 +548,7 @@ def test_an_unfunded_due_point_pays_nothing_owes_nothing_and_the_next_one_pays(e
 
 
 def test_due_points_the_chain_slept_through_are_not_paid_later(evs):
-    ch, tx = _standing()
+    ch, tx = _recurring()
     ch.block([], height=HEIGHT + 5 + 3 * STEP + 9, ts=TS + 5)
     assert [(e["due_index"], e["total"]) for e in _events(ch)] == [(0, 100)]
     ch.block([], height=HEIGHT + 5 + 3 * STEP + 10, ts=TS + 6)
@@ -560,7 +560,7 @@ def test_due_points_the_chain_slept_through_are_not_paid_later(evs):
 
 
 def test_revoking_the_rule_stops_every_later_run_and_a_revoke_wins_in_its_block(evs):
-    ch, tx = _standing()
+    ch, tx = _recurring()
     ch.block([revoke_tx()], height=HEIGHT + 5, ts=TS + 5)
     assert _outcomes(ch) == ["revoked"]
     ch.block([], height=HEIGHT + 5 + STEP, ts=TS + 6)
@@ -568,7 +568,7 @@ def test_revoking_the_rule_stops_every_later_run_and_a_revoke_wins_in_its_block(
 
 
 def test_the_last_due_point_runs_and_then_the_rule_ends(evs):
-    ch, tx = _standing(expires_at=HEIGHT + 5 + STEP + 1)
+    ch, tx = _recurring(expires_at=HEIGHT + 5 + STEP + 1)
     ch.block([], height=HEIGHT + 5, ts=TS + 5)
     ch.block([], height=HEIGHT + 5 + STEP + 3, ts=TS + 6)  # past the end, point 1 still owed
     assert _outcomes(ch) == ["executed", "expired"]
@@ -578,7 +578,7 @@ def test_the_last_due_point_runs_and_then_the_rule_ends(evs):
 def test_a_monthly_rule_on_the_31st_pays_on_the_last_day_of_february(evs):
     jan31 = TS + 30 * DAY
     ch = Chain(_bal())
-    tx = set_tx(rule=STANDING, cap_exec=100, cap_period=100, clock="period_seconds",
+    tx = set_tx(rule=RECURRING, cap_exec=100, cap_period=100, clock="period_seconds",
                 period=DAY, expires_at=TS + 200 * DAY, due_at=jan31, due_months=1)
     ch.block([tx])
     assert ch.lm.payout_rules.get(ALICE) is not None, _reason(ch.last, tx)
@@ -593,7 +593,7 @@ def test_a_monthly_rule_on_the_31st_pays_on_the_last_day_of_february(evs):
 
 
 def test_replay_without_an_evaluator_marks_the_due_point_and_moves_nothing(evs):
-    ch, tx = _standing()
+    ch, tx = _recurring()
     sender_policy.set_evaluator("payout_apply", None)
     ch.block([], height=HEIGHT + 5, ts=TS + 5, replay=True)
     assert _outcomes(ch) == ["due_not_paid"]
@@ -603,7 +603,7 @@ def test_replay_without_an_evaluator_marks_the_due_point_and_moves_nothing(evs):
 def test_the_same_blocks_give_the_same_state_and_a_run_moves_the_hash(evs):
     def run(with_rule):
         ch = Chain(_bal())
-        ch.block([set_tx(rule=STANDING, cap_exec=100, cap_period=100, due_at=HEIGHT + 5,
+        ch.block([set_tx(rule=RECURRING, cap_exec=100, cap_period=100, due_at=HEIGHT + 5,
                          due_every=STEP, expires_at=HEIGHT + 5 + 10 * STEP)]
                  if with_rule else [])
         ch.block([], height=HEIGHT + 5, ts=TS + 5)
@@ -736,14 +736,12 @@ def test_a_sealed_account_signs_nothing_and_pays_no_fee_for_trying(evs):
     ch, tx = _sealed(fee=5)
     before = dict(ch.bal)
     tries = [spend_tx(ALICE, CAROL, 900, 1), revoke_tx(ALICE, 1),
-             set_tx(ALICE, 1, rule=SPEND, slots=[CAROL], cap_exec=1_000, cap_period=1_000),
-             create_tx(ALICE, CAROL, 900, 1, first_due=HEIGHT + 3)]
+             set_tx(ALICE, 1, rule=SPEND, slots=[CAROL], cap_exec=1_000, cap_period=1_000)]
     for n, attempt in enumerate(tries):
         result = ch.block([attempt], height=HEIGHT + 1 + n, ts=TS + 1 + n)
         assert _reason(result, attempt) == "account_sealed"
         assert _events(ch) == [] and ch.bal == before and ch.seq == {ALICE: 1}
     assert ch.lm.payout_rules.get(ALICE).rule_id.hex() == rid(tx)
-    assert not ch.lm.standing_payments.terms
 
 
 def test_money_leaves_a_sealed_account_by_its_rule_and_money_still_comes_in(evs):
@@ -772,25 +770,6 @@ def test_a_seal_set_in_a_block_holds_for_the_rest_of_that_block(evs):
     result = ch.block([seal, after])
     assert ch.lm.payout_rules.sealed(ALICE) and _reason(result, after) == "account_sealed"
     assert ch.bal[ALICE] == 1_000 and ch.seq == {ALICE: 1}
-
-
-def test_a_standing_payment_signed_before_the_seal_pays_nothing_while_it_holds(evs):
-    ch = Chain(_bal())
-    order = create_tx(ALICE, CAROL, 900, 0, first_due=HEIGHT + 5, interval=EVERY, periods=2)
-    ch.block([order])
-    assert ch.lm.standing_payments.terms
-    seal = set_tx(ALICE, 1, rule=SPEND, sealed=True, cap_exec=400, cap_period=400,
-                  expires_at=HEIGHT + 6)
-    ch.block([seal], height=HEIGHT + 1, ts=TS + 1)
-    assert ch.lm.payout_rules.sealed(ALICE), _reason(ch.last, seal)
-    ch.block([], height=HEIGHT + 5, ts=TS + 5)
-    assert [o for o, _ in ch.outcomes()] == ["missed"]     # blocked, as a clause blocks one
-    assert (ch.bal[ALICE], ch.bal[CAROL]) == (1_000, 500)
-    ch.block([], height=HEIGHT + 6, ts=TS + 6)             # the seal ends with the rule
-    assert not ch.lm.payout_rules.sealed(ALICE)
-    ch.block([], height=HEIGHT + 5 + EVERY, ts=TS + 7)
-    assert [o for o, _ in ch.outcomes()] == ["paid", "ended"]
-    assert (ch.bal[ALICE], ch.bal[CAROL]) == (100, 1_400)
 
 
 def test_sealing_ends_the_transfers_the_account_had_parked(evs, monkeypatch):

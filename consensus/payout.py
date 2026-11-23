@@ -64,7 +64,7 @@ first period.
 
 `due_at`: a point on the rule's clock at which the node runs the rule itself,
 once, with no executor and no named recipient: in the first block whose clock
-reaches it, after the block's transactions and the standing-payment sweep, at
+reaches it, after the block's transactions and the runs on arrival, at
 most MAX_PAYOUT_DUE_RUNS_PER_BLOCK rules a block (the rest wait for the next
 blocks, earliest due point first). The run is an execution like any other (the
 rule is stepped once, all slots are paid or none, both caps and the balance
@@ -209,6 +209,55 @@ def abi_width(name: str, slot_count: int = MAX_SLOTS, per_sale: bool = False) ->
     return None
 
 
+# --- Calendar (integer arithmetic, proleptic Gregorian, UTC) -------------------
+
+
+def _days_from_civil(year: int, month: int, day: int) -> int:
+    """Days since 1970-01-01 for a valid date (H. Hinnant's algorithm)."""
+    year -= month <= 2
+    era = year // 400
+    yoe = year - era * 400
+    doy = (153 * (month + (-3 if month > 2 else 9)) + 2) // 5 + day - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _civil_from_days(days: int) -> Tuple[int, int, int]:
+    """(year, month, day) of a day count since 1970-01-01."""
+    days += 719468
+    era = days // 146097
+    doe = days - era * 146097
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    day = doy - (153 * mp + 2) // 5 + 1
+    month = mp + 3 if mp < 10 else mp - 9
+    return yoe + era * 400 + (month <= 2), month, day
+
+
+def _month_length(year: int, month: int) -> int:
+    if month == 2:
+        leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+        return 29 if leap else 28
+    return 30 if month in (4, 6, 9, 11) else 31
+
+
+def add_months(anchor: int, months: int) -> int:
+    """`anchor` moved by whole calendar months, keeping day and time of day.
+
+    A day the target month does not have becomes its last day: a schedule
+    anchored on the 31st pays on 30 April and on 28 or 29 February. Each due
+    point is derived from the anchor, never from the previous due point, so the
+    31st comes back in May (no drift).
+    """
+    days, seconds = divmod(int(anchor), 86400)
+    year, month, day = _civil_from_days(days)
+    total = (month - 1) + int(months)
+    year, month = year + total // 12, total % 12 + 1
+    day = min(day, _month_length(year, month))
+    return _days_from_civil(year, month, day) * 86400 + seconds
+
+
 # --- Terms and state -------------------------------------------------------------
 
 
@@ -219,8 +268,6 @@ def due_point_of(due_at: int, due_every: Optional[int], due_months: Optional[int
     for the 31st runs on the last day of a shorter month and comes back to the
     31st."""
     if due_months is not None:
-        from consensus.standing import add_months
-
         return add_months(int(due_at), int(index) * int(due_months))
     if due_every is not None:
         return int(due_at) + int(index) * int(due_every)

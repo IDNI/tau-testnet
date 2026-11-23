@@ -42,7 +42,7 @@ from tests.test_miner_retractable_wake import (  # noqa: F401  (`node` is a fixt
     RECIPIENT, SENDER, head_number, node,
 )
 from tests.test_payout_apply import _bal, _events, _executed, exec_tx, rid, set_tx
-from tests.test_standing_apply import (
+from tests.chain_harness import (
     ALICE, BOB, CAROL, HEIGHT, PROPOSER, SKS, TS, Chain, Oracle, _logs, _sign,
 )
 

@@ -179,8 +179,6 @@ The full registry (31 names, `app/container.py`):
 | `getretractable` | `getretractable <retractable_id>` — 64 hex chars |
 | `getretractables` | `getretractables <address> [in\|out\|all]` (default `all`) |
 | `getretractableid` | `getretractableid <json_payload>` |
-| `getstandingpayments` | `getstandingpayments <address> [out\|in\|all]` (default `all`) |
-| `getstandingpayment` | `getstandingpayment <standing_id>` — 64 hex chars |
 | `getpayoutrule` | `getpayoutrule <address>` |
 
 `gettimestamp` and `getcurrenttimestamp` share one handler, and it hardcodes
@@ -450,7 +448,7 @@ connection/timeout errors.
 
 `--fee <n>` sets `fee_limit`. Without `--fee`, a fee-bearing command (`tx send`,
 `rule offer|accept|reject`, `approval request`, `retractable send`,
-`standing create`, `payout set`, `payout execute`) signs a
+`payout set`, `payout execute`) signs a
 draft with `fee_limit` 0, asks the node with `checktx estimate`, and signs the
 transaction again with the estimate as `fee_limit`. The estimate does not
 depend on the draft's `fee_limit`. On `ESTIMATE_BUSY`, the CLI asks again up to
@@ -462,7 +460,7 @@ A sender that cannot pay the estimated fee gets `INSUFFICIENT_FUNDS` and no
 estimate, even with `--fee`. Fund the sender first.
 
 The fee-exempt commands have no `--fee`: `approval approve`, `approval decline`,
-`retractable retract`, `standing cancel`, `payout revoke`, `gov propose` and
+`retractable retract`, `payout revoke`, `gov propose` and
 `gov vote`. They sign `fee_limit` 0.
 
 ## Rule sharing
@@ -577,49 +575,6 @@ RPC replies:
 - `gettxstatus` adds `retractable: {id, status}` to a confirmed park and
   `retracts` to a confirmed retract. `getaccountstate` adds `escrowed_out` and
   `escrowed_in`, and a queued park counts as `pending_outgoing`.
-
-## Standing payments
-
-Sign once to pay a fixed amount to a fixed recipient every period, until the
-last period or a cancel. Semantics are in the
-[README](../README.md#standing-payments).
-Long-form guide: [standing_payments.md](standing_payments.md).
-
-```bash
-tau-testnet standing create --key alice --to <pk> --amount 25 --periods 12 --every-months 1 --first-due-time 1798761600
-tau-testnet standing create --key alice --to <pk> --amount 10 --periods 52 --every-seconds 604800 --first-due-after 3600
-tau-testnet standing create --key alice --to <pk> --amount 5 --periods 10 --every-blocks 1000 --first-due-in 50
-tau-testnet standing list --key alice --role out
-tau-testnet standing show <standing_id>
-tau-testnet standing cancel --key alice <standing_id>
-```
-
-Exactly one of `--every-blocks`, `--every-seconds`, `--every-months`, and one
-first-due flag: `--first-due-height` or `--first-due-in` for a block schedule,
-`--first-due-time` or `--first-due-after` for a time or month schedule.
-`--first-due-in N` counts from the next block, like `--expire-in`. The CLI clamps
-`expire_at_height` to the first due height, or `expiration_time` below the first
-due time, because admission refuses a create that could be mined at or after its
-own first payment. `create` prints the standing payment id.
-
-Raw transactions (root fields only; a nested `payload` is ignored):
-
-| `tx_type` | Signed fields beyond the envelope |
-|---|---|
-| `standing_payment_create` | `genesis_hash`, `recipient_pubkey`, `amount`, exactly one of `interval_blocks` / `interval_seconds` / `interval_months`, `first_due`, `periods` |
-| `standing_payment_cancel` | `genesis_hash`, `standing_id` (feeless) |
-
-RPC replies:
-
-- `getstandingpayments` returns `payments` (open authorizations the address pays
-  or receives, each with its terms, current period window, `status`
-  `waiting`/`due`/`retrying` and counts), `block_hash`, and `semantics` (the
-  node's rules and limits for the feature).
-- `getstandingpayment` returns the open entry with its `history`, or
-  `{standing_id, status: "ended"|"cancelled", resolved_at_height, history}` once
-  resolved on the canonical chain, or `STANDING_PAYMENT_UNKNOWN`.
-- `gettxstatus` adds `standing: {id, status}` to a confirmed create and
-  `cancels` to a confirmed cancel.
 
 ## Payout rules
 

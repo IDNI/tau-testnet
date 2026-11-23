@@ -4,7 +4,7 @@ the native Tau engine.
 
 A payout rule is stepped when someone sends an execution. Here the node also
 steps it by the clock, again and again, and when a payment arrives. With that a
-standing payment and a share routed from every incoming payment are payout
+recurring payment and a share routed from every incoming payment are payout
 rules like any other, and a sealed account holds money its own key cannot move.
 
     due_at + due_every   Alice's account pays Bob 100 at a block she signed and
@@ -22,7 +22,7 @@ RPC port and the CLI; node B receives A's blocks only. The clock is the block
 height, so the run takes minutes.
 
 SCENARIOS (balances through an accounting oracle, fees to the miner included)
-    1. Alice installs the standing rule. At the signed block Bob has 100 more,
+    1. Alice installs the recurring rule. At the signed block Bob has 100 more,
        in a block with no transaction. The blocks after it pay nothing.
     2. The shop installs the route. Carol pays 101: the creator has 20, the
        shop 81, Carol paid 101 and her one fee. 4 is too small to share. Two
@@ -124,8 +124,8 @@ def pay(rig, orc, who, to, amount, label):
 # scenarios
 # --------------------------------------------------------------------------- #
 
-def scenario_standing(rig, st):
-    say("1. A standing payment as a rule: the clock starts it, again and again")
+def scenario_recurring(rig, st):
+    say("1. A recurring payment as a rule: the clock starts it, again and again")
     orc = Oracle(rig, "1", ("alice", "bob"))
     st["rent_due"] = rig.a.height() + 5
     ok, out = install(rig, "alice", RENT_RULE, "--slot", rig.pk["bob"],
@@ -348,7 +348,7 @@ def run(root: str) -> int:
     try:
         if rig.start():
             rig.mine()
-            scenario_standing(rig, st)
+            scenario_recurring(rig, st)
             scenario_route(rig, st)
             scenario_no_second_hop(rig, st)
             scenario_seal(rig, st)
