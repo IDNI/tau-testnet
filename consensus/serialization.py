@@ -930,6 +930,7 @@ def _encode_payout_terms(
     period: int,
     expires_at: int,
     sealed: bool = False,
+    options: bytes = b"",
 ) -> bytes:
     out = bytearray()
     out.extend(encode_pubkey48(account_pubkey))
@@ -949,6 +950,7 @@ def _encode_payout_terms(
     out.extend(encode_uint64(int(period)))
     out.extend(encode_uint64(int(expires_at)))
     out.extend(b"\x01" if sealed else b"\x00")
+    out.extend(bytes(options))
     return bytes(out)
 
 
@@ -964,24 +966,27 @@ def compute_payout_rule_id(
     expires_at: int,
     per_sale: bool = False,
     sealed: bool = False,
+    options: bytes = b"",
 ) -> bytes:
     """BLAKE3 of the signed terms of a payout rule. Returns 32 bytes.
 
     An execution names the id it was signed against, so a rule replaced between
     signing and inclusion cannot be executed with inputs meant for another one.
+    `options` is empty for a rule without optional terms, so such a rule keeps
+    the id it always had.
     """
     out = bytearray()
     domain = DOMAIN_PAYOUT_RULE_PER_SALE_V1 if per_sale else DOMAIN_PAYOUT_RULE_V1
     out.extend(encode_string(domain.decode()))
     out.extend(_encode_payout_terms(
         account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
-        cap_per_period, kind, period, expires_at, sealed,
+        cap_per_period, kind, period, expires_at, sealed, options,
     ))
     return blake3(bytes(out)).digest()
 
 
 def compute_payout_resolved_acc(acc: Any, rule_id: Any, outcome: int) -> bytes:
-    """Fold one removal (revoked, expired, replaced) into the running commitment."""
+    """Fold one removal (revoked, expired, replaced, superseded) into the running commitment."""
     out = bytearray()
     out.extend(encode_string(DOMAIN_PAYOUT_RESOLVED_V1.decode()))
     out.extend(encode_hash32(acc))
@@ -1009,12 +1014,18 @@ def encode_payout_entry(
     last_height: int,
     sealed: bool = False,
     sales: Any = None,
+    more: Any = None,
 ) -> bytes:
     """The signed terms, then where the rule stands: the period caps depend on it.
 
     `sales`, only for a rule that pays per sale: (missed, open sales), each open
-    sale (sale_id, payer, amount, height). Which sales are still payable is state
-    every node must agree on, so it is part of the entry.
+    sale (sale_id, payer, amount, height, kind). Which sales are still payable is
+    state every node must agree on, so it is part of the entry.
+
+    `more`, only for an extended rule (optional terms or a rule that reads the
+    kept clocks): (periods_from, due_at, last_clock, due_done, due_every,
+    due_months, on_arrival, due_index, missed, max_fee_per_execution, version,
+    lineage). A rule without it keeps the entry it always had.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -1034,11 +1045,46 @@ def encode_payout_entry(
         out.extend(b"\x01")
         out.extend(encode_uint64(int(missed)))
         out.extend(encode_uint32(len(open_sales)))
-        for sale_id, payer, amount, height in open_sales:
+        for entry in open_sales:
+            sale_id, payer, amount, height = entry[0], entry[1], entry[2], entry[3]
+            kind = entry[4] if len(entry) > 4 else "user_tx"
             out.extend(encode_hash32(sale_id))
             out.extend(encode_pubkey48(payer))
             out.extend(encode_uint64(int(amount)))
             out.extend(encode_uint64(int(height)))
+            out.extend(encode_string(str(kind)))
+    else:
+        out.extend(b"\x00")
+    if more is not None:
+        (periods_from, due_at, last_clock, due_done, due_every, due_months,
+         on_arrival, due_index, missed, max_fee, version, lineage) = more
+        out.extend(b"\x01")
+        for value in (periods_from, due_at):
+            if value is None:
+                out.extend(b"\x00")
+            else:
+                out.extend(b"\x01")
+                out.extend(encode_uint64(int(value)))
+        out.extend(encode_uint64(int(last_clock)))
+        out.extend(b"\x01" if due_done else b"\x00")
+        for value in (due_every, due_months):
+            if value is None:
+                out.extend(b"\x00")
+            else:
+                out.extend(b"\x01")
+                out.extend(encode_uint64(int(value)))
+        out.extend(b"\x01" if on_arrival else b"\x00")
+        out.extend(encode_uint64(int(due_index)))
+        out.extend(encode_uint64(int(missed)))
+        if max_fee is None:
+            out.extend(b"\x00")
+        else:
+            out.extend(b"\x01")
+            out.extend(encode_uint64(int(max_fee)))
+        out.extend(encode_uint64(int(version)))
+        out.extend(encode_hash32(bytes.fromhex(lineage)))
+    else:
+        out.extend(b"\x00")
     return bytes(out)
 
 

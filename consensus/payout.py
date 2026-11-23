@@ -1,9 +1,11 @@
 """Payout rules: an account's money paid out by a rule it installed (#63).
 
-An account installs ONE payout rule with `payout_rule_set`: a Tau clause, up to
-eight recipient slots, a cap per execution, a cap per period and an end. From
-then on anyone may send `payout_execute` naming the account, the rule's id and
-the inputs the rule reads. The node steps the clause once in an isolated policy
+An account installs payout rules with `payout_rule_set`: a Tau clause, up to
+eight recipient slots, a cap per execution, a cap per period and an end. One
+account may hold MANY independent rules (each with its own id, caps and
+schedule); installing a second rule does not touch the first. From then on
+anyone may send `payout_execute` naming the account, the rule's id and the
+inputs the rule reads. The node steps the clause once in an isolated policy
 worker, reads one amount per slot, and pays all of them or none:
 
     total = sum of the slot amounts
@@ -16,12 +18,18 @@ the recipient, and the rule sees it as an input and decides what it may get).
 
 The rule is a second, separate authorization for the account's money, chosen
 by the account: the o5 clause governs transfers the account signs, the payout
-rule governs executions. Installing, replacing and revoking a payout rule are
+rule governs executions. Installing, updating and revoking a payout rule are
 rule changes, so an account's rule-change guard judges them (kinds 6 and 7) and
 a guarded account installs one through a rule-change request. An escrow account
 therefore locks its money to its payout rule with three things: a payout rule,
 an o5 clause that blocks signed transfers, and a guard that needs co-signers
 for any rule change.
+
+An update (`payout_rule_update`) never mutates the old terms: it resolves the
+old version as superseded and installs a new version under the same lineage
+(the first version's id), version + 1, with a fresh execution schedule. The
+old version's terms are folded into the resolved commitment, so the book root
+commits to the full history.
 
 PAYOUT ABI v1 (CONSENSUS-FROZEN)
 --------------------------------
@@ -43,6 +51,12 @@ let any number of payout rules share one worker.
     i27  bv[24]   the amount of the sale the execution names
     i28  bv[384]  who paid it
 
+  two clocks the node keeps for a rule that reads them, on the rule's own clock
+  (heights with `period_blocks`, unix seconds with `period_seconds`):
+    i48  bv[64]   the clock at which the rule was installed
+    i49  bv[64]   the clock of its last paid execution (the install clock
+                  until one has paid)
+
 A rule reads [t] only, reads at least one input and writes at least one slot
 amount, and mentions no slot it does not have.
 
@@ -57,8 +71,48 @@ bv[24]). An execution must name one open sale; the rule reads the sale's amount
 and payer (i27, i28), and a paid execution closes the sale, so a second
 execution naming it is refused. A refused execution leaves it open. At most
 MAX_OPEN_SALES are open at once; a sale that arrives while that many are open is
-not recorded and is counted as missed. Replacing, revoking or expiring the rule
-drops its open sales.
+not recorded and is counted as missed. Revoking or expiring the rule drops its
+open sales.
+
+ON ARRIVAL
+----------
+A rule installed with `per_sale` and `on_arrival: true` is run by the node
+itself, once per arrival, in the first block after the arrival: no executor,
+no named recipient, all slots fixed. An arrival is ANY credit the chain
+recorded for the account while the rule is installed -- a signed transfer, a
+retractable release, an approver-released transfer, or a payout leg -- each
+tagged with its kind. Money the node moves is never a sale for a `per_sale`
+rule that is not on arrival: a payout leg pays out of what arrived, and the
+rule of the account that gets it runs only when it is itself on arrival, one
+hop a block. A run happens once for an arrival: paid or not, the arrival is
+closed. Arrivals are never turned away for an on-arrival rule: each was paid
+for by a transaction or a run, and the node takes them off again block by
+block.
+
+DUE POINTS
+----------
+A rule installed with `due_at` is run by the node itself at that point on the
+rule's clock, once, in the first block whose clock reaches it, after the
+block's transactions and the runs on arrival, at most
+MAX_PAYOUT_DUE_RUNS_PER_BLOCK rules a block (the rest wait for the next
+blocks, earliest due point first). The run is an execution like any other (the
+rule is stepped once, all slots are paid or none, both caps and the balance
+apply), with no executor and no named recipient, so a due rule needs a fixed
+slot. A due point that could not pay is tried again by the node while its
+window is open -- until the next due point arrives -- then it is counted
+missed, never caught up. A rule that repeats (`due_every` or `due_months`)
+is queued for its next due point after the one that ran. Nobody signs for a
+run, and its only charge was the fee of the transaction that installed the
+rule. A standing payment is a due rule with one fixed slot and a fixed amount:
+the payer pays the payee that amount every period, without signing again.
+
+SEALED
+------
+A rule installed with `sealed: true` seals its account: until the rule ends,
+the node takes no transaction the account signs -- not its transfers, not a
+replace or revoke of the rule itself. Executions by others still pay out, and
+the node still runs the rule at its due points and on arrival. The seal lifts
+only when the rule ends; there is no unseal.
 """
 from __future__ import annotations
 
@@ -67,7 +121,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import tau_defs
 from consensus.serialization import (
@@ -79,10 +133,12 @@ from consensus.serialization import (
 
 TX_TYPE_PAYOUT_RULE_SET = "payout_rule_set"
 TX_TYPE_PAYOUT_RULE_REVOKE = "payout_rule_revoke"
+TX_TYPE_PAYOUT_RULE_UPDATE = "payout_rule_update"
 TX_TYPE_PAYOUT_EXECUTE = "payout_execute"
 
 PAYOUT_TX_TYPES = frozenset(
-    {TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_RULE_REVOKE, TX_TYPE_PAYOUT_EXECUTE}
+    {TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_RULE_REVOKE,
+     TX_TYPE_PAYOUT_RULE_UPDATE, TX_TYPE_PAYOUT_EXECUTE}
 )
 
 # The pools payout rules are stepped in: never the o5 pools.
@@ -99,8 +155,9 @@ PERIOD_FIELDS = (("period_blocks", KIND_BLOCKS), ("period_seconds", KIND_SECONDS
 OUTCOME_REVOKED = 1
 OUTCOME_EXPIRED = 2
 OUTCOME_REPLACED = 3
+OUTCOME_SUPERSEDED = 4
 OUTCOME_NAMES = {OUTCOME_REVOKED: "revoked", OUTCOME_EXPIRED: "expired",
-                 OUTCOME_REPLACED: "replaced"}
+                 OUTCOME_REPLACED: "replaced", OUTCOME_SUPERSEDED: "superseded"}
 
 MAX_SLOTS = 8
 MAX_DATA = 8
@@ -111,9 +168,20 @@ STREAM_EXECUTOR = 13
 STREAM_SPENT = 26
 SLOT_BASE = 30
 DATA_BASE = 40
+STREAM_INSTALLED = 48
+STREAM_LAST_PAID = 49
 STREAM_SALE_AMOUNT = 27
 STREAM_SALE_PAYER = 28
 MAX_OPEN_SALES = 64
+
+# How an arrival reached the account. A per-sale rule records only user_tx;
+# an on-arrival rule records every kind.
+ARRIVAL_USER_TX = "user_tx"
+ARRIVAL_RETRACTABLE = "retractable"
+ARRIVAL_APPROVER = "approver"
+ARRIVAL_PAYOUT = "payout"
+ARRIVAL_KINDS = (ARRIVAL_USER_TX, ARRIVAL_RETRACTABLE, ARRIVAL_APPROVER,
+                 ARRIVAL_PAYOUT)
 
 AMOUNT_WIDTH = tau_defs.TRANSFER_VALUE_BV_WIDTH
 KEY_WIDTH = 384
@@ -122,10 +190,20 @@ CLOCK_WIDTH = 64
 MAX_RULE_BYTES = 4096
 MAX_PAYOUT_RULES_TOTAL = 4096
 MAX_PAYOUT_EXECUTIONS_PER_BLOCK = 16
+MAX_PAYOUT_DUE_RUNS_PER_BLOCK = 16
+MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK = 16
+# A rule that repeats is run at most this often. The floor on the block clock
+# is what lets a full book be served: every due point gets its run before the
+# rule's next one comes.
+MIN_DUE_EVERY_BLOCKS = 256
+MIN_DUE_EVERY_SECONDS = 3_600
+MAX_DUE_MONTHS = 12
 MAX_PERIOD_BLOCKS = 1_000_000
 MAX_PERIOD_SECONDS = 31_622_400            # 366 days
 MAX_LIFETIME_BLOCKS = 10_000_000
 MAX_LIFETIME_SECONDS = 4 * 31_622_400      # four years of 366 days
+
+assert MIN_DUE_EVERY_BLOCKS >= -(-MAX_PAYOUT_RULES_TOTAL // MAX_PAYOUT_DUE_RUNS_PER_BLOCK)
 
 ZERO_ACC = bytes(32)
 
@@ -133,6 +211,7 @@ _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
 _ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = 0xFFFFFFFFFFFFFFFF
 _MENTION_RE = re.compile(r"\b([io])(\d+)\b")
+_CLOCKS_RE = re.compile(r"\bi(?:%d|%d)\b" % (STREAM_INSTALLED, STREAM_LAST_PAID))
 _TYPED_RE = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
 
 
@@ -156,7 +235,7 @@ def abi_width(name: str, slot_count: int = MAX_SLOTS, per_sale: bool = False) ->
         return AMOUNT_WIDTH
     if per_sale and index == STREAM_SALE_PAYER:
         return KEY_WIDTH
-    if index in (STREAM_TIME, STREAM_HEIGHT):
+    if index in (STREAM_TIME, STREAM_HEIGHT, STREAM_INSTALLED, STREAM_LAST_PAID):
         return CLOCK_WIDTH
     if index == STREAM_EXECUTOR:
         return KEY_WIDTH
@@ -165,6 +244,112 @@ def abi_width(name: str, slot_count: int = MAX_SLOTS, per_sale: bool = False) ->
     if DATA_BASE <= index < DATA_BASE + MAX_DATA:
         return AMOUNT_WIDTH
     return None
+
+
+# --- Calendar (integer arithmetic, proleptic Gregorian, UTC) -------------------
+# Ported from the standing-payment schedule: a monthly due point anchored on
+# the 31st runs on the last day of a shorter month and comes back to the 31st.
+
+
+def _days_from_civil(year: int, month: int, day: int) -> int:
+    """Days since 1970-01-01 for a valid date (H. Hinnant's algorithm)."""
+    year -= month <= 2
+    era = year // 400
+    yoe = year - era * 400
+    doy = (153 * (month + (-3 if month > 2 else 9)) + 2) // 5 + day - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _civil_from_days(days: int) -> Tuple[int, int, int]:
+    """(year, month, day) of a day count since 1970-01-01."""
+    days += 719468
+    era = days // 146097
+    doe = days - era * 146097
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    day = doy - (153 * mp + 2) // 5 + 1
+    month = mp + 3 if mp < 10 else mp - 9
+    return yoe + era * 400 + (month <= 2), month, day
+
+
+def _month_length(year: int, month: int) -> int:
+    if month == 2:
+        leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+        return 29 if leap else 28
+    return 30 if month in (4, 6, 9, 11) else 31
+
+
+def add_months(anchor: int, months: int) -> int:
+    """`anchor` moved by whole calendar months, keeping day and time of day.
+
+    A day the target month does not have becomes its last day: a schedule
+    anchored on the 31st pays on 30 April and on 28 or 29 February. Each due
+    point is derived from the anchor, never from the previous due point, so the
+    31st comes back in May (no drift).
+    """
+    days, seconds = divmod(int(anchor), 86400)
+    year, month, day = _civil_from_days(days)
+    total = (month - 1) + int(months)
+    year, month = year + total // 12, total % 12 + 1
+    day = min(day, _month_length(year, month))
+    return _days_from_civil(year, month, day) * 86400 + seconds
+
+
+def due_point_of(due_at: int, due_every: Optional[int], due_months: Optional[int],
+                 index: int) -> int:
+    """Due point number `index` of a rule; number 0 is `due_at`. Each one is
+    derived from `due_at`, never from the one before, so a monthly rule signed
+    for the 31st runs on the last day of a shorter month and comes back to the
+    31st."""
+    if due_months is not None:
+        return add_months(int(due_at), int(index) * int(due_months))
+    if due_every is not None:
+        return int(due_at) + int(index) * int(due_every)
+    return int(due_at)
+
+
+# --- Optional-terms encoding (for the rule id) -----------------------------------
+# A rule without any optional term has the id it always had: the encoding is
+# empty when every optional term is at its default, and each present term
+# carries a tag byte so two different option sets never encode the same.
+
+_OPT_PERIODS_FROM = 1
+_OPT_DUE_AT = 2
+_OPT_DUE_EVERY = 3
+_OPT_DUE_MONTHS = 4
+_OPT_ON_ARRIVAL = 5
+_OPT_MAX_FEE = 6
+_OPT_VERSION = 7
+
+
+def _options_bytes(periods_from: Optional[int], due_at: Optional[int],
+                   due_every: Optional[int], due_months: Optional[int],
+                   on_arrival: bool, max_fee_per_execution: Optional[int],
+                   version: int) -> bytes:
+    out = bytearray()
+    if periods_from is not None:
+        out.append(_OPT_PERIODS_FROM)
+        out.extend(int(periods_from).to_bytes(8, "big"))
+    if due_at is not None:
+        out.append(_OPT_DUE_AT)
+        out.extend(int(due_at).to_bytes(8, "big"))
+    if due_every is not None:
+        out.append(_OPT_DUE_EVERY)
+        out.extend(int(due_every).to_bytes(8, "big"))
+    if due_months is not None:
+        out.append(_OPT_DUE_MONTHS)
+        out.extend(int(due_months).to_bytes(8, "big"))
+    if on_arrival:
+        out.append(_OPT_ON_ARRIVAL)
+    if max_fee_per_execution is not None:
+        out.append(_OPT_MAX_FEE)
+        out.extend(int(max_fee_per_execution).to_bytes(8, "big"))
+    if version != 1:
+        out.append(_OPT_VERSION)
+        out.extend(int(version).to_bytes(8, "big"))
+    return bytes(out)
 
 
 # --- Terms and state -------------------------------------------------------------
@@ -185,6 +370,36 @@ class PayoutTerms:
     expires_at: int
     per_sale: bool = False          # pays only against sales the chain recorded
     sealed: bool = False            # while set, the node refuses the key-holder's txs
+    periods_from: Optional[int] = None   # the periods count from here, not the install
+    due_at: Optional[int] = None         # the node runs the rule itself at this point
+    due_every: Optional[int] = None      # ... and again every so much on the rule's clock
+    due_months: Optional[int] = None     # ... or every so many calendar months (UTC)
+    on_arrival: bool = False             # per sale: the node pays each arrival as it arrives
+    max_fee_per_execution: Optional[int] = None  # a manual execution's fee_limit may not pass this
+    version: int = 1                     # updates count up; 1 is the first install
+
+    @property
+    def options(self) -> Tuple:
+        return (self.periods_from, self.due_at, self.due_every, self.due_months,
+                self.on_arrival, self.max_fee_per_execution, self.version)
+
+    @property
+    def repeats(self) -> bool:
+        return self.due_every is not None or self.due_months is not None
+
+    def due_point(self, index: int) -> int:
+        """The rule's due point number `index`; number 0 is `due_at`."""
+        return due_point_of(self.due_at, self.due_every, self.due_months, index)
+
+    def due_index_after(self, index: int, clock: int) -> int:
+        """The next due point after number `index` that the clock has not
+        reached. One the clock has passed is not caught up."""
+        k = int(index) + 1
+        if self.due_every is not None and clock >= self.due_at:
+            k = max(k, (int(clock) - self.due_at) // self.due_every + 1)
+        while self.due_point(k) <= clock and self.due_point(k) < self.expires_at:
+            k += 1
+        return k
 
     @property
     def body_hash(self) -> bytes:
@@ -196,7 +411,26 @@ class PayoutTerms:
             self.account_pubkey, self.sequence_number, self.body_hash, self.slots,
             self.cap_per_execution, self.cap_per_period, self.kind, self.period,
             self.expires_at, self.per_sale, self.sealed,
+            _options_bytes(self.periods_from, self.due_at, self.due_every,
+                           self.due_months, self.on_arrival,
+                           self.max_fee_per_execution, self.version),
         )
+
+    @property
+    def reads_clocks(self) -> bool:
+        """The rule reads i48 or i49, so the node keeps its last paid clock."""
+        from consensus.rule_offers import strip_clause_comments
+
+        return _CLOCKS_RE.search(strip_clause_comments(self.body)) is not None
+
+    @property
+    def extended(self) -> bool:
+        """Carries an optional term or reads the kept clocks: its entry and its
+        stored row hold `more` (see PayoutState.more)."""
+        return (self.periods_from is not None or self.due_at is not None
+                or self.due_every is not None or self.due_months is not None
+                or self.on_arrival or self.max_fee_per_execution is not None
+                or self.version != 1 or self.reads_clocks)
 
     def clock(self, height: int, ts: int) -> int:
         return height if self.kind == KIND_BLOCKS else ts
@@ -212,18 +446,44 @@ class PayoutState:
     executions: int = 0
     paid_total: int = 0
     last_height: int = 0         # height of the last execution, 0 = never
-    # per-sale rules only: (sale_id, payer, amount, height) in arrival order
-    open_sales: Tuple[Tuple[bytes, str, int, int], ...] = ()
+    # per-sale rules only: (sale_id, payer, amount, height, kind) in arrival order
+    open_sales: Tuple[Tuple[bytes, str, int, int, str], ...] = ()
     sales_missed: int = 0
+    # kept only for a rule that is `extended`:
+    last_clock: int = 0          # the rule's clock at its last paid execution, 0 = never
+    due_done: bool = False       # the node owes the rule no further due point
+    due_index: int = 0           # a rule that repeats: the number of its next due point
+    missed: int = 0              # due points the clock passed unpaid (never caught up)
 
-    def sale(self, sale_id: bytes) -> Optional[Tuple[bytes, str, int, int]]:
+    def sale(self, sale_id: bytes) -> Optional[Tuple[bytes, str, int, int, str]]:
         for entry in self.open_sales:
             if entry[0] == sale_id:
                 return entry
         return None
 
     def period_at(self, terms: PayoutTerms, clock: int) -> int:
-        return max(0, int(clock) - self.anchor) // terms.period
+        base = self.anchor if terms.periods_from is None else terms.periods_from
+        return max(0, int(clock) - base) // terms.period
+
+    def next_due(self, terms: PayoutTerms) -> Optional[int]:
+        """The due point the node still owes the rule, or None."""
+        if terms.due_at is None or self.due_done:
+            return None
+        return terms.due_point(self.due_index)
+
+    def due_pending(self, terms: PayoutTerms) -> bool:
+        return terms.due_at is not None and not self.due_done
+
+    def more(self, terms: PayoutTerms, lineage: bytes) -> Optional[Tuple]:
+        """(periods_from, due_at, last_clock, due_done, due_every, due_months,
+        on_arrival, due_index, missed, max_fee_per_execution, version, lineage)
+        for an extended rule; None keeps the stored row the shape it always had."""
+        if not terms.extended:
+            return None
+        return (terms.periods_from, terms.due_at, self.last_clock, self.due_done,
+                terms.due_every, terms.due_months, terms.on_arrival,
+                self.due_index, self.missed, terms.max_fee_per_execution,
+                terms.version, lineage.hex())
 
     def spent_at(self, terms: PayoutTerms, clock: int) -> int:
         return self.spent_in_period if self.period_index == self.period_at(terms, clock) else 0
@@ -231,7 +491,7 @@ class PayoutState:
 
 @dataclass(frozen=True)
 class PayoutExecution:
-    executor_pubkey: str
+    executor_pubkey: str                      # "" for a run by the node at a due point
     account_pubkey: str
     rule_id: bytes
     recipients: Tuple[Tuple[int, str], ...]   # (slot, pubkey) for open slots, sorted
@@ -256,6 +516,15 @@ def _u64(fields: Dict[str, Any], name: str) -> int:
     value = fields.get(name)
     if not _is_int(value) or value < 0 or value > _U64_MAX:
         raise PayoutShapeError(f"{name} must be an unsigned 64-bit integer")
+    return value
+
+
+def _opt_u64(fields: Dict[str, Any], name: str) -> Optional[int]:
+    value = fields.get(name)
+    if value is None:
+        return None
+    if not _is_int(value) or value < 0 or value > _U64_MAX:
+        raise PayoutShapeError(f"{name} must be an unsigned 64-bit integer or left out")
     return value
 
 
@@ -297,6 +566,9 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
     if sealed is not None and sealed is not True:
         # one spelling per meaning, as for per_sale
         raise PayoutShapeError("sealed must be true or left out")
+    on_arrival = fields.get("on_arrival")
+    if on_arrival is not None and on_arrival is not True:
+        raise PayoutShapeError("on_arrival must be true or left out")
     return PayoutTerms(
         account_pubkey=account,
         sequence_number=sequence,
@@ -309,11 +581,19 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
         expires_at=_u64(fields, "expires_at"),
         per_sale=per_sale is True,
         sealed=sealed is True,
+        periods_from=_opt_u64(fields, "periods_from"),
+        due_at=_opt_u64(fields, "due_at"),
+        due_every=_opt_u64(fields, "due_every"),
+        due_months=_opt_u64(fields, "due_months"),
+        on_arrival=on_arrival is True,
+        max_fee_per_execution=_opt_u64(fields, "max_fee_per_execution"),
     )
 
 
 SPEC_FIELDS = ("rule_text", "slots", "cap_per_execution", "cap_per_period",
-               "period_blocks", "period_seconds", "expires_at", "per_sale", "sealed")
+               "period_blocks", "period_seconds", "expires_at", "per_sale", "sealed",
+               "periods_from", "due_at", "due_every", "due_months", "on_arrival",
+               "max_fee_per_execution")
 
 
 def parse_payout_rule_set(tx: Dict[str, Any]) -> PayoutTerms:
@@ -323,6 +603,20 @@ def parse_payout_rule_set(tx: Dict[str, Any]) -> PayoutTerms:
     account = _pubkey(tx.get("sender_pubkey"), "sender_pubkey")
     sequence = _u64(tx, "sequence_number")
     return _terms_from_fields(tx, account, sequence)
+
+
+def parse_payout_rule_update(tx: Dict[str, Any]) -> Tuple[str, bytes, PayoutTerms]:
+    """Read a payout rule update: the account, the id of the version it replaces,
+    and the new terms. The node assigns version + 1; the terms as signed carry
+    version 1, so one set of new terms has one body hash whatever its version."""
+    if not isinstance(tx, dict):
+        raise PayoutShapeError("transaction must be an object")
+    account = _pubkey(tx.get("sender_pubkey"), "sender_pubkey")
+    sequence = _u64(tx, "sequence_number")
+    raw_id = tx.get("rule_id")
+    if not isinstance(raw_id, str) or not _ID_RE.match(raw_id):
+        raise PayoutShapeError("rule_id must be 64 lowercase hex characters")
+    return account, bytes.fromhex(raw_id), _terms_from_fields(tx, account, sequence)
 
 
 def payout_spec_text(fields: Dict[str, Any], sequence_number: Optional[int] = None) -> str:
@@ -361,10 +655,15 @@ def parse_payout_spec(text: Any, account: str,
     return _terms_from_fields(fields, account, sequence)
 
 
-def parse_payout_rule_revoke(tx: Dict[str, Any]) -> str:
+def parse_payout_rule_revoke(tx: Dict[str, Any]) -> Tuple[str, bytes]:
+    """The account and the id of the rule to revoke."""
     if not isinstance(tx, dict):
         raise PayoutShapeError("transaction must be an object")
-    return _pubkey(tx.get("sender_pubkey"), "sender_pubkey")
+    account = _pubkey(tx.get("sender_pubkey"), "sender_pubkey")
+    raw_id = tx.get("rule_id")
+    if not isinstance(raw_id, str) or not _ID_RE.match(raw_id):
+        raise PayoutShapeError("rule_id must be 64 lowercase hex characters")
+    return account, bytes.fromhex(raw_id)
 
 
 def parse_payout_execute(tx: Dict[str, Any]) -> PayoutExecution:
@@ -405,8 +704,6 @@ def parse_payout_execute(tx: Dict[str, Any]) -> PayoutExecution:
     return PayoutExecution(executor, account, bytes.fromhex(raw_id),
                            tuple(sorted(named)), tuple(sorted(values)),
                            bytes.fromhex(sale) if sale is not None else None)
-
-
 # --- Screens ---------------------------------------------------------------------
 
 
@@ -646,6 +943,37 @@ def validate_terms_shape(terms: PayoutTerms, height: int, ts: int) -> Optional[s
         return "expires_at must be in the future"
     if terms.expires_at > now + life:
         return f"expires_at is more than {life} {KIND_NAMES[terms.kind]} ahead"
+    if terms.periods_from is not None and terms.periods_from >= terms.expires_at:
+        return "periods_from must be before expires_at"
+    if terms.max_fee_per_execution is not None and not (
+            0 <= terms.max_fee_per_execution <= tau_defs.MAX_TRANSFER_VALUE):
+        return (f"max_fee_per_execution must be in 0..{tau_defs.MAX_TRANSFER_VALUE}")
+    if terms.due_at is not None:
+        if terms.per_sale:
+            return "a rule that pays per sale has no due point"
+        if not fixed:
+            return "a due point needs a fixed slot: the node names no recipient"
+        if not now < terms.due_at < terms.expires_at:
+            return "due_at must be in the future and before expires_at"
+    if terms.repeats:
+        if terms.due_at is None:
+            return "a rule that repeats needs its first due point (due_at)"
+        if terms.due_every is not None and terms.due_months is not None:
+            return "due_every and due_months exclude each other"
+        if terms.due_every is not None:
+            lo = MIN_DUE_EVERY_BLOCKS if terms.kind == KIND_BLOCKS else MIN_DUE_EVERY_SECONDS
+            if not lo <= terms.due_every <= hi:
+                return f"due_every must be in {lo}..{hi} {KIND_NAMES[terms.kind]}"
+        else:
+            if terms.kind != KIND_SECONDS:
+                return "due_months needs the time clock (period_seconds)"
+            if not 1 <= terms.due_months <= MAX_DUE_MONTHS:
+                return f"due_months must be in 1..{MAX_DUE_MONTHS}"
+    if terms.on_arrival:
+        if not terms.per_sale:
+            return "on_arrival needs a rule that pays per sale"
+        if not fixed:
+            return "on_arrival needs a fixed slot: the node names no recipient"
     return None
 
 
@@ -665,9 +993,12 @@ def execution_inputs(terms: PayoutTerms, state: PayoutState, exe: PayoutExecutio
         STREAM_BALANCE: str(max(0, min(int(parent_balance), tau_defs.MAX_TRANSFER_VALUE))),
         STREAM_TIME: str(int(ts)),
         STREAM_HEIGHT: str(int(height)),
-        STREAM_EXECUTOR: _key_literal(exe.executor_pubkey),
+        STREAM_EXECUTOR: _key_literal(exe.executor_pubkey) if exe.executor_pubkey else "0",
         STREAM_SPENT: str(state.spent_at(terms, terms.clock(height, ts))),
     }
+    if terms.reads_clocks:
+        values[STREAM_INSTALLED] = str(state.anchor)
+        values[STREAM_LAST_PAID] = str(state.last_clock or state.anchor)
     for k, slot in enumerate(terms.slots):
         who = slot or named.get(k, "")
         values[SLOT_BASE + k] = _key_literal(who) if who else "0"
@@ -727,40 +1058,61 @@ def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
 
 # --- The book --------------------------------------------------------------------
 
-_Row = Tuple  # the 16 fields of encode_payout_entry, plus `sales` for a per-sale rule
+_Row = Tuple  # the fields of encode_payout_entry, plus `sales` and `more`
 
 
-def _restore_sales(sales: Any, rid: bytes) -> Tuple[Tuple[Tuple[bytes, str, int, int], ...], int]:
-    """A stored (missed, open sales) pair, checked; ((), 0) for a rule without it."""
+def _restore_sales(sales: Any, rid: bytes) -> Tuple[Tuple[Tuple[bytes, str, int, int, str], ...], int]:
+    """A stored (missed, open sales) pair, checked; ((), 0) for a rule without it.
+    Accepts the old 4-field entries (kind user_tx) and the new 5-field ones."""
     if sales is None:
         return (), 0
     try:
         missed, entries = sales
         out = []
-        for sale_id, payer, amount, height in entries:
+        for entry in entries:
+            if len(entry) == 4:
+                sale_id, payer, amount, height = entry
+                kind = ARRIVAL_USER_TX
+            else:
+                sale_id, payer, amount, height, kind = entry
             sale_id = bytes.fromhex(sale_id) if isinstance(sale_id, str) else bytes(sale_id)
             if len(sale_id) != 32 or not _PUBKEY_RE.match(str(payer)):
                 raise ValueError
             if not (_is_int(amount) and 1 <= amount <= tau_defs.MAX_TRANSFER_VALUE
                     and _is_int(height) and height >= 0):
                 raise ValueError
-            out.append((sale_id, str(payer), int(amount), int(height)))
+            if str(kind) not in ARRIVAL_KINDS:
+                raise ValueError
+            out.append((sale_id, str(payer), int(amount), int(height), str(kind)))
     except (TypeError, ValueError):
         raise ValueError(f"stored payout rule has malformed sales: {rid.hex()}") from None
-    if not _is_int(missed) or missed < 0 or len(out) > MAX_OPEN_SALES \
+    if not _is_int(missed) or missed < 0 or len(out) > MAX_OPEN_SALES * 64 \
             or len({e[0] for e in out}) != len(out):
-        raise ValueError(f"stored payout rule has impossible sales: {rid.hex()}")
+        raise ValueError(f"stored payout rule has impossible sales: {rid.hex()}") from None
     return tuple(out), int(missed)
 
 
 class PayoutBook:
-    """One installed rule per account. Copies share the frozen terms and states."""
+    """Many installed rules, keyed by (account, rule_id). Copies share the frozen
+    terms and states. One account may hold many independent rules; each has its
+    own caps, schedule and history. An update keeps the rule's lineage (its
+    first version's id) and moves the lineage to the new version."""
 
     def __init__(self) -> None:
-        self.terms: Dict[str, PayoutTerms] = {}
-        self.state: Dict[str, PayoutState] = {}
-        # (expires_at, account), sorted, per clock.
-        self._expiry: Dict[int, List[Tuple[int, str]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
+        self.terms: Dict[Tuple[str, bytes], PayoutTerms] = {}
+        self.state: Dict[Tuple[str, bytes], PayoutState] = {}
+        self._by_account: Dict[str, List[bytes]] = {}
+        self._lineage: Dict[bytes, bytes] = {}   # first version's id -> current id
+        self._lineage_by_id: Dict[bytes, bytes] = {}  # any open version's id -> its lineage
+        # (expires_at, account, rule_id), sorted, per clock.
+        self._expiry: Dict[int, List[Tuple[int, str, bytes]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
+        # (due_at, account, rule_id), sorted, per clock: points not yet run.
+        self._due: Dict[int, List[Tuple[int, str, bytes]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
+        # (due_at, account, rule_id), sorted, per clock: points being retried
+        # while their window is open.
+        self._retry: Dict[int, List[Tuple[int, str, bytes]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
+        # (account, rule_id) with arrivals waiting for an on-arrival run.
+        self._arrivals: Set[Tuple[str, bytes]] = set()
         self.resolved_count = 0
         self.resolved_acc = ZERO_ACC
         self._root: Optional[bytes] = None
@@ -769,7 +1121,13 @@ class PayoutBook:
         clone = PayoutBook.__new__(PayoutBook)
         clone.terms = dict(self.terms)
         clone.state = dict(self.state)
+        clone._by_account = {a: list(r) for a, r in self._by_account.items()}
+        clone._lineage = dict(self._lineage)
+        clone._lineage_by_id = dict(self._lineage_by_id)
         clone._expiry = {k: list(rows) for k, rows in self._expiry.items()}
+        clone._due = {k: list(rows) for k, rows in self._due.items()}
+        clone._retry = {k: list(rows) for k, rows in self._retry.items()}
+        clone._arrivals = set(self._arrivals)
         clone.resolved_count = self.resolved_count
         clone.resolved_acc = self.resolved_acc
         clone._root = self._root
@@ -779,9 +1137,10 @@ class PayoutBook:
     @classmethod
     def restore(cls, rows: Iterable[Tuple], resolved_count: int,
                 resolved_acc: bytes) -> "PayoutBook":
-        """Rebuild from stored rows (account, sequence, body, slots, caps, kind,
-        period, expires_at, rule_id, anchor, state...); refuses a row whose id
-        does not recompute or whose state is impossible."""
+        """Rebuild from stored rows (rule_id, account, sequence, body, slots,
+        caps, kind, period, expires_at, anchor, state..., sealed, sales, more);
+        refuses a row whose id does not recompute or whose state is impossible.
+        Rows without `more` are the old shape and restore as version 1."""
         if not isinstance(resolved_acc, (bytes, bytearray)) or len(resolved_acc) != 32:
             raise ValueError("resolved_acc must be 32 bytes")
         if not _is_int(resolved_count) or resolved_count < 0:
@@ -791,6 +1150,7 @@ class PayoutBook:
             row = tuple(row)
             sealed = bool(row[16]) if len(row) > 16 else False
             sales = row[17] if len(row) > 17 else None
+            more = row[18] if len(row) > 18 else None
             (stored_id, account, sequence, body, slots, cap_exec, cap_period, kind,
              period, expires_at, anchor, period_index, spent, executions, paid_total,
              last_height) = row[:16]
@@ -798,73 +1158,142 @@ class PayoutBook:
                 raise ValueError("stored payout rule has an unknown period clock")
             if not (_is_int(period) and period >= 1):
                 raise ValueError("stored payout rule has a bad period")
-            terms = PayoutTerms(account, sequence, body, tuple(slots), cap_exec,
-                                cap_period, kind, period, expires_at, sales is not None,
-                                sealed)
+            if more is None:
+                terms = PayoutTerms(account, sequence, body, tuple(slots), cap_exec,
+                                    cap_period, kind, period, expires_at, sales is not None,
+                                    sealed)
+                lineage = terms.rule_id
+                last_clock, due_done, due_index, missed = 0, False, 0, 0
+            else:
+                (periods_from, due_at, last_clock, due_done, due_every, due_months,
+                 on_arrival, due_index, missed, max_fee, version, lineage_hex) = more
+                terms = PayoutTerms(account, sequence, body, tuple(slots), cap_exec,
+                                    cap_period, kind, period, expires_at, sales is not None,
+                                    sealed, periods_from, due_at, due_every, due_months,
+                                    on_arrival, max_fee, version)
+                lineage = bytes.fromhex(lineage_hex)
             rid = terms.rule_id
             if rid != bytes(stored_id):
                 raise ValueError(f"stored payout rule id does not match its terms: {rid.hex()}")
-            if account in book.terms:
-                raise ValueError(f"two stored payout rules for one account: {account[:16]}")
-            open_sales, missed = _restore_sales(sales, rid)
+            if (account, rid) in book.terms:
+                raise ValueError(f"two stored payout rules with one id: {rid.hex()}")
+            if lineage in book._lineage:
+                raise ValueError(f"two stored payout rules with one lineage: {lineage.hex()}")
+            open_sales, missed_sales = _restore_sales(sales, rid)
             state = PayoutState(anchor, period_index, spent, executions, paid_total,
-                                last_height, open_sales, missed)
+                                last_height, open_sales, missed_sales,
+                                last_clock, due_done, due_index, missed)
             if not all(_is_int(v) and v >= 0 for v in (anchor, period_index, spent,
-                                                        executions, paid_total, last_height)):
+                                                        executions, paid_total, last_height,
+                                                        last_clock, due_index, missed)):
                 raise ValueError(f"stored payout rule has bad progress: {rid.hex()}")
             if spent > cap_period or (executions == 0) != (paid_total == 0):
                 raise ValueError(f"stored payout rule has inconsistent progress: {rid.hex()}")
-            book._insert(terms, state)
+            book._insert(terms, state, lineage)
         book.resolved_count = resolved_count
         book.resolved_acc = bytes(resolved_acc)
         return book
 
     # -- internals ---------------------------------------------------------------
 
-    def _insert(self, terms: PayoutTerms, state: PayoutState) -> None:
-        self.terms[terms.account_pubkey] = terms
-        self.state[terms.account_pubkey] = state
-        bisect.insort(self._expiry[terms.kind], (terms.expires_at, terms.account_pubkey))
+    def _insert(self, terms: PayoutTerms, state: PayoutState, lineage: bytes) -> None:
+        key = (terms.account_pubkey, terms.rule_id)
+        self.terms[key] = terms
+        self.state[key] = state
+        self._by_account.setdefault(terms.account_pubkey, []).append(terms.rule_id)
+        self._lineage[lineage] = terms.rule_id
+        self._lineage_by_id[terms.rule_id] = lineage
+        bisect.insort(self._expiry[terms.kind],
+                      (terms.expires_at, terms.account_pubkey, terms.rule_id))
+        if terms.due_at is not None and not state.due_done:
+            bisect.insort(self._due[terms.kind],
+                          (state.next_due(terms), terms.account_pubkey, terms.rule_id))
+        if terms.on_arrival and state.open_sales:
+            self._arrivals.add(key)
         self._root = None
 
-    def _remove(self, account: str, outcome: int) -> PayoutTerms:
-        terms = self.terms.pop(account)
-        del self.state[account]
+    def _remove(self, account: str, rule_id: bytes, outcome: int) -> PayoutTerms:
+        key = (account, rule_id)
+        terms = self.terms.pop(key)
+        state = self.state.pop(key)
+        ids = self._by_account[account]
+        ids.remove(rule_id)
+        if not ids:
+            del self._by_account[account]
+        for lineage, current in list(self._lineage.items()):
+            if current == rule_id:
+                del self._lineage[lineage]
+        del self._lineage_by_id[rule_id]
         rows = self._expiry[terms.kind]
-        del rows[bisect.bisect_left(rows, (terms.expires_at, account))]
-        self.resolved_acc = compute_payout_resolved_acc(self.resolved_acc, terms.rule_id, outcome)
+        entry = (terms.expires_at, account, rule_id)
+        i = bisect.bisect_left(rows, entry)
+        if i < len(rows) and rows[i] == entry:
+            del rows[i]
+        due = state.next_due(terms)
+        if due is not None:
+            row = (due, account, rule_id)
+            for index in (self._due[terms.kind], self._retry[terms.kind]):
+                i = bisect.bisect_left(index, row)
+                if i < len(index) and index[i] == row:
+                    del index[i]
+        self._arrivals.discard(key)
+        self.resolved_acc = compute_payout_resolved_acc(self.resolved_acc, rule_id, outcome)
         self.resolved_count += 1
         self._root = None
         return terms
 
     # -- queries -----------------------------------------------------------------
 
-    def _row(self, account: str) -> _Row:
-        t, s = self.terms[account], self.state[account]
+    def _row(self, account: str, rule_id: bytes) -> _Row:
+        key = (account, rule_id)
+        t, s = self.terms[key], self.state[key]
+        lineage = self._lineage_of(rule_id)
         row = (t.rule_id, t.account_pubkey, t.sequence_number, t.body_hash, t.slots,
                t.cap_per_execution, t.cap_per_period, t.kind, t.period, t.expires_at,
                s.anchor, s.period_index, s.spent_in_period, s.executions,
                s.paid_total, s.last_height, int(t.sealed))
-        return row + ((s.sales_missed, s.open_sales),) if t.per_sale else row
+        row = row + ((s.sales_missed, s.open_sales),) if t.per_sale else row + (None,)
+        return row + (s.more(t, lineage),)
+
+    def _lineage_of(self, rule_id: bytes) -> bytes:
+        """The lineage a rule id belongs to: its own id when it is the first
+        version, else the lineage that points at it."""
+        return self._lineage_by_id.get(bytes(rule_id), bytes(rule_id))
 
     def root(self) -> bytes:
         if self._root is None:
             self._root = compute_payout_book_root(
-                [self._row(a) for a in self.terms], self.resolved_count, self.resolved_acc)
+                [self._row(a, r) for a, r in self.terms], self.resolved_count, self.resolved_acc)
         return self._root
 
     def is_empty(self) -> bool:
         """True while the book has never held a rule (it then stays out of the hash)."""
         return not self.terms and self.resolved_count == 0
 
-    def get(self, account: str) -> Optional[PayoutTerms]:
-        return self.terms.get(account)
+    def get(self, account: str, rule_id: Optional[bytes] = None) -> Optional[PayoutTerms]:
+        if rule_id is not None:
+            return self.terms.get((account, bytes(rule_id)))
+        ids = self._by_account.get(account)
+        return self.terms.get((account, ids[0])) if ids else None
 
-    def state_of(self, account: str) -> Optional[PayoutState]:
-        return self.state.get(account)
+    def get_rules(self, account: str) -> List[PayoutTerms]:
+        return [self.terms[(account, rid)] for rid in self._by_account.get(account, ())]
+
+    def rule_ids_for(self, account: str) -> List[bytes]:
+        return list(self._by_account.get(account, ()))
+
+    def state_of(self, account: str, rule_id: bytes) -> Optional[PayoutState]:
+        return self.state.get((account, bytes(rule_id)))
+
+    def current_id(self, lineage: bytes) -> Optional[bytes]:
+        """The current version of a lineage, or None when it has none open."""
+        return self._lineage.get(bytes(lineage))
 
     def count(self) -> int:
         return len(self.terms)
+
+    def count_for(self, account: str) -> int:
+        return len(self._by_account.get(account, ()))
 
     def has_expiring(self, height: int, ts: int) -> bool:
         h, t = self._expiry[KIND_BLOCKS], self._expiry[KIND_SECONDS]
@@ -873,13 +1302,16 @@ class PayoutBook:
     def store_rows(self) -> List[Tuple]:
         """Rows for persistence: the body text instead of its hash."""
         out = []
-        for account in sorted(self.terms):
-            t, s = self.terms[account], self.state[account]
-            row = (t.rule_id, account, t.sequence_number, t.body, t.slots,
-                   t.cap_per_execution, t.cap_per_period, t.kind, t.period,
-                   t.expires_at, s.anchor, s.period_index, s.spent_in_period,
-                   s.executions, s.paid_total, s.last_height, int(t.sealed))
-            out.append(row + ((s.sales_missed, s.open_sales),) if t.per_sale else row)
+        for account in sorted(self._by_account):
+            for rule_id in self._by_account[account]:
+                t, s = self.terms[(account, rule_id)], self.state[(account, rule_id)]
+                lineage = self._lineage_of(rule_id)
+                row = (t.rule_id, account, t.sequence_number, t.body, t.slots,
+                       t.cap_per_execution, t.cap_per_period, t.kind, t.period,
+                       t.expires_at, s.anchor, s.period_index, s.spent_in_period,
+                       s.executions, s.paid_total, s.last_height, int(t.sealed))
+                row = row + ((s.sales_missed, s.open_sales),) if t.per_sale else row + (None,)
+                out.append(row + (s.more(t, lineage),))
         return out
 
     def resolved_state(self) -> Tuple[int, bytes]:
@@ -891,26 +1323,35 @@ class PayoutBook:
         reason = validate_terms_shape(terms, height, ts)
         if reason:
             return False, reason
-        current = self.terms.get(terms.account_pubkey)
-        if current is not None and current.rule_id == terms.rule_id:
+        if (terms.account_pubkey, terms.rule_id) in self.terms:
             return False, "this payout rule is already installed"
-        if current is None and len(self.terms) >= MAX_PAYOUT_RULES_TOTAL:
+        if len(self.terms) >= MAX_PAYOUT_RULES_TOTAL:
             return False, "the payout rule book is full"
         return True, ""
 
-    def can_admit_revoke(self, account: str) -> Tuple[bool, str]:
-        if account not in self.terms:
-            return False, "the account has no payout rule"
+    def can_admit_revoke(self, account: str, rule_id: bytes) -> Tuple[bool, str]:
+        if (account, bytes(rule_id)) not in self.terms:
+            return False, "the account has no payout rule with that id"
+        return True, ""
+
+    def can_admit_update(self, account: str, rule_id: bytes, new_terms: PayoutTerms,
+                         height: int, ts: int) -> Tuple[bool, str]:
+        old = self.terms.get((account, bytes(rule_id)))
+        if old is None:
+            return False, "the account has no payout rule with that id"
+        reason = validate_terms_shape(new_terms, height, ts)
+        if reason:
+            return False, reason
+        if replace(new_terms, version=old.version) == old:
+            return False, "the update changes nothing"
         return True, ""
 
     def check_execution(self, exe: PayoutExecution, height: int,
                         ts: int) -> Tuple[PayoutTerms, PayoutState]:
         """The installed rule and its state for this execution, or PayoutRefused."""
-        terms = self.terms.get(exe.account_pubkey)
+        terms = self.terms.get((exe.account_pubkey, exe.rule_id))
         if terms is None:
-            raise PayoutRefused("the account has no payout rule")
-        if terms.rule_id != exe.rule_id:
-            raise PayoutRefused("the account's payout rule is not the one named")
+            raise PayoutRefused("the account has no payout rule with that id")
         if terms.clock(height, ts) >= terms.expires_at:
             raise PayoutRefused("the payout rule has expired")
         for k, who in exe.recipients:
@@ -920,7 +1361,7 @@ class PayoutBook:
                 raise PayoutRefused(f"slot {k} has a fixed recipient")
             if who == terms.account_pubkey:
                 raise PayoutRefused("a slot may not pay the account itself")
-        state = self.state[exe.account_pubkey]
+        state = self.state[(exe.account_pubkey, exe.rule_id)]
         if terms.per_sale:
             if exe.sale_id is None:
                 raise PayoutRefused("this payout rule pays per sale: name an open sale (sale_id)")
@@ -933,23 +1374,42 @@ class PayoutBook:
 
     # -- mutation ----------------------------------------------------------------
 
-    def install(self, terms: PayoutTerms, anchor: int) -> Optional[bytes]:
-        """Install `terms`; the id of a rule it replaced, else None."""
-        replaced = None
-        if terms.account_pubkey in self.terms:
-            replaced = self._remove(terms.account_pubkey, OUTCOME_REPLACED).rule_id
-        self._insert(terms, PayoutState(anchor=int(anchor)))
-        return replaced
+    def install(self, terms: PayoutTerms, anchor: int) -> None:
+        """Install `terms` as a new rule. Installing never replaces another rule:
+        a second rule for the same account is independent of the first."""
+        key = (terms.account_pubkey, terms.rule_id)
+        if key in self.terms:
+            raise ValueError("this payout rule is already installed")
+        self._insert(terms, PayoutState(anchor=int(anchor)), terms.rule_id)
 
-    def revoke(self, account: str) -> PayoutTerms:
-        if account not in self.terms:
-            raise KeyError(account)
-        return self._remove(account, OUTCOME_REVOKED)
+    def update(self, account: str, rule_id: bytes, new_terms: PayoutTerms,
+               anchor: int) -> Tuple[PayoutTerms, PayoutTerms]:
+        """Replace the named version with `new_terms` (version + 1, same lineage,
+        fresh schedule). The old version is resolved as superseded, never mutated.
+        Returns (old terms, new terms)."""
+        key = (account, bytes(rule_id))
+        old = self.terms.get(key)
+        if old is None:
+            raise KeyError("the account has no payout rule with that id")
+        lineage = self._lineage_of(rule_id)
+        if replace(new_terms, version=old.version) == old:
+            raise ValueError("the update changes nothing")
+        updated = replace(new_terms, version=old.version + 1)
+        self._remove(account, rule_id, OUTCOME_SUPERSEDED)
+        self._insert(updated, PayoutState(anchor=int(anchor)), lineage)
+        return old, updated
 
-    def record(self, account: str, total: int, height: int, ts: int,
+    def revoke(self, account: str, rule_id: bytes) -> PayoutTerms:
+        key = (account, bytes(rule_id))
+        if key not in self.terms:
+            raise KeyError("the account has no payout rule with that id")
+        return self._remove(account, rule_id, OUTCOME_REVOKED)
+
+    def record(self, account: str, rule_id: bytes, total: int, height: int, ts: int,
                sale_id: Optional[bytes] = None) -> PayoutState:
         """A paid execution; for a per-sale rule it closes the sale it paid."""
-        terms, state = self.terms[account], self.state[account]
+        key = (account, bytes(rule_id))
+        terms, state = self.terms[key], self.state[key]
         clock = terms.clock(height, ts)
         index = state.period_at(terms, clock)
         spent = state.spent_at(terms, clock)
@@ -961,54 +1421,229 @@ class PayoutBook:
         state = replace(state, period_index=index, spent_in_period=spent + total,
                         executions=state.executions + 1,
                         paid_total=state.paid_total + total, last_height=int(height),
-                        open_sales=open_sales)
-        self.state[account] = state
+                        open_sales=open_sales,
+                        last_clock=int(clock) if terms.extended else 0)
+        self.state[key] = state
+        if terms.on_arrival and not open_sales:
+            self._arrivals.discard(key)
         self._root = None
         return state
 
-    def pays_per_sale(self, account: str) -> bool:
-        terms = self.terms.get(account)
-        return terms is not None and terms.per_sale
+    def pays_per_sale(self, account: str, rule_id: Optional[bytes] = None) -> bool:
+        if rule_id is not None:
+            terms = self.terms.get((account, bytes(rule_id)))
+            return terms is not None and terms.per_sale
+        return any(t.per_sale for t in self.get_rules(account))
 
     def note_sale(self, account: str, sale_id: bytes, payer: str, amount: int,
                   height: int) -> Optional[str]:
-        """A signed transaction paid `account` `amount` in total: record it as an
-        open sale of the account's per-sale rule, its id the transaction hash.
-        Returns "recorded", "missed" (MAX_OPEN_SALES already open), or None when
-        the account has no per-sale rule, the payer is the account itself, or the
-        sale is already recorded."""
-        terms = self.terms.get(account)
-        if terms is None or not terms.per_sale or payer == account or amount <= 0:
-            return None
-        state = self.state[account]
-        sale_id = bytes(sale_id)
-        if state.sale(sale_id) is not None:
-            return None
-        if len(state.open_sales) >= MAX_OPEN_SALES:
-            self.state[account] = replace(state, sales_missed=state.sales_missed + 1)
+        """A signed transaction paid `account` `amount` in total. Kept for the
+        transfer loop: records it for every per-sale rule of the account."""
+        outcomes = self.note_arrival(account, sale_id, payer, amount, height,
+                                     ARRIVAL_USER_TX)
+        return outcomes[0][1] if outcomes else None
+
+    def note_arrival(self, account: str, sale_id: bytes, payer: str, amount: int,
+                     height: int, kind: str, ts: Optional[int] = None
+                     ) -> List[Tuple[bytes, Optional[str]]]:
+        """A credit reached `account`: record it as an open arrival for every
+        rule of the account that takes it. A per-sale rule takes only signed
+        transfers (`user_tx`); an on-arrival rule takes every kind. Returns
+        [(rule_id, outcome)] with outcome "recorded", "missed" (a per-sale
+        rule already has MAX_OPEN_SALES open), or None when the rule takes no
+        arrival of this kind, the payer is the account itself, or the arrival
+        is already recorded. An on-arrival rule never turns an arrival away,
+        and takes none once its end is reached: the node would owe a run the
+        rule no longer promises."""
+        out: List[Tuple[bytes, Optional[str]]] = []
+        for terms in self.get_rules(account):
+            if kind == ARRIVAL_USER_TX:
+                if not terms.per_sale:
+                    continue
+            elif not terms.on_arrival:
+                continue
+            if payer == account or amount <= 0:
+                out.append((terms.rule_id, None))
+                continue
+            key = (account, terms.rule_id)
+            state = self.state[key]
+            sale_id = bytes(sale_id)
+            if state.sale(sale_id) is not None:
+                out.append((terms.rule_id, None))
+                continue
+            if terms.on_arrival and ts is not None and terms.clock(height, ts) >= terms.expires_at:
+                out.append((terms.rule_id, None))
+                continue
+            if len(state.open_sales) >= MAX_OPEN_SALES and not terms.on_arrival:
+                self.state[key] = replace(state, sales_missed=state.sales_missed + 1)
+                self._root = None
+                out.append((terms.rule_id, "missed"))
+                continue
+            entry = (sale_id, payer, min(int(amount), tau_defs.MAX_TRANSFER_VALUE),
+                     int(height), kind)
+            self.state[key] = replace(state, open_sales=state.open_sales + (entry,))
+            if terms.on_arrival:
+                self._arrivals.add(key)
             self._root = None
-            return "missed"
-        entry = (sale_id, payer, min(int(amount), tau_defs.MAX_TRANSFER_VALUE), int(height))
-        self.state[account] = replace(state, open_sales=state.open_sales + (entry,))
+            out.append((terms.rule_id, "recorded"))
+        return out
+
+    # -- runs the node makes by itself -------------------------------------------
+
+    def has_due(self, height: int, ts: int) -> bool:
+        h, t = self._due[KIND_BLOCKS], self._due[KIND_SECONDS]
+        rh, rt = self._retry[KIND_BLOCKS], self._retry[KIND_SECONDS]
+        return bool((h and h[0][0] <= height) or (t and t[0][0] <= ts)
+                    or (rh and rh[0][0] <= height) or (rt and rt[0][0] <= ts))
+
+    def due(self, height: int, ts: int,
+            cap: int = MAX_PAYOUT_DUE_RUNS_PER_BLOCK) -> List[Tuple[str, bytes]]:
+        """The rules the node runs in this block: every due point this block's
+        clock reached and that has not run, earliest first (rules on the block
+        clock before rules on the time clock), then points being retried while
+        their window is open, at most `cap` in all."""
+        out: List[Tuple[str, bytes]] = []
+        for kind, clock in ((KIND_BLOCKS, height), (KIND_SECONDS, ts)):
+            for due_at, account, rule_id in self._due[kind]:
+                if due_at > clock or len(out) >= cap:
+                    break
+                out.append((account, rule_id))
+        for kind, clock in ((KIND_BLOCKS, height), (KIND_SECONDS, ts)):
+            for due_at, account, rule_id in self._retry[kind]:
+                if len(out) >= cap:
+                    break
+                out.append((account, rule_id))
+        return out
+
+    def due_execution(self, account: str, rule_id: bytes
+                      ) -> Tuple[PayoutTerms, PayoutState, PayoutExecution]:
+        """The run the node makes at a rule's due point: no executor, no named
+        recipient, no data."""
+        key = (account, bytes(rule_id))
+        terms, state = self.terms[key], self.state[key]
+        if not state.due_pending(terms):
+            raise KeyError("the rule has no due point to run")
+        return terms, state, PayoutExecution("", account, terms.rule_id, (), ())
+
+    def due_ran(self, account: str, rule_id: bytes, clock: int, paid: bool) -> None:
+        """The due point of the rule has run, paid or not. A rule that repeats
+        is queued for its next point; a point that could not pay is tried again
+        while its window is open, then counted missed, never caught up."""
+        key = (account, bytes(rule_id))
+        terms, state = self.terms[key], self.state[key]
+        due = state.next_due(terms)
+        if due is None:
+            raise KeyError("the rule has no due point to run")
+        for index in (self._due[terms.kind], self._retry[terms.kind]):
+            i = bisect.bisect_left(index, (due, account, rule_id))
+            if i < len(index) and index[i] == (due, account, rule_id):
+                del index[i]
+                break
+        if not terms.repeats:
+            self.state[key] = replace(state, due_done=True,
+                                      missed=state.missed + (0 if paid else 1))
+            self._root = None
+            return
+        nxt = terms.due_index_after(state.due_index, clock)
+        if paid:
+            ni = max(state.due_index + 1, nxt - 1)
+            done = terms.due_point(ni) >= terms.expires_at
+            self.state[key] = replace(state, due_done=done, due_index=ni)
+            if not done:
+                bisect.insort(self._due[terms.kind],
+                              (terms.due_point(ni), account, rule_id))
+        elif nxt == state.due_index + 1:
+            # The window is still open: try this point again next block.
+            bisect.insort(self._retry[terms.kind], (due, account, rule_id))
+        else:
+            # The window closed: this point and every passed one are missed.
+            # The next point to attempt is the last one the clock reached.
+            missed = state.missed
+            for j in range(state.due_index, nxt - 1):
+                if terms.due_point(j) < terms.expires_at:
+                    missed += 1
+            ni = nxt - 1
+            done = terms.due_point(ni) >= terms.expires_at
+            self.state[key] = replace(state, due_done=done, due_index=ni, missed=missed)
+            if not done:
+                bisect.insort(self._due[terms.kind],
+                              (terms.due_point(ni), account, rule_id))
         self._root = None
-        return "recorded"
+
+    def sealed(self, account: Any) -> bool:
+        """Some rule of the account is sealed: until it ends, the node takes no
+        transaction the account signs."""
+        return isinstance(account, str) and any(
+            t.sealed for t in self.get_rules(account))
+
+    def has_arrivals(self) -> bool:
+        return bool(self._arrivals)
+
+    def arrivals(self, cap: int = MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK
+                 ) -> List[Tuple[str, bytes, bytes]]:
+        """The open arrivals the node runs in this block, (account, rule_id,
+        sale_id), at most `cap`: every rule's longest-waiting arrival first,
+        then every rule's second, and so on; within one such round the arrival
+        of the earlier block first, then by account. So a rule with many
+        arrivals waiting does not hold up the single arrival of another."""
+        rows = []
+        for account, rule_id in self._arrivals:
+            for position, (sale_id, _payer, _amount, height, _kind) in enumerate(
+                    self.state[(account, rule_id)].open_sales[:cap]):
+                rows.append((position, height, account, rule_id, sale_id))
+        rows.sort()
+        return [(account, rule_id, sale_id) for _, _, account, rule_id, sale_id in rows[:cap]]
+
+    def arrival_execution(self, account: str, rule_id: bytes, sale_id: bytes
+                          ) -> Tuple[PayoutTerms, PayoutState, PayoutExecution]:
+        """The run the node makes for one arrival: no executor, no named
+        recipient, no data."""
+        key = (account, bytes(rule_id))
+        terms, state = self.terms[key], self.state[key]
+        if not terms.on_arrival or state.sale(sale_id) is None:
+            raise KeyError("the rule has no such arrival to run")
+        return terms, state, PayoutExecution("", account, terms.rule_id, (), (),
+                                            bytes(sale_id))
+
+    def drop_sale(self, account: str, rule_id: bytes, sale_id: bytes) -> None:
+        """The node ran the rule for this arrival and the rule paid nothing: the
+        arrival is closed, a run on arrival happens once."""
+        key = (account, bytes(rule_id))
+        terms, state = self.terms[key], self.state[key]
+        left = tuple(e for e in state.open_sales if e[0] != bytes(sale_id))
+        if len(left) != len(state.open_sales) - 1:
+            raise KeyError("not an open arrival of this rule")
+        self.state[key] = replace(state, open_sales=left)
+        if not left:
+            self._arrivals.discard(key)
+        self._root = None
 
     def expire(self, height: int, ts: int) -> List[PayoutTerms]:
-        """Remove every rule whose end this block reached, earliest first."""
+        """Remove every rule whose end this block reached, earliest first. A rule
+        whose due point has not run yet stays until it has, and so does a rule
+        with an arrival still waiting for its run on arrival: the node owes them."""
         gone: List[PayoutTerms] = []
         for kind, clock in ((KIND_BLOCKS, height), (KIND_SECONDS, ts)):
             rows = self._expiry[kind]
-            while rows and rows[0][0] <= clock:
-                gone.append(self._remove(rows[0][1], OUTCOME_EXPIRED))
+            i = 0
+            while i < len(rows):
+                expires_at, account, rule_id = rows[i]
+                if expires_at > clock:
+                    break
+                terms, state = self.terms[(account, rule_id)], self.state[(account, rule_id)]
+                if state.due_pending(terms) or (terms.on_arrival and state.open_sales):
+                    i += 1
+                    continue
+                gone.append(self._remove(account, rule_id, OUTCOME_EXPIRED))
         return gone
 
 
 def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
-             ts: int = 0) -> Dict[str, Any]:
+             ts: int = 0, lineage: Optional[bytes] = None) -> Dict[str, Any]:
     """One installed rule as a wallet reads it."""
     clock = terms.clock(height, ts) if (height or ts) else None
     spent = state.spent_at(terms, clock) if clock is not None else state.spent_in_period
-    return {
+    out: Dict[str, Any] = {
         "rule_id": terms.rule_id.hex(),
         "account_pubkey": terms.account_pubkey,
         "sequence_number": terms.sequence_number,
@@ -1028,8 +1663,25 @@ def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
         "executions": state.executions,
         "paid_total": state.paid_total,
         "last_height": state.last_height or None,
+        "version": terms.version,
+        "lineage": (lineage.hex() if lineage is not None
+                    else terms.rule_id.hex()),
+        **({"periods_from": terms.periods_from} if terms.periods_from is not None else {}),
+        **({"max_fee_per_execution": terms.max_fee_per_execution}
+           if terms.max_fee_per_execution is not None else {}),
+        **({"due_at": terms.due_at,
+            "due_every": terms.due_every,
+            "due_months": terms.due_months,
+            "due_index": state.due_index,
+            "due_done": state.due_done,
+            "next_due": state.next_due(terms),
+            "missed_due_points": state.missed}
+           if terms.due_at is not None else {}),
+        **({"on_arrival": True} if terms.on_arrival else {}),
         **({"per_sale": True,
             "open_sales": [{"sale_id": sid.hex(), "payer_pubkey": payer, "amount": amount,
-                            "height": h} for sid, payer, amount, h in state.open_sales],
+                            "height": h, "kind": kind}
+                           for sid, payer, amount, h, kind in state.open_sales],
             "sales_missed": state.sales_missed} if terms.per_sale else {}),
     }
+    return out
