@@ -841,11 +841,25 @@ def committed_journal_entries(limit=None):
         return _journal_rows(_db_conn.cursor(), limit=limit)
 
 
-def _journal_rows(cur, limit=None):
+def committed_journal_entries_after(seq):
+    """The committed journal entries with sequence greater than `seq`, in
+    order. The incremental form of committed_journal_entries for a consumer
+    that tracks how far it has replayed (the spec shadow, issue #42)."""
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        return _journal_rows(_db_conn.cursor(), after_seq=int(seq))
+
+
+def _journal_rows(cur, limit=None, after_seq=None):
     """The committed journal, on a cursor the caller already holds the lock for."""
     sql = ('SELECT seq, kind, phase, rule_text, inputs, target, accumulate, '
-           'units, outcome, result_fp, identity, prev, link FROM tau_journal_v1 '
-           'ORDER BY seq')
+           'units, outcome, result_fp, identity, prev, link, tip '
+           'FROM tau_journal_v1 ')
+    if after_seq is not None:
+        sql += f'WHERE seq > {int(after_seq)} '
+    sql += 'ORDER BY seq'
     if limit is not None:
         sql += f' LIMIT {int(limit)}'
     cur.execute(sql)
@@ -859,9 +873,25 @@ def _journal_rows(cur, limit=None):
             "units": [tuple(u) for u in json.loads(r[7] or "[]")],
             "outcome": r[8], "result_fingerprint": r[9],
             "identity": json.loads(r[10]) if r[10] else None,
-            "prev": r[11], "link": r[12],
+            "prev": r[11], "link": r[12], "tip": r[13],
         })
     return out
+
+
+def get_block_number(block_hash: str):
+    """The height of a stored block, or None. The blocks table's indexed
+    columns only -- no block_data parse."""
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT block_number FROM blocks WHERE block_hash = ? LIMIT 1',
+            (block_hash,),
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row else None
 
 
 def committed_anchor(rows: bool = True) -> dict:
@@ -1853,10 +1883,12 @@ def get_survival_ledger(height: Optional[int] = None,
     current-spec view cannot: is the unit still in force, was part of it
     displaced (and what fragment survives), or was it displaced entirely
     -- and which transaction did the displacing. A unit's identity is its
-    canonical text (the accumulation dedups exact units globally); the
-    submitting tx and account recorded at its first feed are attributes
-    of the entry. Registry-routed units never enter the shadow, so they
-    are never in this ledger.
+    canonical text; the submitting tx and account recorded at its FIRST
+    feed are attributes of the entry. A unit the journal records again
+    after another unit displaced it (a resend) is fed again, in journal
+    order, and its re-feed is a step like any other: it can displace in
+    turn. Registry-routed units never enter the shadow, so they are
+    never in this ledger.
 
     Statuses are derived, never stored: the replay walks the canonical
     feed steps in order, diffing each step's normalized text against the
@@ -1908,7 +1940,6 @@ def get_survival_ledger(height: Optional[int] = None,
     fragments: Dict[str, str] = {}   # fragment key -> current text
     owners: Dict[str, str] = {}      # fragment key -> owning unit text
     units: Dict[str, Dict] = {}      # unit text -> entry under construction
-    fed = set()
     started = False
     for block_hash, block_number, _step, unit_text, tx_hash, acct, \
             text_after in rows:
@@ -1924,12 +1955,11 @@ def get_survival_ledger(height: Optional[int] = None,
                 started = True
             continue
         started = True
-        if unit_text in fed:
-            # A restarted shadow re-feeding a unit an earlier canonical
-            # block already recorded: the accumulation dedups exact
-            # units, and so does the ledger.
-            continue
-        fed.add(unit_text)
+        # No dedup: the steps are the journal's feeds in order, and a
+        # unit fed again (a resend after displacement) is a real step --
+        # it restores the unit's fragments and displaces the current
+        # owner's in turn. The entry keeps its first-feed attribution
+        # (setdefault below); only its fragments and displacer move.
         new_fragments = dict(split_spec_fragments(text_after))
         entry = units.setdefault(unit_text, {
             "unit": unit_text,

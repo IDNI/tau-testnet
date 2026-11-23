@@ -700,8 +700,8 @@ def _record_survival_feeds(block, next_snapshot, shadow, first_advance,
 
     Each step is attributed to the block transaction that submitted its
     unit (see _shared_rule_submissions); a step no transaction in this
-    block submitted -- a restarted shadow catching up on the persisted
-    accumulation -- is recorded unattributed, and on the shadow's first
+    block submitted -- the block's journal group and its rule outcomes
+    disagreeing -- is recorded unattributed, and on the shadow's first
     advance a baseline row carries the spec it started from, so the
     ledger's replay (db.get_survival_ledger) can diff from the true
     initial text.
@@ -755,36 +755,177 @@ def _record_survival_feeds(block, next_snapshot, shadow, first_advance,
             block.block_hash, block.header.block_number, enriched)
 
 
+def _stage_rule_unit(rule_text):
+    """A rule text staged exactly as the engine stages it into the
+    application-rules accumulation (`_preprocess_tau_spec_text`, raw text
+    as fallback) -- so a journal-fed unit compares equal to the
+    accumulation line and to a block submission's unit (see
+    _shared_rule_submissions)."""
+    try:
+        return (_preprocess_tau_spec_text(rule_text) or rule_text).strip()
+    except Exception:
+        return (rule_text or "").strip()
+
+
+def _journal_groups_after(cursor):
+    """The durable committed journal's rule revisions after `cursor`,
+    grouped per block: [{tip, height, units, last_seq}] in journal order.
+
+    Only REVISION entries that accumulated carry shared-spec rule units:
+    STEP entries do not change the spec; governance activations record
+    accumulate=False (they are the lifecycle's state, not the shared
+    spec's -- the accumulation never held them either); and a RESET's
+    units re-state texts whose own REVISION entries the shadow already
+    consumes in order, so replaying the revisions reproduces the
+    post-reset spec without re-feeding the reset. The journal only ever
+    holds the canonical chain (a reorg rebuilds it from genesis), so
+    journal order is canonical order and no block-hash resolution is
+    needed to replay it; the height is read from the blocks table for
+    snapshot bookkeeping only.
+    """
+    import tau_journal as _tau_journal
+
+    groups = []
+    for row in db.committed_journal_entries_after(cursor):
+        if row.get("kind") != _tau_journal.REVISION:
+            continue
+        if not row.get("accumulate") or not row.get("rule_text"):
+            continue
+        unit = _stage_rule_unit(row["rule_text"])
+        if not unit:
+            continue
+        tip = row.get("tip")
+        if groups and groups[-1]["tip"] == tip:
+            groups[-1]["units"].append(unit)
+            groups[-1]["last_seq"] = int(row["seq"])
+        else:
+            groups.append({
+                "tip": tip,
+                "height": db.get_block_number(tip) if tip else None,
+                "units": [unit],
+                "last_seq": int(row["seq"]),
+            })
+    return groups
+
+
+def _memory_journal_units_for_block(block, next_snapshot):
+    """This block's rule revisions from the in-process committed journal,
+    or [] when they cannot be identified there.
+
+    The journal is one record with two embodiments: durable
+    (tau_journal_v1, written by the commit protocol under worker-backed
+    authority) and in-process (tau_journal.committed(), written live by
+    the in-process evaluator session). Where the durable table holds no
+    revisions for this block, the block's execution lives only in the
+    in-process journal, whose entries carry no block attribution -- so
+    the block's share is identified by content: this block's shared-spec
+    submissions (from the snapshot's rule outcomes) must appear in the
+    journal's accumulated REVISION entries as a contiguous run, in
+    order. The newest such run is used: the recorder is not necessarily
+    called between two applies (a commit path may apply several blocks
+    before recording any), and where two runs are identical the units
+    are verbatim the same, so the occurrences are interchangeable.
+    Anything in the journal that matches no recorded block's submissions
+    -- a discarded candidate's revisions, an apply whose recorder never
+    ran -- is never fed. On no match nothing is fed: a shadow that
+    cannot identify its block's revisions in the journal must record
+    nothing rather than guess.
+    """
+    import tau_journal as _tau_journal
+
+    submissions = _shared_rule_submissions(block, next_snapshot)
+    if not submissions:
+        return []
+    wanted = [unit for _hash, _account, unit in submissions]
+    revisions = [
+        _stage_rule_unit(entry.rule_text)
+        for entry in _tau_journal.committed().entries()
+        if entry.kind == _tau_journal.REVISION and entry.accumulate
+        and entry.rule_text
+    ]
+    if not revisions:
+        # The in-process journal is not the embodiment in use here (the
+        # durable journal is); nothing to identify.
+        return []
+    span = len(wanted)
+    for start in range(len(revisions) - span, -1, -1):
+        if revisions[start:start + span] == wanted:
+            return wanted
+    logger.warning(
+        "shadow: in-process journal holds no run matching block #%s "
+        "rule submissions; recording no snapshot for it",
+        block.header.block_number,
+    )
+    return []
+
+
 def _record_shadow_snapshot(block, next_snapshot) -> None:
     """Best-effort shadow advance + snapshot write, mirroring
     _record_rule_outcomes.
 
-    The units are read from the snapshot's tau_bytes -- the post-block
-    application-rules accumulation, i.e. exactly the canonical bytes that
-    entered state in and before this block. The shadow feeds only the ones
-    it has not seen, so a clause-only block (whose snapshot text is
-    unchanged) advances nothing, and a shadow rebuilt after a restart
-    catches up from the full accumulation on the next rule block. When the
-    accumulation changed, the snapshot is persisted per block so the
-    getaccountrules view (and at-height queries) can be served without
-    touching the live interpreter, and the advance's per-unit steps are
-    persisted for the survival ledger (see _record_survival_feeds).
+    The feed source is the committed journal, never the accumulation:
+    the accumulation dedups exact units, so a unit that was displaced
+    and then submitted again (a resend) would never be re-fed, while the
+    engine applied it again and runs it. The journal records every
+    application in order, resends included, so the shadow fed from it
+    tracks what the engine last applied.
+
+    Durable embodiment first: every journal group after the shadow's
+    cursor is fed in journal order. The current block's group is
+    snapshotted and its steps persisted for the survival ledger (see
+    _record_survival_feeds); an earlier group -- a restarted shadow
+    catching up, or a state rebuild whose journal commit lands after
+    the recorder runs -- is fed and snapshotted under its own block,
+    without survival feeds: its steps belong to that block's recording,
+    not this one's. Where the durable journal holds no group for this
+    block, the block's revisions are identified in the in-process
+    journal instead (see _memory_journal_units_for_block).
     """
     try:
         shadow = get_shadow_spec()
         if shadow is None:
             return
-        raw = getattr(next_snapshot, "tau_bytes", b"") or b""
-        text = raw.decode("utf-8", errors="ignore") if isinstance(
-            raw, (bytes, bytearray)) else str(raw)
-        units = [u for u in text.split("\n") if u.strip()]
+        if block.block_hash in shadow.journal_fed_blocks:
+            # Already fed: journal feeding is not idempotent (a re-fed
+            # unit is a resend), so a duplicate recording of the same
+            # block must not feed its revisions a second time.
+            return
         first_advance = not shadow.fed_units
         before_text = shadow.normalized_text
-        snap = shadow.advance(
+        fed_current = False
+        for group in _journal_groups_after(shadow.journal_cursor):
+            snap = shadow.advance_journal(
+                group["units"],
+                height=group["height"]
+                if group["height"] is not None
+                else block.header.block_number,
+                block_hash=group["tip"] or block.block_hash,
+            )
+            shadow.journal_cursor = group["last_seq"]
+            if snap is not None:
+                db.record_spec_snapshot(
+                    snap["block_hash"], snap["height"],
+                    snap["shadow_revision"], snap["normalized_text"],
+                    snap["sha256"],
+                )
+            if group["tip"] == block.block_hash:
+                fed_current = True
+                shadow.journal_fed_blocks.add(block.block_hash)
+                if snap is not None:
+                    _record_survival_feeds(
+                        block, next_snapshot, shadow, first_advance,
+                        before_text)
+        if fed_current:
+            return
+        units = _memory_journal_units_for_block(block, next_snapshot)
+        if not units:
+            return
+        snap = shadow.advance_journal(
             units,
             height=block.header.block_number,
             block_hash=block.block_hash,
         )
+        shadow.journal_fed_blocks.add(block.block_hash)
         if snap is not None:
             db.record_spec_snapshot(
                 snap["block_hash"], snap["height"], snap["shadow_revision"],
@@ -796,13 +937,22 @@ def _record_shadow_snapshot(block, next_snapshot) -> None:
         logger.exception("could not record spec snapshot")
 
 
-def rebuild_shadow_from_accumulation():
-    """Rebuild the shadow from block 0 over the persisted accumulation and
-    make it the node's shadow. Returns the rebuilt shadow (or None when no
-    driver is available). The snapshots this produces are the same ones
-    the incremental advance recorded -- that equality is the cross-node
-    comparability claim of the design, and it is what a restart relies on
-    instead of trusting process-local interpreter text."""
+def rebuild_shadow_from_journal():
+    """Rebuild the shadow from sequence 0 over the committed journal and
+    make it the node's shadow. Returns the rebuilt shadow (or None when
+    no driver is available). The snapshots this produces are the same
+    ones the incremental advance recorded -- that equality is the
+    cross-node comparability claim of the design, and it is what a
+    restart relies on instead of trusting process-local interpreter
+    text.
+
+    The durable journal is the source. Where it holds nothing (the
+    in-process embodiment keeps the journal only in memory), the
+    in-process journal's accumulated revisions are replayed as one
+    group instead -- within one process that is the same record. Across
+    a restart of such a node the journal is gone by its own design, and
+    the rebuilt shadow tracks from the next recorded block.
+    """
     global _shadow_spec
     from consensus.shadow_spec import ShadowSpec
 
@@ -811,17 +961,36 @@ def rebuild_shadow_from_accumulation():
     if driver is None:
         return None
     shadow = ShadowSpec(driver)
-    units = [u for u in (get_application_rules_state() or "").split("\n")
-             if u.strip()]
+    groups = _journal_groups_after(0)
     with _shadow_lock:
         _shadow_spec = shadow
-    if units:
-        shadow.advance(
-            units,
-            height=int(db.get_chain_state_value("canonical_head_number", "0")
-                       or 0),
-            block_hash=db.get_chain_state_value("canonical_head_hash", ""),
-        )
+    if groups:
+        for group in groups:
+            shadow.advance_journal(
+                group["units"],
+                height=group["height"] if group["height"] is not None else 0,
+                block_hash=group["tip"] or "",
+            )
+            shadow.journal_cursor = group["last_seq"]
+    else:
+        import tau_journal as _tau_journal
+
+        units = [
+            unit for unit in (
+                _stage_rule_unit(entry.rule_text)
+                for entry in _tau_journal.committed().entries()
+                if entry.kind == _tau_journal.REVISION and entry.accumulate
+                and entry.rule_text
+            ) if unit
+        ]
+        if units:
+            shadow.advance_journal(
+                units,
+                height=int(db.get_chain_state_value(
+                    "canonical_head_number", "0") or 0),
+                block_hash=db.get_chain_state_value(
+                    "canonical_head_hash", ""),
+            )
     return shadow
 
 
