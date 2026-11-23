@@ -368,11 +368,13 @@ def test_a_comment_is_not_a_mention_and_i170_is_not_i17():
 
 
 def test_the_sender_pass_overwrites_a_forged_i17_without_touching_the_original():
-    values = {1: "5", 17: "9"}
+    values = {1: "5", 17: "9", "17": "9", "i17": "9"}
     fed = sender_clause_inputs(values, True)
     assert fed[17] == "0"
-    assert values[17] == "9"
-    assert sender_clause_inputs(None, True) == {17: "0"}
+    assert fed["17"] == "0"
+    assert fed["i17"] == "0"
+    assert values["i17"] == "9"
+    assert sender_clause_inputs(None, True) == {17: "0", "17": "0", "i17": "0"}
 
 
 def test_a_non_positive_hold_stays_inside_its_unit_and_an_unknown_kind_does_not():

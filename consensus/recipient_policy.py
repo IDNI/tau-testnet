@@ -86,7 +86,6 @@ _CMP_OP = r"\s*(?:!=|<=|>=|=|<|>)\s*"
 _DIRECT_RE = re.compile(
     r"(?:" + _I17_TYPED + _CMP_OP + _LIT_BV + r")|(?:" + _LIT_BV + _CMP_OP + _I17_TYPED + r")"
 )
-_ANY_BV64_RE = re.compile(_LIT_BV)
 # Arithmetic would move the change points off the written literals. &&, ||, !
 # and -> are comparisons' connectives, not arithmetic.
 _ARITHMETIC_RE = re.compile(
@@ -115,11 +114,16 @@ def sender_clause_inputs(values: dict, active: bool) -> dict:
     Absent keeps a pre-activation evaluation byte-identical. The value is added
     only for the clause evaluator: the transfer step that prices the fee does
     not see it, so a custom use of i17 on an inactive chain is left alone.
+    Every key shape is overwritten. The evaluator keeps the last one it sees,
+    so a forged ``"i17"`` left beside key 17 would be the value that wins.
     """
     if not active:
         return values
     fed = dict(values or {})
-    fed[STREAM] = str(CODE_OUTBOUND)
+    code = str(CODE_OUTBOUND)
+    fed[STREAM] = code
+    fed[str(STREAM)] = code
+    fed[f"i{STREAM}"] = code
     return fed
 
 
@@ -268,11 +272,11 @@ def _literal_value(text: str) -> Optional[int]:
 def comparison_literals(body: str) -> Optional[tuple]:
     """The ``bv[64]`` literals ``i17`` is compared with, or None.
 
-    None means the shape is not a direct comparison: arithmetic, a comparison
-    with another stream, or a ``bv[64]`` literal that is not one side of an
-    ``i17`` comparison. The probe names the cap in that case. A tuple means
-    every ``i17`` mention is such a comparison, so the verdict on a fixed
-    payment can change only where ``i17`` crosses one of these constants.
+    None means the shape is not a direct comparison: arithmetic, or an ``i17``
+    mention that is not a comparison with a literal. The probe names the cap
+    in that case. A tuple means every ``i17`` mention is such a comparison.
+    Other ``bv[64]`` literals, such as a time lock on ``i5``, do not move
+    those change points: every input but ``i17`` is fixed while the cap is read.
     """
     text = strip_clause_comments(body or "")
     mentions = len(_MENTION_RE.findall(text))
@@ -289,8 +293,6 @@ def comparison_literals(body: str) -> Optional[tuple]:
             return None
         found.append(value)
     if len(found) != mentions:
-        return None
-    if len(list(_ANY_BV64_RE.finditer(text))) != len(found):
         return None
     return tuple(found)
 

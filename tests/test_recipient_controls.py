@@ -310,6 +310,36 @@ def test_a_seconds_cap_past_the_release_window_still_refuses_a_height_park():
     assert "max_hold_seconds" not in height.message
 
 
+def test_a_time_lock_literal_stays_on_the_exact_path():
+    """i5 is bv[64] too. That literal is not an i17 change point, so the cap
+    is still read off the i17 comparison. Falling through to the probe here
+    is how a hole next to a time lock gets quoted.
+    """
+    body = "(i17[t]:bv[64] > {601}:bv[64]) && (i5[t]:bv[64] > {100}:bv[64])"
+    assert comparison_literals(body) == (601,)
+    ev = _use(_over(601), body)
+    refusal = recipient_refusal(body, {5: "200"}, 1 + 3600, pool="apply")
+    assert refusal.details == {"max_hold_seconds": 600}
+    assert len(ev.verdict_calls) <= 12
+
+    holed = (
+        "(i5[t]:bv[64] > {10}:bv[64]) && ("
+        "(i17[t]:bv[64] <= {101}:bv[64]) || "
+        "((i17[t]:bv[64] >= {5000}:bv[64]) && (i17[t]:bv[64] <= {6000}:bv[64])))"
+    )
+
+    def decide(inputs):
+        code = int(inputs["i17"])
+        if code <= 101 or 5000 <= code <= 6000:
+            return 1
+        return 0
+
+    _use(decide, holed)
+    refusal = recipient_refusal(holed, {5: "200"}, 200, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
+
+
 def test_a_hex_literal_and_an_implication_are_still_one_threshold():
     body = "(i17[t]:bv[64] > { #x0259 }:bv[64]) -> (o5[t]:bv[24] = {0}:bv[24])"
     assert comparison_literals(body) == (0x259,)
