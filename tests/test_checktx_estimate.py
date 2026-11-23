@@ -170,11 +170,13 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
-    if kind == "standing_payment_create":
-        return _envelope(kind, SENDER, fee_limit, recipient_pubkey=RECIPIENT,
-                         amount=100, interval_blocks=128,
-                         first_due=NEXT_HEIGHT + 20, periods=3,
-                         genesis_hash=chain_genesis_hash())
+    if kind == "payout_rule_update":
+        # The recipient owns the installed rule; the update changes its cap,
+        # so it is a real update, not a no-op.
+        return _envelope(kind, RECIPIENT, fee_limit,
+                         rule_id=_payout_book().get(RECIPIENT).rule_id.hex(),
+                         genesis_hash=chain_genesis_hash(),
+                         **{**_payout_fields(), "cap_per_execution": 50})
     if kind == "payout_rule_set":
         return _envelope(kind, SENDER, fee_limit, genesis_hash=chain_genesis_hash(),
                          **_payout_fields())
@@ -194,7 +196,7 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request", "standing_payment_create", "payout_rule_set",
+               "rule_change_request", "payout_rule_set", "payout_rule_update",
                "payout_execute"]
 
 
