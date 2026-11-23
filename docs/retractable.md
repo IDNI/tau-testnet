@@ -150,6 +150,12 @@ sender's `o5` policy (evaluated with the approval slots empty), the fee step, an
 the balance. Scheduling a payment therefore cannot be used to get around a
 co-signature policy. Retractable transfers are not co-signable.
 
+Once recipient policy is active, a park is also judged by the **recipient's**
+clause, with the park's hold on the receive stream `i17` (seconds for a
+`release_at_time`, blocks for a `release_at_height`), so a recipient can refuse
+payments held longer than it accepts. A retract is never judged by the
+recipient. See [recipient_policy.md](recipient_policy.md).
+
 Nothing is re-checked at release. The release sweep is a plain credit from the
 escrow book, with no Tau evaluation, so a later policy change, a changed fee
 model, or the sender's balance dropping to zero does not block it. This is also
@@ -199,6 +205,8 @@ honest nodes disagree about admissibility and fork.
 | `UNKNOWN_RETRACTABLE` | A retract names an id that is not open (unknown, or already resolved). |
 | `NOT_RETRACTABLE_SENDER` | A retract is signed by someone other than the entry's sender. |
 | `RETRACT_TOO_LATE` | The next block is already at or past the release point. |
+| `RECIPIENT_MAX_HOLD` | The recipient's clause accepts this payment instantly but not with this hold; the details carry the recipient's `max_hold_seconds` or `max_hold_blocks`. |
+| `RECIPIENT_POLICY` | The recipient's clause refuses this payment whatever its hold (for example, the sender is not on its allow-list). |
 
 A malformed transaction, an out-of-range amount, or a release point that is not
 in the future or is outside the window is rejected with a descriptive message

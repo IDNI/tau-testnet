@@ -36,6 +36,15 @@ def get_args():
     )
     parser.add_argument("--network-id", type=str, default="tau-testnet-v2", help="Network ID")
     parser.add_argument(
+        "--recipient-policy-active", action="store_true",
+        help=(
+            "Activate recipient policy (#47/#76: i17 receive stream, recipients' "
+            "o5 clauses judging incoming payments) from block 0. For a FRESH "
+            "chain only; on an existing chain this is the governance patch "
+            "recipient_policy_active, which audits the live spec first."
+        ),
+    )
+    parser.add_argument(
         "--approval-slots", action="store_true",
         help=(
             "Activate co-signature approval slots (i18-i25) from block 0. For a "
@@ -319,6 +328,7 @@ def main():
         args.vote_quorum, args.eligibility_mode, args.fee_beneficiary,
         approval_slots_active=bool(getattr(args, "approval_slots", False)),
         faucet_amount=args.faucet_amount,
+        recipient_policy_active=bool(getattr(args, "recipient_policy_active", False)),
     )
     consensus_meta = {
         "proof_scheme": "bls_header_sig",

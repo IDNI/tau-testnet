@@ -530,6 +530,31 @@ in place of `--file`, `--fee`, `--expire-in N` (default 2000 blocks, so the
 send nothing) and `--dry-run`, and print the request id. `cancel` is feeless.
 They exit like the other transaction commands.
 
+### Incoming payments (recipient policy)
+
+Once recipient policy is active on the chain (`tau-testnet governance` shows
+`recipient_policy.active: true`), your clause can also judge payments made **to**
+you. Compose it instead of writing Tau text by hand, then deploy it as any rule:
+
+```bash
+tau-testnet policy receive --allow <A> --allow <B> --out rule.tau   # only A or B may pay me
+tau-testnet policy receive --max-hold-seconds 0                     # instant payments only
+tau-testnet policy receive --max-hold-seconds 600 --max-hold-blocks 10
+tau-testnet policy receive --allow <A> --send-only-to <C>           # one clause, both directions
+tau-testnet tx send --key me --rule-file rule.tau
+```
+
+Ask the node before paying (advisory, rate-limited like `checktx`):
+
+```bash
+tau-testnet rpc "getrecipientpolicy <recipient>"
+tau-testnet rpc "getrecipientpolicy <recipient> <sender> <amount> 3600 seconds"
+```
+
+A refused payment answers `RECIPIENT_POLICY`, or `RECIPIENT_MAX_HOLD` with the
+recipient's `max_hold_seconds` / `max_hold_blocks`. Full semantics:
+[recipient_policy.md](recipient_policy.md).
+
 ## Retractable transfers
 
 Escrow a transfer until a block height or Unix time; the sender can take it back

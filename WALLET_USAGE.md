@@ -189,7 +189,11 @@ closed (treated as block), and so does a registered clause the engine refuses to
 evaluate for the transfer's inputs.
 
 A clause is evaluated on its own, and only for transfers you send, so it carries
-**no sender guard** and must not reference `i12`. You hold one clause; submitting
+**no sender guard** and must not reference `i12`. Once the chain activates
+recipient policy, a clause that reads the receive stream `i17` is also evaluated
+for payments you **receive**: an inbound allow-list, or a cap on how long an
+incoming payment may be held (`tau-testnet policy receive` writes it for you; see
+[docs/recipient_policy.md](docs/recipient_policy.md)). You hold one clause; submitting
 another replaces it. A transfer is blocked when the consensus rules or your
 clause yield `o5 = 0`. A policy rule cannot share a transaction with transfers
 (`RULE_WITH_TRANSFERS`): send the rule first, then the transfers.

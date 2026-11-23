@@ -2201,6 +2201,25 @@ def cmd_policy_change_cancel(args: argparse.Namespace) -> int:
     return _submit_rule_tx(args, _build)
 
 
+def cmd_policy_receive(args: argparse.Namespace) -> int:
+    from tau_testnet_cli.recipient_rules import compose_receive_clause
+
+    try:
+        rule = compose_receive_clause(
+            allow=args.allow,
+            max_hold_seconds=args.max_hold_seconds,
+            max_hold_blocks=args.max_hold_blocks,
+            send_only_to=args.send_only_to,
+        )
+    except ValueError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    if args.out:
+        Path(args.out).write_text(rule + "\n", encoding="utf-8")
+    print(rule)
+    return EXIT_OK
+
+
 def _add_policy_subparsers(sub) -> None:
     """`tau-testnet policy ...` -- the rule-change guard and its requests."""
     import tau_defs
@@ -2213,6 +2232,28 @@ def _add_policy_subparsers(sub) -> None:
     psub = p_pol.add_subparsers(dest="policy_command", required=True)
     common = [_GLOBAL_PARENT]
     default_expire = 2 * tau_defs.RULE_CHANGE_DELAY_BLOCKS
+
+    # --- receive (#47/#76): compose a recipient-policy clause ---
+    p_recv = psub.add_parser(
+        "receive", parents=common,
+        help="Compose a clause that judges incoming payments (allow-list, hold cap)",
+        description=(
+            "Print the o5 clause for an inbound allow-list and/or a hold cap, "
+            "ready to deploy with `tau-testnet tx send --rule-file`. Needs "
+            "recipient policy active on the chain (see `tau-testnet governance`)."
+        ),
+    )
+    p_recv.add_argument("--allow", action="append", default=[], metavar="PUBKEY",
+                        help="Accept incoming money only from this sender. Repeatable.")
+    p_recv.add_argument("--max-hold-seconds", type=int, default=None,
+                        help="Accept time-based retractable transfers held at most N seconds "
+                             "(0 = instant only)")
+    p_recv.add_argument("--max-hold-blocks", type=int, default=None,
+                        help="Accept height-based retractable transfers held at most N blocks")
+    p_recv.add_argument("--send-only-to", action="append", default=[], metavar="PUBKEY",
+                        help="Also restrict what this account sends (outbound whitelist). Repeatable.")
+    p_recv.add_argument("--out", default=None, help="Write the rule to this file")
+    p_recv.set_defaults(func=cmd_policy_receive)
 
     def _key_group(parser, required=True):
         src = parser.add_mutually_exclusive_group(required=required)

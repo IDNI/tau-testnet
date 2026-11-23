@@ -29,6 +29,7 @@ from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
+    recipient_policy_active,
     RULE_CHANGE_TX_TYPES,
     TX_TYPE_APPROVAL_REQUEST,
     TX_TYPE_RULE_CHANGE_REQUEST,
@@ -516,9 +517,82 @@ def _policy_call(call):
 def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     """(blocked, detail) for the sender's own o5 clause on one transfer's inputs."""
     body = tip_view.clause_for(sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
+    if recipient_policy_active(tip_view):
+        # i17 = 0: the clause owner is sending (#47/#76).
+        values = sender_policy.sending_inputs(values)
     return _policy_call(lambda: sender_policy.clause_blocks(
         body, values, pool="admission", timeout=budget
     ))
+
+
+def _admission_hold(tx_type: str, data: dict, tip_view):
+    """The hold of a payment as its recipient's clause sees it at admission.
+
+    0 for a plain transfer. A time-based park is measured in seconds against
+    the same clock admission already uses to refuse a park that could be mined
+    at or after its release (the next block's timestamp); a height-based park is
+    measured in blocks against the next block's height. Apply measures against
+    the block that carries the park, and is authoritative.
+    """
+    if tx_type != TX_TYPE_RETRACTABLE_TRANSFER:
+        return 0
+    from consensus.retractable import KIND_HEIGHT
+    if (data or {}).get("release_kind") == KIND_HEIGHT:
+        return tau_defs.HeldBlocks(int(data["release_at"]) - int(tip_view.next_block_height))
+    return int(data["release_at"]) - int(tip_view.next_block_timestamp)
+
+
+def _recipient_refusal(tip_view, tx_type, data, recipient, values, budget,
+                       index, details):
+    """The rejection envelope when the recipient's clause refuses this payment,
+    or None. A refused park whose recipient would take the same payment
+    instantly is a hold refusal (RECIPIENT_MAX_HOLD, carrying the cap in the
+    park's own unit); any other refusal is RECIPIENT_POLICY."""
+    body = tip_view.clause_for(recipient, tau_defs.USER_POLICY_STREAM_INDEX)
+    hold = _admission_hold(tx_type, data, tip_view)
+    # i2 in the recipient pass is the recipient's own balance, as the sender's
+    # is in the sender pass (the clause owner's balance in both).
+    own = _admission_i2(recipient)
+    blocked, o5 = _policy_call(lambda: sender_policy.recipient_clause_blocks(
+        body, values, recipient, hold, pool="admission", owner_balance=own,
+        timeout=budget,
+    ))
+    if not blocked:
+        return None
+    if tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+        instant_blocked, _ = _policy_call(lambda: sender_policy.recipient_clause_blocks(
+            body, values, recipient, 0, pool="admission", owner_balance=own,
+            timeout=budget,
+        ))
+        if not instant_blocked:
+            in_blocks = isinstance(hold, tau_defs.HeldBlocks)
+            unit = "blocks" if in_blocks else "seconds"
+            cap = _policy_call(lambda: sender_policy.recipient_hold_cap(
+                body, values, recipient, blocks=in_blocks,
+                pool="admission", owner_balance=own, held=hold, timeout=budget,
+                max_points=sender_policy.ADMISSION_CAP_MAX_POINTS,
+            ))
+            if cap == 0:
+                said = "accepts only payments that arrive instantly (no hold)"
+            elif cap is None:
+                said = (f"does not accept a hold counted in {unit}"
+                        if in_blocks else "does not accept this hold")
+            else:
+                said = f"accepts payments held for at most {cap} {unit}"
+            return _qt_err(
+                "RECIPIENT_MAX_HOLD",
+                f"Transaction rejected by recipient policy (o5): the recipient "
+                f"{said}; this payment is held {int(hold)} {unit}. Send it as a "
+                f"plain transfer or with a shorter hold.",
+                transfer_index=index,
+                **{f"max_hold_{unit}": cap, f"hold_{unit}": int(hold)},
+            )
+    return _qt_err(
+        "RECIPIENT_POLICY",
+        f"Transaction rejected by recipient policy (o5): the recipient's policy "
+        f"clause refused transfer #{index} ({details}). Policy output: {o5}",
+        transfer_index=index,
+    )
 
 
 def _clause_build_refusal(body, budget):
@@ -936,6 +1010,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         or idx in tau_defs.reserved_operation_keys(
                             tip_view.eligibility_mode,
                             approval_slots_active=approval_slots_active(tip_view),
+                            recipient_policy_active=recipient_policy_active(tip_view),
                         ):
                     return _qt_err(
                         "TX_INVALID",
@@ -1309,6 +1384,19 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 ),
                                 transfer_index=i + 1,
                             )
+
+                        # --- Recipient policy (#47/#76) ---
+                        # After the sender's checks, the recipient's own clause
+                        # judges the payment it would receive. One refusal
+                        # fails the whole transaction, as an o5 block does.
+                        if recipient_policy_active(tip_view):
+                            refusal = _recipient_refusal(
+                                tip_view, tx_type, admission_eval.data,
+                                tau_input_dict['to_addr'], tau_input_stream_values,
+                                admission_tau.budget, i + 1, transfer_details,
+                            )
+                            if refusal is not None:
+                                return refusal
 
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.

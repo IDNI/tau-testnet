@@ -99,6 +99,13 @@ class ApprovalShapeError(ValueError):
     """A request or vote does not have a shape the node can safely record."""
 
 
+def recipient_policy_active(tip_view) -> bool:
+    """Whether recipient policy (#47/#76) is active at the tip. Requires a genuine
+    `True` for the same reason approval_slots_active below does: a mocked view
+    must never silently run as if a consensus feature were activated."""
+    return getattr(tip_view, "recipient_policy_active", False) is True
+
+
 def approval_slots_active(tip_view) -> bool:
     """Whether the co-signature approval slots are reserved at the tip.
 
@@ -357,6 +364,68 @@ def audit_stream_collisions(spec_texts) -> List[str]:
                 f"it would keep writing o5 on the main interpreter beside the "
                 f"registered clauses. Clear it or start from fresh state before "
                 f"activating."
+            )
+    return findings
+
+
+_RECEIVE_MENTION_RE = re.compile(r"\bi%d\b" % tau_defs.RECIPIENT_HOLD_STREAM_INDEX)
+
+
+def screen_receive_stream(body: str, active: bool) -> Optional[str]:
+    """Why an o5 clause reading the receive stream i17 cannot be registered, or None.
+
+    A clause that never mentions i17 is unaffected. One that does is refused
+    while recipient policy is inactive, with a reason, instead of being admitted
+    as a rule that never runs (#47 case 5, #76 case 6): before activation i17 is
+    a sender-written custom stream, not the receive context. Once active, every
+    mention must be typed bv[64], because stream typing is process-global.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(body or "")
+    mentions = list(_RECEIVE_MENTION_RE.finditer(scrubbed))
+    if not mentions:
+        return None
+    idx = tau_defs.RECIPIENT_HOLD_STREAM_INDEX
+    if not active:
+        return (
+            f"this clause reads i{idx}, the recipient-policy receive stream, but "
+            f"recipient policy is not active on this chain (governance patch "
+            f"recipient_policy_active); it would never judge an incoming payment"
+        )
+    typed = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*%d\s*\]"
+                       % tau_defs.RECIPIENT_HOLD_BV_WIDTH)
+    for match in mentions:
+        if not typed.match(scrubbed, match.end()):
+            return (
+                f"every mention of i{idx} must be written "
+                f"i{idx}[t]:bv[{tau_defs.RECIPIENT_HOLD_BV_WIDTH}]"
+            )
+    return None
+
+
+def audit_recipient_stream_collisions(spec_texts) -> List[str]:
+    """Reasons recipient policy (#47/#76) cannot safely be activated. Empty means clear.
+
+    Before activation i17 is an ordinary custom input stream: a sender may write
+    it, and any rule or clause may read it at any width. Activation makes it a
+    node-fed bv[64] receive stream, so a spec that already mentions i17 would
+    either change meaning under its owner (a clause reading i17 would start
+    judging incoming payments) or collide with the bv[64] typing process-wide.
+    Both are refused the same way the approval-slot audit refuses i18..i25.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    findings: List[str] = []
+    idx = tau_defs.RECIPIENT_HOLD_STREAM_INDEX
+    for label, text in spec_texts or ():
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if re.search(r"\bi%d\b" % idx, strip_clause_comments(text)):
+            findings.append(
+                f"{label} already references i{idx}; activating recipient "
+                f"policy would make it the node-fed receive stream under a "
+                f"rule written for something else"
             )
     return findings
 

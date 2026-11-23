@@ -436,6 +436,112 @@ async function sendRpc(command) {
     // Simple wait/lock mechanism could be added here if we wanted request/response matching
 }
 
+// Recipient policy (#47/#76): the same clause `tau-testnet policy receive`
+// composes (tau_testnet_cli/recipient_rules.py); a parity test keeps them equal.
+function composeReceiveClause(opts) {
+    const o = opts || {};
+    const allow = o.allow || [], sendOnlyTo = o.sendOnlyTo || [];
+    const maxS = (o.maxHoldSeconds === null || o.maxHoldSeconds === undefined) ? null : Number(o.maxHoldSeconds);
+    const maxB = (o.maxHoldBlocks === null || o.maxHoldBlocks === undefined) ? null : Number(o.maxHoldBlocks);
+    if (!allow.length && !sendOnlyTo.length && maxS === null && maxB === null) {
+        throw new Error('give at least one of: accepted senders, a max hold, send-only-to');
+    }
+    const BASE = 1n << 63n;
+    const u64 = (v) => '{ #x' + BigInt(v).toString(16).padStart(16, '0') + ' }:bv[64]';
+    const key = (pk) => {
+        let k = String(pk).trim().toLowerCase();
+        if (k.startsWith('0x')) k = k.slice(2);
+        if (!/^[0-9a-f]{96}$/.test(k)) throw new Error('not a 96-hex-digit public key: ' + pk);
+        return '{ #x' + k + ' }:bv[384]';
+    };
+    const anyOf = (stream, keys) => '(' + keys.map((k) => `(${stream}[t]:bv[384] = ${key(k)})`).join(' || ') + ')';
+    for (const [name, cap, limit] of [['max_hold_seconds', maxS, BASE - 2n], ['max_hold_blocks', maxB, BASE - 1n]]) {
+        if (cap !== null && (!Number.isInteger(cap) || cap < 0 || BigInt(cap) > limit)) {
+            throw new Error(`${name} must be a whole number between 0 and ${limit}`);
+        }
+    }
+    const i17 = 'i17[t]:bv[64]';
+    const receiving = `(${i17} > ${u64(0)})`;
+    const sending = `(${i17} = ${u64(0)})`;
+    const refuseIn = [];
+    if (allow.length) refuseIn.push('!' + anyOf('i3', allow));
+    const sLim = maxS === null ? null : 1n + BigInt(maxS);
+    const bLim = maxB === null ? null : BASE + BigInt(maxB);
+    if (sLim !== null && bLim === null) {
+        refuseIn.push(`(${i17} > ${u64(sLim)})`);
+    } else if (sLim === null && bLim !== null) {
+        refuseIn.push(`(${i17} > ${u64(bLim)})`);
+    } else if (sLim !== null && bLim !== null) {
+        refuseIn.push(`((${i17} > ${u64(sLim)}) && (${i17} < ${u64(BASE)}))`);
+        refuseIn.push(`(${i17} > ${u64(bLim)})`);
+    }
+    const parts = [];
+    if (refuseIn.length) parts.push(`(${receiving} && (${refuseIn.join(' || ')}))`);
+    if (sendOnlyTo.length) parts.push(`(${sending} && !${anyOf('i4', sendOnlyTo)})`);
+    return `always ( (${parts.join(' || ')}) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).`;
+}
+
+function initReceiveRuleBuilder() {
+    const btn = document.getElementById('btn-build-receive-rule');
+    if (!btn) return;
+    const status = document.getElementById('rcv-status');
+    const lines = (id) => (document.getElementById(id).value || '').split(/\s+/).filter(Boolean);
+    const num = (id) => {
+        const v = document.getElementById(id).value;
+        return v === '' ? null : Number(v);
+    };
+    window.addEventListener('govStatusResponse', (e) => {
+        const rp = (e.detail || {}).recipient_policy;
+        if (!status || !rp || !status.dataset.waiting) return;
+        delete status.dataset.waiting;
+        status.textContent = rp.active
+            ? 'Rule built. This node enforces rules on incoming payments.'
+            : 'Rule built, but this node does not enforce rules on incoming payments yet: it would refuse the rule (RECIPIENT_POLICY_INACTIVE).';
+    });
+    btn.addEventListener('click', () => {
+        let rule;
+        try {
+            rule = composeReceiveClause({
+                allow: lines('rcv-allow'), sendOnlyTo: lines('rcv-send-only-to'),
+                maxHoldSeconds: num('rcv-max-seconds'), maxHoldBlocks: num('rcv-max-blocks'),
+            });
+        } catch (err) {
+            if (status) status.textContent = err.message;
+            return;
+        }
+        if (ruleEditor) ruleEditor.setValue(rule); else if (txRule) txRule.value = rule;
+        if (status) {
+            status.textContent = 'Rule built. Checking whether this node enforces it...';
+            status.dataset.waiting = '1';
+        }
+        if (isConnected) sendRpc('getgovernance');
+    });
+}
+
+// Recipient policy (#47/#76): turn the node's refusal into a sentence the payer
+// can act on. `details` is the error envelope's details object.
+function describeRecipientRefusal(code, details) {
+    const d = details || {};
+    if (code === 'RECIPIENT_MAX_HOLD') {
+        const unit = d.max_hold_blocks !== undefined || d.hold_blocks !== undefined ? 'blocks' : 'seconds';
+        const cap = unit === 'blocks' ? d.max_hold_blocks : d.max_hold_seconds;
+        if (cap === 0) {
+            return 'The recipient only accepts payments that arrive instantly. Send it as a plain transfer instead.';
+        }
+        if (cap === null || cap === undefined) {
+            return `The recipient does not accept a payment held in ${unit}. Send it as a plain transfer instead.`;
+        }
+        return `The recipient only accepts payments held for up to ${cap} ${unit}. Send it now or with a shorter hold.`;
+    }
+    if (code === 'RECIPIENT_POLICY') {
+        return 'The recipient does not accept payments from this account.';
+    }
+    if (code === 'RECIPIENT_POLICY_INACTIVE') {
+        return 'This node does not enforce rules on incoming payments yet, so this rule would never run.';
+    }
+    return null;
+}
+
 function handleServerResponse(msg) {
     // All blockchain command responses use the standard JSON envelope:
     //   {"status":"ok","command":"<name>","data":{...}}
@@ -554,6 +660,8 @@ function handleServerResponse(msg) {
                         Number.isFinite(Number(errDetails.required_fee))) {
                     txFeeLimit.value = String(errDetails.required_fee);
                     log(`Fee limit too low. Updated fee limit to required ${errDetails.required_fee}. Review and resend.`, 'warn');
+                } else if (describeRecipientRefusal(errCode, errDetails)) {
+                    log(describeRecipientRefusal(errCode, errDetails), 'warn');
                 } else if (errCode === 'INSUFFICIENT_FUNDS' &&
                         errDetails.required !== undefined) {
                     log(`Insufficient funds: balance ${errDetails.balance}, need ${errDetails.required} (transfers + fee).`, 'warn');
@@ -3556,6 +3664,7 @@ function checkSelectedProposalStillPending() {
 // Call this function when the window loads
 window.addEventListener('load', () => {
     initRuleTemplates();
+    initReceiveRuleBuilder();
     initGovRuleTemplates();
     initPolicyPanel();
     if (btnRefreshProposals) btnRefreshProposals.addEventListener('click', refreshGovernanceAdvisory);
