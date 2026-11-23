@@ -21,6 +21,11 @@ def execute(raw_command: str, container):
     chain_state = container.chain_state
     db = container.db
 
+    # The precheck of a flag patch audits the rules in force, and that audit
+    # takes the rules lock. Running it inside this block never returns, and
+    # block apply needs the same lock, so the node stalls while the patch is
+    # scheduled. The entries are filled in after the locks are released.
+    deferred_prechecks = []
     with chain_state._balance_lock, chain_state._sequence_lock, chain_state._rules_lock:
         head = db.get_canonical_head_block() or {}
         header = head.get("header") or {}
@@ -101,13 +106,13 @@ def execute(raw_command: str, container):
             # is checked when submitted, but activates later, and the tip moves in
             # between (issue #24 ask 4). Informational only — consensus never
             # reads it, so an operator gets a warning window while the terminal
-            # behaviour of a bad activation is unchanged.
-            precheck = precheck_scheduled_update(
-                payload_obj, chain_state._lifecycle_manager.active_validators
-            )
-            entry["precheck"] = precheck["status"]
-            if precheck["error"]:
-                entry["precheck_error"] = precheck["error"]
+            # behaviour of a bad activation is unchanged. Run after the locks
+            # are released: see deferred_prechecks above.
+            deferred_prechecks.append((
+                entry,
+                payload_obj,
+                list(chain_state._lifecycle_manager.active_validators),
+            ))
             scheduled_updates.append(entry)
 
         for uid, voter_set in chain_state._lifecycle_manager.votes.items():
@@ -187,5 +192,11 @@ def execute(raw_command: str, container):
             "lifecycle": lifecycle,
             "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
         }
+
+    for entry, payload_obj, validators in deferred_prechecks:
+        precheck = precheck_scheduled_update(payload_obj, validators)
+        entry["precheck"] = precheck["status"]
+        if precheck["error"]:
+            entry["precheck_error"] = precheck["error"]
 
     return api_response.success_response("getgovernance", payload)
