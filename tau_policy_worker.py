@@ -189,8 +189,11 @@ class _PolicyWorker:
             return {"ok": False, "phase": "step", "o5": None, "asked": names,
                     "error": info["diagnostics"][:_ERROR_LIMIT], **info}
         named = {k.name: str(v) for k, v in outs.items()}
+        # "outputs" carries the FULL named output map alongside the o5
+        # shortcut: verdict-only callers ignore it, multi-output clause
+        # consumers (the payout rule evaluator) read their streams from it.
         return {"ok": True, "phase": "step", "o5": named.get("o5"), "asked": names,
-                **info}
+                "outputs": named, **info}
 
     def stats(self) -> dict:
         self.state_revision += 1

@@ -2641,7 +2641,7 @@ def load_retractable_state() -> tuple[List[tuple], int, bytes]:
 
 # Section names of the programmable-payments snapshot, in the shape
 # ProgrammablePayments.snapshot_rows() produces and .restore() consumes.
-_PAYMENT_SECTIONS = ("standing", "routes", "payouts", "grants")
+_PAYMENT_SECTIONS = ("standing", "routes", "payouts", "grants", "runner")
 
 
 def _write_payments_rows(state: Dict) -> None:
@@ -2674,6 +2674,9 @@ def load_payments_state() -> Dict:
         "routes": stored.get("routes") or [],
         "payouts": stored.get("payouts") or [],
         "grants": stored.get("grants") or {"grants": [], "shared_caps": []},
+        # Absent on rows written before the runner existed: an empty
+        # runner section, which restore reads as an empty runner book.
+        "runner": stored.get("runner") or {"rules": [], "shared_caps": []},
     }
 
 

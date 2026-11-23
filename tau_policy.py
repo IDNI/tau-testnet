@@ -164,8 +164,10 @@ class PolicyEvaluator:
             raise SpeculationError(_failure_text(resp))
         return PolicyBuild(ok=False, error=str(resp.get("error") or ""))
 
-    def verdict(self, body: str, inputs: dict, *,
-                timeout=_SESSION_DEFAULT) -> PolicyVerdict:
+    def _step_response(self, body: str, inputs: dict, timeout) -> dict:
+        """One clause step, with the verdict path's failure mapping: build
+        failures raise PolicyBuildError, step failures PolicyStepError,
+        anything else SpeculationError (evaluator loss propagates)."""
         resp = self._run(
             {"op": "step", "key": clause_key(body), "text": body,
              "inputs": dict(inputs or {})},
@@ -177,9 +179,23 @@ class PolicyEvaluator:
             if resp.get("phase") == "step":
                 raise PolicyStepError(str(resp.get("error") or ""))
             raise SpeculationError(f"policy step failed: {_failure_text(resp)}")
+        return resp
+
+    def verdict(self, body: str, inputs: dict, *,
+                timeout=_SESSION_DEFAULT) -> PolicyVerdict:
+        resp = self._step_response(body, inputs, timeout)
         o5 = resp.get("o5")
         value = parse_o5(o5)
         return PolicyVerdict(blocked=value == 0, o5=o5, built=bool(resp.get("built")))
+
+    def outputs(self, body: str, inputs: dict, *,
+                timeout=_SESSION_DEFAULT) -> dict:
+        """The FULL named output map of one clause step ({stream name:
+        value text}), for clauses whose meaning lives on streams other
+        than o5 -- the payout rule's leg streams are the first consumer.
+        Same failure mapping as `verdict`."""
+        resp = self._step_response(body, inputs, timeout)
+        return dict(resp.get("outputs") or {})
 
     def stats(self) -> dict:
         with self._lock:
