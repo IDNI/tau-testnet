@@ -232,7 +232,9 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # condition. The apply path creates exactly these root fields, so
         # anything omitted here could be rewritten by a proposer into a
         # different grant than the funder chose — above all the beneficiary
-        # and the total.
+        # and the total. The form and (for the Tau form) the clause text
+        # and the periods_from anchor fix the grant exactly as the
+        # schedule does, so they are signed too.
         signing_dict["grant_beneficiary_pubkey"] = payload.get("grant_beneficiary_pubkey")
         signing_dict["grant_total_amount"] = payload.get("grant_total_amount")
         signing_dict["grant_release_per_period"] = payload.get("grant_release_per_period")
@@ -245,6 +247,9 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["grant_window_end_ts"] = payload.get("grant_window_end_ts")
         signing_dict["grant_inactivity_seconds"] = payload.get("grant_inactivity_seconds")
         signing_dict["grant_version"] = payload.get("grant_version")
+        signing_dict["grant_form"] = payload.get("grant_form")
+        signing_dict["grant_clause"] = payload.get("grant_clause")
+        signing_dict["grant_periods_from_ts"] = payload.get("grant_periods_from_ts")
     elif tx_type == TX_TYPE_DRAW_GRANT:
         # The id names the exact grant (a hash of its signed terms) and the
         # amount is the draw's whole content, so signing both binds the

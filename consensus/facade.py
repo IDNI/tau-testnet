@@ -716,7 +716,8 @@ class TipAdmissionView:
         row = next(r for r in book.rows() if r[0] == entry.grant_id)
         (grant_id, funder, beneficiary, total, release, kind, day, start,
          deadline, locked, win_start, win_end, inactivity, version,
-         spent, last_draw, refunded, refunded_amount, refunded_ts) = row
+         spent, last_draw, refunded, refunded_amount, refunded_ts,
+         form, clause_text, periods_from_ts) = row
         ts = self.next_block_timestamp
         return {
             "grant_id": entry.grant_id.hex(),
@@ -733,6 +734,9 @@ class TipAdmissionView:
             "window_end_ts": win_end,
             "inactivity_seconds": inactivity,
             "version": version,
+            "form": form,
+            "clause_text": clause_text,
+            "periods_from_ts": periods_from_ts,
             "total_spent": spent,
             "last_draw_ts": last_draw,
             "refunded": bool(refunded),

@@ -34,12 +34,15 @@ from .approvals import (
     parse_transfer_vote,
 )
 from .grants import (
+    FORM_TAU_CLAUSE as GRANT_FORM_TAU_CLAUSE,
     GRANT_TX_TYPES,
     TX_TYPE_CREATE_GRANT,
     TX_TYPE_DRAW_GRANT,
     TX_TYPE_SET_GRANT_SHARED_CAP,
     GrantBook,
     GrantShapeError,
+    decode_clause_released,
+    grant_clause_inputs,
     parse_create_grant,
     parse_draw_grant,
     parse_set_grant_shared_cap,
@@ -3449,17 +3452,62 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             gr_id = None
                             gr_entry = None
                             gr_decision = None
+                            gr_clause_released = None
                             reason = f"invalid grant draw ({exc})"
                         else:
                             gr_entry = gr_book.get(gr_id)
                             if gr_entry is None:
                                 gr_decision = None
+                                gr_clause_released = None
                                 reason = "no grant with this id"
                             else:
-                                gr_decision = gr_book.evaluate_draw(
-                                    gr_id, gr_amount, gr_ts
-                                )
-                                reason = "" if gr_decision.drawn else gr_decision.reason
+                                # The book computes the released amount —
+                                # from the stored schedule (declared form)
+                                # or from stepping the funder's clause over
+                                # the node-built input map (Tau form) — and
+                                # checks it against the declared schedule
+                                # cap; the credit below then lands on the
+                                # beneficiary directly, so no receive route
+                                # can split it.
+                                gr_clause_released = None
+                                reason = ""
+                                if gr_entry.form == GRANT_FORM_TAU_CLAUSE:
+                                    outputs, detail = (
+                                        sender_policy.clause_outputs(
+                                            gr_entry.clause_text,
+                                            grant_clause_inputs(
+                                                gr_entry,
+                                                sender if isinstance(
+                                                    sender, str) else "",
+                                                gr_amount, gr_ts,
+                                                gr_book.held(gr_id),
+                                                gr_book.accounting(gr_id)["drawn"],
+                                            ),
+                                            pool="apply",
+                                        )
+                                    )
+                                    if outputs is None:
+                                        reason = (
+                                            "the grant's clause did not "
+                                            "produce a released amount "
+                                            f"({detail})"
+                                        )
+                                    else:
+                                        gr_clause_released, why = (
+                                            decode_clause_released(
+                                                gr_entry, outputs)
+                                        )
+                                        if gr_clause_released is None:
+                                            reason = why
+                                if not reason:
+                                    gr_decision = gr_book.evaluate_draw(
+                                        gr_id, gr_amount, gr_ts,
+                                        clause_released=gr_clause_released,
+                                    )
+                                    reason = (
+                                        "" if gr_decision.drawn
+                                        else gr_decision.reason
+                                    )
                         if gr_id is None or reason:
                             tx_receipt["logs"].append(f"Grant draw ignored: {reason}")
                             tx_receipt["reason"] = "grant_not_drawn"
@@ -3477,7 +3525,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 _read_bal(gr_entry.beneficiary_pubkey)
                                 + gr_amount
                             )
-                            pending_grant_draw = (gr_entry, gr_decision)
+                            pending_grant_draw = (
+                                gr_entry, gr_decision, gr_clause_released
+                            )
                             tx_receipt["logs"].append(
                                 "Grant draw staged: " + gr_id.hex()
                             )
@@ -4304,13 +4354,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         + pending_grant_create.grant_id.hex()
                     )
                 elif pending_grant_draw is not None:
-                    gr_entry, _gr_decision = pending_grant_draw
+                    gr_entry, _gr_decision, _gr_clause_released = pending_grant_draw
                     # Same fork, same inputs as the branch's
                     # evaluate_draw: the settled decision is the staged
-                    # one by construction.
+                    # one by construction. The staged clause-released
+                    # amount rides along, so a Tau-form grant's
+                    # settlement re-evaluates to the staged decision.
                     settled = gr_book.draw(
                         gr_entry.grant_id, _gr_decision.amount,
                         int(block_timestamp or 0),
+                        clause_released=_gr_clause_released,
                     )
                     tx_receipt["grant_event"] = {
                         "grant_id": gr_entry.grant_id.hex(),

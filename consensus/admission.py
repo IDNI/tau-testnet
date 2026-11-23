@@ -49,11 +49,14 @@ from consensus.approvals import (
     validate_rule_change_shape,
 )
 from consensus.grants import (
+    FORM_TAU_CLAUSE as GRANT_FORM_TAU_CLAUSE,
     TX_TYPE_CREATE_GRANT,
     TX_TYPE_DRAW_GRANT,
     TX_TYPE_SET_GRANT_SHARED_CAP,
     GrantBook,
     GrantShapeError,
+    decode_clause_released,
+    grant_clause_inputs,
     parse_create_grant,
     parse_draw_grant,
     parse_set_grant_shared_cap,
@@ -2224,6 +2227,12 @@ def _tip_grant_book(row: Optional[Dict]) -> GrantBook:
         int(row["refunded"]),
         int(row["refunded_amount"]),
         int(row["refunded_ts"]),
+        # The Tau form's signed fields ride the same row (the facade's
+        # view carries them); a row built before the clause form existed
+        # reads as declared, so admission of an old grant is unchanged.
+        int(row.get("form", 1)),
+        str(row.get("clause_text", "")),
+        int(row.get("periods_from_ts", 0)),
     )
     cap_rows = []
     cap = row.get("shared_cap")
@@ -2306,6 +2315,12 @@ def validate_draw_grant_payload(
     against the tip state — the same call block apply makes, so the two
     agree on identical state. The fee is apply-side (it needs the
     engine's evaluation), exactly as for the other lifecycle types.
+
+    A Tau-form grant's released amount comes from stepping its clause,
+    so this screen steps it too — the same clause, the same input-map
+    builder, the admission pool — mirroring the apply site's
+    construction step for step; the declared form stays Tau-free, as
+    before.
     """
     try:
         grant_id, amount = parse_draw_grant(tx)
@@ -2318,8 +2333,33 @@ def validate_draw_grant_payload(
             "Unknown grant.",
             code="UNKNOWN_GRANT",
         )
-    decision = _tip_grant_book(row).evaluate_draw(
-        grant_id, amount, tip_view.next_block_timestamp)
+    book = _tip_grant_book(row)
+    ts = tip_view.next_block_timestamp
+    clause_released = None
+    entry = book.get(grant_id)
+    if entry is not None and entry.form == GRANT_FORM_TAU_CLAUSE:
+        from consensus import sender_policy
+
+        sender = tx.get("sender_pubkey")
+        outputs, detail = sender_policy.clause_outputs(
+            entry.clause_text,
+            grant_clause_inputs(
+                entry,
+                sender if isinstance(sender, str) else "",
+                amount, ts, book.held(grant_id),
+                book.accounting(grant_id)["drawn"],
+            ),
+            pool="admission",
+        )
+        if outputs is None:
+            return format_error(
+                f"draw_grant rejected: the grant's clause did not produce "
+                f"a released amount ({detail})")
+        clause_released, why = decode_clause_released(entry, outputs)
+        if clause_released is None:
+            return format_error(f"draw_grant rejected: {why}")
+    decision = book.evaluate_draw(
+        grant_id, amount, ts, clause_released=clause_released)
     if not decision.drawn:
         return format_error(f"draw_grant rejected: {decision.reason}")
 
