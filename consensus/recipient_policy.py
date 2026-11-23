@@ -6,10 +6,13 @@ runs only when that clause mentions i17, and feeds a code:
     0                  the owner's own send
     1                  a plain payment arriving (hold length 0)
     1 + seconds        a time park, seconds in 1 .. 7_776_000
-    7_776_001 + blocks a height park, blocks in 1 .. 100_000
+    (2^63 - 1 - 100_000) + blocks
+                       a height park, blocks in 1 .. 100_000
 
 A cap of 0 is the comparison ``i17 > 1``. A cap of 600 seconds is ``i17 > 601``,
-and every height park fails it, because those codes sit above the seconds range.
+and every height park fails it. Height codes sit at the top of the
+non-negative ``bv[64]`` range, so a seconds literal also fails them when the
+number is longer than the 90-day window.
 That refusal reports ``max_hold_blocks=0`` and, when the seconds side is itself
 one cap, ``max_hold_seconds`` as well.
 
@@ -51,10 +54,14 @@ WIDTH = tau_defs.RECIPIENT_HOLD_BV_WIDTH
 CODE_OUTBOUND = 0
 CODE_PLAIN = 1
 # A time park of S seconds is code (1 + S). The largest legal S lands on
-# TIME_CODE_MAX, and height parks start at the next code.
+# TIME_CODE_MAX. Height codes occupy the top of the non-negative bv[64]
+# range, the same ceiling i16 uses for "never sent". A seconds comparison
+# then refuses every height park, including a literal longer than 90 days.
+# Packing height codes in at the next second would let that literal admit
+# every legal height park.
 TIME_CODE_MAX = 1 + MAX_RELEASE_WINDOW_SECONDS
-HEIGHT_CODE_BASE = TIME_CODE_MAX
-HEIGHT_CODE_MAX = HEIGHT_CODE_BASE + MAX_RELEASE_WINDOW_BLOCKS
+HEIGHT_CODE_MAX = (1 << 63) - 1
+HEIGHT_CODE_BASE = HEIGHT_CODE_MAX - MAX_RELEASE_WINDOW_BLOCKS
 
 SECONDS_LO = 2
 BLOCKS_LO = HEIGHT_CODE_BASE + 1

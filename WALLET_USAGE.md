@@ -228,8 +228,11 @@ custom input and a clause that types it `bv[64]` is refused
 patch, the node feeds `i17` and a sender cannot write it.
 
 `0` is your own send. `1` is a plain payment arriving. A time park is
-`1 + seconds` (up to 7,776,000). A height park is `7,776,001 + blocks` (up to
-100,000). A clause that never mentions `i17` keeps judging only what you send.
+`1 + seconds` (up to 7,776,000). A height park of N blocks is
+`(2^63 - 1 - 100,000) + N`, at the top of the non-negative `bv[64]` range.
+A comparison written in seconds therefore refuses every height park, including
+one whose number is longer than the 90-day release window. A clause that never
+mentions `i17` keeps judging only what you send.
 One that does is also asked about each payment to you. Branch on `0` so an
 inbound rule does not block your own sends:
 

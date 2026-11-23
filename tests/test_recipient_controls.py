@@ -20,6 +20,7 @@ from consensus.recipient_policy import (
     BLOCKS_LO,
     CODE_PLAIN,
     HEIGHT_CODE_BASE,
+    HEIGHT_CODE_MAX,
     MAX_CAP_POINTS,
     MAX_HOLD,
     POLICY_BLOCK,
@@ -33,7 +34,7 @@ from consensus.recipient_policy import (
     screen_hold_clause,
     sender_clause_inputs,
 )
-from consensus.retractable import KIND_HEIGHT, KIND_TIME
+from consensus.retractable import KIND_HEIGHT, KIND_TIME, MAX_RELEASE_WINDOW_BLOCKS
 from consensus import sender_policy
 
 HOLD = "i17[t]:bv[64]"
@@ -77,8 +78,12 @@ def test_a_time_park_and_a_height_park_use_different_ranges():
     assert park_hold_code(KIND_TIME, 1_000 + 600, 0, 1_000) == 601
     assert park_hold_code(KIND_HEIGHT, 10 + 3, 10, 0) == HEIGHT_CODE_BASE + 3
     assert park_hold_code(KIND_TIME, 5, 0, 5) == 2
-    assert HEIGHT_CODE_BASE == TIME_CODE_MAX
-    assert BLOCKS_LO == TIME_CODE_MAX + 1
+    assert HEIGHT_CODE_BASE > TIME_CODE_MAX
+    assert BLOCKS_LO == HEIGHT_CODE_BASE + 1
+    assert HEIGHT_CODE_MAX == (1 << 63) - 1
+    assert park_hold_code(
+        KIND_HEIGHT, MAX_RELEASE_WINDOW_BLOCKS, 0, 0,
+    ) == HEIGHT_CODE_MAX
 
 
 def test_the_sender_pass_feeds_zero_only_when_the_feature_is_on():
@@ -288,6 +293,21 @@ def test_a_direct_comparison_names_the_cap_from_its_literal():
     assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 600}
     assert "600 seconds" in height.message
     assert "straight away" not in height.message
+
+
+def test_a_seconds_cap_past_the_release_window_still_refuses_a_height_park():
+    """A one-year literal is not a binding seconds cap: every legal time park
+    is shorter. It must still refuse a height park. Packed against the 90-day
+    window, that same literal sat above every height code and admitted them.
+    """
+    year = 1 + 365 * 24 * 3600
+    body = _literal(year)
+    _use(_over(year), body)
+    assert recipient_refusal(body, {}, TIME_CODE_MAX, pool="apply") is None
+    height = recipient_refusal(body, {}, HEIGHT_CODE_BASE + 1, pool="apply")
+    assert height.code == MAX_HOLD
+    assert height.details == {"max_hold_blocks": 0}
+    assert "max_hold_seconds" not in height.message
 
 
 def test_a_hex_literal_and_an_implication_are_still_one_threshold():
