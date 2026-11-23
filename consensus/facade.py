@@ -644,6 +644,21 @@ class TipAdmissionView:
             "current_period_total": (
                 book.period_total(entry.rule_id, period) if period >= 0 else 0
             ),
+            # Never below 0: a carried total may stand over a lowered cap
+            # (FIX 5C); None when the rule names no per-period cap.
+            "left_this_period": (
+                None
+                if max_period == 0
+                else max(
+                    0,
+                    max_period
+                    - (
+                        book.period_total(entry.rule_id, period)
+                        if period >= 0
+                        else 0
+                    ),
+                )
+            ),
             "settlements": [
                 {
                     "settlement_id": s.settlement_id.hex(),

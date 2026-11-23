@@ -565,3 +565,44 @@ def test_admission_agrees_with_apply():
     assert not validate_execute_payout_rule_payload(
         _execute_tx(EXECUTOR, SK_EXECUTOR, entry.rule_id, SID_1, 101, seq=0),
         live).is_valid
+
+
+# --- FIX 5C: a replacement keeps what its place paid this period ----------------
+
+
+def test_direct_replacement_carries_the_period_spend():
+    """FIX 5C / cb8c42d: a direct-tx replacement carries the period's spend —
+    the period's cap is not refunded by installing a new version."""
+    chain, rule_id = _installed_chain(
+        legs=[[ARTIST, LEG_BPS_OF_BASE, 10000]], max_per_period=250)
+    first = _execute_tx(EXECUTOR, SK_EXECUTOR, rule_id, SID_1, 200, seq=0)
+    result = chain.apply([first])
+    assert first["tx_id"] in result.accepted_tx_ids
+    assert chain.balances[ARTIST] == 1000 + 200
+
+    again = _install_tx(OWNER, SK_OWNER, seq=1,
+                        legs=[[ARTIST, LEG_BPS_OF_BASE, 10000]],
+                        max_per_period=250, anchor_ts=TS - 100, version=2)
+    result = chain.apply([again])
+    assert again["tx_id"] in result.accepted_tx_ids
+    new_id = _rule_id(again)
+    assert _book(chain).period_total(new_id, 0) == 200
+
+    view = _TipView(_book(chain), dict(chain.balances))
+    got = view.get_payout_rule_for_owner(OWNER)
+    assert got["current_period_total"] == 200
+    assert got["left_this_period"] == 50
+
+    over = _execute_tx(EXECUTOR, SK_EXECUTOR, new_id, SID_2, 200, seq=1)
+    result = chain.apply([over])
+    assert over["tx_id"] in result.invalid_tx_ids
+    assert "past the rule's declared max per period" in _logs(result)
+    assert chain.balances[ARTIST] == 1000 + 200
+
+    # (The refused `over` still consumed the executor's sequence number,
+    # so the next execution reuses seq 1.)
+    rest = _execute_tx(EXECUTOR, SK_EXECUTOR, new_id, SID_2, 50, seq=1)
+    result = chain.apply([rest])
+    assert rest["tx_id"] in result.accepted_tx_ids
+    assert chain.balances[ARTIST] == 1000 + 250
+    assert _book(chain).period_total(new_id, 0) == 250

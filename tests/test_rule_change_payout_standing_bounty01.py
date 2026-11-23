@@ -531,3 +531,77 @@ def test_unguarded_direct_operations_are_unchanged():
     assert cancel["tx_id"] in applied.accepted_tx_ids
     ok, reason = _standing_book(chain).can_cancel(entry.auth_id, TS)
     assert not ok and reason == "authorization is already cancelled"
+
+
+# --- FIX 5C: a guarded replacement keeps what its place paid --------------------
+
+
+def test_kind8_request_update_carries_the_period_spend():
+    """FIX 5C / cb8c42d: a kind-8 release carries the period's spend — the
+    co-signers approve the new terms, not a fresh cap in the same period."""
+    chain = _guarded_chain()
+    req = _request(
+        KIND_SET_PAYOUT,
+        text=payout_payload_text(_payout_entry(
+            payout_legs=[[BOB, 2, 10000]], payout_max_per_period=250)),
+        seq=0, expire=3000)
+    chain.block(_tx(req))
+    assert chain.entry(req).status == STATUS_OPEN
+    chain.block(_vote(req.request_id, seq=0))
+    assert chain.entry(req).status == STATUS_EXECUTED
+    book = _payout_book(chain)
+    rule = book.get(ALICE)
+    assert rule is not None and rule.version == 1
+    # A settled execution: 200 of the 250 period cap paid.
+    assert book.execute(
+        rule.rule_id, bytes.fromhex("11" * 32), 200, TS, 10_000).executed
+    assert book.period_total(rule.rule_id, 0) == 200
+
+    req = _request(
+        KIND_UPDATE_PAYOUT,
+        text=payout_payload_text(_payout_entry(
+            payout_version=2, payout_legs=[[BOB, 2, 10000]],
+            payout_max_per_period=250)),
+        seq=1, expire=3000)
+    chain.block(_tx(req))
+    assert chain.entry(req).status == STATUS_OPEN
+    chain.block(_vote(req.request_id, seq=1))
+    assert chain.entry(req).status == STATUS_EXECUTED
+    new = _payout_book(chain).get(ALICE)
+    assert new.version == 2
+    assert _payout_book(chain).period_total(new.rule_id, 0) == 200
+    # Only the 50 the cap leaves can still execute this period.
+    assert not _payout_book(chain).execute(
+        new.rule_id, bytes.fromhex("22" * 32), 200, TS, 10_000).executed
+    assert _payout_book(chain).execute(
+        new.rule_id, bytes.fromhex("22" * 32), 50, TS, 10_000).executed
+
+
+def test_kind11_request_update_carries_the_settled_period():
+    """FIX 5C / cb8c42d (standing): a kind-11 release carries the settled
+    current period — the update cannot double-pay it."""
+    chain = _guarded_chain()
+    _standing_v1_via_request(chain, seq=0)
+    book = _standing_book(chain)
+    v1 = book.get_for_series(_standing_entry().series_key)
+    assert v1 is not None and v1.version == 1
+    # Settle the current period under v1 (daily schedule, anchor TS-100).
+    assert book.execute(v1.auth_id, TS, 10_000).executed
+    assert book.paid_for_period(v1.auth_id, 0).amount == 500
+
+    req = _request(
+        KIND_UPDATE_STANDING,
+        text=standing_payload_text(_standing_entry(
+            standing_version=2, standing_amount=750)),
+        seq=1, expire=3000)
+    chain.block(_tx(req))
+    assert chain.entry(req).status == STATUS_OPEN
+    chain.block(_vote(req.request_id, seq=1))
+    assert chain.entry(req).status == STATUS_EXECUTED
+    v2 = _standing_book(chain).get_for_series(_standing_entry().series_key)
+    assert v2.version == 2 and v2.amount == 750
+    fact = _standing_book(chain).paid_for_period(v2.auth_id, 0)
+    assert fact is not None and fact.amount == 500
+    # The same period cannot settle again under the new version.
+    again = _standing_book(chain).execute(v2.auth_id, TS, 10_000)
+    assert not again.executed and "already settled" in again.reason

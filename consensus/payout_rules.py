@@ -760,21 +760,48 @@ class PayoutRuleBook:
     def install(self, entry: PayoutRuleEntry, now_ts: int) -> bytes:
         """Install a rule; a new version supersedes the old one wholesale.
 
-        The old version can no longer execute and its period totals are
-        discarded with it (its terms may have changed), but its settlements
-        stay recorded — history is not rewritten, and reinstalling the old
-        version later cannot re-pay them.
+        The old version can no longer execute, but what it paid in its
+        current period carries into the new version's first period
+        (FIX 5C, cb8c42d parity): a replacement never gives a period its
+        cap again, and neither does a chain of them through a lower cap.
+        The carry is read on the old rule's clock at the replacing block
+        and lands in the new rule's period containing that block (its
+        first period when the anchor is the install time); when the
+        anchors put the two periods apart — the old period already ended
+        before the new rule's first period starts — nothing carries.
+        Settlements stay recorded — history is not rewritten, and
+        reinstalling the old version later cannot re-pay them.
         """
         ok, reason = self.can_install(entry, now_ts)
         if not ok:
             raise ValueError(reason)
         old = self._entries.get(entry.owner_pubkey)
+        carried = 0
+        if old is not None:
+            old_period = period_index_at(old, now_ts)
+            if old_period >= 0:
+                carried = self.period_total(old.rule_id, old_period)
         if old is not None:
             del self._by_id[old.rule_id]
             self._period_totals.pop(old.rule_id, None)
         self._entries[entry.owner_pubkey] = entry
         self._by_id[entry.rule_id] = entry.owner_pubkey
-        self._period_totals[entry.rule_id] = {}
+        totals: Dict[int, int] = {}
+        if carried:
+            first = period_index_at(entry, now_ts)
+            if first < 0:
+                first = 0
+            # The carry belongs to the new rule's first period only while
+            # the two periods overlap in time: the old period's window
+            # must reach the new period's window, else the old period
+            # already ended before the new rule's first period starts.
+            old_start = old.period_anchor_ts + old_period * old.period_seconds
+            old_end = old_start + old.period_seconds
+            new_start = entry.period_anchor_ts + first * entry.period_seconds
+            new_end = new_start + entry.period_seconds
+            if old_start < new_end and new_start < old_end:
+                totals[first] = carried
+        self._period_totals[entry.rule_id] = totals
         self._root = None
         return entry.rule_id
 

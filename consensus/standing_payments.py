@@ -1206,14 +1206,34 @@ class StandingPaymentBook:
     def create(self, entry: StandingPaymentEntry, now_ts: int) -> bytes:
         """Install an authorization; a new version supersedes the old one.
 
-        Supersession is wholesale: the old version can no longer execute and
-        its progress is discarded with it (its terms may have changed), but
-        its paid-for-period facts stay readable — history is not rewritten.
+        Supersession is wholesale: the old version can no longer execute
+        and its progress is discarded with it (its terms may have changed),
+        but its paid-for-period facts stay readable — history is not
+        rewritten. One thing does carry (FIX 5C, cb8c42d parity): when the
+        old version already settled the period containing this block, the
+        new version's first period starts settled with the same amount, so
+        an update never lets one period be paid twice. Nothing carries
+        from a cancelled or ended authorization, from a period that has
+        already ended, or into a first period the old period does not
+        overlap in time. A cancel followed by a fresh create starts from
+        nothing, like a first install.
         """
         ok, reason = self.can_create(entry, now_ts)
         if not ok:
             raise ValueError(reason)
         old_id = self._series.get(entry.series_key)
+        carried_fact: Optional[PaidForPeriodFact] = None
+        if old_id is not None:
+            old = self._entries[old_id]
+            old_progress = self._progress[old_id]
+            old_period = period_index_at(old, now_ts)
+            if (
+                not old_progress.cancelled
+                and not (old.final_ts and now_ts >= old.final_ts)
+                and old_period >= 0
+                and old_period in old_progress.settled_periods
+            ):
+                carried_fact = self._facts.get((old_id, old_period))
         if old_id is not None:
             del self._entries[old_id]
             del self._progress[old_id]
@@ -1225,6 +1245,30 @@ class StandingPaymentBook:
         self._entries[entry.auth_id] = entry
         self._series[entry.series_key] = entry.auth_id
         self._progress[entry.auth_id] = _Progress()
+        if carried_fact is not None:
+            new_period = period_index_at(entry, now_ts)
+            if new_period < 0:
+                new_period = 0
+            # The carry belongs to the new version's first period only
+            # while the old period's window overlaps it.
+            new_start, new_end = period_bounds(entry, new_period)
+            if (
+                carried_fact.period_start_ts < new_end
+                and new_start < carried_fact.period_end_ts
+            ):
+                progress = self._progress[entry.auth_id]
+                progress.settled_periods.add(new_period)
+                progress.total_paid += carried_fact.amount
+                progress.last_execution_ts = carried_fact.execution_ts
+                self._facts[(entry.auth_id, new_period)] = PaidForPeriodFact(
+                    auth_id=entry.auth_id,
+                    payer_pubkey=entry.payer_pubkey,
+                    period_index=new_period,
+                    period_start_ts=new_start,
+                    period_end_ts=new_end,
+                    amount=carried_fact.amount,
+                    execution_ts=carried_fact.execution_ts,
+                )
         self._root = None
         return entry.auth_id
 
