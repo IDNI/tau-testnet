@@ -486,6 +486,8 @@ class TipAdmissionView:
             "expiry_ts": entry.expiry_ts,
             "locked_until_ts": entry.locked_until_ts,
             "version": entry.version,
+            "form": entry.form,
+            "clause_text": entry.clause_text,
         }
 
     def _tip_standing_book(self) -> Optional[StandingPaymentBook]:
@@ -507,7 +509,7 @@ class TipAdmissionView:
         (auth_id, payer, recipient, amount, kind, day, anchor, window,
          final_ts, max_occ, max_total, fee_limit, policy_ref, catch_up,
          version, settled, total_paid, last_exec, cancelled,
-         cancelled_ts) = row
+         cancelled_ts, form, clause_text) = row
         ts = self.next_block_timestamp
         occurrences, total = book.total_executed(entry.auth_id)
         return {
@@ -526,6 +528,8 @@ class TipAdmissionView:
             "policy_version_ref": policy_ref,
             "allow_catch_up": catch_up,
             "version": version,
+            "form": form,
+            "clause_text": clause_text,
             "settled_periods": list(settled),
             "total_paid": total_paid,
             "last_execution_ts": last_exec,

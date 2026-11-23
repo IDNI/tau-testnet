@@ -153,6 +153,10 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["route_expiry_ts"] = payload.get("route_expiry_ts")
         signing_dict["route_locked_until_ts"] = payload.get("route_locked_until_ts")
         signing_dict["route_version"] = payload.get("route_version")
+        # The form and (for the Tau form) the clause text fix the route
+        # exactly as the share does, so they are signed too.
+        signing_dict["route_form"] = payload.get("route_form")
+        signing_dict["route_clause"] = payload.get("route_clause")
     elif tx_type == TX_TYPE_REMOVE_RECEIVE_ROUTE:
         # The destination's authorization, when presented, is bound into the
         # owner's signature so it cannot be transplanted onto another removal;
@@ -179,6 +183,10 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["standing_policy_version_ref"] = payload.get("standing_policy_version_ref")
         signing_dict["standing_allow_catch_up"] = payload.get("standing_allow_catch_up")
         signing_dict["standing_version"] = payload.get("standing_version")
+        # The form and (for the Tau form) the clause text fix the
+        # authorization exactly as the amount does, so they are signed too.
+        signing_dict["standing_form"] = payload.get("standing_form")
+        signing_dict["standing_clause"] = payload.get("standing_clause")
     elif tx_type == TX_TYPE_CANCEL_STANDING_PAYMENT:
         # The id names the exact authorization (a hash of its signed terms),
         # so signing it binds the cancellation to that authorization alone.

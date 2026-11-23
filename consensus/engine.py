@@ -62,24 +62,31 @@ from .receive_routes import (
     CREDIT_ORDINARY_TRANSFER,
     CREDIT_PAYOUT_LEG,
     CREDIT_STANDING_EXECUTION,
+    FORM_TAU_CLAUSE as ROUTE_FORM_TAU_CLAUSE,
     RECEIVE_ROUTE_TX_TYPES,
+    ROUTE_TRIGGER_CREDIT_CLASSES,
     TX_TYPE_INSTALL_RECEIVE_ROUTE,
     ReceiveRouteBook,
     ReceiveRouteShapeError,
+    decode_clause_legs as decode_route_clause_legs,
     destination_authorized as route_destination_authorized,
     parse_install_receive_route,
     parse_remove_receive_route,
+    route_clause_inputs,
 )
 from .standing_payments import (
+    FORM_TAU_CLAUSE as STANDING_FORM_TAU_CLAUSE,
     STANDING_PAYMENT_TX_TYPES,
     TX_TYPE_CANCEL_STANDING_PAYMENT,
     TX_TYPE_CREATE_STANDING_PAYMENT,
     TX_TYPE_EXECUTE_STANDING_PAYMENT,
     StandingPaymentBook,
     StandingPaymentShapeError,
+    decode_clause_legs as decode_standing_clause_legs,
     parse_cancel_standing_payment,
     parse_create_standing_payment,
     parse_execute_standing_payment,
+    standing_clause_inputs,
 )
 from .retractable import (
     RETRACTABLE_TX_TYPES,
@@ -2290,13 +2297,49 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # (route_output) never triggers a route — routing is
                         # single-hop by construction, not by counter.
                         route_book = _receive_route_book(lifecycle_mgr)
-                        application = (
-                            route_book.apply_route(
-                                to_addr, amount, credit_class,
-                                int(block_timestamp or 0),
+                        application = None
+                        if route_book is not None:
+                            route_ts = int(block_timestamp or 0)
+                            route_entry = route_book.active_route(
+                                to_addr, route_ts)
+                            route_clause_legs = None
+                            if (
+                                route_entry is not None
+                                and route_entry.form == ROUTE_FORM_TAU_CLAUSE
+                                and credit_class in ROUTE_TRIGGER_CREDIT_CLASSES
+                                and amount >= route_entry.min_amount
+                            ):
+                                # A Tau-form route's legs come from
+                                # stepping the owner's clause over the
+                                # node-built input map — the payout
+                                # form's construction, at the seam. The
+                                # step happens ONLY for a triggering
+                                # class: a route output never reaches
+                                # this code, so routing stays single-hop
+                                # in both forms. A clause that does not
+                                # produce legs leaves route_clause_legs
+                                # None, and the book routes nothing —
+                                # the credit lands whole; a broken route
+                                # clause can never block a transfer.
+                                outputs, _detail = (
+                                    sender_policy.clause_outputs(
+                                        route_entry.clause_text,
+                                        route_clause_inputs(
+                                            route_entry, from_addr, amount,
+                                            route_ts, _read_bal(to_addr),
+                                        ),
+                                        pool="apply",
+                                    )
+                                )
+                                if outputs is not None:
+                                    route_clause_legs, _why = (
+                                        decode_route_clause_legs(
+                                            route_entry, outputs)
+                                    )
+                            application = route_book.apply_route(
+                                to_addr, amount, credit_class, route_ts,
+                                clause_legs=route_clause_legs,
                             )
-                            if route_book is not None else None
-                        )
                         if application is not None and application.applied:
                             staged_writes[to_addr] = (
                                 _read_bal(to_addr) + application.net
@@ -3068,15 +3111,54 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 # payer's o5 is re-checked on the real
                                 # recipient and amount by the same
                                 # evaluation an ordinary transfer of theirs
-                                # would face.
+                                # would face. A Tau-form authorization's
+                                # legs come from stepping the payer's
+                                # clause over the node-built input map —
+                                # the payout form's construction, one
+                                # stage earlier.
                                 sp_balance = _read_bal(sp_entry.payer_pubkey)
-                                sp_decision = sp_book.execution_due(
-                                    sp_auth_id, sp_ts, sp_balance,
-                                    executor_pubkey=(
-                                        sender if isinstance(sender, str) else None
-                                    ),
-                                )
-                                reason = "" if sp_decision.executed else sp_decision.reason
+                                sp_decision = None
+                                reason = ""
+                                sp_clause_legs = None
+                                if sp_entry.form == STANDING_FORM_TAU_CLAUSE:
+                                    outputs, detail = (
+                                        sender_policy.clause_outputs(
+                                            sp_entry.clause_text,
+                                            standing_clause_inputs(
+                                                sp_entry,
+                                                sender if isinstance(
+                                                    sender, str) else "",
+                                                sp_ts, sp_balance,
+                                                sp_book.period_paid_total(
+                                                    sp_auth_id, sp_ts),
+                                            ),
+                                            pool="apply",
+                                        )
+                                    )
+                                    if outputs is None:
+                                        reason = (
+                                            "the authorization's clause did "
+                                            f"not produce legs ({detail})"
+                                        )
+                                    else:
+                                        sp_clause_legs, why = (
+                                            decode_standing_clause_legs(
+                                                sp_entry, outputs)
+                                        )
+                                        if sp_clause_legs is None:
+                                            reason = why
+                                if not reason:
+                                    sp_decision = sp_book.execution_due(
+                                        sp_auth_id, sp_ts, sp_balance,
+                                        executor_pubkey=(
+                                            sender if isinstance(sender, str) else None
+                                        ),
+                                        clause_legs=sp_clause_legs,
+                                    )
+                                    reason = (
+                                        "" if sp_decision.executed
+                                        else sp_decision.reason
+                                    )
                         if sp_auth_id is None or reason:
                             tx_receipt["logs"].append(f"Standing payment execution ignored: {reason}")
                             tx_receipt["reason"] = "standing_payment_not_executed"
@@ -3091,12 +3173,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             # whole. No custom inputs: the executor's
                             # inputs must not steer the payer's policy
                             # evaluation; the signed terms are the entry's.
-                            moved = _execute_fee_era_transfer(
-                                sp_entry.payer_pubkey, sp_entry.recipient_pubkey,
-                                sp_decision.amount,
-                                slot_values=_approval_slot_values(),
-                                overrides={},
-                                credit_class=CREDIT_STANDING_EXECUTION,
+                            # The decision's legs are one aggregated leg
+                            # for both forms today (the candidate set is
+                            # the signed recipient), so this is exactly
+                            # the single transfer the declared form made.
+                            moved = all(
+                                _execute_fee_era_transfer(
+                                    sp_entry.payer_pubkey, leg_recipient,
+                                    leg_amount,
+                                    slot_values=_approval_slot_values(),
+                                    overrides={},
+                                    credit_class=CREDIT_STANDING_EXECUTION,
+                                )
+                                for leg_recipient, leg_amount
+                                in sp_decision.legs
                             )
                             # The fee was measured on the real transfer
                             # inputs; the transfer-less fee-query step must
@@ -4004,6 +4094,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     tx_receipt["standing_payment_event"] = {
                         "auth_id": pending_standing_create.auth_id.hex(),
                         "action": "created",
+                        "form": pending_standing_create.form,
                         "payer_pubkey": pending_standing_create.payer_pubkey,
                         "recipient_pubkey": pending_standing_create.recipient_pubkey,
                         "amount": pending_standing_create.amount,
@@ -4033,15 +4124,25 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     sp_entry, _sp_decision, sp_balance = pending_standing_execution
                     # Same fork, same inputs as the branch's execution_due:
                     # the settled decision is the staged one by construction.
+                    # For a Tau-form authorization the staged decision's
+                    # legs are handed back in — the clause is not stepped
+                    # a second time, so the commit cannot compute
+                    # different legs than the branch validated (the payout
+                    # form's deferred-commit discipline).
                     settled = sp_book.execute(
                         sp_entry.auth_id, int(block_timestamp or 0), sp_balance,
                         executor_pubkey=(
                             sender if isinstance(sender, str) else None
                         ),
+                        clause_legs=(
+                            _sp_decision.legs
+                            if sp_entry.form == STANDING_FORM_TAU_CLAUSE else None
+                        ),
                     )
                     sp_event = {
                         "auth_id": sp_entry.auth_id.hex(),
                         "action": "executed",
+                        "form": sp_entry.form,
                         "payer_pubkey": sp_entry.payer_pubkey,
                         "recipient_pubkey": sp_entry.recipient_pubkey,
                         "amount": settled.amount,

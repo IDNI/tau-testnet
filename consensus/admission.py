@@ -82,14 +82,17 @@ from consensus.receive_routes import (
     parse_remove_receive_route,
 )
 from consensus.standing_payments import (
+    FORM_TAU_CLAUSE as STANDING_FORM_TAU_CLAUSE,
     TX_TYPE_CANCEL_STANDING_PAYMENT,
     TX_TYPE_CREATE_STANDING_PAYMENT,
     TX_TYPE_EXECUTE_STANDING_PAYMENT,
     StandingPaymentBook,
     StandingPaymentShapeError,
+    decode_clause_legs as decode_standing_clause_legs,
     parse_cancel_standing_payment,
     parse_create_standing_payment,
     parse_execute_standing_payment,
+    standing_clause_inputs,
 )
 from consensus.retractable import (
     KIND_HEIGHT,
@@ -1726,11 +1729,14 @@ def _tip_route_book(tip_view: TipAdmissionView, owner_pubkey: str) -> ReceiveRou
             expiry_ts=int(row["expiry_ts"]),
             locked_until_ts=int(row["locked_until_ts"]),
             version=int(row["version"]),
+            form=int(row.get("form", 1)),
+            clause_text=str(row.get("clause_text", "")),
         )
         book = ReceiveRouteBook.restore([(
             entry.route_id, entry.owner_pubkey, entry.destination_pubkey,
             entry.bps, entry.min_amount, entry.activation_ts, entry.expiry_ts,
-            entry.locked_until_ts, entry.version,
+            entry.locked_until_ts, entry.version, entry.form,
+            entry.clause_text,
         )])
     return book
 
@@ -1835,6 +1841,8 @@ def _tip_standing_book(row: Optional[Dict]) -> StandingPaymentBook:
         int(row["last_execution_ts"]),
         int(row["cancelled"]),
         int(row["cancelled_ts"]),
+        int(row.get("form", 1)),
+        str(row.get("clause_text", "")),
     )
     fact_rows = [
         (
@@ -1922,13 +1930,19 @@ def validate_cancel_standing_payment_payload(
 def validate_execute_standing_payment_payload(
     tx: Dict, tip_view: TipAdmissionView
 ) -> AdmissionResult:
-    """Tau-free screens for executing a standing payment (#34).
+    """Screens for executing a standing payment (#34).
 
     Anyone may trigger an execution. Whether anything is due is the book's
     execution_due against the tip state and the payer's tip balance — the
     same call block apply makes, so the two agree on identical state. The
     payer's o5 re-check and the fee are apply-side (they need the engine's
     evaluation), exactly as for an ordinary transfer.
+
+    A Tau-form authorization's legs come from stepping its clause, so
+    this screen steps it too — the same clause, the same input-map
+    builder, the admission pool — mirroring the apply site's
+    construction step for step; the declared form stays Tau-free, as
+    before (the payout form's admission discipline, one stage earlier).
     """
     try:
         auth_id = parse_execute_standing_payment(tx)
@@ -1942,11 +1956,36 @@ def validate_execute_standing_payment_payload(
             code="UNKNOWN_STANDING_PAYMENT",
         )
     sender = tx.get("sender_pubkey")
+    book = _tip_standing_book(row)
+    ts = tip_view.next_block_timestamp
+    balance = tip_view.get_balance(row["payer_pubkey"])
+    clause_legs = None
+    entry = book.get(auth_id)
+    if entry is not None and entry.form == STANDING_FORM_TAU_CLAUSE:
+        from consensus import sender_policy
+
+        outputs, detail = sender_policy.clause_outputs(
+            entry.clause_text,
+            standing_clause_inputs(
+                entry,
+                sender if isinstance(sender, str) else "",
+                ts, balance,
+                book.period_paid_total(auth_id, ts),
+            ),
+            pool="admission",
+        )
+        if outputs is None:
+            return format_error(
+                f"execute_standing_payment rejected: the authorization's "
+                f"clause did not produce legs ({detail})")
+        clause_legs, why = decode_standing_clause_legs(entry, outputs)
+        if clause_legs is None:
+            return format_error(f"execute_standing_payment rejected: {why}")
     try:
-        decision = _tip_standing_book(row).execution_due(
-            auth_id, tip_view.next_block_timestamp,
-            tip_view.get_balance(row["payer_pubkey"]),
+        decision = book.execution_due(
+            auth_id, ts, balance,
             executor_pubkey=sender if isinstance(sender, str) else None,
+            clause_legs=clause_legs,
         )
     except StandingPaymentShapeError as exc:
         return format_error(f"Malformed execute_standing_payment: {exc}.")
