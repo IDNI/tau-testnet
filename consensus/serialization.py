@@ -929,6 +929,7 @@ def _encode_payout_terms(
     kind: int,
     period: int,
     expires_at: int,
+    sealed: bool = False,
 ) -> bytes:
     out = bytearray()
     out.extend(encode_pubkey48(account_pubkey))
@@ -947,6 +948,7 @@ def _encode_payout_terms(
     out.extend(bytes([int(kind) & 0xFF]))
     out.extend(encode_uint64(int(period)))
     out.extend(encode_uint64(int(expires_at)))
+    out.extend(b"\x01" if sealed else b"\x00")
     return bytes(out)
 
 
@@ -961,6 +963,7 @@ def compute_payout_rule_id(
     period: int,
     expires_at: int,
     per_sale: bool = False,
+    sealed: bool = False,
 ) -> bytes:
     """BLAKE3 of the signed terms of a payout rule. Returns 32 bytes.
 
@@ -972,7 +975,7 @@ def compute_payout_rule_id(
     out.extend(encode_string(domain.decode()))
     out.extend(_encode_payout_terms(
         account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
-        cap_per_period, kind, period, expires_at,
+        cap_per_period, kind, period, expires_at, sealed,
     ))
     return blake3(bytes(out)).digest()
 
@@ -1004,6 +1007,7 @@ def encode_payout_entry(
     executions: int,
     paid_total: int,
     last_height: int,
+    sealed: bool = False,
     sales: Any = None,
 ) -> bytes:
     """The signed terms, then where the rule stands: the period caps depend on it.
@@ -1016,7 +1020,7 @@ def encode_payout_entry(
     out.extend(encode_hash32(rule_id))
     out.extend(_encode_payout_terms(
         account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
-        cap_per_period, kind, period, expires_at,
+        cap_per_period, kind, period, expires_at, sealed,
     ))
     out.extend(encode_uint64(int(anchor)))
     out.extend(encode_uint64(int(period_index)))
@@ -1024,6 +1028,7 @@ def encode_payout_entry(
     out.extend(encode_uint64(int(executions)))
     out.extend(encode_uint64(int(paid_total)))
     out.extend(encode_uint64(int(last_height)))
+    out.extend(b"\x01" if sealed else b"\x00")
     if sales is not None:
         missed, open_sales = sales
         out.extend(b"\x01")
@@ -1044,6 +1049,113 @@ def compute_payout_book_root(
     encoded = sorted(encode_payout_entry(*e) for e in (entries or []))
     out = bytearray()
     out.extend(encode_string(DOMAIN_PAYOUT_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()
+
+
+# --- Receive routes (#35) ---------------------------------------------------------
+
+DOMAIN_ROUTE_RULE_V1 = b"tau.route.rule.v1"
+DOMAIN_ROUTE_RESOLVED_V1 = b"tau.route.resolved.v1"
+DOMAIN_ROUTE_BOOK_V1 = b"tau.route.book.v1"
+
+
+def compute_route_body_hash(body: str) -> bytes:
+    """BLAKE3 of a route rule body's UTF-8 bytes. Returns 32 bytes."""
+    return blake3(str(body).encode("utf-8")).digest()
+
+
+def _encode_route_terms(
+    account_pubkey: Any,
+    sequence_number: int,
+    body_hash: Any,
+    destination: Any,
+    min_amount: int,
+    active_from: int,
+    expires_at: int,
+    kind: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(account_pubkey))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(encode_hash32(body_hash))
+    out.extend(encode_pubkey48(destination))
+    out.extend(encode_uint64(int(min_amount)))
+    out.extend(encode_uint64(int(active_from)))
+    out.extend(encode_uint64(int(expires_at)))
+    out.extend(bytes([int(kind) & 0xFF]))
+    return bytes(out)
+
+
+def compute_route_rule_id(
+    account_pubkey: Any,
+    sequence_number: int,
+    body_hash: Any,
+    destination: Any,
+    min_amount: int,
+    active_from: int,
+    expires_at: int,
+    kind: int,
+) -> bytes:
+    """BLAKE3 of the signed terms of a receive route. Returns 32 bytes.
+
+    An execution names the id it was signed against, so a route replaced
+    between signing and inclusion cannot be applied with inputs meant for
+    another one.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ROUTE_RULE_V1.decode()))
+    out.extend(_encode_route_terms(
+        account_pubkey, sequence_number, body_hash, destination, min_amount,
+        active_from, expires_at, kind,
+    ))
+    return blake3(bytes(out)).digest()
+
+
+def compute_route_resolved_acc(acc: Any, rule_id: Any, outcome: int) -> bytes:
+    """Fold one removal (revoked, expired, replaced) into the running commitment."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ROUTE_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(rule_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_route_entry(
+    rule_id: Any,
+    account_pubkey: Any,
+    sequence_number: int,
+    body_hash: Any,
+    destination: Any,
+    min_amount: int,
+    active_from: int,
+    expires_at: int,
+    kind: int,
+    anchor: int,
+) -> bytes:
+    """The signed terms, then where the route stands (its install clock)."""
+    out = bytearray()
+    out.extend(encode_hash32(rule_id))
+    out.extend(_encode_route_terms(
+        account_pubkey, sequence_number, body_hash, destination, min_amount,
+        active_from, expires_at, kind,
+    ))
+    out.extend(encode_uint64(int(anchor)))
+    return bytes(out)
+
+
+def compute_route_book_root(
+    entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the route book: sorted installed routes, then the removals."""
+    encoded = sorted(encode_route_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ROUTE_BOOK_V1.decode()))
     out.extend(encode_uint32(len(encoded)))
     for blob in encoded:
         out.extend(blob)

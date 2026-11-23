@@ -56,6 +56,18 @@ from .payout import (
     parse_payout_rule_set,
     settle as settle_payout,
 )
+from .routes import (
+    POOL_APPLY as ROUTE_POOL_APPLY,
+    ROUTE_TX_TYPES,
+    RouteBook,
+    RouteRefused,
+    RouteShapeError,
+    TX_TYPE_ROUTE_SET,
+    parse_route_revoke,
+    parse_route_set,
+    route_inputs,
+    settle_route,
+)
 from .standing import (
     ATTEMPT_BLOCKED,
     ATTEMPT_NO_FUNDS,
@@ -102,7 +114,7 @@ from .rule_offers import (
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_PAYMENT_CREATE,
-     TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE}
+     TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_ROUTE_SET}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -319,12 +331,31 @@ def _payout_book(lm) -> Optional[PayoutBook]:
     return book if isinstance(book, PayoutBook) else None
 
 
+def _route_book(lm) -> Optional[RouteBook]:
+    book = getattr(lm, "routes", None)
+    return book if isinstance(book, RouteBook) else None
+
+
 def _expire_payout_rules(lm, height, timestamp) -> List[Dict[str, Any]]:
     """Remove every payout rule whose end this block reached; their events.
 
     The money stays where it is: an ended rule only stops paying.
     """
     book = _payout_book(lm)
+    if book is None or not book.has_expiring(int(height), int(timestamp)):
+        return []
+    return [
+        {"account_pubkey": t.account_pubkey, "rule_id": t.rule_id.hex(), "outcome": "expired"}
+        for t in book.expire(int(height), int(timestamp))
+    ]
+
+
+def _expire_route_rules(lm, height, timestamp) -> List[Dict[str, Any]]:
+    """Remove every receive route whose end this block reached; their events.
+
+    The money stays where it is: an ended route only stops splitting.
+    """
+    book = _route_book(lm)
     if book is None or not book.has_expiring(int(height), int(timestamp)):
         return []
     return [
@@ -807,6 +838,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             return True
         if tx_type == TX_TYPE_PAYOUT_RULE_SET:
             return True
+        if tx_type == TX_TYPE_ROUTE_SET:
+            return True
         if tx_type != "user_tx":
             return False
         operations = tx.get("operations")
@@ -1134,6 +1167,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         payout_expired = _expire_payout_rules(
             lm, block.header.block_number, block.header.timestamp
         )
+        route_expired = _expire_route_rules(
+            lm, block.header.block_number, block.header.timestamp
+        )
         payout_released: List[Dict[str, Any]] = []
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
@@ -1214,6 +1250,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 payout_events.append(event)
         payout_events.extend(payout_expired)
         payout_events.extend(payout_released)
+
+        # Receive routes: installs and revokes from the kept transactions,
+        # then expiries.
+        route_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get("route_event")
+            if event and tx in exec_result.accepted_transactions:
+                route_events.append(event)
+        route_events.extend(route_expired)
 
         # 3. Post-State Materialization Layer
         
@@ -1372,6 +1417,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "retractable_events": retractable_events,
                 "standing_events": standing_events,
                 "payout_events": payout_events,
+                "route_events": route_events,
             }
         )
         
@@ -1387,6 +1433,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "retractable_events": retractable_events,
                 "standing_events": standing_events,
                 "payout_events": payout_events,
+                "route_events": route_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1890,6 +1937,25 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     tx_receipt["reason"], detail = tx_error
                     tx_receipt["logs"].append(f"Error: {detail}")
 
+            # A sealed account's key-holder cannot transact while the seal
+            # runs: the seal is a commitment, and it lifts only when the
+            # payout rule expires. Executions by others still pay out.
+            if not hard_reject and isinstance(sender, str):
+                sealed_book = _payout_book(lifecycle_mgr)
+                sealed_terms = sealed_book.get(sender) if sealed_book is not None else None
+                if (sealed_terms is not None and sealed_terms.sealed
+                        and sealed_terms.clock(int(block_height or 0), int(block_timestamp or 0))
+                        < sealed_terms.expires_at):
+                    accepted_in_block = False
+                    hard_reject = True
+                    execution_success = False
+                    precheck_rejected = True
+                    operations = {}
+                    tx_receipt["reason"] = "account_sealed"
+                    tx_receipt["logs"].append(
+                        "Transaction refused: the account's payout rule is sealed "
+                        f"until {sealed_terms.expires_at}")
+
             # Process operations
             # Parse operations first to establish deterministic order:
             # 1. Rule update (key "0")
@@ -1926,6 +1992,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_payout_set = None
             pending_payout_revoke: Optional[str] = None
             pending_payout_exec = None   # (account, total, legs, sale_id)
+            pending_route_set = None
+            pending_route_revoke: Optional[str] = None
+            # Splits this tx's transfers routed: (recipient, destination, routed, gross).
+            pending_route_splits: List[Tuple[str, str, int, int]] = []
             # Signed transfers this tx credited, as sales: (recipient, payer) ->
             # amount. Recorded for a recipient whose payout rule pays per sale
             # only once the tx stays accepted.
@@ -1936,6 +2006,66 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return
                 key = (str(to_addr), str(from_addr))
                 pending_sales[key] = pending_sales.get(key, 0) + int(amount)
+
+            def _apply_route(to_addr, from_addr, amount) -> None:
+                """Split one credit through the recipient's receive route, if any.
+
+                Runs inside _execute_fee_era_transfer, after the credit is
+                staged: net to the recipient, routed to the destination, in
+                the same staged writes, so the split commits with the
+                transfer or not at all. A route that refuses leaves the
+                gross whole: the sender's transfer must settle regardless
+                of the recipient's rule. Evaluator LOSS is the one
+                exception: in live mode it raises, like every other
+                evaluator-dependent step -- a locally-valid divergent
+                transition is worse than a stalled block. In replay
+                without an evaluator the gross lands whole, as for
+                payout executions.
+                """
+                if tx.get("tx_type", "user_tx") != "user_tx":
+                    return
+                if str(to_addr) == str(from_addr):
+                    return
+                book = _route_book(lifecycle_mgr)
+                terms = book.get(str(to_addr)) if book is not None else None
+                if terms is None:
+                    return
+                height_now = int(block_height or 0)
+                ts_now = int(block_timestamp or 0)
+                clock = terms.clock(height_now, ts_now)
+                if not (terms.active_from <= clock < terms.expires_at):
+                    return
+                if int(amount) < terms.min_amount:
+                    return
+                try:
+                    values = route_inputs(
+                        terms, gross=int(amount), payer=str(from_addr),
+                        parent_balance=int(_parent_bal(to_addr)),
+                        height=height_now, ts=ts_now,
+                    )
+                    outputs = sender_policy.payout_outputs(
+                        terms.body, values, pool=ROUTE_POOL_APPLY,
+                        timeout=getattr(_session, "request_budget", None))
+                    routed = settle_route(terms, outputs, gross=int(amount))
+                except RouteRefused as exc:
+                    tx_receipt["logs"].append(f"Route refused for this credit: {exc}")
+                    return
+                except Exception:
+                    if not replay_mode:
+                        raise
+                    tx_receipt["logs"].append(
+                        "Replay without a policy evaluator: route "
+                        f"{terms.rule_id.hex()[:16]} not re-run.")
+                    return
+                if routed <= 0:
+                    return
+                staged_writes[to_addr] = _read_bal(to_addr) - routed
+                staged_writes[terms.destination] = _read_bal(terms.destination) + routed
+                pending_route_splits.append(
+                    (str(to_addr), terms.destination, routed, int(amount)))
+                tx_receipt["logs"].append(
+                    f"Route split {routed} of {int(amount)} from {str(to_addr)[:10]}... "
+                    f"to {terms.destination[:10]}...")
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2291,6 +2421,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     staged_writes[from_addr] = current_from - amount
                     if not escrow:
                         staged_writes[to_addr] = _read_bal(to_addr) + amount
+                        _apply_route(to_addr, from_addr, amount)
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -3085,6 +3216,76 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             pending_payout_revoke = account
                             tx_receipt["logs"].append("Payout rule revoked: " + account[:16])
 
+            elif tx_type in ROUTE_TX_TYPES:
+                # Root fields only: only they are signed.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    book = _route_book(lifecycle_mgr)
+                    height_now = int(block_height or 0)
+                    ts_now = int(block_timestamp or 0)
+                    budget = getattr(_session, "request_budget", None)
+                    if tx_type == TX_TYPE_ROUTE_SET:
+                        terms, reason = None, ""
+                        try:
+                            terms = parse_route_set(tx)
+                        except RouteShapeError as exc:
+                            reason = f"invalid receive route ({exc})"
+                        if terms is not None:
+                            if not isinstance(sender, str) or sender != terms.account_pubkey:
+                                reason = "sender is not the signer"
+                            elif book is None:
+                                reason = "no receive route book"
+                            else:
+                                _, reason = book.can_admit_set(terms, height_now, ts_now)
+                        if terms is not None and not reason:
+                            built = sender_policy.evaluator(ROUTE_POOL_APPLY).validate(
+                                terms.body, timeout=budget)
+                            if not built.ok:
+                                reason = f"the receive route does not build: {built.error[:200]}"
+                        if terms is not None and not reason:
+                            blocked, detail = sender_policy.rule_change_blocked(
+                                lambda who, idx: lifecycle_mgr.rule_offers.accepted_clauses.get((who, idx)),
+                                sender, tau_defs.RULE_CHANGE_KIND_SET_ROUTE, ts_now,
+                                pool="apply", timeout=budget,
+                            )
+                            if blocked:
+                                reason = f"rule-change guard blocks ({detail}); use a rule-change request"
+                        if reason:
+                            tx_receipt["logs"].append(f"Receive route ignored: {reason}")
+                            tx_receipt["reason"] = "route_not_set"
+                            accepted_in_block = False
+                        else:
+                            pending_route_set = terms
+                            tx_receipt["logs"].append("Receive route set: " + terms.rule_id.hex())
+                    else:  # TX_TYPE_ROUTE_REVOKE
+                        reason, account = "", None
+                        try:
+                            account = parse_route_revoke(tx)
+                        except RouteShapeError as exc:
+                            reason = f"invalid receive route revoke ({exc})"
+                        if account is not None:
+                            if not isinstance(sender, str) or sender != account:
+                                reason = "sender is not the signer"
+                            elif book is None:
+                                reason = "no receive route book"
+                            else:
+                                _, reason = book.can_admit_revoke(account)
+                        if account is not None and not reason:
+                            blocked, detail = sender_policy.rule_change_blocked(
+                                lambda who, idx: lifecycle_mgr.rule_offers.accepted_clauses.get((who, idx)),
+                                sender, tau_defs.RULE_CHANGE_KIND_REVOKE_ROUTE, ts_now,
+                                pool="apply", timeout=budget,
+                            )
+                            if blocked:
+                                reason = f"rule-change guard blocks ({detail}); use a rule-change request"
+                        if reason:
+                            tx_receipt["logs"].append(f"Receive route revoke ignored: {reason}")
+                            tx_receipt["reason"] = "route_not_revoked"
+                            accepted_in_block = False
+                        else:
+                            pending_route_revoke = account
+                            tx_receipt["logs"].append("Receive route revoked: " + account[:16])
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3672,6 +3873,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                  for k, who, amount in legs],
                         **({"sale_id": sale_id.hex()} if sale_id is not None else {}),
                     }
+                if pending_route_set is not None:
+                    terms = pending_route_set
+                    replaced = _lifecycle_for_write().routes.install(
+                        terms, terms.clock(int(block_height or 0), int(block_timestamp or 0)))
+                    tx_receipt["route_event"] = {
+                        "account_pubkey": terms.account_pubkey, "rule_id": terms.rule_id.hex(),
+                        "outcome": "installed", "tx_id": tx_id,
+                        **({"replaced": replaced.hex()} if replaced else {}),
+                    }
+                elif pending_route_revoke is not None:
+                    gone = _lifecycle_for_write().routes.revoke(pending_route_revoke)
+                    tx_receipt["route_event"] = {
+                        "account_pubkey": gone.account_pubkey, "rule_id": gone.rule_id.hex(),
+                        "outcome": "revoked", "tx_id": tx_id,
+                    }
+                if pending_route_splits:
+                    tx_receipt["route_splits"] = [
+                        {"account_pubkey": to, "destination": dest, "routed": routed,
+                         "gross": gross, "tx_id": tx_id}
+                        for to, dest, routed, gross in pending_route_splits
+                    ]
                 if pending_sales and any(lifecycle_mgr.payout_rules.pays_per_sale(to)
                                          for to, _ in pending_sales):
                     # The sale's id is the transaction's hash, computed from the

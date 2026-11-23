@@ -545,7 +545,25 @@ def init_db():
                     spent_in_period   INTEGER NOT NULL,
                     executions        INTEGER NOT NULL,
                     paid_total        INTEGER NOT NULL,
-                    last_height       INTEGER NOT NULL
+                    last_height       INTEGER NOT NULL,
+                    sealed            INTEGER NOT NULL
+                );
+            ''')
+            # Receive routes (#35): one installed route per account with its
+            # install clock. Bound into consensus_meta_hash once the book
+            # has held anything, so written in the same transaction as accounts.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS routes_v1 (
+                    account_pubkey    TEXT PRIMARY KEY,
+                    rule_id           TEXT NOT NULL,
+                    sequence_number   INTEGER NOT NULL,
+                    body              TEXT NOT NULL,
+                    destination       TEXT NOT NULL,
+                    min_amount        INTEGER NOT NULL,
+                    active_from       INTEGER NOT NULL,
+                    expires_at        INTEGER NOT NULL,
+                    kind              INTEGER NOT NULL,
+                    anchor            INTEGER NOT NULL
                 );
             ''')
             # Node-local history: installs, revokes, executions with their legs,
@@ -2355,7 +2373,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None, routes: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2396,6 +2414,7 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 rule_change_requests=rule_change_requests,
                 standing_payments=standing_payments,
                 payout_rules=payout_rules,
+                routes=routes,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
 
@@ -2460,7 +2479,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None, routes: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2673,6 +2692,8 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
         _write_standing_rows(standing_payments)
     if payout_rules is not None:
         _write_payout_rows(payout_rules)
+    if routes is not None:
+        _write_route_rows(routes)
 
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
@@ -2919,7 +2940,7 @@ def get_canonical_retractable_events(retractable_id: str) -> List[Dict]:
 _PAYOUT_COLUMNS = (
     'rule_id, account_pubkey, sequence_number, body, slots_json, cap_per_execution, '
     'cap_per_period, kind, period, expires_at, anchor, period_index, spent_in_period, '
-    'executions, paid_total, last_height'
+    'executions, paid_total, last_height, sealed'
 )
 
 
@@ -2930,15 +2951,15 @@ def _write_payout_rows(state: Dict) -> None:
     # that part in one chain_state value, so the table keeps its columns.
     sales = {}
     for row in state['rows']:
-        (rule_id, account, sequence, body, slots), rest = row[:5], row[5:16]
-        if len(row) > 16:
-            missed, open_sales = row[16]
+        (rule_id, account, sequence, body, slots), rest = row[:5], row[5:17]
+        if len(row) > 17:
+            missed, open_sales = row[17]
             sales[account] = {'missed': int(missed), 'open': [
                 [bytes(sid).hex(), payer, int(amount), int(height)]
                 for sid, payer, amount, height in open_sales]}
         _db_conn.execute(
             f'INSERT INTO payout_rules_v1 ({_PAYOUT_COLUMNS}) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (bytes(rule_id).hex(), account, int(sequence), body, json.dumps(list(slots)))
             + tuple(int(v) for v in rest),
         )
@@ -2982,6 +3003,55 @@ def load_payout_state() -> tuple[List[tuple], int, bytes]:
             entry = sales[r[1]]
             row += ((entry['missed'], tuple(tuple(e) for e in entry['open'])),)
         out.append(row)
+    return out, count, acc
+
+
+_ROUTE_COLUMNS = (
+    'rule_id, account_pubkey, sequence_number, body, destination, min_amount, '
+    'active_from, expires_at, kind, anchor'
+)
+
+
+def _write_route_rows(state: Dict) -> None:
+    """Full replace of the installed receive routes plus the removal commitment."""
+    _db_conn.execute('DELETE FROM routes_v1')
+    for row in state['rows']:
+        (rule_id, account, sequence, body, destination, min_amount, active_from,
+         expires_at, kind, anchor) = row
+        _db_conn.execute(
+            f'INSERT INTO routes_v1 ({_ROUTE_COLUMNS}) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (bytes(rule_id).hex(), account, int(sequence), body, destination,
+             int(min_amount), int(active_from), int(expires_at), int(kind), int(anchor)),
+        )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        (
+            'routes_resolved',
+            json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
+        )
+    )
+
+
+def load_route_state() -> tuple[List[tuple], int, bytes]:
+    """(rows, resolved_count, resolved_acc) in RouteBook.restore order."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            f'SELECT {_ROUTE_COLUMNS} FROM routes_v1 ORDER BY account_pubkey'
+        ).fetchall()
+        raw = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = 'routes_resolved'"
+        ).fetchone()
+    count, acc = 0, bytes(32)
+    if raw and raw[0]:
+        parsed = json.loads(raw[0])
+        count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
+    out = []
+    for r in rows:
+        out.append(((bytes.fromhex(r[0]), r[1], int(r[2]), r[3], r[4], int(r[5]),
+                     int(r[6]), int(r[7]), int(r[8]), int(r[9]))))
     return out, count, acc
 
 

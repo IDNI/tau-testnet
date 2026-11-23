@@ -31,6 +31,7 @@ from consensus.payout import (
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_RULE_SET,
 )
+from consensus.routes import ROUTE_TX_TYPES, TX_TYPE_ROUTE_SET
 from consensus.standing import (
     STANDING_TX_TYPES,
     TX_TYPE_STANDING_PAYMENT_CANCEL,
@@ -56,6 +57,7 @@ KNOWN_TX_TYPES = frozenset(
     | set(RETRACTABLE_TX_TYPES)
     | set(STANDING_TX_TYPES)
     | set(PAYOUT_TX_TYPES)
+    | set(ROUTE_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is

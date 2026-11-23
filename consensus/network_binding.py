@@ -26,6 +26,8 @@ BOUND_TX_TYPES = frozenset({
     "payout_rule_set",
     "payout_rule_revoke",
     "payout_execute",
+    "route_set",
+    "route_revoke",
 })
 
 _HEX_DIGITS = frozenset("0123456789abcdef")

@@ -184,6 +184,7 @@ class PayoutTerms:
     period: int
     expires_at: int
     per_sale: bool = False          # pays only against sales the chain recorded
+    sealed: bool = False            # while set, the node refuses the key-holder's txs
 
     @property
     def body_hash(self) -> bytes:
@@ -194,7 +195,7 @@ class PayoutTerms:
         return compute_payout_rule_id(
             self.account_pubkey, self.sequence_number, self.body_hash, self.slots,
             self.cap_per_execution, self.cap_per_period, self.kind, self.period,
-            self.expires_at, self.per_sale,
+            self.expires_at, self.per_sale, self.sealed,
         )
 
     def clock(self, height: int, ts: int) -> int:
@@ -292,6 +293,10 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
         # one spelling per meaning: leave the field out for a rule that does not
         # pay per sale, so equal terms always sign and hash the same
         raise PayoutShapeError("per_sale must be true or left out")
+    sealed = fields.get("sealed")
+    if sealed is not None and sealed is not True:
+        # one spelling per meaning, as for per_sale
+        raise PayoutShapeError("sealed must be true or left out")
     return PayoutTerms(
         account_pubkey=account,
         sequence_number=sequence,
@@ -303,11 +308,12 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
         period=_u64(fields, name),
         expires_at=_u64(fields, "expires_at"),
         per_sale=per_sale is True,
+        sealed=sealed is True,
     )
 
 
 SPEC_FIELDS = ("rule_text", "slots", "cap_per_execution", "cap_per_period",
-               "period_blocks", "period_seconds", "expires_at", "per_sale")
+               "period_blocks", "period_seconds", "expires_at", "per_sale", "sealed")
 
 
 def parse_payout_rule_set(tx: Dict[str, Any]) -> PayoutTerms:
@@ -783,7 +789,8 @@ class PayoutBook:
         book = cls()
         for row in rows:
             row = tuple(row)
-            sales = row[16] if len(row) > 16 else None
+            sealed = bool(row[16]) if len(row) > 16 else False
+            sales = row[17] if len(row) > 17 else None
             (stored_id, account, sequence, body, slots, cap_exec, cap_period, kind,
              period, expires_at, anchor, period_index, spent, executions, paid_total,
              last_height) = row[:16]
@@ -792,7 +799,8 @@ class PayoutBook:
             if not (_is_int(period) and period >= 1):
                 raise ValueError("stored payout rule has a bad period")
             terms = PayoutTerms(account, sequence, body, tuple(slots), cap_exec,
-                                cap_period, kind, period, expires_at, sales is not None)
+                                cap_period, kind, period, expires_at, sales is not None,
+                                sealed)
             rid = terms.rule_id
             if rid != bytes(stored_id):
                 raise ValueError(f"stored payout rule id does not match its terms: {rid.hex()}")
@@ -836,7 +844,7 @@ class PayoutBook:
         row = (t.rule_id, t.account_pubkey, t.sequence_number, t.body_hash, t.slots,
                t.cap_per_execution, t.cap_per_period, t.kind, t.period, t.expires_at,
                s.anchor, s.period_index, s.spent_in_period, s.executions,
-               s.paid_total, s.last_height)
+               s.paid_total, s.last_height, int(t.sealed))
         return row + ((s.sales_missed, s.open_sales),) if t.per_sale else row
 
     def root(self) -> bytes:
@@ -870,7 +878,7 @@ class PayoutBook:
             row = (t.rule_id, account, t.sequence_number, t.body, t.slots,
                    t.cap_per_execution, t.cap_per_period, t.kind, t.period,
                    t.expires_at, s.anchor, s.period_index, s.spent_in_period,
-                   s.executions, s.paid_total, s.last_height)
+                   s.executions, s.paid_total, s.last_height, int(t.sealed))
             out.append(row + ((s.sales_missed, s.open_sales),) if t.per_sale else row)
         return out
 
@@ -1014,6 +1022,7 @@ def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
         "period": terms.period,
         "anchor": state.anchor,
         "expires_at": terms.expires_at,
+        "sealed": terms.sealed,
         "spent_this_period": spent,
         "left_this_period": terms.cap_per_period - spent,
         "executions": state.executions,
