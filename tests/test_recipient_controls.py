@@ -224,6 +224,164 @@ def test_sender_supplied_hold_streams_are_forced_not_merged():
     assert sender_out[17] == "0" and sender_out[16] == "0"
 
 
+def test_forged_hold_key_shapes_are_forced_in_every_shape():
+    """The same stream can be spelled 17, "17" or "i17" in a hand-built
+    map, and clause_inputs collapses those spellings last-one-wins — so
+    forcing only the integer key would let a forged "i17" entry sitting
+    after it reach the recipient's clause. The overlay must leave exactly
+    one shape per gated stream, carrying the gate's value."""
+    forged = {1: "5", 17: "999999", "17": "999999", "i17": "999999",
+              16: "3", "16": "3", "i16": "3"}
+    out = sender_policy.recipient_hold_inputs(forged, hold=0, context=1)
+    seen = sender_policy.clause_inputs(out)
+    assert seen["i17"] == "0" and seen["i16"] == "1"
+    assert "17" not in out and "i17" not in out
+    assert "16" not in out and "i16" not in out
+    # The caller's map is untouched.
+    assert forged["i17"] == "999999" and forged[17] == "999999"
+    # The sender pass is built on the same overlay and covered too.
+    sender_seen = sender_policy.clause_inputs(
+        sender_policy.sender_pass_inputs(forged))
+    assert sender_seen["i17"] == "0" and sender_seen["i16"] == "0"
+    # End to end: judged as the plain final payment it is (hold 0,
+    # context 1), not as the forged 999999-block height park.
+    sender_policy.set_evaluator("apply", _ev(CAP_BODY, cap_verdict))
+    blocked, _info = sender_policy.recipient_clause_blocks(
+        _clause_for({(ap.BOB, 5): CAP_BODY}), ap.BOB, forged,
+        hold=0, context=1, pool="apply")
+    assert blocked is False
+
+
+# Admits 0..101 and 5000..6000 seconds, refuses between and above: the
+# lower band's edge is NOT the cap, however clean it looks at two points.
+HOLED_BODY = (
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] <= { #x0065 }:bv[64]) || "
+    "(i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] >= { #x1388 }:bv[64] && "
+    "i17[t]:bv[64] <= { #x1770 }:bv[64])) "
+    "? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24])"
+)
+
+
+def holed_verdict(inputs):
+    ctx = int(inputs.get("i16") or 0)
+    hold = int(inputs.get("i17") or 0)
+    if ctx == 2:
+        return "1" if (hold <= 101 or 5000 <= hold <= 6000) else "0"
+    return "0"
+
+
+def test_a_holed_clause_quotes_no_cap():
+    """101 passes a two-point check (admits 101, refuses 102) yet is not
+    the cap — the clause admits 5000..6000 too. Cap naming verifies a
+    single threshold across EVERY change point of the branch, so a holed
+    clause is reported without a number."""
+    sender_policy.set_evaluator("apply", _ev(HOLED_BODY, holed_verdict))
+    values = {1: "5", 3: "{ #x" + ap.ALICE + " }:bv[384]"}
+    blocked, info = sender_policy.recipient_clause_blocks(
+        _clause_for({(ap.BOB, 5): HOLED_BODY}), ap.BOB, values,
+        hold=200, context=2, pool="apply")
+    assert blocked is True and info["reason"] == "recipient_max_hold"
+    assert info["cap_kind"] == "rule"
+    assert "max_hold_seconds" not in info and "max_hold_blocks" not in info
+
+
+# The seconds branch caps the hold at the payment amount (i1): no literal
+# anywhere, but the change point is fixed by this very payment.
+STREAM_CAP_BODY = (
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > i1[t]:bv[64]) || "
+    "(i16[t]:bv[64] = { #x0003 }:bv[64] && i17[t]:bv[64] > { #x0064 }:bv[64])) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+
+def stream_cap_verdict(inputs):
+    ctx = int(inputs.get("i16") or 0)
+    hold = int(inputs.get("i17") or 0)
+    if ctx == 2:
+        return "0" if hold > int(inputs.get("i1") or 0) else "1"
+    if ctx == 3:
+        return "0" if hold > 100 else "1"
+    return "1"
+
+
+def test_hold_cap_named_from_a_change_point_this_payment_fixes():
+    """A cap written against another stream is still named when this
+    payment fixes that stream's value: paying 600 makes the change point
+    600, and the threshold verifies against actual evaluation."""
+    sender_policy.set_evaluator(
+        "apply", _ev(STREAM_CAP_BODY, stream_cap_verdict))
+    values = {1: "600", 3: "{ #x" + ap.ALICE + " }:bv[384]"}
+    blocked, info = sender_policy.recipient_clause_blocks(
+        _clause_for({(ap.BOB, 5): STREAM_CAP_BODY}), ap.BOB, values,
+        hold=700, context=2, pool="apply")
+    assert blocked is True and info["reason"] == "recipient_max_hold"
+    assert info["cap_kind"] == "threshold"
+    assert info["max_hold_seconds"] == 600
+
+
+UNFIXED_STREAM_BODY = (
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > i9[t]:bv[64]) || "
+    "(i16[t]:bv[64] = { #x0003 }:bv[64] && i17[t]:bv[64] > { #x0064 }:bv[64])) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+
+def unfixed_stream_verdict(inputs):
+    # i9 is judged as 50 by state this payment does not carry; the
+    # refusal is real, but its threshold is not this payment's to name.
+    ctx = int(inputs.get("i16") or 0)
+    hold = int(inputs.get("i17") or 0)
+    if ctx == 2:
+        return "0" if hold > 50 else "1"
+    if ctx == 3:
+        return "0" if hold > 100 else "1"
+    return "1"
+
+
+def test_no_cap_when_the_compared_stream_is_not_fixed_by_this_payment():
+    """The payment's input map carries no i9, so the comparison's change
+    point is not fixed by this payment: the refusal reports no number."""
+    sender_policy.set_evaluator(
+        "apply", _ev(UNFIXED_STREAM_BODY, unfixed_stream_verdict))
+    values = {1: "5", 3: "{ #x" + ap.ALICE + " }:bv[384]"}
+    blocked, info = sender_policy.recipient_clause_blocks(
+        _clause_for({(ap.BOB, 5): UNFIXED_STREAM_BODY}), ap.BOB, values,
+        hold=200, context=2, pool="apply")
+    assert blocked is True and info["reason"] == "recipient_max_hold"
+    assert info["cap_kind"] == "rule"
+    assert "max_hold_seconds" not in info and "max_hold_blocks" not in info
+
+
+ARITHMETIC_BODY = (
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && "
+    "i17[t]:bv[64] + { #x0001 }:bv[64] > { #x0258 }:bv[64])) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+
+def arithmetic_verdict(inputs):
+    ctx = int(inputs.get("i16") or 0)
+    hold = int(inputs.get("i17") or 0)
+    if ctx == 2:
+        return "0" if hold + 1 > 600 else "1"
+    return "1"
+
+
+def test_arithmetic_on_the_hold_stream_names_no_cap():
+    """This rule's verdict is in fact a clean threshold (599), but the
+    hold appears inside arithmetic, not in a direct comparison — there
+    is no change point to name a cap from, so none is printed."""
+    sender_policy.set_evaluator(
+        "apply", _ev(ARITHMETIC_BODY, arithmetic_verdict))
+    values = {1: "5", 3: "{ #x" + ap.ALICE + " }:bv[384]"}
+    blocked, info = sender_policy.recipient_clause_blocks(
+        _clause_for({(ap.BOB, 5): ARITHMETIC_BODY}), ap.BOB, values,
+        hold=700, context=2, pool="apply")
+    assert blocked is True and info["reason"] == "recipient_max_hold"
+    assert info["cap_kind"] == "rule"
+    assert "max_hold_seconds" not in info and "max_hold_blocks" not in info
+
+
 # --- deploy screens ----------------------------------------------------------
 
 BLIND_RULE = (

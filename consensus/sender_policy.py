@@ -177,8 +177,19 @@ def recipient_hold_inputs(values: dict, *, hold: int, context: int) -> dict:
     never merged — so a sender-supplied value on either stream (possible in
     a parked request's custom inputs before activation) never reaches the
     recipient's clause.
+
+    Forced under EVERY key shape: the same stream can be spelled `17`,
+    `"17"` or `"i17"` in a hand-built map, and the clause path collapses
+    those spellings last-one-wins (`clause_inputs`), so forcing only the
+    integer key would let a forged `"i17"` entry sitting after it win.
+    The alias spellings are removed and the canonical integer key carries
+    the gate's value — one shape per gated stream, which is also the only
+    shape the raw evaluator path accepts (it rejects duplicate aliases).
     """
     out = dict(values or {})
+    for idx in (tau_defs.HOLD_STREAM_INDEX, tau_defs.CONTEXT_STREAM_INDEX):
+        out.pop(str(idx), None)
+        out.pop(f"i{idx}", None)
     out[tau_defs.HOLD_STREAM_INDEX] = str(int(hold))
     out[tau_defs.CONTEXT_STREAM_INDEX] = str(int(context))
     return out
@@ -225,6 +236,22 @@ _CONTEXT_GUARD_RE = re.compile(
     r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*=\s*"
     r"\{\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}\s*:\s*bv\s*\[\s*64\s*\]"
 )
+_HOLD_STREAM_CMP_RE = re.compile(
+    r"\bi17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*(<=|>=|<|>)\s*"
+    r"i(\d+)\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
+)
+_HOLD_STREAM_CMP_FLIPPED_RE = re.compile(
+    r"\bi(\d+)\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*(<=|>=|<|>)\s*"
+    r"i17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
+)
+_HOLD_MENTION_RE = re.compile(
+    r"\bi17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
+)
+
+# Past this many change points in one branch the cap is reported without a
+# number rather than verified point by point (each point costs an engine
+# evaluation on the refusal path).
+_MAX_CAP_CHANGE_POINTS = 24
 
 
 def _literal_value(match, base: int) -> int:
@@ -237,16 +264,26 @@ def _literal_value(match, base: int) -> int:
     return int(dec_part)
 
 
-def extract_candidate_cap(body, context: int):
-    """A candidate hold cap for `context` from canonical i17 comparisons.
+def _branch_change_points(body, context: int, fed: dict = None):
+    """The hold values at which the verdict for `context` can change, or
+    None when this branch's cap cannot be named soundly.
 
-    A HINT, never a verdict: the caller verifies the candidate against the
-    clause's actual evaluation before printing it (see
-    `recipient_clause_blocks`). Extraction is branch-aware — a comparison is
-    attributed to the i16 branch whose guard most recently precedes it in
-    the ternary chain — and per-branch restrictive (the minimum bound in the
-    branch), never a global "most restrictive wins" over the whole clause,
-    which would print one counterparty's cap to another.
+    A cap is named ONLY from change points this payment fixes:
+
+    - every i17 mention attributed to this branch must be a DIRECT
+      comparison — against a bv[64] literal, or against another bv[64]
+      stream whose value this payment fixes (resolved from `fed`, the
+      input map the clause is judged with). A mention doing anything
+      else (arithmetic, a comparison with i16/i17 itself, a stream this
+      payment does not fix) means the branch's threshold is not a fixed
+      set of points, and no cap is named;
+    - comparisons in other branches are that branch's business: they are
+      attributed by the same positional i16-guard rule the extractor has
+      always used and checked when that branch's cap is named.
+
+    Returns the sorted, de-duplicated polarity-adjusted bounds (the same
+    operator-to-cap mapping the literal extractor has always used); the
+    caller verifies them against actual evaluation before printing.
     """
     if not body:
         return None
@@ -266,44 +303,120 @@ def extract_candidate_cap(body, context: int):
                 break
         return branch
 
-    # The operator-to-cap mapping assumes the comparison bounds the hold
-    # from above in whichever polarity the rule writes it (allow form
-    # `i17 <= cap`, refusal form `i17 > cap`). It only ever produces a
-    # candidate; `_cap_verified` decides.
-    caps = []
-    for m in _HOLD_CMP_RE.finditer(scrubbed):
-        if guards and branch_of(m.start()) != context:
-            continue
-        bound = _literal_value(m, 2)
-        caps.append(bound - 1 if m.group(1) in ("<", ">=") else bound)
-    for m in _HOLD_CMP_FLIPPED_RE.finditer(scrubbed):
-        if guards and branch_of(m.start()) != context:
-            continue
-        bound = _literal_value(m, 1)
-        caps.append(bound - 1 if m.group(4) in (">", "<") else bound)
-    caps = [c for c in caps if c >= 0]
-    if not caps:
+    def in_branch(pos: int) -> bool:
+        return not guards or branch_of(pos) == context
+
+    mentions = [
+        m.start() for m in _HOLD_MENTION_RE.finditer(scrubbed)
+        if in_branch(m.start())
+    ]
+    if not mentions:
         return None
-    return min(caps)
+
+    points = []
+    covered = []
+
+    def note_literal(match, bound: int, op: str, flipped: bool) -> None:
+        if not in_branch(match.start()):
+            return
+        adjust = ("<", ">=") if not flipped else (">", "<")
+        points.append(bound - 1 if op in adjust else bound)
+        covered.append((match.start(), match.end()))
+
+    for m in _HOLD_CMP_RE.finditer(scrubbed):
+        note_literal(m, _literal_value(m, 2), m.group(1), flipped=False)
+    for m in _HOLD_CMP_FLIPPED_RE.finditer(scrubbed):
+        note_literal(m, _literal_value(m, 1), m.group(4), flipped=True)
+
+    for match in _HOLD_STREAM_CMP_RE.finditer(scrubbed):
+        if not in_branch(match.start()):
+            continue
+        op, idx = match.group(1), int(match.group(2))
+        if idx in (tau_defs.HOLD_STREAM_INDEX, tau_defs.CONTEXT_STREAM_INDEX):
+            return None
+        raw = (fed or {}).get(f"i{idx}")
+        if raw is None or not re.fullmatch(r"\d+", str(raw).strip()):
+            return None
+        points.append(int(raw) - 1 if op in ("<", ">=") else int(raw))
+        covered.append((match.start(), match.end()))
+    for match in _HOLD_STREAM_CMP_FLIPPED_RE.finditer(scrubbed):
+        if not in_branch(match.start()):
+            continue
+        idx, op = int(match.group(1)), match.group(2)
+        if idx in (tau_defs.HOLD_STREAM_INDEX, tau_defs.CONTEXT_STREAM_INDEX):
+            return None
+        raw = (fed or {}).get(f"i{idx}")
+        if raw is None or not re.fullmatch(r"\d+", str(raw).strip()):
+            return None
+        points.append(int(raw) - 1 if op in (">", "<") else int(raw))
+        covered.append((match.start(), match.end()))
+
+    for pos in mentions:
+        if not any(start <= pos < end for start, end in covered):
+            return None
+    points = sorted({p for p in points if p >= 0})
+    if not points or len(points) > _MAX_CAP_CHANGE_POINTS:
+        return None
+    return points
+
+
+def _fed_values(values: dict, context: int) -> dict:
+    """The bare input map the recipient's clause is judged with for this
+    payment (gate overlay forced, hold irrelevant to every other stream)."""
+    return clause_inputs(recipient_hold_inputs(values, hold=0, context=context))
+
+
+def extract_candidate_cap(body, context: int, values: dict = None):
+    """A candidate hold cap for `context`, from the branch's change points.
+
+    A HINT, never a verdict: the caller verifies the candidate against the
+    clause's actual evaluation before printing it (see
+    `recipient_clause_blocks`). Change points are branch-aware — a
+    comparison is attributed to the i16 branch whose guard most recently
+    precedes it in the ternary chain — and per-branch restrictive (the
+    minimum bound in the branch), never a global "most restrictive wins"
+    over the whole clause, which would print one counterparty's cap to
+    another. A comparison against another stream counts only when
+    `values` (this payment's input map) fixes that stream's value; with
+    `values=None` such a clause names no cap here.
+    """
+    fed = _fed_values(values, context) if values is not None else None
+    points = _branch_change_points(body, context, fed)
+    if not points:
+        return None
+    return min(points)
 
 
 def _cap_verified(body, values: dict, *, cap: int, context: int,
-                  pool: str, timeout) -> bool:
-    """True when the clause admits hold == cap and refuses hold == cap + 1
-    for THIS counterparty (the actual sender, amount and context in
-    `values`). A non-monotonic rule (admits 0 and 2, refuses 1) fails here
-    and is honestly reported without a number."""
-    blocked_at_cap, _ = clause_blocks(
-        body, recipient_hold_inputs(values, hold=cap, context=context),
-        pool=pool, timeout=timeout,
+                  points, pool: str, timeout) -> bool:
+    """True when the clause's verdict for THIS counterparty (the actual
+    sender, amount and context in `values`) is a single threshold at
+    `cap` across the branch's whole change-point set: admitted exactly
+    at holds <= cap. Evaluates hold 0, the unit maximum, and every
+    change point and its successor — a holed rule (admits 0..101 and
+    5000..6000, refuses between) fails at the hole's edge and is
+    honestly reported without a number, as is any rule whose verdict
+    moves anywhere the points did not predict."""
+    from consensus.retractable import (
+        MAX_RELEASE_WINDOW_BLOCKS,
+        MAX_RELEASE_WINDOW_SECONDS,
     )
-    if blocked_at_cap:
-        return False
-    blocked_above_cap, _ = clause_blocks(
-        body, recipient_hold_inputs(values, hold=cap + 1, context=context),
-        pool=pool, timeout=timeout,
-    )
-    return blocked_above_cap
+
+    unit_max = MAX_RELEASE_WINDOW_SECONDS \
+        if context == tau_defs.CONTEXT_INCOMING_TIME_PARK \
+        else MAX_RELEASE_WINDOW_BLOCKS
+    probes = {0, unit_max}
+    for point in points:
+        probes.add(min(point, unit_max))
+        probes.add(min(point + 1, unit_max))
+    for hold in sorted(probes):
+        blocked, _ = clause_blocks(
+            body, recipient_hold_inputs(values, hold=hold, context=context),
+            pool=pool, timeout=timeout,
+        )
+        if blocked == (hold <= cap):
+            return False
+    return True
 
 
 def recipient_clause_blocks(clause_for, recipient: str, values: dict, *,
@@ -362,9 +475,10 @@ def recipient_clause_blocks(clause_for, recipient: str, values: dict, *,
         "hold": int(hold),
         "unit": unit,
     })
-    candidate = extract_candidate_cap(body, context)
-    if candidate is not None and candidate >= 0 and _cap_verified(
-        body, values, cap=candidate, context=context,
+    points = _branch_change_points(body, context, _fed_values(values, context))
+    candidate = min(points) if points else None
+    if candidate is not None and _cap_verified(
+        body, values, cap=candidate, context=context, points=points,
         pool=pool, timeout=timeout,
     ):
         info["cap_kind"] = "threshold"

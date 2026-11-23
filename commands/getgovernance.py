@@ -34,6 +34,7 @@ def execute(raw_command: str, container):
 
         pending_updates = []
         scheduled_updates = []
+        deferred_prechecks = []
         archival_updates = sorted(_normalize_hexish(uid) for uid in chain_state._lifecycle_manager.archival_updates)
         votes = []
         lifecycle = {}
@@ -102,12 +103,14 @@ def execute(raw_command: str, container):
             # between (issue #24 ask 4). Informational only — consensus never
             # reads it, so an operator gets a warning window while the terminal
             # behaviour of a bad activation is unchanged.
-            precheck = precheck_scheduled_update(
-                payload_obj, chain_state._lifecycle_manager.active_validators
-            )
-            entry["precheck"] = precheck["status"]
-            if precheck["error"]:
-                entry["precheck_error"] = precheck["error"]
+            #
+            # DEFERRED until after this lock block: for a patch carrying an
+            # activation flag (approval_slots_active / recipient_policy_active)
+            # the precheck audits the tip's effective spec texts, and the
+            # chain_state getters it reads take _rules_lock — which this block
+            # already holds, and the lock is not re-entrant. Running it here
+            # deadlocked the read (and, with it, the balance/sequence locks).
+            deferred_prechecks.append((entry, payload_obj))
             scheduled_updates.append(entry)
 
         for uid, voter_set in chain_state._lifecycle_manager.votes.items():
@@ -211,5 +214,15 @@ def execute(raw_command: str, container):
                 },
             },
         }
+
+    # The deferred prechecks run only now, with the state locks released:
+    # the entries they fill are the same dicts `payload` already references,
+    # so the verdicts land in the response below. The validator set is the
+    # snapshot taken under the lock — the same set the entries describe.
+    for entry, payload_obj in deferred_prechecks:
+        precheck = precheck_scheduled_update(payload_obj, active_validators)
+        entry["precheck"] = precheck["status"]
+        if precheck["error"]:
+            entry["precheck_error"] = precheck["error"]
 
     return api_response.success_response("getgovernance", payload)
