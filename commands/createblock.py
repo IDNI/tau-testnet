@@ -475,8 +475,8 @@ def create_block_from_mempool(allow_empty: bool = False, wake_if_due: bool = Fal
     run of empty blocks.
 
     `wake_if_due` permits an empty block only when a retractable transfer or a
-    standing payment is due at this candidate's own height and header timestamp,
-    judged under the lock;
+    payout rule's due point (or an arrival waiting for its run) is due at this
+    candidate's own height and header timestamp, judged under the lock;
     the miner's pre-check is a hint and may be stale.
     """
     print(f"[INFO][createblock] Starting block creation process...")
@@ -544,12 +544,16 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
     block_timestamp = int(time.time())
     empty_ok = allow_empty
     if wake_if_due and not empty_ok:
-        for name in ("retractable_transfers", "standing_payments"):
+        for name in ("retractable_transfers", "payout_rules"):
             book = getattr(lm, name, None)
             has_due = getattr(book, "has_due", None)
             if has_due is not None and has_due(block_number, block_timestamp) is True:
                 empty_ok = True
                 break
+        if not empty_ok:
+            payout_book = getattr(lm, "payout_rules", None)
+            if payout_book is not None and payout_book.has_arrivals():
+                empty_ok = True
 
     # Get batch of reserved transactions from mempool. The chain-write lock is
     # already held for the whole round, so no second producer can sweep or

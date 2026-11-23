@@ -50,9 +50,8 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
             return {}
         tx = txs[ids.index(tx_hash)]
         tx_type = tx.get("tx_type") if isinstance(tx, dict) else None
-        if tx_type in ("standing_payment_create", "standing_payment_cancel"):
-            return _standing_fields(tx)
-        if tx_type in ("payout_rule_set", "payout_rule_revoke", "payout_execute"):
+        if tx_type in ("payout_rule_set", "payout_rule_update",
+                       "payout_rule_revoke", "payout_execute"):
             return _payout_fields(tx, tx_hash, block_hash)
         if tx_type == "retract_transfer":
             return {"retracts": tx.get("retractable_id")}
@@ -74,37 +73,12 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
         return {}
 
 
-def _standing_fields(tx: dict) -> dict:
-    """`standing` for a confirmed create, `cancels` for a confirmed cancel.
-
-    `status` is the authorization's state now: waiting, due or retrying while it
-    is open, ended or cancelled once resolved, not_recorded when this node has
-    no record of how it ended.
-    """
-    if tx.get("tx_type") == "standing_payment_cancel":
-        return {"cancels": tx.get("standing_id")}
-    from commands.getstandingpayments import _tip
-    from consensus.standing import describe, parse_standing_payment_create
-    import db
-
-    sid = parse_standing_payment_create(tx).standing_id
-    _head, book = _tip()
-    if book.knows(sid):
-        status = describe(book.get(sid), book.progress[sid], sid)["status"]
-    else:
-        status = "not_recorded"
-        for event in db.get_canonical_standing_events(sid.hex()):
-            if event.get("outcome") in ("ended", "cancelled"):
-                status = event["outcome"]
-                break
-    return {"standing": {"id": sid.hex(), "status": status}}
-
-
 def _payout_fields(tx: dict, tx_hash: str, block_hash: str) -> dict:
     """`payout` for a confirmed payout transaction: what it did in its block.
 
     For an install, `status` says whether the rule is still the account's rule
-    (installed), or how it ended (replaced, revoked, expired, not_recorded).
+    (installed), or how it ended (revoked, expired, not_recorded); an update
+    answers `updated`. The rule is named by (account, rule_id).
     """
     import db
 
@@ -118,7 +92,9 @@ def _payout_fields(tx: dict, tx_hash: str, block_hash: str) -> dict:
     if mine is None:
         return {"payout": {"status": "not_recorded"}}
     out = {k: v for k, v in mine.items() if k not in ("block_hash", "block_number", "tx_id")}
-    if mine.get("outcome") == "installed":
+    if mine.get("outcome") == "updated":
+        out["status"] = "updated"
+    elif mine.get("outcome") == "installed":
         rule_id = mine.get("rule_id")
         status = "installed"
         for event in history:   # newest first: the latest thing that happened to it

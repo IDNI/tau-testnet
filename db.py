@@ -2963,6 +2963,40 @@ def get_canonical_payout_events(account_pubkey: str, limit: int = 50) -> List[Di
     return out
 
 
+def get_canonical_payout_events_by_rule(rule_id: str, limit: int = 50) -> List[Dict]:
+    """History of one payout rule on the canonical chain, newest first.
+
+    Keyed by rule id rather than account, so a resolved standing payment can
+    be answered from its id alone.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT rule_id, block_hash, block_number, event_index, outcome, detail_json '
+            'FROM payout_events WHERE rule_id = ? '
+            'ORDER BY block_number DESC, event_index DESC',
+            (rule_id,),
+        ).fetchall()
+    out: List[Dict] = []
+    canonical: Dict[str, bool] = {}
+    for rid, block_hash, number, index, outcome, detail in rows:
+        if block_hash not in canonical:
+            canonical[block_hash] = get_canonical_confirmation(block_hash, int(number))[0]
+        if not canonical[block_hash]:
+            continue
+        item = {"block_number": int(number), "block_hash": block_hash,
+                "rule_id": rid, "outcome": outcome}
+        try:
+            item.update(json.loads(detail or '{}'))
+        except Exception:
+            pass
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def has_due_payout_rules(next_height: int, now: int) -> bool:
     """True if a payout rule has a due point this block reaches, or an arrival
     waiting for its run on arrival.
