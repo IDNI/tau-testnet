@@ -15,7 +15,7 @@ from .governance import (
     normalize_validator_set,
     is_tau_authoritative_eligibility_mode,
 )
-from . import faucet, fees
+from . import faucet, fees, periods
 from . import sender_policy
 from .fees import FeeRuleError
 from .approvals import (
@@ -44,10 +44,15 @@ from .retractable import (
 from .payouts import (
     PAYOUT_TX_TYPES,
     PayoutShapeError,
+    PayoutTerms,
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_INSTALL,
     TX_TYPE_PAYOUT_REMOVE,
     PAYOUT_STREAM_INDEX,
+    ZERO_PUBKEY,
+    arrival_settlement_id,
+    clock_due_period,
+    clock_settlement_id,
     legs_from_outputs,
     parse_payout_execute,
     parse_payout_install,
@@ -1625,6 +1630,61 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 )
             return lifecycle_mgr
 
+        def _step_triggered_payout(book, offers, owner, settlement_id, gross,
+                                   *, ts, balance):
+            """Step a triggered rule's clause and check its legs.
+
+            Shared by the clock and arrival triggers (Bounty 01 stage 1
+            in rules form): the same evaluation and the same book
+            checks as a submitted payout execution, with the node
+            itself (the zero pubkey) as executor and the period-paid
+            feed on i26. Returns (legs, total), or None when the
+            trigger settles nothing -- no rule, no clause, a malformed
+            or refused execution, or a balance that cannot cover the
+            legs. A trigger never fails the block or the crediting
+            transaction: it settles what it can, or nothing.
+            """
+            if book is None:
+                return None
+            state = book.get(owner)
+            if state is None:
+                return None
+            if not isinstance(state.terms, PayoutTerms):
+                # Terms this build does not recognise (a book double
+                # in tests carries mocks here): a trigger settles
+                # nothing rather than failing the block.
+                return None
+            if offers is None or offers.clause_for(
+                    owner, PAYOUT_STREAM_INDEX) is None:
+                return None
+            # The period-paid feed, read without rolling the state:
+            # the current period's spend, or 0 in a period the book
+            # has not rolled into yet (check_execution rolls it).
+            idx_now = periods.period_index_at(
+                state.terms.anchor_ts, state.terms.period_kind, ts)
+            spent_feed = (
+                state.spent_in_period if state.period_index == idx_now else 0)
+            values = payout_values(
+                {2: str(balance), 5: str(ts), 26: str(spent_feed)},
+                state.terms,
+                executor=ZERO_PUBKEY,
+                gross=gross,
+            )
+            with tau_manager.tau_comm_lock:
+                outputs = _session.evaluate(
+                    values, multi=True,
+                    apply_rules_update=False,
+                )
+            try:
+                legs = legs_from_outputs(outputs, state.terms)
+                total = book.check_execution(
+                    owner, settlement_id, legs, ts=ts)
+            except PayoutShapeError:
+                return None
+            if balance < total:
+                return None
+            return legs, total
+
         for i, tx in enumerate(transactions):
             # One branch per transaction. Its journal child, allocator child and
             # state delta resolve together; a rejection that already stepped the
@@ -1764,6 +1824,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_payout_install = None
             pending_payout_remove_owner = None
             pending_payout_settle = None
+            # Ordinary (non-payout-class) credits staged by this tx,
+            # per recipient: the arrival trigger's input. Payout legs,
+            # grant draws and fee credits never land here -- they are
+            # staged by their own branches -- so a routed share can
+            # never trigger another route.
+            arrival_credits: Dict[str, int] = {}
             pending_grant_create = None
             pending_grant_draw = None
 
@@ -3239,6 +3305,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 slot_values=_approval_slot_values(),
                             ):
                                 break
+                            try:
+                                arrival_credits[to_addr] = (
+                                    arrival_credits.get(to_addr, 0)
+                                    + int(amount_val)
+                                )
+                            except (TypeError, ValueError):
+                                pass
                     elif isinstance(transfers_op_data, list):
                         for transfer in transfers_op_data:
                             if isinstance(transfer, (list, tuple)) and len(transfer) == 3:
@@ -3501,6 +3574,41 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     _lifecycle_for_write().payout_rules.settle(
                         s_owner, s_id, s_total, ts=s_ts)
                     tx_receipt["payout_event"] = (s_id, "executed")
+                if arrival_credits:
+                    # Arrival trigger (receive routes, #35): a credit
+                    # to an on_arrival rule's owner steps the owner's
+                    # clause with the gross credit and settles in this
+                    # same apply, under a settlement id derived from
+                    # the crediting transaction -- so the same credit
+                    # can never settle twice. The legs are staged like
+                    # any payout execution's, so a rejected crediting
+                    # tx takes its route settlement with it.
+                    for a_owner in sorted(arrival_credits):
+                        a_book = _payout_book(lifecycle_mgr)
+                        a_state = a_book.get(a_owner) if a_book else None
+                        if a_state is None or not a_state.terms.on_arrival:
+                            continue
+                        a_sid = arrival_settlement_id(tx_id)
+                        stepped = _step_triggered_payout(
+                            a_book, lifecycle_mgr.rule_offers,
+                            a_owner, a_sid, arrival_credits[a_owner],
+                            ts=int(block_timestamp or 0),
+                            balance=_read_bal(a_owner),
+                        )
+                        if stepped is None:
+                            continue
+                        a_legs, a_total = stepped
+                        staged_writes[a_owner] = _read_bal(a_owner) - a_total
+                        for a_recipient, a_amount in a_legs:
+                            staged_writes[a_recipient] = (
+                                _read_bal(a_recipient) + a_amount
+                            )
+                        _lifecycle_for_write().payout_rules.settle(
+                            a_owner, a_sid, a_total,
+                            ts=int(block_timestamp or 0))
+                        tx_receipt["payout_event"] = (a_sid, "executed")
+                        tx_receipt["logs"].append(
+                            "Payout arrival settled: " + a_sid)
                 if pending_grant_create is not None:
                     _lifecycle_for_write().grants.create(pending_grant_create)
                     tx_receipt["grant_event"] = (
@@ -3618,6 +3726,50 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     rejected_receipt["fee_charged"] = 0
                 receipts[tx_id] = rejected_receipt
                 logger.error("TX REJECTED during apply: %s", tx_receipt["logs"])
+
+        # --- Block-end clock settlements (Bounty 01 stage 1, rules form) ---
+        # A standing payment is a payout rule whose terms carry the
+        # clock trigger: at the end of the block the node steps each
+        # due rule's clause itself (gross 0, the zero pubkey as
+        # executor) and settles through the same book path as a
+        # submitted execution, under a settlement id derived from the
+        # rule and the period. Fee-free, like the codebase's other
+        # sweep movements -- no executor signed for a fee. A rule
+        # whose legs fail any check settles nothing; the period is
+        # skipped, never retried or caught up.
+        if target_balances is not None:
+            _clock_book = _payout_book(_block_lifecycle)
+            if _clock_book is not None:
+                _clock_ts = int(block_timestamp or 0)
+                for c_owner in _clock_book.owners():
+                    c_state = _clock_book.get(c_owner)
+                    c_period = clock_due_period(c_state, _clock_ts)
+                    if c_period is None:
+                        continue
+                    c_sid = clock_settlement_id(
+                        c_state.terms.rule_id, c_period)
+                    stepped = _step_triggered_payout(
+                        _clock_book,
+                        getattr(_block_lifecycle, "rule_offers", None),
+                        c_owner, c_sid, 0,
+                        ts=_clock_ts, balance=_balance_of(c_owner),
+                    )
+                    if stepped is None:
+                        continue
+                    c_legs, c_total = stepped
+                    if (c_state.terms.max_total is not None
+                            and c_state.total_spent + c_total
+                            > c_state.terms.max_total):
+                        # The firing would overrun the authorization's
+                        # total: it does not fire at all.
+                        continue
+                    target_balances[c_owner] = _balance_of(c_owner) - c_total
+                    for c_recipient, c_amount in c_legs:
+                        target_balances[c_recipient] = (
+                            _balance_of(c_recipient) + c_amount
+                        )
+                    _clock_book.settle_clock(
+                        c_owner, c_sid, c_total, ts=_clock_ts)
 
         # Create new snapshot
         new_snapshot = TauStateSnapshot(

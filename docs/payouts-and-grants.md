@@ -33,6 +33,51 @@ follows the account's normal rules, like a standing cancel.
 Settlement ids are the idempotency property: a 5% royalty rule
 stepped twice with the same settlement id pays 5, once.
 
+## Triggers: standing payments and receive routes in the same form
+
+Stage 1 (#34 standing payments, #35 receive routes) needs no new
+book and no new transaction types: the payout rule's signed terms
+may declare a trigger, and the trigger settles through the same
+clause, the same caps and the same settlement-id idempotency as a
+submitted execution.
+
+- **Clock (`due: true`)** -- a standing payment. The terms' anchor
+  and period kind are the schedule (a monthly anchor on the 31st
+  runs on the last day of a shorter month and returns to the 31st;
+  see `consensus/periods.py`). The terms must declare exactly ONE
+  end condition -- `end_period_index`, `max_fires` or `max_total`
+  -- so no standing authorization is open-ended. At the end of
+  each block the node steps a due rule's clause itself: gross 0 on
+  i1, the zero pubkey (the node) on i3, the period-paid feed on
+  i26. The firing settles under `clock:<rule_id>:<period_index>`;
+  a period that saw no block is skipped, never caught up. The
+  sweep movement is fee-free, like the codebase's other sweeps.
+- **Arrival (`on_arrival: true`)** -- a receive route. When an
+  ordinary transfer credits the owner's account, the node steps
+  the owner's clause with the gross credit on i1, in the same
+  apply, and settles under `arrival:<crediting tx id>` -- so the
+  same credit can never settle twice, and a rejected crediting
+  transaction takes its route settlement with it. Only ordinary
+  transfer credits trigger a route: payout legs, grant draws and
+  fee credits are payout-class and never do, so a routed share can
+  never trigger another route.
+
+A rule with neither flag is exactly the #63 rule above; its rule
+id is unchanged. A triggered rule's id covers its trigger terms.
+
+Clause templates, shipped as configuration examples in
+`consensus/payouts.py` (the amounts and percentages are the
+owner's configuration -- edit the constants, keep the shape):
+
+- `TEMPLATE_STANDING_PAYMENT_CLAUSE` -- one fixed leg of 500 to
+  recipient index 0, paid each time the clock fires.
+- `TEMPLATE_PERCENTAGE_ROUTE_CLAUSE` -- 20% of the gross credit
+  to recipient index 0, floored by Tau integer division; the rest
+  simply stays, because a route forwards only what its legs name
+  (101 routed at 20% gives 20 and 81).
+- `TEMPLATE_ROYALTY_5PCT_CLAUSE` -- 5% of the gross input; the
+  settlement id makes it pay once per settlement.
+
 ## Conditional grants
 
 `grant_create` debits the sender immediately into a book entry: the
@@ -92,6 +137,7 @@ Worked example (the bounty page's demo): 5,000 granted, cap
   recipient, and the encoding keeps leg outputs in plain integer
   streams).
 - Payout legs and grant draws are book movements: they never
-  trigger receive routes, standing payments or each other.
+  trigger receive routes, standing payments or each other. A
+  receive route fires only on an ordinary transfer credit.
 - Grant periods are weeks from the opening anchor; calendar-month
   grant periods are future work.
