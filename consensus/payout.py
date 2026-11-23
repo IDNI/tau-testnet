@@ -183,6 +183,16 @@ ARRIVAL_PAYOUT = "payout"
 ARRIVAL_KINDS = (ARRIVAL_USER_TX, ARRIVAL_RETRACTABLE, ARRIVAL_APPROVER,
                  ARRIVAL_PAYOUT)
 
+
+def due_arrival_id(rule_id: bytes, due_index: int, slot: int) -> bytes:
+    """The arrival id of one leg of one due run: domain + rule + due point +
+    slot, so every node names the same leg the same, and a leg never collides
+    with a transaction hash or a retractable id."""
+    return hashlib.sha256(
+        b"tau-payout-due-arrival-v1" + bytes(rule_id)
+        + int(due_index).to_bytes(8, "little") + int(slot).to_bytes(8, "little")
+    ).digest()
+
 AMOUNT_WIDTH = tau_defs.TRANSFER_VALUE_BV_WIDTH
 KEY_WIDTH = 384
 CLOCK_WIDTH = 64
@@ -1434,6 +1444,12 @@ class PayoutBook:
             terms = self.terms.get((account, bytes(rule_id)))
             return terms is not None and terms.per_sale
         return any(t.per_sale for t in self.get_rules(account))
+
+    def pays_on_arrival(self, account: str, rule_id: Optional[bytes] = None) -> bool:
+        if rule_id is not None:
+            terms = self.terms.get((account, bytes(rule_id)))
+            return terms is not None and terms.on_arrival
+        return any(t.on_arrival for t in self.get_rules(account))
 
     def note_sale(self, account: str, sale_id: bytes, payer: str, amount: int,
                   height: int) -> Optional[str]:
