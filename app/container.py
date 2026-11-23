@@ -21,6 +21,7 @@ from commands import (
     getapprovalrequest,
     getapprovalrequests,
     getapprovalslots,
+    getrecipientpolicy,
     getrequestid,
     getretractable,
     getretractableid,
@@ -90,6 +91,7 @@ class ServiceContainer:
         # in server.py.
         "getapprovalslots": getapprovalslots,
         "getapprovalpreview": getapprovalpreview,
+        "getrecipientpolicy": getrecipientpolicy,
         }
 
         mempool = override_map.get("mempool") or []

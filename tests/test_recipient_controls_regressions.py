@@ -55,8 +55,11 @@ from tau_speculation import WorkerLost
 import test_approval_apply as ap
 import test_retractable_apply as parks
 
+# The `+ {0}` keeps this off the literal-threshold path. These tests decide
+# the verdict in the mock, and the literal path would read `{1}` out of the
+# text instead of asking the mock where the cap actually is.
 HOLD = (
-    "(i17[t]:bv[64] > {1}:bv[64]) ? "
+    "(i17[t]:bv[64] + {0}:bv[64] > {1}:bv[64]) ? "
     "(o5[t]:bv[24] = { #x000000 }:bv[24]) : "
     "(o5[t]:bv[24] = { #x000001 }:bv[24])"
 )

@@ -147,7 +147,7 @@ arguments keep their case except where a handler lowercases a hex id. Payload
 commands take the rest of the line verbatim as one JSON argument, and tolerate
 it being wrapped in matching single or double quotes.
 
-The full registry (28 names, `app/container.py`):
+The full registry (29 names, `app/container.py`):
 
 | Command | Grammar |
 |---|---|
@@ -176,6 +176,7 @@ The full registry (28 names, `app/container.py`):
 | `getrequestid` | `getrequestid <json_payload>` |
 | `getapprovalslots` | `getapprovalslots <address>` — advisory, node-local |
 | `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local; `"request_type":"rule_change"` previews a policy change |
+| `getrecipientpolicy` | `getrecipientpolicy <recipient> [<sender> <amount> [<hold> <seconds\|blocks>]]` — advisory, node-local. The bare form reports whether recipient controls are on and whether the clause judges incoming payments. With a sender and an amount it runs the same helper as admission; a hold of `0`, or no hold, is a plain payment |
 | `getretractable` | `getretractable <retractable_id>` — 64 hex chars |
 | `getretractables` | `getretractables <address> [in\|out\|all]` (default `all`) |
 | `getretractableid` | `getretractableid <json_payload>` |

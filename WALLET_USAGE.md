@@ -240,6 +240,8 @@ inbound rule does not block your own sends:
 
 The approval slots `i18`–`i25` are the sender's co-signers. The recipient pass reads a slot the transfer already carries as `0`; the sender's own clause still sees the keys. A slot the transfer does not carry stays absent.
 
+`getrecipientpolicy <recipient>` reports the flag and whether the clause judges incoming payments. `getrecipientpolicy <recipient> <sender> <amount> [<hold> <seconds|blocks>]` asks the same helper admission and apply use, so a refused hold comes back with the same cap. A hold of `0` is a plain payment. The answer is advisory: apply measures a real park against the block that carries it.
+
 Admission measures a time park against `next_block_timestamp` (the later of the tip timestamp and the wall clock) and a height park against `next_block_height`. Apply measures against the block being applied, so a park that lands later has a shorter hold. A refusal at admission or at apply charges no fee: apply hard-rejects, and the fee is taken only from a transaction that stays accepted. A retract is not judged again, and a release is not judged again. Rule offers and approval requests are not gated; the transfer that an approval later pays is.
 
 Policy clauses **may** read `i2` (balance): it is the sender's balance at the

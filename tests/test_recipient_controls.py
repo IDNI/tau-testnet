@@ -3,6 +3,7 @@
 The evaluator is the in-process mock. These tests do not need the native engine:
 the admission and apply paths call the same `recipient_refusal`.
 """
+import json
 import pytest
 from unittest.mock import MagicMock
 
@@ -19,11 +20,13 @@ from consensus.recipient_policy import (
     BLOCKS_LO,
     CODE_PLAIN,
     HEIGHT_CODE_BASE,
+    MAX_CAP_POINTS,
     MAX_HOLD,
     POLICY_BLOCK,
     TIME_CODE_MAX,
     audit_hold_stream,
     clause_reads_hold_stream,
+    comparison_literals,
     controls_active,
     park_hold_code,
     recipient_refusal,
@@ -268,3 +271,151 @@ def test_the_flag_round_trips_through_canonical_state(temp_database):
         recipient_controls_active=True,
     )
     assert db.get_chain_state_value("recipient_controls_active", None) == "1"
+
+
+def _literal(limit):
+    return f"(i17[t]:bv[64] > {{{limit}}}:bv[64])"
+
+
+def test_a_direct_comparison_names_the_cap_from_its_literal():
+    body = _literal(601)
+    assert comparison_literals(body) == (601,)
+    ev = _use(_over(601), body)
+    refusal = recipient_refusal(body, {}, 1 + 3600, pool="apply")
+    assert refusal.details == {"max_hold_seconds": 600}
+    assert len(ev.verdict_calls) <= 12
+    height = recipient_refusal(body, {}, HEIGHT_CODE_BASE + 10, pool="apply")
+    assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 600}
+    assert "600 seconds" in height.message
+    assert "straight away" not in height.message
+
+
+def test_a_hex_literal_and_an_implication_are_still_one_threshold():
+    body = "(i17[t]:bv[64] > { #x0259 }:bv[64]) -> (o5[t]:bv[24] = {0}:bv[24])"
+    assert comparison_literals(body) == (0x259,)
+    _use(_over(601), body)
+    refusal = recipient_refusal(body, {}, 1 + 3600, pool="apply")
+    assert refusal.details == {"max_hold_seconds": 600}
+
+
+def test_a_hole_between_the_literals_is_not_quoted():
+    """Allow up to 100 seconds, and again from 4999 to 5999 seconds.
+
+    The quarter probes sit elsewhere, so the probe would report 100. The
+    literals are the change points, and the second allow cancels the number.
+    """
+    body = (
+        "(i17[t]:bv[64] <= {101}:bv[64]) || "
+        "((i17[t]:bv[64] >= {5000}:bv[64]) && (i17[t]:bv[64] <= {6000}:bv[64]))"
+    )
+
+    def decide(inputs):
+        code = int(inputs["i17"])
+        if code <= 101 or 5000 <= code <= 6000:
+            return 1
+        return 0
+
+    _use(decide, body)
+    refusal = recipient_refusal(body, {}, 200, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
+
+
+def test_too_many_literals_refuse_without_a_number_or_a_probe():
+    limits = range(100, 100 + MAX_CAP_POINTS)
+    body = " && ".join(_literal(limit) for limit in limits)
+    ev = _use(_over(601), body)
+    refusal = recipient_refusal(body, {}, 1 + 3600, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
+    assert len(ev.verdict_calls) == 2
+
+
+def test_arithmetic_and_a_stream_comparison_fall_back_to_the_probe():
+    added = "(i17[t]:bv[64] + {0}:bv[64] > {601}:bv[64])"
+    assert comparison_literals(added) is None
+    _use(_over(601), added)
+    assert recipient_refusal(added, {}, 1 + 3600, pool="apply").details == {
+        "max_hold_seconds": 600,
+    }
+
+    other = "(i17[t]:bv[64] > i26[t]:bv[64])"
+    assert comparison_literals(other) is None
+
+    def decide(inputs):
+        return 0 if int(inputs["i17"]) > int(inputs["i26"]) else 1
+
+    _use(decide, other)
+    refusal = recipient_refusal(other, {26: "601"}, 1 + 3600, pool="apply")
+    assert refusal.details == {"max_hold_seconds": 600}
+
+
+def test_getrecipientpolicy_reports_the_same_cap_the_helper_does(monkeypatch):
+    from commands.getrecipientpolicy import execute
+    from consensus.facade import TipAdmissionView
+
+    body = _literal(601)
+    mock = MockPolicyEvaluator()
+    mock.set_verdict(body, _over(601))
+    sender_policy.set_evaluator("admission", mock)
+    monkeypatch.setattr(
+        TipAdmissionView, "clause_for", lambda self, pubkey, stream: body,
+    )
+    monkeypatch.setattr(
+        TipAdmissionView, "recipient_controls_active", property(lambda self: True),
+    )
+    monkeypatch.setattr(
+        TipAdmissionView, "approval_slots_active", property(lambda self: False),
+    )
+    monkeypatch.setattr("commands.sendtx._admission_i2", lambda address: "10")
+    monkeypatch.setattr("commands.sendtx._admission_timestamp", lambda: 1_700_000_000)
+
+    bare = json.loads(execute(f"getrecipientpolicy {PAYER}", None))
+    assert bare["data"]["judges_incoming"] is True
+    assert "allowed" not in bare["data"]
+
+    asked = json.loads(execute(
+        f"getrecipientpolicy {PAYER} {OTHER} 5 3600 seconds", None,
+    ))
+    assert asked["data"]["allowed"] is False
+    assert asked["data"]["code"] == MAX_HOLD
+    assert asked["data"]["max_hold_seconds"] == 600
+    assert asked["data"]["hold_seconds"] == 3600
+    seen = mock.verdict_calls[0][1]
+    assert seen["i2"] == "10"
+    assert OTHER in seen["i12"]
+    assert PAYER in seen["i4"]
+
+    height = json.loads(execute(
+        f"getrecipientpolicy {PAYER} {OTHER} 5 10 blocks", None,
+    ))
+    assert height["data"]["max_hold_blocks"] == 0
+    assert height["data"]["max_hold_seconds"] == 600
+    assert "straight away" not in height["data"]["message"]
+
+
+def test_getrecipientpolicy_allows_when_the_feature_is_off_or_the_args_are_bad(monkeypatch):
+    from commands.getrecipientpolicy import execute
+    from consensus.facade import TipAdmissionView
+    from server import _EXPENSIVE_COMMANDS
+
+    assert "getrecipientpolicy" in _EXPENSIVE_COMMANDS
+    monkeypatch.setattr(TipAdmissionView, "clause_for", lambda self, pubkey, stream: HOLD)
+    monkeypatch.setattr(
+        TipAdmissionView, "recipient_controls_active", property(lambda self: False),
+    )
+
+    def explode(_inputs):
+        raise AssertionError("the clause was asked while the feature is off")
+
+    sender_policy.set_evaluator("admission", MockPolicyEvaluator())
+    sender_policy.evaluator("admission").set_verdict(HOLD, explode)
+    off = json.loads(execute(f"getrecipientpolicy {PAYER} {OTHER} 5", None))
+    assert off["data"]["allowed"] is True
+    assert off["data"]["judges_incoming"] is False
+    assert off["data"]["hold_seconds"] == 0
+
+    assert json.loads(execute("getrecipientpolicy", None))["error"]["code"] == "INVALID_PARAMS"
+    assert json.loads(execute(
+        f"getrecipientpolicy {PAYER} {OTHER} 5 3 minutes", None,
+    ))["error"]["code"] == "INVALID_PARAMS"
