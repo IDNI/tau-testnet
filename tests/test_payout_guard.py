@@ -149,7 +149,8 @@ def test_an_update_parks_then_releases_on_the_co_signature():
     chain.block(_vote(install.request_id))
     old = chain.lm.payout_rules.get(ALICE)
     assert old is not None
-    update = _request(KIND_UPDATE_PAYOUT, text=spec(cap_per_execution=500), seq=1,
+    update = _request(KIND_UPDATE_PAYOUT,
+                      text=spec(cap_per_execution=500, cap_per_period=2000), seq=1,
                       offer_id=old.rule_id.hex(), expire=LATE)
     chain.block(_tx(update))
     assert chain.entry(update).status == STATUS_OPEN
@@ -180,7 +181,8 @@ def test_an_update_request_from_a_sealed_account_is_refused():
     chain.block(_vote(install.request_id))
     old = chain.lm.payout_rules.get(ALICE)
     assert old is not None and chain.lm.payout_rules.sealed(ALICE)
-    update = _request(KIND_UPDATE_PAYOUT, text=spec(cap_per_execution=500), seq=1,
+    update = _request(KIND_UPDATE_PAYOUT,
+                      text=spec(cap_per_execution=500, cap_per_period=2000), seq=1,
                       offer_id=old.rule_id.hex(), expire=LATE)
     result = chain.block(_tx(update))
     assert update.request_id.hex() not in str(chain.book.rule_change_requests.keys())
