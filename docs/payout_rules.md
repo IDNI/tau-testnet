@@ -27,7 +27,7 @@ Short reference: [README](../README.md#payout-rules). CLI summary:
 ```
 payout_rule_set ──► installed ──► payout_execute (anyone) ──► paid (all slots) or refused
                        │   ▲            ...repeat within the caps...
-                       │   └── payout_rule_set again: replaced (new id, new period count)
+                       │   └── payout_rule_set again: replaced (new id, the period's spend kept)
                        ├──► payout_rule_revoke: revoked
                        └──► expires_at reached: expired
 ```
@@ -71,6 +71,21 @@ does not build is not installed.
 Installing costs one fee, paid by the account. Installing again in the same
 place replaces the rule there: the old one is removed (outcome `replaced`) and
 the new one starts its own period count where it is installed. There is no edit.
+
+A replacement keeps what the place has paid this period. The new rule's first
+period starts with everything the old rule paid in its own current period
+already spent, read on the old rule's clock at the replacing block, even when
+that is more than the new cap per period. So no replacement gives a period its
+cap again, and neither does a chain of them through a lower cap: replacing a
+cap of 250 with 200 paid by a cap of 50, and that by 250 again, still leaves 50
+for the period, not 250. Until the new rule's first period ends it pays only
+what its own cap leaves above that amount; `getpayoutrule` shows it as
+`spent_this_period` and `left_this_period` (never below 0). Nothing is carried
+from an old rule that has reached its end, from one whose period has already
+ended, or into another place. Revoking a rule and installing a new one starts
+from nothing, like a first install: both are the account's own changes, and
+behind a rule-change guard both need the guard's co-signers. The new rule's
+executions and paid total start at 0.
 
 ### The id
 
@@ -666,6 +681,8 @@ tau-testnet payout revoke --key alice --rule-index 1
 - Each rule has its own period count, due points, open sales and runs. A
   payment that arrives is a sale of every per-sale rule of the account, and each
   pays its own share of it under its own caps.
+- A set that replaces the rule in its place keeps what that place has paid this
+  period (see "Installing"); the other places are not touched.
 - A sealed rule in any place seals the account: until it ends, the account
   signs nothing, so no rule of it can be set or revoked.
 - The 4,096 rules of the book count rules, not accounts.

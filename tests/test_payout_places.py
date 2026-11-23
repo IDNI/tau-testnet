@@ -18,6 +18,8 @@ No engine here: block apply runs through the real `apply_block` with scripted
 evaluators. The same rules run on the real engine in
 tests/test_payout_places_native.py.
 """
+from dataclasses import replace
+
 import pytest
 
 import chain_state
@@ -34,6 +36,7 @@ from consensus.payout import (
     PayoutRefused,
     PayoutShapeError,
     PayoutShort,
+    describe,
     parse_payout_rule_revoke_place,
     parse_payout_rule_set,
     parse_payout_spec,
@@ -50,7 +53,7 @@ from consensus.tx_signing import signing_message_bytes
 from tests.test_payout_apply import _events, _reason, exec_tx, rid, set_tx
 from tests.test_payout_options import NOW, NOW_TS, fields, seconds, terms
 from tests.chain_harness import (
-    ALICE, BOB, CAROL, FAR, HEIGHT, PROPOSER, SKS, TS, Chain, _sign, spend_tx,
+    ALICE, BOB, CAROL, FAR, HEIGHT, PROPOSER, SKS, TS, Chain, _logs, _sign, spend_tx,
 )
 
 STEP = MIN_DUE_EVERY_BLOCKS
@@ -298,6 +301,72 @@ def test_the_rows_carry_places_and_retries_and_restore_them():
     assert again._retry == book._retry and again._due == book._due
 
 
+def test_a_replacement_starts_with_what_its_place_paid_this_period():
+    book = PayoutBook()
+    book.install(terms(rule_index=1), NOW)                      # 300 per 10 blocks
+    key = f"{A}/1"
+    book.record(key, 100, NOW + 1, NOW_TS)
+    book.record(key, 100, NOW + 2, NOW_TS)
+    book.install(terms(rule_index=1, cap_per_period=500), NOW + 3, NOW + 3, NOW_TS)
+    state, new = book.state_of(key), book.get(key)
+    assert (state.anchor, state.spent_in_period, state.executions, state.paid_total) == \
+        (NOW + 3, 200, 0, 0)
+    # The new rule's first period runs from its install, with the 200 in it.
+    assert state.spent_at(new, NOW + 12) == 200 and state.spent_at(new, NOW + 13) == 0
+
+
+def test_a_lower_cap_keeps_all_of_it_so_two_replacements_give_nothing_back():
+    book = PayoutBook()
+    book.install(terms(), NOW)
+    book.record(A, 100, NOW + 1, NOW_TS)
+    book.record(A, 100, NOW + 1, NOW_TS)
+    book.install(terms(cap_per_execution=50, cap_per_period=50), NOW + 2, NOW + 2, NOW_TS)
+    assert book.state_of(A).spent_in_period == 200               # over the new cap of 50
+    again = PayoutBook.restore(book.store_rows(), *book.resolved_state())
+    assert again.root() == book.root() and again.store_rows() == book.store_rows()
+    book.install(terms(), NOW + 3, NOW + 3, NOW_TS)
+    assert book.state_of(A).spent_in_period == 200               # not 50: the 300 stay 300
+
+
+def test_a_spend_over_the_cap_loads_only_while_the_rule_has_paid_nothing():
+    book = PayoutBook()
+    book.install(terms(), NOW)
+    book.record(A, 100, NOW + 1, NOW_TS)
+    book.install(terms(cap_per_execution=50, cap_per_period=50), NOW + 2, NOW + 2, NOW_TS)
+    row = book.store_rows()[0]
+    assert row[12:15] == (100, 0, 0)                             # spent, executions, paid
+    paid = row[:13] + (1, 100) + row[15:]
+    with pytest.raises(ValueError, match="inconsistent progress"):
+        PayoutBook.restore([paid], *book.resolved_state())
+
+
+def test_a_past_period_an_ended_rule_or_no_block_carries_nothing():
+    book = PayoutBook()
+    book.install(terms(), NOW)
+    book.record(A, 100, NOW + 1, NOW_TS)
+    book.install(terms(cap_per_period=301), NOW + 10, NOW + 10, NOW_TS)   # its next period
+    assert book.state_of(A).spent_in_period == 0
+    book.install(terms(rule_index=2, expires_at=NOW + 5), NOW)
+    book.record(f"{A}/2", 100, NOW + 1, NOW_TS)
+    book.install(terms(rule_index=2), NOW + 5, NOW + 5, NOW_TS)            # it has ended
+    assert book.state_of(f"{A}/2").spent_in_period == 0
+    book.record(f"{A}/2", 100, NOW + 6, NOW_TS)
+    book.install(terms(rule_index=2, cap_per_period=301), NOW + 7)        # no block given
+    assert book.state_of(f"{A}/2").spent_in_period == 0
+
+
+def test_a_replacement_on_the_other_clock_carries_into_its_own_period():
+    book = PayoutBook()
+    book.install(terms(**seconds()), NOW_TS)                     # 300 per 60 seconds
+    book.record(A, 100, NOW + 1, NOW_TS + 30)
+    book.install(terms(), NOW + 2, NOW + 2, NOW_TS + 40)          # blocks, 10 a period
+    state = book.state_of(A)
+    assert (state.anchor, state.spent_in_period) == (NOW + 2, 100)
+    assert state.spent_at(book.get(A), NOW + 11) == 100 and state.spent_at(book.get(A), NOW + 12) == 0
+    book.install(terms(**seconds()), NOW + 3, NOW + 3, NOW_TS + 50)
+    assert book.state_of(A).spent_in_period == 100
+
+
 @pytest.mark.parametrize("key, change, why", [
     (lambda a: f"{a}/1", lambda r: r[:1] + (r[1][:-1] + "2",) + r[2:], "wrong place"),
     (lambda a: f"{a}/5", lambda r: r[:17] + (r[17][:11] + (NOW + 9, NOW + 9),), "retry"),
@@ -389,6 +458,50 @@ def test_a_set_replaces_and_a_revoke_removes_only_its_own_place(evs):
     assert _reason(ch.last, empty) == "payout_rule_not_revoked"
     ch.block([revoke_tx(seq=4)], height=HEIGHT + 4, ts=TS + 4)
     assert ch.lm.payout_rules.keys_of(ALICE) == []
+
+
+def test_a_replacement_keeps_what_its_place_paid_this_period(evs):
+    ch = Chain(_bal())
+    first = set_tx(rule=DATA, rule_index=1)                   # 100 a run, 250 per 10 blocks
+    ch.block([first])
+    ch.block([exec_tx(rule_id=rid(first), data={"0": 100}),
+              exec_tx(CAROL, 1, rule_id=rid(first), data={"0": 100})],
+             height=HEIGHT + 1, ts=TS + 1)
+    again = set_tx(seq=1, rule=DATA, rule_index=1, cap_period=300)
+    ch.block([again], height=HEIGHT + 2, ts=TS + 2)
+    assert _events(ch)[0]["replaced"] == rid(first)
+    assert ch.lm.payout_rules.state_of(A1).spent_in_period == 200
+    ch.block([exec_tx(CAROL, 2, rule_id=rid(again), data={"0": 100})],
+             height=HEIGHT + 3, ts=TS + 3)
+    over = ch.block([exec_tx(CAROL, 3, rule_id=rid(again), data={"0": 1})],
+                    height=HEIGHT + 4, ts=TS + 4)
+    assert "with 300 paid this period" in _logs(over)
+    # The new rule's periods count from its install: the next one starts at HEIGHT + 12.
+    ch.block([exec_tx(CAROL, 3, rule_id=rid(again), data={"0": 100})],
+             height=HEIGHT + 12, ts=TS + 12)
+    assert (ch.bal[ALICE], ch.bal[BOB]) == (600, 400)
+
+
+def test_a_replacement_with_a_lower_cap_pays_nothing_more_this_period(evs):
+    ch = Chain(_bal())
+    first = set_tx(rule=DATA)
+    ch.block([first])
+    ch.block([exec_tx(rule_id=rid(first), data={"0": 100})], height=HEIGHT + 1, ts=TS + 1)
+    low = set_tx(seq=1, rule=DATA, cap_exec=50, cap_period=50)
+    ch.block([low], height=HEIGHT + 2, ts=TS + 2)
+    refused = ch.block([exec_tx(seq=1, rule_id=rid(low), data={"0": 1})],
+                       height=HEIGHT + 3, ts=TS + 3)
+    assert "with 100 paid this period" in _logs(refused)
+    book = ch.lm.payout_rules
+    shown = describe(book.get(ALICE), book.state_of(ALICE), height=HEIGHT + 3, ts=TS + 3)
+    assert (shown["spent_this_period"], shown["left_this_period"]) == (100, 0)
+    back = set_tx(seq=2, rule=DATA)                            # 250 again
+    ch.block([back], height=HEIGHT + 4, ts=TS + 4)
+    assert ch.lm.payout_rules.state_of(ALICE).spent_in_period == 100
+    paid, over = (exec_tx(seq=1, rule_id=rid(back), data={"0": 100}),
+                  exec_tx(seq=2, rule_id=rid(back), data={"0": 51}))
+    result = ch.block([paid, over], height=HEIGHT + 5, ts=TS + 5)
+    assert "with 200 paid this period" in _logs(result) and ch.bal[BOB] == 200
 
 
 def test_a_sealed_rule_in_another_place_seals_the_account(evs):

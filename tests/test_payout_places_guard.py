@@ -92,6 +92,23 @@ def test_a_guarded_account_installs_and_revokes_a_rule_in_another_place():
     assert [(e["outcome"], e.get("rule_index")) for e in events] == [("revoked", 2)]
 
 
+def test_a_guarded_replacement_keeps_what_its_place_paid_this_period():
+    chain = Chain(_guarded())
+    first = _request(KIND_SET_PAYOUT, text=spec(rule_index=2), expire=LATE)
+    chain.block(_tx(first))
+    chain.block(_vote(first.request_id))
+    key = payout_key(ALICE, 2)
+    # A paid execution as the block apply records one (payments: test_payout_apply).
+    chain.lm.payout_rules.record(key, 100, chain.height, 0)
+    again = _request(KIND_SET_PAYOUT, text=spec(rule_index=2, cap_per_period=500), seq=1,
+                     expire=LATE)
+    chain.block(_tx(again))
+    chain.block(_vote(again.request_id, seq=1))
+    assert chain.entry(again).status == STATUS_EXECUTED
+    book = chain.lm.payout_rules
+    assert book.get(key).cap_per_period == 500 and book.state_of(key).spent_in_period == 100
+
+
 def test_a_waiting_revoke_of_a_place_fails_once_another_place_is_sealed():
     chain = Chain(_guarded())
     install = _request(KIND_SET_PAYOUT, text=spec(rule_index=1), expire=LATE)

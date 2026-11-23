@@ -651,7 +651,8 @@ def _write_payout_change(lm, entry, height, timestamp, timeout, events) -> Optio
     built = sender_policy.evaluator(PAYOUT_POOL_APPLY).validate(terms.body, timeout=timeout)
     if not built.ok:
         return f"the payout rule does not build: {built.error[:200]}"
-    replaced = book.install(terms, terms.clock(int(height), int(timestamp)))
+    replaced = book.install(terms, terms.clock(int(height), int(timestamp)),
+                            int(height), int(timestamp))
     if terms.sealed:
         lm.approval_requests.resolve_all_for_sender(sender, STATUS_FAILED)
     if events is not None:
@@ -3664,7 +3665,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if pending_payout_set is not None:
                     terms = pending_payout_set
                     replaced = _lifecycle_for_write().payout_rules.install(
-                        terms, terms.clock(int(block_height or 0), int(block_timestamp or 0)))
+                        terms, terms.clock(int(block_height or 0), int(block_timestamp or 0)),
+                        int(block_height or 0), int(block_timestamp or 0))
                     if terms.sealed:
                         # What the account had asked for before the seal ends
                         # here: a parked transfer or a waiting rule change would

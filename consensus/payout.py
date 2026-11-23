@@ -1189,7 +1189,10 @@ class PayoutBook:
             if not all(_is_int(v) and v >= 0 for v in (anchor, period_index, spent,
                                                         executions, paid_total, last_height)):
                 raise ValueError(f"stored payout rule has bad progress: {rid.hex()}")
-            if spent > cap_period or (executions == 0) != (paid_total == 0):
+            # Only a spend carried from a replaced rule can stand over the cap,
+            # and then the rule has paid nothing yet (an execution needs room).
+            if spent > tau_defs.MAX_TRANSFER_VALUE or (spent > cap_period and executions) \
+                    or (executions == 0) != (paid_total == 0):
                 raise ValueError(f"stored payout rule has inconsistent progress: {rid.hex()}")
             book._insert(terms, state)
         book.resolved_count = resolved_count
@@ -1521,12 +1524,31 @@ class PayoutBook:
 
     # -- mutation ----------------------------------------------------------------
 
-    def install(self, terms: PayoutTerms, anchor: int) -> Optional[bytes]:
-        """Install `terms` in its place; the id of a rule it replaced there, else None."""
-        replaced = None
+    def install(self, terms: PayoutTerms, anchor: int, height: Optional[int] = None,
+                ts: Optional[int] = None) -> Optional[bytes]:
+        """Install `terms` in its place; the id of a rule it replaced there, else None.
+
+        A rule that replaces another in its place starts its first period with
+        what that rule paid in its own current period (read on its own clock at
+        this block) already spent, all of it, even above the new cap. So no
+        replacement, and no chain of them through a lower cap, gives a period
+        its cap again. A rule that has reached its end carries nothing. The
+        block apply passes the block's `height` and `ts`; without them nothing
+        is carried.
+        """
+        replaced, carried = None, 0
         if terms.key in self.terms:
+            if height is not None:
+                old, was = self.terms[terms.key], self.state[terms.key]
+                now = old.clock(int(height), int(ts or 0))
+                if now < old.expires_at:
+                    carried = was.spent_at(old, now)
             replaced = self._remove(terms.key, OUTCOME_REPLACED).rule_id
-        self._insert(terms, PayoutState(anchor=int(anchor)))
+        state = PayoutState(anchor=int(anchor))
+        if carried:
+            state = replace(state, period_index=state.period_at(terms, int(anchor)),
+                            spent_in_period=carried)
+        self._insert(terms, state)
         return replaced
 
     def revoke(self, key: str) -> PayoutTerms:
@@ -1653,7 +1675,7 @@ def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
         **({"last_paid_clock": state.last_clock or None} if terms.extended else {}),
         "expires_at": terms.expires_at,
         "spent_this_period": spent,
-        "left_this_period": terms.cap_per_period - spent,
+        "left_this_period": max(0, terms.cap_per_period - spent),
         "executions": state.executions,
         "paid_total": state.paid_total,
         "last_height": state.last_height or None,

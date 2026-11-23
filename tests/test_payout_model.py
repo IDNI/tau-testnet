@@ -6,6 +6,9 @@ commitments. For every execution it applies the documented rules directly:
   * the rule must be installed, be the one named, and not have reached its end;
   * the period is (clock - anchor) // period, anchored where the rule was
     installed; what was paid in an earlier period does not count;
+  * a replacement starts with what the rule it replaced paid in that rule's
+    current period, all of it, even over the new cap; an ended rule carries
+    nothing;
   * every slot the rule writes is paid, or nothing: an open slot needs a named
     recipient, 1 <= total <= cap per execution, period total <= cap per period,
     total <= the account's balance at that point in the block;
@@ -58,8 +61,13 @@ class Model:
         self.rules = {}     # account -> dict(terms, anchor, index, spent, n, paid)
 
     def install(self, terms, height):
+        """A replacement starts with what the rule it replaces paid in that
+        rule's current period, all of it."""
+        old, carried = self.rules.get(terms.account_pubkey), 0
+        if old and old["index"] == (height - old["anchor"]) // old["t"].period:
+            carried = old["spent"]
         self.rules[terms.account_pubkey] = {"t": terms, "anchor": height, "index": 0,
-                                            "spent": 0, "n": 0, "paid": 0}
+                                            "spent": carried, "n": 0, "paid": 0}
 
     def expire(self, height):
         """Rules whose end the block reached; the node removes them after the
@@ -289,5 +297,9 @@ def test_node_equals_the_reference_model(program):
                     state = book.state_of(account)
                     assert book.get(account).rule_id == r["t"].rule_id
                     assert (state.executions, state.paid_total) == (r["n"], r["paid"])
+                    terms = book.get(account)
+                    index = (height - r["anchor"]) // r["t"].period
+                    assert state.spent_at(terms, terms.clock(height, TS + height)) == \
+                        (r["spent"] if r["index"] == index else 0)
     finally:
         sender_policy.set_evaluator("payout_apply", None)
