@@ -289,7 +289,9 @@ def test_kinds_without_a_body_hash_the_empty_string():
 
 @pytest.mark.parametrize("mutate", [
     lambda t: t.update(kind=0),
-    lambda t: t.update(kind=6),
+    # Kind 6 is UPDATE_POLICY since FIX 5 (Bounty 01): the out-of-range
+    # boundary moved from 6 to 7.
+    lambda t: t.update(kind=7),
     lambda t: t.update(kind=True),
     lambda t: t.update(kind="1"),
     lambda t: t.update(sequence_number="0"),

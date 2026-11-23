@@ -1221,7 +1221,7 @@ def grant_capabilities() -> Dict[str, Any]:
                 "i3": "the funder's pubkey",
                 "i4": "the drawer's pubkey",
                 "i5": "the block timestamp",
-                tau_defs.GRANT_SPENT_STREAM_INDEX: (
+                tau_defs.TAU_INPUT_STREAM_GRANT_SPENT: (
                     "what this grant has already spent"
                 ),
             },

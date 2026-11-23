@@ -130,5 +130,6 @@ jobs:
           tests/test_paid_fact_native.py
           tests/test_payout_tau_rule_native.py
           tests/test_stage1_clause_form_native.py
+          tests/test_grants_clause_native.py
           -p no:asyncio -v
           "
