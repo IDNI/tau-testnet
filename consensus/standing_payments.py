@@ -37,6 +37,23 @@ make two honest nodes disagree about admissibility, which forks.
 - Update is a new version that supersedes, never an invisible mutation.
   Progress does not carry across versions (the terms may have changed);
   paid-for-period facts are history and are never rewritten.
+- TWO FORMS (FIX 2, the stage-1 clause form): an authorization is either
+  the DECLARED form above — fixed recipient, fixed amount — or the TAU
+  CLAUSE form: the payer's own Tau clause, stepped by the node through
+  the existing policy-evaluation path (sender_policy.clause_outputs)
+  over a node-built input map (standing_clause_inputs), names the legs
+  of a due execution under the stage's shared output encoding (o30 leg
+  count, o31.. candidate/amount pairs). The clause decides; the book
+  re-checks every leg against the candidate set (the signed recipient),
+  the per-execution cap (the signed amount times the periods being
+  settled), the per-period cap (the signed amount, by attribution), the
+  max_total end condition and the payer's balance — and settles
+  atomically or not at all. The calendar, window, at-most-once and
+  catch-up machinery is the book's and is identical for both forms:
+  the clause never decides WHEN a period is due, only what a due
+  execution pays. The form is a signed field, inside the authorization
+  id (a domain-separated id for the clause form), so the form an
+  execution runs under is the form the payer signed.
 """
 from __future__ import annotations
 
@@ -56,6 +73,7 @@ from consensus.payment_calendar import (
 from consensus.serialization import (
     compute_standing_payment_book_root,
     compute_standing_payment_id,
+    compute_standing_payment_tau_id,
 )
 
 TX_TYPE_CREATE_STANDING_PAYMENT = "create_standing_payment"
@@ -97,6 +115,31 @@ STATUS_ACTIVE = "active"
 STATUS_CANCELLED = "cancelled"
 STATUS_ENDED = "ended"
 
+# The two forms an authorization can take. The form is a signed field of
+# the authorization: it is inside the creation signature and the
+# authorization id, so the form an execution runs under is the form the
+# payer signed.
+FORM_DECLARED = 1
+FORM_TAU_CLAUSE = 2
+STANDING_FORMS = frozenset({FORM_DECLARED, FORM_TAU_CLAUSE})
+
+# The Tau form's clause text bound, in UTF-8 bytes — the same bound the
+# payout-rule form puts on its clause (consensus/payout_rules
+# MAX_PAYOUT_CLAUSE_BYTES), so a stage-1 clause is no larger than a
+# clause the node already carries.
+MAX_STANDING_CLAUSE_BYTES = 8192
+
+# The Tau form's output encoding — the stage's shared encoding, the same
+# one the payout-rule form pins: o30 carries the leg count, then each
+# leg is a (recipient candidate index, amount) pair on consecutive
+# streams.
+STANDING_OUTPUT_COUNT_STREAM = 30
+STANDING_OUTPUT_FIRST_STREAM = 31
+
+# A clause names at most this many legs in one execution (the payout
+# form's MAX_LEGS bound, shared across the stage).
+MAX_CLAUSE_LEGS = 32
+
 _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
 _AUTH_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = 0xFFFFFFFFFFFFFFFF
@@ -108,7 +151,16 @@ class StandingPaymentShapeError(ValueError):
 
 @dataclass(frozen=True)
 class StandingPaymentEntry:
-    """The signed terms of one authorization version. Nothing here mutates."""
+    """The signed terms of one authorization version. Nothing here mutates.
+
+    `form` and `clause_text` default to the declared form, so every
+    entry constructed before the Tau form existed — and every
+    declared-form entry constructed now — is byte-identical to what
+    it was. For the declared form, `amount` is the fixed per-period
+    payment; for the Tau form it is the signed per-period CAP: the
+    clause names what a due execution pays, never more than `amount`
+    per settled period.
+    """
 
     payer_pubkey: str
     recipient_pubkey: str
@@ -124,9 +176,29 @@ class StandingPaymentEntry:
     policy_version_ref: int
     allow_catch_up: bool
     version: int
+    form: int = FORM_DECLARED
+    clause_text: str = ""
 
     @property
     def auth_id(self) -> bytes:
+        if self.form == FORM_TAU_CLAUSE:
+            return compute_standing_payment_tau_id(
+                self.payer_pubkey,
+                self.recipient_pubkey,
+                self.amount,
+                self.schedule_kind,
+                self.signed_day,
+                self.anchor_ts,
+                self.window_seconds,
+                self.final_ts,
+                self.max_occurrences,
+                self.max_total,
+                self.fee_limit,
+                self.policy_version_ref,
+                int(self.allow_catch_up),
+                self.clause_text,
+                self.version,
+            )
         return compute_standing_payment_id(
             self.payer_pubkey,
             self.recipient_pubkey,
@@ -143,6 +215,16 @@ class StandingPaymentEntry:
             int(self.allow_catch_up),
             self.version,
         )
+
+    @property
+    def candidates(self) -> Tuple[str, ...]:
+        """The recipient candidate set a clause's legs index into.
+
+        A standing authorization has exactly one signed recipient, so
+        the set has one member: candidate 0 is the recipient, and any
+        other index names something the payer never signed.
+        """
+        return (self.recipient_pubkey,)
 
     @property
     def series_key(self) -> Tuple[str, str, int, int]:
@@ -191,6 +273,8 @@ class ExecutionDecision:
     amount: int
     periods_collected: int
     total_paid_after: int
+    legs: Tuple[Tuple[str, int], ...] = ()
+    period_amounts: Tuple[Tuple[int, int], ...] = ()
 
 
 @dataclass
@@ -239,6 +323,116 @@ def period_index_at(entry: StandingPaymentEntry, ts: int) -> int:
     return (ts - entry.anchor_ts) // _FIXED_PERIOD_SECONDS[entry.schedule_kind]
 
 
+# --- The Tau form: input map and output decoding ------------------------------
+
+_OUTPUT_VALUE_RE = re.compile(
+    r"^\{?\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}?(?::bv\[\d+\])?$"
+)
+
+
+def _parse_output_value(value: Any) -> Optional[int]:
+    """One clause output as an integer, or None when it is not one.
+
+    The worker reports outputs as Tau value strings; this reads them
+    with the same grammar tau_policy.parse_o5 reads o5 with (hex /
+    binary / decimal, optional braces and :bv[N] annotation) — the
+    payout form's identical reader, kept per book as this codebase
+    keeps its small helpers.
+    """
+    if value is None:
+        return None
+    match = _OUTPUT_VALUE_RE.match(str(value).strip())
+    if not match:
+        return None
+    hex_digits, bin_digits, dec_digits = match.groups()
+    if hex_digits is not None:
+        return int(hex_digits, 16)
+    if bin_digits is not None:
+        return int(bin_digits, 2)
+    return int(dec_digits)
+
+
+def standing_clause_inputs(
+    entry: StandingPaymentEntry,
+    executor_pubkey: str,
+    ts: int,
+    payer_balance: int,
+    period_paid_total: int,
+) -> Dict[int, Any]:
+    """The input map a Tau-form execution steps the payer's clause over.
+
+    ONE definition, called by the engine at apply and by admission at
+    the tip with their own site values — the construction cannot drift
+    between them. The value formats mirror the transfer input map
+    (consensus/engine._transfer_input_map) exactly: amounts and the
+    timestamp as decimal strings, accounts as `{ #x.. }:bv[384]`
+    literals. The map is the payout form's map (i1..i5/i26) with the
+    standing meanings:
+
+    - i1: the signed per-period amount — for the clause form, the
+      per-period cap its legs are checked against
+    - i2: the payer's balance
+    - i3: the payer's pubkey
+    - i4: the execution submitter's pubkey (anyone may execute)
+    - i5: the block timestamp
+    - i26 (tau_defs.PAYOUT_PERIOD_PAID_STREAM_INDEX): what this
+      authorization has already paid for the period containing `ts`,
+      from the book's recorded paid-for-period facts — the
+      release-schedule input a prorating clause computes from
+
+    Nothing in the map comes from the execution transaction: the map
+    is node-built, so no submitter can steer the clause by writing a
+    stream.
+    """
+    return {
+        1: str(int(entry.amount)),
+        2: str(int(payer_balance)),
+        3: "{ #x" + str(entry.payer_pubkey) + " }:bv[384]",
+        4: "{ #x" + str(executor_pubkey) + " }:bv[384]",
+        5: str(int(ts)),
+        tau_defs.PAYOUT_PERIOD_PAID_STREAM_INDEX: str(int(period_paid_total)),
+    }
+
+
+def decode_clause_legs(
+    entry: StandingPaymentEntry, outputs: Dict[str, Any]
+) -> Tuple[Optional[Tuple[Tuple[str, int], ...]], str]:
+    """The legs a stepped clause named, or (None, why not).
+
+    The encoding (pinned in standing_payment_capabilities): o30 is the
+    leg count; leg k reads its recipient candidate index — 0-based
+    into the entry's candidate set — from o(31+2k) and its amount from
+    o(32+2k). Zero-amount legs are dropped, as the payout form drops
+    them. A count above the bound, a missing or unreadable value, or
+    an index outside the candidate set means the clause named
+    something the node cannot settle: no legs, and the execution
+    settles nothing.
+    """
+    count = _parse_output_value(outputs.get(f"o{STANDING_OUTPUT_COUNT_STREAM}"))
+    if count is None:
+        return None, "the authorization's clause did not report a leg count"
+    if count < 0 or count > MAX_CLAUSE_LEGS:
+        return None, f"the authorization's clause reported {count} legs"
+    legs: List[Tuple[str, int]] = []
+    for k in range(count):
+        index = _parse_output_value(
+            outputs.get(f"o{STANDING_OUTPUT_FIRST_STREAM + 2 * k}")
+        )
+        amount = _parse_output_value(
+            outputs.get(f"o{STANDING_OUTPUT_FIRST_STREAM + 2 * k + 1}")
+        )
+        if index is None or amount is None:
+            return None, "the authorization's clause reported an unreadable leg"
+        if not 0 <= index < len(entry.candidates):
+            return None, (
+                "the authorization's clause named recipient candidate "
+                f"{index}, outside the declared set"
+            )
+        if amount > 0:
+            legs.append((entry.candidates[index], amount))
+    return tuple(legs), ""
+
+
 # --- Parsing -------------------------------------------------------------------
 
 
@@ -269,8 +463,31 @@ def _auth_id_field(tx: Dict[str, Any]) -> bytes:
     return bytes.fromhex(value)
 
 
+def _form_field(tx: Dict[str, Any]) -> int:
+    value = tx.get("standing_form", FORM_DECLARED)
+    if not _is_int(value) or value not in STANDING_FORMS:
+        raise StandingPaymentShapeError(
+            "standing_form must be 1 (declared) or 2 (Tau clause)"
+        )
+    return int(value)
+
+
+def _clause_field(tx: Dict[str, Any]) -> str:
+    value = tx.get("standing_clause", "")
+    if not isinstance(value, str):
+        raise StandingPaymentShapeError("standing_clause must be a string")
+    return value
+
+
 def parse_create_standing_payment(tx: Dict[str, Any]) -> StandingPaymentEntry:
-    """Read a creation from ROOT fields only; a nested `payload` is unsigned data."""
+    """Read a creation from ROOT fields only; a nested `payload` is unsigned data.
+
+    The form selects which fields carry the payment decision, and the
+    two forms' fields are mutually exclusive (the payout form's parse
+    discipline): the Tau form reads `standing_clause` and the declared
+    form refuses one. A transaction that mixes them is malformed, not
+    ambiguous.
+    """
     if not isinstance(tx, dict):
         raise StandingPaymentShapeError("transaction must be an object")
     schedule_name = tx.get("standing_schedule")
@@ -281,6 +498,17 @@ def parse_create_standing_payment(tx: Dict[str, Any]) -> StandingPaymentEntry:
     catch_up = _u64_field(tx, "standing_allow_catch_up")
     if catch_up not in (0, 1):
         raise StandingPaymentShapeError("standing_allow_catch_up must be 0 or 1")
+    form = _form_field(tx)
+    clause_text = _clause_field(tx)
+    if form == FORM_TAU_CLAUSE:
+        if not clause_text:
+            raise StandingPaymentShapeError(
+                "a Tau-form standing payment must carry standing_clause"
+            )
+    elif clause_text:
+        raise StandingPaymentShapeError(
+            "standing_clause is only for the Tau form (standing_form 2)"
+        )
     return StandingPaymentEntry(
         payer_pubkey=_pubkey_field(tx, "sender_pubkey"),
         recipient_pubkey=_pubkey_field(tx, "standing_recipient_pubkey"),
@@ -296,6 +524,8 @@ def parse_create_standing_payment(tx: Dict[str, Any]) -> StandingPaymentEntry:
         policy_version_ref=_u64_field(tx, "standing_policy_version_ref"),
         allow_catch_up=bool(catch_up),
         version=_u64_field(tx, "standing_version", default=1),
+        form=form,
+        clause_text=clause_text,
     )
 
 
@@ -352,12 +582,31 @@ def validate_standing_payment_shape(
         )
     if entry.final_ts and entry.final_ts <= entry.anchor_ts:
         return "standing_final_ts must be after the first due date"
-    if entry.max_total and entry.max_total < entry.amount:
+    if (
+        entry.max_total
+        and entry.max_total < entry.amount
+        and entry.form == FORM_DECLARED
+    ):
+        # A declared payment is exactly `amount`, so a smaller total
+        # could never pay even once. A Tau-form clause names its own
+        # amounts under the cap, so a max_total below the cap is a
+        # meaningful, tighter end condition there — not a dead entry.
         return "standing_max_total must cover at least one payment"
     if entry.fee_limit > tau_defs.MAX_TRANSFER_VALUE:
         return "standing_fee_limit exceeds the maximum transfer value"
     if entry.version < 1:
         return "standing_version must start at 1"
+    if entry.form not in STANDING_FORMS:
+        return "unknown standing payment form"
+    if entry.form == FORM_TAU_CLAUSE:
+        if not entry.clause_text:
+            return "a Tau-form standing payment must carry a clause"
+        if len(entry.clause_text.encode("utf-8")) > MAX_STANDING_CLAUSE_BYTES:
+            return (
+                f"a standing clause is at most {MAX_STANDING_CLAUSE_BYTES} bytes"
+            )
+    elif entry.clause_text:
+        return "a declared-form standing payment carries no clause"
     return None
 
 
@@ -365,7 +614,7 @@ def validate_standing_payment_shape(
 
 _EntryRow = Tuple[
     bytes, str, str, int, int, int, int, int, int, int, int, int, int, int, int,
-    Tuple[int, ...], int, int, int, int,
+    Tuple[int, ...], int, int, int, int, int, str,
 ]
 _FactRow = Tuple[bytes, str, int, int, int, int, int]
 
@@ -404,13 +653,16 @@ class StandingPaymentBook:
     ) -> "StandingPaymentBook":
         """Rebuild from stored rows; refuses any row whose id does not recompute."""
         book = cls()
+        tau_entries: List[StandingPaymentEntry] = []
         for row in rows:
             (auth_id, payer, recipient, amount, kind, day, anchor, window,
              final_ts, max_occ, max_total, fee_limit, policy_ref, catch_up,
-             version, settled, total_paid, last_exec, cancelled, cancelled_ts) = row
+             version, settled, total_paid, last_exec, cancelled, cancelled_ts,
+             form, clause_text) = row
             entry = StandingPaymentEntry(
                 payer, recipient, amount, kind, day, anchor, window, final_ts,
                 max_occ, max_total, fee_limit, policy_ref, bool(catch_up), version,
+                form, clause_text,
             )
             if entry.auth_id != bytes(auth_id):
                 raise ValueError(
@@ -420,7 +672,12 @@ class StandingPaymentBook:
                 raise ValueError(f"duplicate stored authorization: {entry.auth_id.hex()}")
             if entry.series_key in book._series:
                 raise ValueError("duplicate stored authorization series")
-            if total_paid != amount * len(settled):
+            if entry.form == FORM_TAU_CLAUSE:
+                # A clause-form total is the sum of its settled periods'
+                # fact amounts — variable per period, so it is verified
+                # against the facts below, once they are loaded.
+                tau_entries.append(entry)
+            elif total_paid != amount * len(settled):
                 raise ValueError("stored total_paid disagrees with the settled markers")
             book._entries[entry.auth_id] = entry
             book._series[entry.series_key] = entry.auth_id
@@ -438,6 +695,26 @@ class StandingPaymentBook:
             if (fact.auth_id, period) in book._facts:
                 raise ValueError("duplicate stored paid-period fact")
             book._facts[(fact.auth_id, period)] = fact
+        for entry in tau_entries:
+            progress = book._progress[entry.auth_id]
+            fact_total = 0
+            for period in progress.settled_periods:
+                fact = book._facts.get((entry.auth_id, period))
+                if fact is None:
+                    raise ValueError(
+                        "stored Tau-form authorization settles a period "
+                        "with no paid-period fact"
+                    )
+                if not 1 <= fact.amount <= entry.amount:
+                    raise ValueError(
+                        "stored Tau-form fact amount is outside the "
+                        "per-period cap"
+                    )
+                fact_total += fact.amount
+            if fact_total != progress.total_paid:
+                raise ValueError(
+                    "stored Tau-form total_paid disagrees with its facts"
+                )
         return book
 
     def rows(self) -> List[_EntryRow]:
@@ -466,6 +743,8 @@ class StandingPaymentBook:
                     progress.last_execution_ts,
                     int(progress.cancelled),
                     progress.cancelled_ts,
+                    entry.form,
+                    entry.clause_text,
                 )
             )
         return out
@@ -665,9 +944,29 @@ class StandingPaymentBook:
         if entry.max_occurrences:
             capacity = entry.max_occurrences - len(progress.settled_periods)
         if entry.max_total:
-            by_total = (entry.max_total - progress.total_paid) // entry.amount
+            if entry.form == FORM_TAU_CLAUSE:
+                # A clause names variable amounts, so max_total cannot
+                # be divided into whole occurrences: it bounds the
+                # money (checked on the clause total in the evaluation),
+                # and as a period capacity it is exhausted exactly when
+                # the recorded total reaches it.
+                by_total = 0 if progress.total_paid >= entry.max_total else 1 << 62
+            else:
+                by_total = (entry.max_total - progress.total_paid) // entry.amount
             capacity = by_total if capacity is None else min(capacity, by_total)
         return capacity if capacity is not None else 1 << 62
+
+    def period_paid_total(self, auth_id: bytes, ts: int) -> int:
+        """What the authorization has recorded paid for the period
+        containing `ts` — the value standing_clause_inputs feeds at
+        i26, identical at admission and apply because both read the
+        book's recorded facts."""
+        entry, _ = self._entry_and_progress(auth_id)
+        period = period_index_at(entry, ts)
+        if period < 0:
+            return 0
+        fact = self._facts.get((entry.auth_id, period))
+        return fact.amount if fact is not None else 0
 
     def _evaluate(
         self,
@@ -675,6 +974,7 @@ class StandingPaymentBook:
         progress: _Progress,
         ts: int,
         payer_balance: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
     ) -> Tuple[ExecutionDecision, List[int]]:
         """Pure evaluation: the decision, plus the periods it would settle."""
 
@@ -714,6 +1014,10 @@ class StandingPaymentBook:
         if capacity == 0:
             return refuse("the authorization's end condition is reached", current)
         to_settle = to_settle[:capacity]
+        if entry.form == FORM_TAU_CLAUSE:
+            return self._evaluate_clause(
+                entry, progress, current, to_settle, payer_balance, clause_legs,
+            )
         affordable = payer_balance // entry.amount
         if affordable == 0:
             return refuse(
@@ -738,8 +1042,88 @@ class StandingPaymentBook:
                 amount,
                 len(to_settle),
                 progress.total_paid + amount,
+                legs=((entry.recipient_pubkey, amount),),
+                period_amounts=tuple((p, entry.amount) for p in to_settle),
             ),
             to_settle,
+        )
+
+    def _evaluate_clause(
+        self,
+        entry: StandingPaymentEntry,
+        progress: _Progress,
+        current: int,
+        to_settle: List[int],
+        payer_balance: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]],
+    ) -> Tuple[ExecutionDecision, List[int]]:
+        """The Tau form's evaluation of one due execution.
+
+        The calendar half (which periods are due, the window, the
+        occurrence capacity) has already run — it is the book's, shared
+        with the declared form. What the clause named is re-checked
+        here, leg by leg, against everything the payer signed: the
+        candidate set, the per-execution cap (the signed amount times
+        the periods being settled), the max_total end condition and
+        the balance. Attribution then fills the periods oldest first
+        at no more than the signed amount each (the per-period cap),
+        so every settled period's fact records an amount inside its
+        cap, and a period the total does not reach is not settled.
+        """
+
+        def refuse(reason: str) -> Tuple[ExecutionDecision, List[int]]:
+            return (
+                ExecutionDecision(
+                    False, reason, current, 0, 0, progress.total_paid
+                ),
+                [],
+            )
+
+        if clause_legs is None:
+            return refuse("the authorization's clause was not evaluated")
+        for recipient, leg_amount in clause_legs:
+            if recipient not in entry.candidates:
+                return refuse(
+                    "the clause named a leg outside the declared set"
+                )
+            if leg_amount <= 0:
+                return refuse("the clause named a non-positive leg")
+        total = sum(leg_amount for _, leg_amount in clause_legs)
+        if total == 0:
+            return refuse("the authorization's clause named no legs")
+        if total > entry.amount * len(to_settle):
+            return refuse(
+                "the clause's legs exceed the per-execution cap "
+                f"({entry.amount} per period over {len(to_settle)} periods)"
+            )
+        if entry.max_total and progress.total_paid + total > entry.max_total:
+            return refuse("the authorization's end condition is reached")
+        if payer_balance < total:
+            return refuse(
+                "insufficient funds: the occurrence is not settled and its "
+                "marker does not advance"
+            )
+        period_amounts: List[Tuple[int, int]] = []
+        remaining = total
+        for period in to_settle:
+            attributed = min(entry.amount, remaining)
+            if attributed <= 0:
+                break
+            period_amounts.append((period, attributed))
+            remaining -= attributed
+        settled = [period for period, _ in period_amounts]
+        return (
+            ExecutionDecision(
+                True,
+                "executed",
+                current,
+                total,
+                len(period_amounts),
+                progress.total_paid + total,
+                legs=((entry.recipient_pubkey, total),),
+                period_amounts=tuple(period_amounts),
+            ),
+            settled,
         )
 
     def execution_due(
@@ -748,11 +1132,21 @@ class StandingPaymentBook:
         ts: int,
         payer_balance: int,
         executor_pubkey: Optional[str] = None,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
     ) -> ExecutionDecision:
-        """What an execution at `ts` would do, without doing it."""
+        """What an execution at `ts` would do, without doing it.
+
+        `clause_legs` is the Tau form's leg source: the legs the caller
+        (engine at apply, admission at the tip) decoded from stepping
+        the payer's clause. Declared entries never consult it; Tau
+        entries REQUIRE it — None refuses, because stepping is the
+        caller's job, exactly as the payer balance is a parameter.
+        """
         entry, progress = self._entry_and_progress(auth_id)
         self._check_executor(executor_pubkey)
-        decision, _ = self._evaluate(entry, progress, ts, payer_balance)
+        decision, _ = self._evaluate(
+            entry, progress, ts, payer_balance, clause_legs=clause_legs
+        )
         return decision
 
     @staticmethod
@@ -768,6 +1162,7 @@ class StandingPaymentBook:
         ts: int,
         payer_balance: int,
         executor_pubkey: Optional[str] = None,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
     ) -> ExecutionDecision:
         """Settle what is due at `ts`, or settle nothing.
 
@@ -775,16 +1170,21 @@ class StandingPaymentBook:
         submitter for receipts, but the outcome depends only on the stored
         entry, the progress, the timestamp and the payer's balance — never
         on who submits, and the submitter cannot steer amount, recipient,
-        cadence, expiry or fee terms, which are the entry's alone. A refused
-        execution changes no state: no marker advances, no fact is written,
-        totals do not move.
+        cadence, expiry or fee terms, which are the entry's alone. For the
+        Tau form the amounts are the clause's, re-checked by the book (see
+        _evaluate_clause); the facts record the attributed per-period
+        amounts, so a fact always states what its period was actually
+        paid. A refused execution changes no state: no marker advances,
+        no fact is written, totals do not move.
         """
         entry, progress = self._entry_and_progress(auth_id)
         self._check_executor(executor_pubkey)
-        decision, to_settle = self._evaluate(entry, progress, ts, payer_balance)
+        decision, to_settle = self._evaluate(
+            entry, progress, ts, payer_balance, clause_legs=clause_legs
+        )
         if not decision.executed:
             return decision
-        for period in to_settle:
+        for period, period_amount in decision.period_amounts:
             start, end = period_bounds(entry, period)
             progress.settled_periods.add(period)
             self._facts[(entry.auth_id, period)] = PaidForPeriodFact(
@@ -793,7 +1193,7 @@ class StandingPaymentBook:
                 period_index=period,
                 period_start_ts=start,
                 period_end_ts=end,
-                amount=entry.amount,
+                amount=period_amount,
                 execution_ts=ts,
             )
         progress.total_paid += decision.amount
@@ -830,6 +1230,29 @@ def standing_payment_capabilities() -> Dict[str, Any]:
             "the submitter pays the ordinary fee; payer funding only under "
             "the authorization's signed fee_limit"
         ),
+        "forms": {
+            "declared": FORM_DECLARED,
+            "tau_clause": FORM_TAU_CLAUSE,
+        },
+        "clause_form": {
+            "input_streams": {
+                "i1": "the signed per-period amount (the per-period cap)",
+                "i2": "the payer's balance",
+                "i3": "the payer's pubkey",
+                "i4": "the execution submitter's pubkey",
+                "i5": "the block timestamp",
+                "i26": "what this authorization already paid for the "
+                       "period containing the timestamp (recorded facts)",
+            },
+            "output_encoding": (
+                f"o{STANDING_OUTPUT_COUNT_STREAM} leg count; leg k reads "
+                f"o{STANDING_OUTPUT_FIRST_STREAM}+2k (candidate index) and "
+                f"o{STANDING_OUTPUT_FIRST_STREAM + 1}+2k (amount)"
+            ),
+            "candidate_set": "the signed recipient (candidate 0)",
+            "max_clause_bytes": MAX_STANDING_CLAUSE_BYTES,
+            "max_legs": MAX_CLAUSE_LEGS,
+        },
         "paid_for_period_fact": True,
         "paid_fact_rule_stream": {
             "stream": tau_defs.TAU_INPUT_STREAM_STANDING_PAID,

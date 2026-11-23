@@ -785,6 +785,7 @@ def compute_retractable_book_root(
 # --- Receive routes (Bounty 01, issue #35) ------------------------------------
 
 DOMAIN_RECEIVE_ROUTE_V1 = b"tau.receive_route.v1"
+DOMAIN_RECEIVE_ROUTE_TAU_V1 = b"tau.receive_route.tau.v1"
 DOMAIN_RECEIVE_ROUTE_BOOK_V1 = b"tau.receive_route.book.v1"
 
 
@@ -818,6 +819,39 @@ def compute_receive_route_id(
     return blake3(bytes(out)).digest()
 
 
+def compute_receive_route_tau_id(
+    owner_pubkey: Any,
+    destination_pubkey: Any,
+    clause_text: str,
+    min_amount: int,
+    activation_ts: int,
+    expiry_ts: int,
+    locked_until_ts: int,
+    version: int,
+) -> bytes:
+    """BLAKE3 of a Tau-form (clause) receive route. Returns 32 bytes.
+
+    The Tau-form counterpart of compute_receive_route_id, under its own
+    domain: where the declared form hashes a fixed share (bps), this form
+    hashes the owner's clause TEXT — the clause is a signed field of the
+    route, so a tampered clause is a different, unknown route, and no
+    Tau-form id can ever collide with a declared-form id over the same
+    terms. A Tau-form route carries no bps (its shape requires bps 0),
+    so the share is not a field here.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RECEIVE_ROUTE_TAU_V1.decode()))
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_pubkey48(destination_pubkey))
+    out.extend(encode_string(str(clause_text or "")))
+    out.extend(encode_uint64(int(min_amount)))
+    out.extend(encode_uint64(int(activation_ts)))
+    out.extend(encode_uint64(int(expiry_ts)))
+    out.extend(encode_uint64(int(locked_until_ts)))
+    out.extend(encode_uint64(int(version)))
+    return blake3(bytes(out)).digest()
+
+
 def encode_receive_route_entry(
     route_id: Any,
     owner_pubkey: Any,
@@ -828,6 +862,8 @@ def encode_receive_route_entry(
     expiry_ts: int,
     locked_until_ts: int,
     version: int,
+    form: int = 1,
+    clause_text: str = "",
 ) -> bytes:
     out = bytearray()
     out.extend(encode_hash32(route_id))
@@ -839,6 +875,12 @@ def encode_receive_route_entry(
     out.extend(encode_uint64(int(expiry_ts)))
     out.extend(encode_uint64(int(locked_until_ts)))
     out.extend(encode_uint64(int(version)))
+    if int(form) != 1:
+        # The Tau form's signed fields, appended only for Tau-form
+        # entries: a declared-form entry's record stays byte-identical
+        # to the encoding before the clause form existed.
+        out.extend(encode_uint64(int(form)))
+        out.extend(encode_string(str(clause_text or "")))
     return bytes(out)
 
 
@@ -861,6 +903,7 @@ def compute_receive_route_book_root(entries: list) -> bytes:
 # --- Standing payments (Bounty 01, issue #34) ---------------------------------
 
 DOMAIN_STANDING_PAYMENT_V1 = b"tau.standing_payment.v1"
+DOMAIN_STANDING_PAYMENT_TAU_V1 = b"tau.standing_payment.tau.v1"
 DOMAIN_STANDING_PAYMENT_BOOK_V1 = b"tau.standing_payment.book.v1"
 
 
@@ -907,6 +950,52 @@ def compute_standing_payment_id(
     return blake3(bytes(out)).digest()
 
 
+def compute_standing_payment_tau_id(
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    schedule_kind: int,
+    signed_day: int,
+    anchor_ts: int,
+    window_seconds: int,
+    final_ts: int,
+    max_occurrences: int,
+    max_total: int,
+    fee_limit: int,
+    policy_version_ref: int,
+    allow_catch_up: int,
+    clause_text: str,
+    version: int,
+) -> bytes:
+    """BLAKE3 of a Tau-form (clause) standing-payment authorization.
+
+    The Tau-form counterpart of compute_standing_payment_id, under its
+    own domain: every signed term of the declared form is hashed the
+    same way, and the payer's clause TEXT is hashed with them — the
+    clause is a signed field of the authorization, so a tampered clause
+    is a different, unknown authorization, and no Tau-form id can ever
+    collide with a declared-form id over the same terms.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_PAYMENT_TAU_V1.decode()))
+    out.extend(encode_pubkey48(payer_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(schedule_kind)))
+    out.extend(encode_uint64(int(signed_day)))
+    out.extend(encode_uint64(int(anchor_ts)))
+    out.extend(encode_uint64(int(window_seconds)))
+    out.extend(encode_uint64(int(final_ts)))
+    out.extend(encode_uint64(int(max_occurrences)))
+    out.extend(encode_uint64(int(max_total)))
+    out.extend(encode_uint64(int(fee_limit)))
+    out.extend(encode_uint64(int(policy_version_ref)))
+    out.extend(encode_uint64(int(allow_catch_up)))
+    out.extend(encode_string(str(clause_text or "")))
+    out.extend(encode_uint64(int(version)))
+    return blake3(bytes(out)).digest()
+
+
 def encode_standing_payment_record(
     auth_id: Any,
     payer_pubkey: Any,
@@ -928,6 +1017,8 @@ def encode_standing_payment_record(
     last_execution_ts: int,
     cancelled: int,
     cancelled_ts: int,
+    form: int = 1,
+    clause_text: str = "",
 ) -> bytes:
     """One authorization for the book root: signed fields + live progress.
 
@@ -959,6 +1050,12 @@ def encode_standing_payment_record(
     out.extend(encode_uint64(int(last_execution_ts)))
     out.extend(encode_uint64(int(cancelled)))
     out.extend(encode_uint64(int(cancelled_ts)))
+    if int(form) != 1:
+        # The Tau form's signed fields, appended only for Tau-form
+        # records: a declared-form record stays byte-identical to the
+        # encoding before the clause form existed.
+        out.extend(encode_uint64(int(form)))
+        out.extend(encode_string(str(clause_text or "")))
     return bytes(out)
 
 
