@@ -355,6 +355,52 @@ def test_displacement_probe_matches_running_spec(temp_database, shadow_driver):
     assert "o26[t]:bv[24] = { 7 }:bv[24]" in at_first["shared_spec"]["normalized_text"]
 
 
+def test_resent_unit_restores_displaced_spec_in_view(
+        temp_database, shadow_driver):
+    # The resend case: unit A installs o26={7} && o27={9}, unit B
+    # displaces o26 to {3}, then A is submitted AGAIN. The engine
+    # applies the rule per transaction, so it ends up running A
+    # (measured on the native engine in the issue thread: o26 goes
+    # 7, 3, 7 while the accumulation still lists only [A, B]). The
+    # accumulation cannot express the resend -- it dedups exact units,
+    # so a shadow fed from it stops at B. The shadow is fed from the
+    # committed journal instead, which records every application in
+    # order, resends included.
+    chain = Chain()
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 1, 2)
+    b1 = chain.apply([step1._rule_tx(PROBE_UNIT_1, seq=0)])
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 2, 3)
+    b2 = chain.apply([step1._rule_tx(PROBE_UNIT_2, seq=1)])
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 3, 4)
+    b3 = chain.apply([step1._rule_tx(PROBE_UNIT_1, seq=2)])
+    _commit(chain, [b1, b2, b3])
+
+    # The shadow fed A, B, A -- the journal order, resend included.
+    shadow = chain_state.get_shadow_spec()
+    assert shadow.fed_units == [PROBE_UNIT_1, PROBE_UNIT_2, PROBE_UNIT_1]
+
+    # An independent oracle fed the same sequence agrees.
+    oracle = ScriptedTauDriver()
+    for unit in shadow.fed_units:
+        oracle.feed(unit)
+    assert shadow.normalized_text == oracle.current_spec()
+
+    data = _view()
+    assert data["status"] == "recorded"
+    text = data["shared_spec"]["normalized_text"]
+    # The running spec is A again: o26 back to { 7 }, o27 still { 9 }.
+    assert "o26[t]:bv[24] = { 7 }:bv[24]" in text
+    assert "o27[t]:bv[24] = { 9 }:bv[24]" in text
+    assert "{ 3 }" not in text
+    assert data["snapshot"]["height"] == b3[0].header.block_number
+
+    # At-height history is unchanged: block 2's snapshot still shows
+    # the displacement the resend later undid.
+    at_second = _view(height=b2[0].header.block_number)
+    assert "o26[t]:bv[24] = { 3 }:bv[24]" in \
+        at_second["shared_spec"]["normalized_text"]
+
+
 def test_mirror_satisfiable_rule_in_force(temp_database, shadow_driver):
     # The scripted driver's normalization of the mirror unit is the form
     # measured on the real engine in the thread; the harness cannot run
@@ -394,9 +440,11 @@ def test_view_registry_half_and_not_recorded(temp_database, shadow_driver):
 
     # A clause install lands in the registry: the view's registry half
     # shows it with the registry root. The clause transaction itself must
-    # NOT advance the shadow -- the only unit the shadow ever sees here is
-    # the genesis accumulation the commit-path recorder catches up on,
-    # exactly as a restarted node replays the persisted accumulation.
+    # NOT advance the shadow: it records no journal revision, so the
+    # shadow feeds nothing on this chain and no snapshot exists -- the
+    # shared-spec half stays not_recorded. (The genesis program is the
+    # shadow driver's baseline, not a journal revision, so the genesis
+    # block records no snapshot either.)
     evaluator = MockPolicyEvaluator(pool="apply")
     evaluator.set_verdict(step1.CLAUSE_BODY, "1")
     sender_policy.set_evaluator("apply", evaluator)
@@ -404,14 +452,9 @@ def test_view_registry_half_and_not_recorded(temp_database, shadow_driver):
     genesis = _genesis_block()
     chain = Chain()
     chain.prev_hash = genesis.block_hash
-    # Height 1, not the usual 20: the canonicality walk behind snapshot
-    # queries steps height-by-height, and this test needs it to reach the
-    # genesis snapshot (production chains have every height; the harness
-    # normally jumps straight to 20).
     chain.height = 1
     chain_state._record_shadow_snapshot(genesis, chain.snapshot)
-    fed_at_genesis = chain_state.get_shadow_spec().fed_units
-    assert fed_at_genesis == ["always (o0[t]=1)."]
+    assert chain_state.get_shadow_spec().fed_units == []
 
     b1 = chain.apply([step1._rule_tx(step1.CLAUSE_RULE, seq=0)])
     _commit(chain, [b1], genesis)
@@ -423,15 +466,15 @@ def test_view_registry_half_and_not_recorded(temp_database, shadow_driver):
             (ALICE, STREAM, step1.CLAUSE_BODY))
         db._db_conn.commit()
 
-    # The clause block recorded no new snapshot: the newest canonical
-    # snapshot is still the genesis one, and the shadow fed nothing more.
+    # The clause block fed nothing and recorded no snapshot.
     shadow = chain_state.get_shadow_spec()
-    assert shadow.fed_units == fed_at_genesis
-    assert db.get_spec_snapshot_at()["height"] == 0
+    assert shadow.fed_units == []
+    assert db.get_spec_snapshot_at() is None
 
     data = _view()
-    assert data["status"] == "recorded"
-    assert data["snapshot"]["height"] == 0
+    assert data["status"] == "not_recorded"
+    assert data["snapshot"] is None
+    assert data["shared_spec"] is None
     assert data["registry"]["accepted_clauses"] == [
         {"target_stream": STREAM, "clause_body": step1.CLAUSE_BODY}
     ]

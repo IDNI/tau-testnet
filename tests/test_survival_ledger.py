@@ -111,6 +111,51 @@ def test_probe_unit1_partially_displaced(temp_database, shadow_driver):
     assert "displacer" not in status[step2.PROBE_UNIT_2]
 
 
+def test_resent_unit_displaces_in_turn(temp_database, shadow_driver):
+    # The resend case in the ledger: A installs o26={7} && o27={9}, B
+    # displaces o26 to {3}, then A is submitted again. The ledger
+    # replays the journal-order feeds with no dedup, so the resend is
+    # a step like any other: A is in force again (its entry keeps the
+    # first feed's attribution), and B -- in force until the resend --
+    # is displaced BY the resend.
+    chain = step2.Chain()
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 1, 2)
+    b1 = chain.apply([step1._rule_tx(step2.PROBE_UNIT_1, seq=0)])
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 2, 3)
+    b2 = chain.apply([step1._rule_tx(step2.PROBE_UNIT_2, seq=1)])
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 3, 4)
+    b3 = chain.apply([step1._rule_tx(step2.PROBE_UNIT_1, seq=2)])
+    assert not b3[1].invalid_tx_ids, b3[1].outcomes
+    step2._commit(chain, [b1, b2, b3])
+    tx3_hash = b3[0].tx_ids[0]
+
+    entries = {e["unit"]: e for e in db.get_survival_ledger()}
+    e1 = entries[step2.PROBE_UNIT_1]
+    assert e1["status"] == "in_force"
+    assert e1["tx_hash"] == b1[0].tx_ids[0]
+    assert e1["account"] == ALICE.lower()
+    assert e1["block_height"] == b1[0].header.block_number
+    assert e1["displacer_tx_hash"] is None
+
+    e2 = entries[step2.PROBE_UNIT_2]
+    assert e2["status"] == "displaced"
+    assert e2["surviving_fragment"] is None
+    assert e2["displacer_tx_hash"] == tx3_hash
+    assert e2["displacer_block_height"] == b3[0].header.block_number
+
+    # The same answer through the view.
+    data = step2._view()
+    assert "{ 7 }" in data["shared_spec"]["normalized_text"]
+    status = {s["unit"]: s for s in data["shared_spec"]["unit_status"]}
+    assert status[step2.PROBE_UNIT_1]["status"] == "in_force"
+    assert "displacer" not in status[step2.PROBE_UNIT_1]
+    assert status[step2.PROBE_UNIT_2]["status"] == "displaced"
+    assert status[step2.PROBE_UNIT_2]["displacer"] == {
+        "tx_hash": tx3_hash,
+        "block_height": b3[0].header.block_number,
+    }
+
+
 def test_full_displacement_marks_unit_displaced(temp_database, shadow_driver):
     chain = step2.Chain()
     chain.receipt = step1._receipt("ACCEPTED_CHANGED", 1, 2)
@@ -207,7 +252,9 @@ def test_registry_units_are_not_in_the_ledger(temp_database, shadow_driver):
     assert data["registry"]["accepted_clauses"] == [
         {"target_stream": STREAM, "clause_body": step1.CLAUSE_BODY}
     ]
-    assert data["shared_spec"]["unit_status"] == []
+    # No shared-spec unit was ever fed on this chain, so there is no
+    # snapshot and no shared-spec half to carry a unit_status.
+    assert data["shared_spec"] is None
 
 
 # --- U6: the receipt carries the shadow revision ------------------------------
