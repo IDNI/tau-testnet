@@ -11,8 +11,11 @@ from consensus import network_binding
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
-from consensus.payout import TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_PAYOUT_RULE_SET
-from consensus.standing import TX_TYPE_STANDING_PAYMENT_CREATE
+from consensus.payout import (
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_RULE_SET,
+    TX_TYPE_PAYOUT_RULE_UPDATE,
+)
 from consensus import bls
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -57,10 +60,9 @@ def check_transfer(transfer: Any, sender_pubkey: Any) -> Optional[str]:
 
 def _recipient_keys(tx: dict) -> list:
     tx_type = tx.get("tx_type", "user_tx")
-    if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER,
-                   TX_TYPE_STANDING_PAYMENT_CREATE):
+    if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER):
         return [("recipient_pubkey", tx.get("recipient_pubkey"))]
-    if tx_type == TX_TYPE_PAYOUT_RULE_SET:
+    if tx_type in (TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_RULE_UPDATE):
         slots = tx.get("slots")
         return [(f"slots[{k}]", key) for k, key in enumerate(slots or [])
                 if key != ""] if isinstance(slots, list) else []

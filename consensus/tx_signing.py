@@ -41,10 +41,7 @@ from consensus.retractable import (
 from consensus.payout import (
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_RULE_SET,
-)
-from consensus.standing import (
-    TX_TYPE_STANDING_PAYMENT_CANCEL,
-    TX_TYPE_STANDING_PAYMENT_CREATE,
+    TX_TYPE_PAYOUT_RULE_UPDATE,
 )
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
@@ -136,21 +133,6 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
-    elif tx_type == TX_TYPE_STANDING_PAYMENT_CREATE:
-        # Every term the sweep will act on is signed: it pays later, from
-        # hash-bound state, with no signature of the payer in sight, so an
-        # unsigned field would let a proposer change who is paid, how much or
-        # when. The three interval fields are all listed so that naming a
-        # different one changes the bytes.
-        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
-        signing_dict["amount"] = payload.get("amount")
-        signing_dict["interval_blocks"] = payload.get("interval_blocks")
-        signing_dict["interval_seconds"] = payload.get("interval_seconds")
-        signing_dict["interval_months"] = payload.get("interval_months")
-        signing_dict["first_due"] = payload.get("first_due")
-        signing_dict["periods"] = payload.get("periods")
-    elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
-        signing_dict["standing_id"] = payload.get("standing_id")
     elif tx_type == TX_TYPE_PAYOUT_RULE_SET:
         # Every term an executor will run against: the rule text, who may be
         # paid, both caps, the period and the end. Both period fields are
@@ -162,10 +144,35 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["period_blocks"] = payload.get("period_blocks")
         signing_dict["period_seconds"] = payload.get("period_seconds")
         signing_dict["expires_at"] = payload.get("expires_at")
-        # Signed when present (only `true` is valid): a rule installed to pay per
-        # sale must not be turned into one that pays on any input, or back.
-        if "per_sale" in payload:
-            signing_dict["per_sale"] = payload.get("per_sale")
+        # Signed when present: every optional term changes what the rule does,
+        # so a proposer must not be able to add, drop or rewrite one. Only
+        # `true` is valid for the flags, so presence is the whole meaning, and
+        # a transaction written before a term existed signs exactly as before.
+        for _field in ("per_sale", "sealed", "on_arrival"):
+            if _field in payload:
+                signing_dict[_field] = payload.get(_field)
+        for _field in ("periods_from", "due_at", "due_every", "due_months",
+                       "max_fee_per_execution"):
+            if _field in payload:
+                signing_dict[_field] = payload.get(_field)
+    elif tx_type == TX_TYPE_PAYOUT_RULE_UPDATE:
+        # The rule being replaced plus the new terms, signed like a set: the
+        # node assigns version + 1, so the version itself is not signed.
+        signing_dict["rule_id"] = payload.get("rule_id")
+        signing_dict["rule_text"] = payload.get("rule_text")
+        signing_dict["slots"] = payload.get("slots")
+        signing_dict["cap_per_execution"] = payload.get("cap_per_execution")
+        signing_dict["cap_per_period"] = payload.get("cap_per_period")
+        signing_dict["period_blocks"] = payload.get("period_blocks")
+        signing_dict["period_seconds"] = payload.get("period_seconds")
+        signing_dict["expires_at"] = payload.get("expires_at")
+        for _field in ("per_sale", "sealed", "on_arrival"):
+            if _field in payload:
+                signing_dict[_field] = payload.get(_field)
+        for _field in ("periods_from", "due_at", "due_every", "due_months",
+                       "max_fee_per_execution"):
+            if _field in payload:
+                signing_dict[_field] = payload.get(_field)
     elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
         # The executor answers for which rule it ran and with what inputs.
         signing_dict["account_pubkey"] = payload.get("account_pubkey")

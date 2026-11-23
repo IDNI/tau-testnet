@@ -476,58 +476,12 @@ def init_db():
                     PRIMARY KEY (retractable_id, block_hash, outcome)
                 );
             ''')
-            # Standing payments (#34): the open authorizations with their sweep
-            # progress. Bound into consensus_meta_hash once the book has held
+            # Payout rules (#63): the installed rules with where each stands in
+            # its period. Bound into consensus_meta_hash once the book has held
             # anything, so written in the same transaction as accounts.
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS standing_payments_v1 (
-                    standing_id      TEXT PRIMARY KEY,
-                    payer_pubkey     TEXT NOT NULL,
-                    recipient_pubkey TEXT NOT NULL,
-                    amount           INTEGER NOT NULL,
-                    sequence_number  INTEGER NOT NULL,
-                    kind             INTEGER NOT NULL,
-                    interval         INTEGER NOT NULL,
-                    first_due        INTEGER NOT NULL,
-                    periods          INTEGER NOT NULL,
-                    period           INTEGER NOT NULL,
-                    paid_count       INTEGER NOT NULL,
-                    missed_count     INTEGER NOT NULL,
-                    tries            INTEGER NOT NULL,
-                    queued_at        INTEGER NOT NULL,
-                    last_paid_height INTEGER NOT NULL
-                );
-            ''')
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_standing_payer "
-                "ON standing_payments_v1(payer_pubkey);"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_standing_recipient "
-                "ON standing_payments_v1(recipient_pubkey);"
-            )
-            # Node-local history of what each block did to a standing payment,
-            # keyed per block like retractable_events so a reorg needs no cleanup.
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS standing_payment_events (
-                    standing_id  TEXT NOT NULL,
-                    block_hash   TEXT NOT NULL,
-                    block_number INTEGER NOT NULL,
-                    event_index  INTEGER NOT NULL,
-                    outcome      TEXT NOT NULL,
-                    period       INTEGER NOT NULL,
-                    amount       INTEGER NOT NULL,
-                    detail_json  TEXT NOT NULL DEFAULT '{}',
-                    PRIMARY KEY (block_hash, event_index)
-                );
-            ''')
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_standing_events_id "
-                "ON standing_payment_events(standing_id, block_number);"
-            )
-            # Payout rules (#63): one installed rule per account with where it
-            # stands in its period. Bound into consensus_meta_hash once the book
-            # has held anything, so written in the same transaction as accounts.
+            # v1 holds one row per account (the old one-rule shape) and is kept
+            # only as a migration source; v2 is the live table, one row per
+            # (account, rule), with the extended terms in more_json.
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS payout_rules_v1 (
                     account_pubkey    TEXT PRIMARY KEY,
@@ -549,21 +503,27 @@ def init_db():
                     sealed            INTEGER NOT NULL
                 );
             ''')
-            # Receive routes (#35): one installed route per account with its
-            # install clock. Bound into consensus_meta_hash once the book
-            # has held anything, so written in the same transaction as accounts.
             conn.execute('''
-                CREATE TABLE IF NOT EXISTS routes_v1 (
-                    account_pubkey    TEXT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS payout_rules_v2 (
+                    account_pubkey    TEXT NOT NULL,
                     rule_id           TEXT NOT NULL,
                     sequence_number   INTEGER NOT NULL,
                     body              TEXT NOT NULL,
-                    destination       TEXT NOT NULL,
-                    min_amount        INTEGER NOT NULL,
-                    active_from       INTEGER NOT NULL,
-                    expires_at        INTEGER NOT NULL,
+                    slots_json        TEXT NOT NULL,
+                    cap_per_execution INTEGER NOT NULL,
+                    cap_per_period    INTEGER NOT NULL,
                     kind              INTEGER NOT NULL,
-                    anchor            INTEGER NOT NULL
+                    period            INTEGER NOT NULL,
+                    expires_at        INTEGER NOT NULL,
+                    anchor            INTEGER NOT NULL,
+                    period_index      INTEGER NOT NULL,
+                    spent_in_period   INTEGER NOT NULL,
+                    executions        INTEGER NOT NULL,
+                    paid_total        INTEGER NOT NULL,
+                    last_height       INTEGER NOT NULL,
+                    sealed            INTEGER NOT NULL,
+                    more_json         TEXT,
+                    PRIMARY KEY (account_pubkey, rule_id)
                 );
             ''')
             # Node-local history: installs, revokes, executions with their legs,
@@ -2373,7 +2333,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None, routes: Dict | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, payout_rules: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2412,9 +2372,7 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 approval_slots_active=approval_slots_active,
                 retractable_transfers=retractable_transfers,
                 rule_change_requests=rule_change_requests,
-                standing_payments=standing_payments,
                 payout_rules=payout_rules,
-                routes=routes,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
 
@@ -2479,7 +2437,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None, routes: Dict | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, payout_rules: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2688,12 +2646,8 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
     if retractable_transfers is not None:
         _write_retractable_rows(retractable_transfers)
 
-    if standing_payments is not None:
-        _write_standing_rows(standing_payments)
     if payout_rules is not None:
         _write_payout_rows(payout_rules)
-    if routes is not None:
-        _write_route_rows(routes)
 
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
@@ -2729,112 +2683,6 @@ def _write_retractable_rows(state: Dict) -> None:
             json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
         )
     )
-
-
-_STANDING_COLUMNS = (
-    'standing_id, payer_pubkey, recipient_pubkey, amount, sequence_number, kind, '
-    'interval, first_due, periods, period, paid_count, missed_count, tries, '
-    'queued_at, last_paid_height'
-)
-
-
-def _write_standing_rows(state: Dict) -> None:
-    """Full replace of the open standing payments plus the resolved commitment."""
-    _db_conn.execute('DELETE FROM standing_payments_v1')
-    for row in state['rows']:
-        _db_conn.execute(
-            f'INSERT INTO standing_payments_v1 ({_STANDING_COLUMNS}) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (bytes(row[0]).hex(),) + tuple(row[1:3]) + tuple(int(v) for v in row[3:]),
-        )
-    _db_conn.execute(
-        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-        (
-            'standing_resolved',
-            json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
-        )
-    )
-
-
-def load_standing_state() -> tuple[List[tuple], int, bytes]:
-    """(open rows, resolved_count, resolved_acc) exactly as stored.
-
-    Rows are in StandingBook.restore order with the id as bytes, ordered by id.
-    Absent rows mean an empty book and a zero commitment.
-    """
-    if _db_conn is None:
-        init_db()
-    with _db_lock:
-        rows = _db_conn.execute(
-            f'SELECT {_STANDING_COLUMNS} FROM standing_payments_v1 ORDER BY standing_id'
-        ).fetchall()
-        raw = _db_conn.execute(
-            "SELECT value FROM chain_state WHERE key = 'standing_resolved'"
-        ).fetchone()
-    count, acc = 0, bytes(32)
-    if raw and raw[0]:
-        parsed = json.loads(raw[0])
-        count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
-    return (
-        [(bytes.fromhex(r[0]), r[1], r[2]) + tuple(int(v) for v in r[3:]) for r in rows],
-        count,
-        acc,
-    )
-
-
-def record_standing_events(block_hash: str, block_number: int, events) -> None:
-    """Node-local history of what a block did to standing payments.
-
-    Best effort, like the retractable events: the apply verdict is already final.
-    """
-    if _db_conn is None:
-        init_db()
-    try:
-        with _db_lock:
-            with _db_conn:
-                for index, event in enumerate(events):
-                    detail = {k: v for k, v in event.items()
-                              if k not in ('standing_id', 'outcome', 'period', 'amount')}
-                    _db_conn.execute(
-                        'INSERT OR REPLACE INTO standing_payment_events '
-                        '(standing_id, block_hash, block_number, event_index, outcome, '
-                        'period, amount, detail_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                        (event['standing_id'], block_hash, int(block_number), index,
-                         event['outcome'], int(event.get('period', 0)),
-                         int(event.get('amount', 0)), json.dumps(detail, sort_keys=True)),
-                    )
-    except Exception:
-        logger.exception("could not record standing payment events")
-
-
-def get_canonical_standing_events(standing_id: str, limit: int = 50) -> List[Dict]:
-    """History of one standing payment on the canonical chain, newest first."""
-    if _db_conn is None:
-        init_db()
-    with _db_lock:
-        rows = _db_conn.execute(
-            'SELECT block_hash, block_number, event_index, outcome, period, amount, detail_json '
-            'FROM standing_payment_events WHERE standing_id = ? '
-            'ORDER BY block_number DESC, event_index DESC',
-            (standing_id,),
-        ).fetchall()
-    out: List[Dict] = []
-    canonical: Dict[str, bool] = {}
-    for block_hash, number, index, outcome, period, amount, detail in rows:
-        if block_hash not in canonical:
-            canonical[block_hash] = get_canonical_confirmation(block_hash, int(number))[0]
-        if not canonical[block_hash]:
-            continue
-        item = {"block_number": int(number), "block_hash": block_hash, "outcome": outcome,
-                "period": int(period), "amount": int(amount)}
-        try:
-            item.update(json.loads(detail or '{}'))
-        except Exception:
-            pass
-        out.append(item)
-        if len(out) >= limit:
-            break
-    return out
 
 
 def load_retractable_state() -> tuple[List[tuple], int, bytes]:
@@ -2943,25 +2791,52 @@ _PAYOUT_COLUMNS = (
     'executions, paid_total, last_height, sealed'
 )
 
+_PAYOUT_V2_COLUMNS = (
+    'rule_id, account_pubkey, sequence_number, body, slots_json, cap_per_execution, '
+    'cap_per_period, kind, period, expires_at, anchor, period_index, spent_in_period, '
+    'executions, paid_total, last_height, sealed, more_json'
+)
+
+
+def _more_from_json(raw: str) -> tuple:
+    """The stored `more` tuple back from its JSON list.
+
+    (periods_from, due_at, last_clock, due_done, due_every, due_months,
+    on_arrival, due_index, missed, max_fee_per_execution, version, lineage_hex)
+    """
+    vals = json.loads(raw)
+    return (vals[0], vals[1], int(vals[2]), bool(vals[3]), vals[4], vals[5],
+            bool(vals[6]), int(vals[7]), int(vals[8]), vals[9], int(vals[10]),
+            vals[11])
+
 
 def _write_payout_rows(state: Dict) -> None:
-    """Full replace of the installed payout rules plus the removal commitment."""
-    _db_conn.execute('DELETE FROM payout_rules_v1')
+    """Full replace of the installed payout rules plus the removal commitment.
+
+    Writes payout_rules_v2, one row per (account, rule_id); the extended terms
+    (`more`: due schedule, retry state, max fee, version, lineage) ride in
+    more_json, and the open arrivals ride in the `payout_sales` chain_state
+    value keyed by rule id (a per-sale rule's sales are its own, not its
+    account's: two per-sale rules of one account must not share a ledger).
+    """
+    _db_conn.execute('DELETE FROM payout_rules_v2')
     # Rules that pay per sale (a 17th element: missed count and open sales) keep
     # that part in one chain_state value, so the table keeps its columns.
     sales = {}
     for row in state['rows']:
         (rule_id, account, sequence, body, slots), rest = row[:5], row[5:17]
-        if len(row) > 17:
+        more = row[18] if len(row) > 18 else None
+        if len(row) > 17 and row[17] is not None:
             missed, open_sales = row[17]
-            sales[account] = {'missed': int(missed), 'open': [
-                [bytes(sid).hex(), payer, int(amount), int(height)]
-                for sid, payer, amount, height in open_sales]}
+            sales[bytes(rule_id).hex()] = {'missed': int(missed), 'open': [
+                [bytes(sid).hex(), payer, int(amount), int(height), kind]
+                for sid, payer, amount, height, kind in open_sales]}
         _db_conn.execute(
-            f'INSERT INTO payout_rules_v1 ({_PAYOUT_COLUMNS}) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            f'INSERT INTO payout_rules_v2 ({_PAYOUT_V2_COLUMNS}) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (bytes(rule_id).hex(), account, int(sequence), body, json.dumps(list(slots)))
-            + tuple(int(v) for v in rest),
+            + tuple(int(v) for v in rest)
+            + (json.dumps(list(more)) if more is not None else None,),
         )
     _db_conn.execute(
         'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
@@ -2976,13 +2851,22 @@ def _write_payout_rows(state: Dict) -> None:
     )
 
 
+
+
 def load_payout_state() -> tuple[List[tuple], int, bytes]:
-    """(rows, resolved_count, resolved_acc) in PayoutBook.restore order."""
+    """(rows, resolved_count, resolved_acc) in PayoutBook.restore order.
+
+    Reads payout_rules_v2 when it holds rows. A database written before v2
+    migrates from payout_rules_v1: one rule per account, sales keyed by
+    account with 4-field entries, which gain the kind "user_tx", and no
+    `more` (those rules restore as version 1).
+    """
     if _db_conn is None:
         init_db()
     with _db_lock:
-        rows = _db_conn.execute(
-            f'SELECT {_PAYOUT_COLUMNS} FROM payout_rules_v1 ORDER BY account_pubkey'
+        v2 = _db_conn.execute(
+            f'SELECT {_PAYOUT_V2_COLUMNS} FROM payout_rules_v2 '
+            'ORDER BY account_pubkey, rule_id'
         ).fetchall()
         raw = _db_conn.execute(
             "SELECT value FROM chain_state WHERE key = 'payout_resolved'"
@@ -2995,63 +2879,35 @@ def load_payout_state() -> tuple[List[tuple], int, bytes]:
     if raw and raw[0]:
         parsed = json.loads(raw[0])
         count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
+    if v2:
+        out = []
+        for r in v2:
+            row = ((bytes.fromhex(r[0]), r[1], int(r[2]), r[3], tuple(json.loads(r[4])))
+                   + tuple(int(v) for v in r[5:17]))
+            if r[0] in sales:
+                entry = sales[r[0]]
+                row += ((int(entry['missed']),
+                         tuple(tuple(e) for e in entry['open'])),)
+            else:
+                row += (None,)
+            row += ((_more_from_json(r[17]) if r[17] else None),)
+            out.append(row)
+        return out, count, acc
+    with _db_lock:
+        rows = _db_conn.execute(
+            f'SELECT {_PAYOUT_COLUMNS} FROM payout_rules_v1 ORDER BY account_pubkey'
+        ).fetchall()
     out = []
     for r in rows:
         row = ((bytes.fromhex(r[0]), r[1], int(r[2]), r[3], tuple(json.loads(r[4])))
                + tuple(int(v) for v in r[5:]))
         if r[1] in sales:
             entry = sales[r[1]]
-            row += ((entry['missed'], tuple(tuple(e) for e in entry['open'])),)
+            row += ((int(entry['missed']),
+                     tuple((e[0], e[1], int(e[2]), int(e[3]), "user_tx")
+                           for e in entry['open'])),)
+        row += (None,)
         out.append(row)
-    return out, count, acc
-
-
-_ROUTE_COLUMNS = (
-    'rule_id, account_pubkey, sequence_number, body, destination, min_amount, '
-    'active_from, expires_at, kind, anchor'
-)
-
-
-def _write_route_rows(state: Dict) -> None:
-    """Full replace of the installed receive routes plus the removal commitment."""
-    _db_conn.execute('DELETE FROM routes_v1')
-    for row in state['rows']:
-        (rule_id, account, sequence, body, destination, min_amount, active_from,
-         expires_at, kind, anchor) = row
-        _db_conn.execute(
-            f'INSERT INTO routes_v1 ({_ROUTE_COLUMNS}) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (bytes(rule_id).hex(), account, int(sequence), body, destination,
-             int(min_amount), int(active_from), int(expires_at), int(kind), int(anchor)),
-        )
-    _db_conn.execute(
-        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-        (
-            'routes_resolved',
-            json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
-        )
-    )
-
-
-def load_route_state() -> tuple[List[tuple], int, bytes]:
-    """(rows, resolved_count, resolved_acc) in RouteBook.restore order."""
-    if _db_conn is None:
-        init_db()
-    with _db_lock:
-        rows = _db_conn.execute(
-            f'SELECT {_ROUTE_COLUMNS} FROM routes_v1 ORDER BY account_pubkey'
-        ).fetchall()
-        raw = _db_conn.execute(
-            "SELECT value FROM chain_state WHERE key = 'routes_resolved'"
-        ).fetchone()
-    count, acc = 0, bytes(32)
-    if raw and raw[0]:
-        parsed = json.loads(raw[0])
-        count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
-    out = []
-    for r in rows:
-        out.append(((bytes.fromhex(r[0]), r[1], int(r[2]), r[3], r[4], int(r[5]),
-                     int(r[6]), int(r[7]), int(r[8]), int(r[9]))))
     return out, count, acc
 
 
@@ -3107,35 +2963,45 @@ def get_canonical_payout_events(account_pubkey: str, limit: int = 50) -> List[Di
     return out
 
 
-def has_due_standing_payments(next_height: int, now: int) -> bool:
-    """True if a standing payment is due for a first attempt at this height or time.
+def has_due_payout_rules(next_height: int, now: int) -> bool:
+    """True if a payout rule has a due point this block reaches, or an arrival
+    waiting for its run on arrival.
 
     A hint for the miner thread, from persisted rows like has_due_retractables:
-    an entry waiting for a due point this block reaches, or one already queued
-    but not yet tried (the per-block cap held it back). Retries do not wake an
-    idle chain. The block builder re-checks against the book under the lock.
+    the next due point is derived from the stored schedule (due_at, due_every
+    or due_months, due_index), never from the previous point, so a monthly rule
+    anchored on the 31st wakes on the last day of a shorter month. The block
+    builder re-checks against the book under the lock.
     """
     if _db_conn is None:
         init_db()
     try:
         with _db_lock:
             rows = _db_conn.execute(
-                'SELECT kind, interval, first_due, period, tries, queued_at '
-                'FROM standing_payments_v1'
+                'SELECT rule_id, kind, more_json FROM payout_rules_v2 '
+                'WHERE more_json IS NOT NULL'
             ).fetchall()
+            raw_sales = _db_conn.execute(
+                "SELECT value FROM chain_state WHERE key = 'payout_sales'"
+            ).fetchone()
     except Exception:
         return False
-    from consensus.standing import KIND_BLOCKS, add_months, KIND_MONTHS
-    for kind, interval, first_due, period, tries, queued_at in rows:
-        if queued_at:
-            if not tries:
-                return True
+    from consensus.payout import KIND_BLOCKS, due_point_of
+
+    sales = json.loads(raw_sales[0]) if raw_sales and raw_sales[0] else {}
+    for rule_id, kind, more_json in rows:
+        try:
+            vals = json.loads(more_json)
+        except Exception:
             continue
-        if kind == KIND_MONTHS:
-            due = add_months(int(first_due), int(period) * int(interval))
-        else:
-            due = int(first_due) + int(period) * int(interval)
-        if due <= (next_height if kind == KIND_BLOCKS else now):
+        (_periods_from, due_at, _last_clock, due_done, due_every, due_months,
+         on_arrival, due_index, _missed, _fee, _ver, _lin) = vals
+        if on_arrival and sales.get(rule_id, {}).get('open'):
+            return True
+        if due_at is None or due_done:
+            continue
+        clock = next_height if kind == KIND_BLOCKS else now
+        if due_point_of(int(due_at), due_every, due_months, int(due_index)) <= clock:
             return True
     return False
 
