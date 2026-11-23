@@ -25,7 +25,13 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_REJECT,
     RULE_OFFER_TX_TYPES,
 )
-from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.retractable import (
+    TX_TYPE_RETRACT_TRANSFER,
+    TX_TYPE_RETRACTABLE_TRANSFER,
+    RETRACTABLE_TX_TYPES,
+    hold_lengths,
+    hold_stream_and_value,
+)
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -232,6 +238,12 @@ def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
         values[int(k)] = str(v)
     for slot in _approval_slot_feed(tip_view):
         values[slot] = "0"
+    if tau_defs.RECIPIENT_POLICY_ACTIVE:
+        # A parked approval transfer is a plain transfer once executed: hold 0
+        # on both streams, matching the apply-side measurement
+        # (_measure_parked_transfer via _transfer_input_map).
+        values[tau_defs.HOLD_SECONDS_STREAM_INDEX] = "0"
+        values[tau_defs.HOLD_BLOCKS_STREAM_INDEX] = "0"
     values[5] = str(admission_ts)
     return values
 
@@ -519,6 +531,36 @@ def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     return _policy_call(lambda: sender_policy.clause_blocks(
         body, values, pool="admission", timeout=budget
     ))
+
+
+def _recipient_clause_blocks(tip_view, recipient_pubkey, values, budget, *,
+                             hold_stream=None, hold_value=0):
+    """(blocked, detail, cap) for the RECIPIENT's o5 clause on one transfer.
+
+    Mirrors _sender_clause_blocks, through the shared recipient gate
+    (consensus/sender_policy.py::recipient_blocks): the gate is inert while
+    RECIPIENT_POLICY_ACTIVE is off, and when the clause blocks a park the cap
+    is probed and returned. `hold_stream`/`hold_value` name the park's hold
+    (17/seconds or 27/blocks); 0/absent for a plain transfer.
+    """
+    return _policy_call(lambda: sender_policy.recipient_blocks(
+        tip_view.clause_for, recipient_pubkey, values,
+        pool="admission", timeout=budget,
+        hold_stream=hold_stream, hold_value=hold_value,
+    ))
+
+
+def _recipient_hold_details(hold_stream, hold_value, cap):
+    """Structured RECIPIENT_MAX_HOLD details: the cap in the park's own unit
+    plus the hold as measured, so a wallet can say how long is too long."""
+    details = {"hold_seconds": 0, "hold_blocks": 0}
+    if hold_stream == tau_defs.HOLD_SECONDS_STREAM_INDEX:
+        details["hold_seconds"] = hold_value
+        details["max_hold_seconds"] = cap
+    else:
+        details["hold_blocks"] = hold_value
+        details["max_hold_blocks"] = cap
+    return details
 
 
 def _clause_build_refusal(body, budget):
@@ -1198,6 +1240,23 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         )
                     logger.info("Tau custom input validation successful.")
 
+            # Hold lengths for a retractable park (0/0 for an ordinary
+            # transfer): the recipient's clause reads them on i17 (seconds)
+            # / i27 (blocks). Measured on the same clocks validate_park_shape
+            # uses -- next_block_height / admission_ts here (advisory), the
+            # block's own height / timestamp at apply (authoritative). A park
+            # has exactly one transfer leg, so one hold serves the whole loop.
+            hold_seconds, hold_blocks = 0, 0
+            if tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+                hold_seconds, hold_blocks = hold_lengths(
+                    admission_eval.data["release_kind"],
+                    admission_eval.data["release_at"],
+                    tip_view.next_block_height, admission_ts,
+                )
+            hold_stream, hold_value = hold_stream_and_value(
+                hold_seconds, hold_blocks
+            )
+
             # Step 3: Transfer Validation
             if has_transfers and all_validated_transfers and not skip_tau_eval:
                 if tau_force_test:
@@ -1253,6 +1312,17 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         # Reserved upstream, so a sender cannot pre-fill one.
                         for slot in _approval_slot_feed(tip_view):
                             tau_input_stream_values[slot] = "0"
+                        # Hold streams (i17 seconds / i27 blocks). Fed only
+                        # while recipient policy is active, so a pre-activation
+                        # node stays byte-identical; 0 on both for a plain
+                        # transfer, the park's hold for a retractable one.
+                        # Fed after the slots and before i5, byte-identically
+                        # to the apply-time overlay order in
+                        # consensus/engine.py. Reserved upstream, so a sender
+                        # cannot forge a short hold.
+                        if tau_defs.RECIPIENT_POLICY_ACTIVE:
+                            tau_input_stream_values[tau_defs.HOLD_SECONDS_STREAM_INDEX] = str(hold_seconds)
+                            tau_input_stream_values[tau_defs.HOLD_BLOCKS_STREAM_INDEX] = str(hold_blocks)
                         # i5: advisory block timestamp (see admission_ts above) so
                         # time-lock o5 rules pre-check at admission; apply is
                         # authoritative.
@@ -1306,6 +1376,49 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                     f"Transaction rejected: the sender's own policy clause "
                                     f"blocked transfer #{i+1} ({transfer_details}). "
                                     f"Policy output: {own_o5}"
+                                ),
+                                transfer_index=i + 1,
+                            )
+
+                        # --- Recipient Policy Check (o5, clause mode) ---
+                        # The recipient's own clause judges the transfer TO
+                        # them, after the sender-side checks, once per output.
+                        # A block on any output fails the whole tx. When the
+                        # clause blocks a park for its hold, the refusal
+                        # carries the recipient's cap (probed on the refusal
+                        # path only); any other recipient block is a plain
+                        # policy refusal.
+                        recipient_blocks, recipient_o5, recipient_cap = _recipient_clause_blocks(
+                            tip_view, tau_input_dict['to_addr'],
+                            tau_input_stream_values, admission_tau.budget,
+                            hold_stream=hold_stream, hold_value=hold_value,
+                        )
+                        if recipient_blocks:
+                            if recipient_cap is not None:
+                                unit = (
+                                    "seconds"
+                                    if hold_stream == tau_defs.HOLD_SECONDS_STREAM_INDEX
+                                    else "blocks"
+                                )
+                                return _qt_err(
+                                    "RECIPIENT_MAX_HOLD",
+                                    (
+                                        f"Transaction rejected: the recipient's policy "
+                                        f"caps the hold at {recipient_cap} {unit} "
+                                        f"for transfer #{i+1} ({transfer_details}). "
+                                        f"Policy output: {recipient_o5}"
+                                    ),
+                                    transfer_index=i + 1,
+                                    **_recipient_hold_details(
+                                        hold_stream, hold_value, recipient_cap
+                                    ),
+                                )
+                            return _qt_err(
+                                "RECIPIENT_POLICY_BLOCK",
+                                (
+                                    f"Transaction rejected: the recipient's policy clause "
+                                    f"blocked transfer #{i+1} ({transfer_details}). "
+                                    f"Policy output: {recipient_o5}"
                                 ),
                                 transfer_index=i + 1,
                             )

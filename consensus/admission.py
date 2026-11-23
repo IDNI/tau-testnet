@@ -42,6 +42,7 @@ from consensus.approvals import (
     parse_rule_change_cancel,
     parse_rule_change_request_checked,
     parse_transfer_vote,
+    screen_hold_widths,
     screen_policy_widths,
     screen_slot_widths,
     screen_stream_widths,
@@ -197,6 +198,14 @@ def is_temporal_reference_error(error_text: Optional[str]) -> bool:
     return bool(error_text) and _TEMPORAL_REFERENCE_PHRASE in error_text
 
 
+# A clause that mentions a feature this build does not have switched on.
+_FEATURE_INACTIVE_PHRASE = "is not active on this chain"
+
+
+def is_feature_inactive_error(error_text: Optional[str]) -> bool:
+    return bool(error_text) and _FEATURE_INACTIVE_PHRASE in error_text
+
+
 class AdmissionResult:
     def __init__(self, is_valid: bool, error: Optional[str] = None, data: Optional[Dict] = None,
                  code: Optional[str] = None, details: Optional[Dict] = None):
@@ -224,15 +233,26 @@ def _width_mismatch_details(reason: str) -> Optional[Dict]:
         "must be typed bv[" not in reason
         and "must be written o" not in reason
         and "literals assigned to o" not in reason
+        and "must be written i17" not in reason
+        and "must be written i27" not in reason
     ):
         return None
     stream_m = re.search(r"\bo([58])\b", reason)
-    if not stream_m:
-        return None
+    if stream_m:
+        stream = f"o{stream_m.group(1)}"
+        expected = tau_defs.USER_POLICY_BV_WIDTH
+    else:
+        # A recipient hold stream (i17 seconds, i27 blocks) is bv[64] by the
+        # same frozen-width contract; report it under the same code.
+        hold_m = re.search(r"\bi(17|27)\b", reason)
+        if not hold_m:
+            return None
+        stream = f"i{hold_m.group(1)}"
+        expected = tau_defs.HOLD_STREAM_BV_WIDTH
     found_m = re.search(r"found bv\[(\d+)\]", reason)
     return {
-        "stream": f"o{stream_m.group(1)}",
-        "expected": tau_defs.USER_POLICY_BV_WIDTH,
+        "stream": stream,
+        "expected": expected,
         "found": int(found_m.group(1)) if found_m else "untyped",
     }
 
@@ -241,6 +261,8 @@ def _admission_from_domain_error(domain_error: str, prefix: str = "") -> Admissi
     msg = f"{prefix}{domain_error}" if prefix else domain_error
     if is_temporal_reference_error(domain_error):
         return format_error(msg, code=TEMPORAL_REFERENCE_CODE)
+    if is_feature_inactive_error(domain_error):
+        return format_error(msg, code="FEATURE_INACTIVE")
     mismatch = _width_mismatch_details(domain_error)
     if mismatch:
         return format_error(msg, code="WIDTH_MISMATCH", **mismatch)
@@ -985,10 +1007,29 @@ def _screen_clause_domains(body: str) -> Optional[str]:
             + ", ".join(writes)
         )
 
+    # While recipient policy is inactive the node feeds no hold stream, so a
+    # clause mentioning i17/i27 would never run as written: refuse it at
+    # deploy rather than silently admitting a rule that means something
+    # different once the feature turns on. (When active the streams are
+    # reserved but carved out as readable below, with a strict width screen.)
+    if not tau_defs.RECIPIENT_POLICY_ACTIVE:
+        holds = _streams_referenced(
+            body, tuple(f"i{idx}" for idx in tau_defs.hold_stream_indices())
+        )
+        if holds:
+            return (
+                "Recipient policy " + ", ".join(holds) + " "
+                + _FEATURE_INACTIVE_PHRASE
+                + " (RECIPIENT_POLICY_ACTIVE is off); a max-hold cap cannot "
+                + "be deployed until the feature activates."
+            )
+
     # i12 is excluded: clause_body_v1 already rejects a clause that references
     # it, since a clause is evaluated only for its owner. Approval slots are
     # excluded too -- reading them is the whole point of a co-signature policy --
-    # but they get a stricter width check instead, below.
+    # but they get a stricter width check instead, below. The hold streams are
+    # excluded the same way while the feature is active: reading them is the
+    # whole point of a max-hold cap.
     #
     # The widest reserved set is screened regardless of the tip's current
     # eligibility mode, AND regardless of whether approval slots are active. A
@@ -1020,6 +1061,12 @@ def _screen_clause_widths_and_structure(body: str) -> Optional[str]:
     slot_error = screen_slot_widths(body)
     if slot_error:
         return "Shared rules: " + slot_error
+
+    # Same contract for the recipient hold streams: every i17/i27 occurrence
+    # must be typed bv[64].
+    hold_error = screen_hold_widths(body)
+    if hold_error:
+        return "Shared rules: " + hold_error
 
     # Same contract for o5 itself: an unguarded clause body still types the
     # shared policy stream, and a bv[16] unit here poisons the interpreter

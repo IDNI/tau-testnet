@@ -164,6 +164,36 @@ def validate_park_shape(park: RetractableEntry, height: int, ts: int) -> Optiona
     return None
 
 
+def hold_lengths(kind: int, release_at: int, height: int, ts: int) -> Tuple[int, int]:
+    """(hold_seconds, hold_blocks) of a park against the target block.
+
+    Shared by admission and apply, on the same clocks validate_park_shape
+    uses: admission passes next_block_height / next_block_timestamp
+    (advisory), apply the block's own height / timestamp (authoritative).
+    A time-kind park holds in seconds and 0 blocks; a height-kind park
+    holds in blocks and 0 seconds; a plain transfer is (0, 0). Clamped at
+    0: a park that passed validate_park_shape is always in the future, but
+    a negative hold must never reach a clause as a bare value.
+    """
+    if kind == KIND_TIME:
+        return max(release_at - ts, 0), 0
+    if kind == KIND_HEIGHT:
+        return 0, max(release_at - height, 0)
+    return 0, 0
+
+
+def hold_stream_and_value(hold_seconds: int, hold_blocks: int) -> Tuple[Optional[int], int]:
+    """(stream index, hold value) naming a park's hold: i17/seconds or
+    i27/blocks, (None, 0) for a plain transfer. A park holds in exactly one
+    unit, so the non-zero length decides. Shared by admission and apply so
+    the recipient gate probes the same stream on both paths."""
+    if hold_seconds:
+        return tau_defs.HOLD_SECONDS_STREAM_INDEX, hold_seconds
+    if hold_blocks:
+        return tau_defs.HOLD_BLOCKS_STREAM_INDEX, hold_blocks
+    return None, 0
+
+
 # --- The book -----------------------------------------------------------------
 
 _Row = Tuple[bytes, str, str, int, int, int, int]

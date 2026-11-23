@@ -84,7 +84,7 @@ python wallet.py send --privkey <private_key> \
   --operation "13:custom_data" \
   --operation "100:more_data"
 ```
-*Note: Keys 2–12, 14 and 15 are always reserved, and further keys are reserved in some modes (see Operation Types). Use keys 26 and above for custom application data that a policy rule reads.*
+*Note: Keys 2–12, 14 and 15 are always reserved, and further keys are reserved in some modes (see Operation Types). Use keys 26 and above for custom application data that a policy rule reads (except `i27` once recipient policy is active — see below).*
 
 ### Complex Multi-Operation Transaction
 ```bash
@@ -144,7 +144,9 @@ An operation key `N` maps to Tau input stream `iN`. The wallet supports:
 | `i13` | proposer pubkey, reserved under the `tau_validator_set` eligibility mode |
 | `i14` / `i15` | consensus stake / eligibility-mode inputs |
 | `i16` | seconds since the sender's previous transfer (`bv[64]`). Reserved **only while the network feeds it**; until then it is an ordinary custom stream. While reserved, a policy clause may not read it. |
+| `i17` | seconds a retractable payment to the recipient will be held (`bv[64]`). Reserved **only once recipient policy is active**; until then it is an ordinary custom stream. Unlike `i16`, a policy clause **may** read it: `0` for a plain transfer, the park's hold length for a time-based park, `0` for a height-based park. |
 | `i18`–`i25` | co-signature approval slots, reserved once the chain has activated approvals; only the node fills them |
+| `i27` | blocks a retractable payment to the recipient will be held (`bv[64]`). Reserved **only once recipient policy is active**; until then it is an ordinary custom stream. A policy clause **may** read it: `0` for a plain transfer, `0` for a time-based park, the park's hold length for a height-based park. |
 
 So user-controllable custom input streams start at **`i13`**, and the streams
 above that are reserved as listed. Attempting to set a reserved stream as an
@@ -188,11 +190,13 @@ rejects the whole transaction (no partial execution); a malformed `o5` fails
 closed (treated as block), and so does a registered clause the engine refuses to
 evaluate for the transfer's inputs.
 
-A clause is evaluated on its own, and only for transfers you send, so it carries
-**no sender guard** and must not reference `i12`. You hold one clause; submitting
-another replaces it. A transfer is blocked when the consensus rules or your
-clause yield `o5 = 0`. A policy rule cannot share a transaction with transfers
-(`RULE_WITH_TRANSFERS`): send the rule first, then the transfers.
+A clause is evaluated on its own, and only for transfers you send or receive,
+so it carries **no sender guard** and must not reference `i12`. You hold one
+clause; submitting another replaces it. A transfer is blocked when the
+consensus rules or your clause yield `o5 = 0`. A policy rule cannot share a
+transaction with transfers (`RULE_WITH_TRANSFERS`): send the rule first, then
+the transfers. As the sender, your clause judges your own outgoing transfers;
+as the recipient, it judges incoming ones — see [Recipient clauses](#recipient-clauses) below.
 
 A clause may read the amount (`i1`), your balance (`i2`), sender and recipient
 (`i3`/`i4`), block time (`i5`), approval slots and custom inputs from `i26` up —
@@ -232,6 +236,47 @@ may not read `i2`: admission estimates it against the current head, so the fee
 charged at inclusion could differ from the estimate quoted to the sender. Fee
 rules, unlike clauses, accumulate in a shared specification and must reference
 `i12` or `i3` to scope themselves to you (`UNSCOPED_USER_RULE`).
+
+### Recipient clauses
+
+Once recipient policy is active on the chain, your clause is also evaluated
+for every transfer **to** you — at mempool admission and again at block apply,
+immediately after the sender's own clause is checked. The same clause judges
+both directions, on the same transfer inputs: as the recipient you read the
+counterparty on `i3` (the sender's pubkey) and the amount on `i1`. A condition
+that only makes sense outbound — say, one that compares `i3` to your own
+pubkey — simply never fires inbound, because `i3` is the sender. A recipient
+block rejects the whole transaction with a distinct reason
+(`RECIPIENT_POLICY_BLOCK` at admission, `recipient_policy_block` in the block
+receipt); in a batched transaction each output is checked against its own
+recipient, and one refused output fails the whole transaction. No clause, or a
+clause that never mentions `o5`, allows everything in.
+
+A retractable payment to you carries one more input: how long it will be held.
+`i17` is the hold in seconds for a time-based park (and `0` for a height-based
+park), `i27` is the hold in blocks for a height-based park (and `0` for a
+time-based park); a plain transfer has hold `0` on both. So a clause can cap
+the hold it will accept — a **max-hold cap** is just a condition on `i17` or
+`i27` inside the clause, e.g. "block when `i17[t]:bv[64]` exceeds 600" refuses
+any park held longer than ten minutes while admitting plain transfers and
+shorter parks. A cap of `0` admits only plain transfers. A park refused this
+way fails with `RECIPIENT_MAX_HOLD` (`recipient_max_hold` at apply), and the
+refusal carries the cap the node measured from your clause
+(`max_hold_seconds` / `max_hold_blocks`) alongside the refused hold
+(`hold_seconds` / `hold_blocks`). Only parks are gated: a retract is never
+gated, and a release is never re-checked — a clause you tighten after a park
+lands cannot strand the payment. A refused transfer or park is a hard reject:
+no fee is charged and no funds move. The hold length is measured from the
+block clock admission and apply already use for parks; see
+[docs/retractable.md](docs/retractable.md) for the exact definition.
+
+A wallet can detect the feature without submitting anything: `checktx` and
+`checktx estimate` report `recipient_policy_active` in their response, and a
+`checktx estimate` on a transfer your recipient's clause would refuse returns
+the same `RECIPIENT_POLICY_BLOCK` / `RECIPIENT_MAX_HOLD` refusal sendtx would.
+While the feature is inactive, a node refuses to deploy a clause that mentions
+`i17` or `i27` (`FEATURE_INACTIVE`) rather than silently admitting a cap that
+never runs.
 
 ## Sharing Rules With Another User
 

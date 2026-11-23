@@ -117,6 +117,23 @@ TAU_OUTPUT_STREAM_VALIDATION_RESULT = "o1"
 # the WHOLE user_tx (no partial execution). Malformed/unparseable o5 fails
 # closed (parse_tau_output -> 0 -> block).
 #
+# Recipient-side evaluation (issues #47/#76): while RECIPIENT_POLICY_ACTIVE,
+# a transfer is ALSO judged by the RECIPIENT's o5 clause, evaluated after the
+# sender-side checks, once per transfer output, at admission and at apply
+# (consensus/sender_policy.py::recipient_blocks). One clause per account
+# judges both directions: as the sender it sees the counterparty on i4, as
+# the recipient it sees the counterparty on i3, the amount on i1, and — for
+# a retractable park — the hold length on i17 (seconds) / i27 (blocks), 0
+# for a plain transfer. A clause that only speaks about outbound transfers
+# (its conditions require i3 to be its owner's own key) therefore does not
+# refuse inbound ones: direction is scoped in the clause text, by comparing
+# i3/i4 against the owner's pubkey literal. The guarded (accumulated) o5
+# output stays sender-scoped: the shared spec has no per-account separation,
+# so a second guarded pass with i12 re-fed to the recipient would re-judge
+# the sender's own rules as if the recipient were the sender, and would
+# break the fee model's one-evaluation-per-transfer contract. A recipient
+# with no clause, or a clause that never blocks, allows everything.
+#
 # Width: every o5 (and o8) occurrence must be `o5[t]:bv[24]`, and every literal
 # assigned to them must be a bv[24] literal. Untyped `o5[t] = 0` is how a stray
 # width gets inferred process-wide. Screened at admission and hard-rejected at
@@ -304,6 +321,58 @@ APPROVAL_SLOT_BASE = 18
 APPROVAL_SLOT_COUNT = 8
 APPROVAL_SLOT_BV_WIDTH = 384
 
+# --- Recipient policy: hold-length streams (i17, i27) -----------------------
+# Streams the node fills with how long a payment TO the recipient would be
+# held before it can release. A recipient's o5 clause reads them to cap the
+# hold it accepts; a plain transfer feeds 0 on both, so a cap of 0 admits
+# plain transfers and refuses every park.
+#
+#   i17: hold length in SECONDS (time-kind parks): release_at_time minus the
+#        block timestamp; 0 for a plain transfer or a height-kind park.
+#   i27: hold length in BLOCKS (height-kind parks): release_at_height minus
+#        the block height; 0 for a plain transfer or a time-kind park.
+#        i27 sits above i26 (REQUEST_CUSTOM_INPUT_MIN), the first sender
+#        custom-input stream: i26 itself is never a hold stream.
+#
+# A cap rule must bound BOTH streams to bound both kinds of park: a clause
+# bounding only i17 sees a height-kind park as hold 0, and vice versa.
+# The clocks are exactly the ones validate_park_shape already uses
+# (consensus/retractable.py): admission measures against next_block_height /
+# next_block_timestamp (advisory), apply against the block's own height /
+# timestamp (authoritative). A seconds hold can therefore differ slightly
+# between admission and apply near the boundary — the same
+# advisory/authoritative relationship i5 already has — while a blocks hold
+# is exact on both paths.
+#
+# They are WRITE-reserved and nothing more, like the approval slots: a sender
+# must never be able to put "17"/"27" in `operations` (that would let them
+# forge a short hold), but a registered o5 clause MUST be able to READ them
+# or the cap has no point. So `reserved_operation_keys` governs writes and
+# `rule_text_forbidden_input_streams` governs reads, per context.
+#
+# Width is FROZEN at bv[64], matching the timestamp family (i5, i16).
+# Per-stream bitvector typing is process-global and sticky, so the clause
+# screen rejects any hold-stream occurrence not annotated at exactly bv[64],
+# unannotated ones included (consensus/approvals.py::screen_hold_widths).
+HOLD_SECONDS_STREAM_INDEX = 17
+HOLD_BLOCKS_STREAM_INDEX = 27
+HOLD_STREAM_BV_WIDTH = 64
+
+# OFF by default, and flipping it is a CONSENSUS CHANGE requiring coordinated
+# activation across the network -- same class as editing a rules/ file, not a
+# per-node preference. Three things change together when it goes on:
+#   1. the engine starts feeding i17/i27, which can change an o5 verdict,
+#   2. i17/i27 become reserved operations keys, and
+#   3. the recipient's o5 clause starts judging transfers TO its owner
+#      (consensus/sender_policy.py::recipient_blocks), at admission and apply.
+# Until then the gate is inert: no recipient clause is evaluated, no hold
+# stream is fed, and a clause mentioning i17/i27 is refused at deploy with
+# FEATURE_INACTIVE (consensus/admission.py), so no rule is ever admitted that
+# would mean something different once the feature turns on. This mirrors the
+# COOLDOWN_STREAM_ACTIVE precedent: reserve a stream exactly when the node
+# feeds it.
+RECIPIENT_POLICY_ACTIVE = False
+
 # A parked request's own custom inputs (a 2FA code, a comment to a partner) live
 # ABOVE the slot block. They must also clear the widest reserved set: i13 and i16
 # become reserved under tau_validator_set and cooldown activation respectively,
@@ -319,6 +388,11 @@ RULE_TEXT_CONTEXT_CONSENSUS = "consensus_revision"
 def approval_slot_indices() -> tuple:
     """The approval slot stream indices, low to high."""
     return tuple(range(APPROVAL_SLOT_BASE, APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT))
+
+
+def hold_stream_indices() -> tuple:
+    """The recipient hold-length stream indices: i17 (seconds), i27 (blocks)."""
+    return (HOLD_SECONDS_STREAM_INDEX, HOLD_BLOCKS_STREAM_INDEX)
 
 
 def reserved_operation_keys(
@@ -341,6 +415,10 @@ def reserved_operation_keys(
         # Reserved only while the node actually feeds i16 (see above), so
         # pre-existing user rules using it keep working until activation.
         keys = keys + (COOLDOWN_STREAM_INDEX,)
+    if RECIPIENT_POLICY_ACTIVE:
+        # Reserved only while the node actually feeds i17/i27 (see above), so
+        # pre-existing user rules using them keep working until activation.
+        keys = keys + hold_stream_indices()
     if approval_slots_active:
         # Reserved exactly when the node starts feeding them, mirroring the i13
         # and i16 precedents.
@@ -368,4 +446,10 @@ def rule_text_forbidden_input_streams(
     readable = {12}
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
+        if RECIPIENT_POLICY_ACTIVE:
+            # A clause may read the hold streams: that is what a max-hold cap
+            # is written against. While inactive they never reach this list
+            # (not reserved, not fed) and the clause screen refuses a body
+            # mentioning them outright (FEATURE_INACTIVE).
+            readable |= set(hold_stream_indices())
     return tuple(f"i{idx}" for idx in keys if idx not in readable)

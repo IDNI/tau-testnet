@@ -199,12 +199,57 @@ honest nodes disagree about admissibility and fork.
 | `UNKNOWN_RETRACTABLE` | A retract names an id that is not open (unknown, or already resolved). |
 | `NOT_RETRACTABLE_SENDER` | A retract is signed by someone other than the entry's sender. |
 | `RETRACT_TOO_LATE` | The next block is already at or past the release point. |
+| `RECIPIENT_MAX_HOLD` | The recipient's policy caps how long a payment to them may be held, and this park exceeds it. The refusal carries the measured cap (`max_hold_seconds` / `max_hold_blocks`) and the refused hold (`hold_seconds` / `hold_blocks`). See [Recipient max-hold cap](#recipient-max-hold-cap). |
 
 A malformed transaction, an out-of-range amount, or a release point that is not
 in the future or is outside the window is rejected with a descriptive message
 (`Malformed retractable_transfer: ...`, `retractable_transfer rejected: ...`) and
-the generic error code. A park that fails the sender's `o5` policy, the fee step
-or the balance surfaces as for an ordinary transfer.
+the generic error code. A park that fails the sender's `o5` policy, the
+recipient's `o5` policy, the fee step or the balance surfaces as for an
+ordinary transfer.
+
+## Recipient max-hold cap
+
+Once recipient policy is active on the chain, a retractable transfer is judged
+by the **recipient's** `o5` clause as well as the sender's — at mempool
+admission and again at block apply. The recipient's clause reads the park's
+hold length on two streams: `i17` carries the hold in seconds for a time-based
+park (and `0` for a height-based park), `i27` carries the hold in blocks for a
+height-based park (and `0` for a time-based park). A plain transfer has hold
+`0` on both. A clause can therefore cap the hold it will accept by blocking
+when the hold exceeds a value: a cap of `0` admits only plain transfers, a cap
+of 600 seconds admits a 10-minute park and refuses a 1-hour park. A recipient
+with no clause, or a clause that never mentions the hold streams, accepts
+parks of any length.
+
+**How the hold is measured.** The hold is the release point minus the block
+clock admission and apply already use to refuse a park that could be mined at
+or after its own release: at admission the next block's timestamp
+(`next_block_timestamp`) and height (`next_block_height`), at apply the
+including block's own timestamp and height. Admission's reading is advisory —
+the park may be mined later, in which case the hold apply measures is shorter
+— and apply's reading is authoritative: a park admitted against a 600-second
+cap is refused at apply only if the including block still measures a hold over
+600 seconds. Either way the same clause and the same streams are evaluated on
+both paths, so admission and apply agree whenever the block lands at the
+admission clock.
+
+**Refusal.** A park over the cap is refused with `RECIPIENT_MAX_HOLD` at
+admission (`recipient_max_hold` in the block receipt). The refusal carries the
+cap the node measured from the recipient's clause — by probing where the
+clause flips from allow to block — as `max_hold_seconds` or `max_hold_blocks`,
+alongside the refused hold. A refusal is a hard reject: no fee is charged and
+no funds move, exactly as for a sender-policy block.
+
+**Only parks are gated.** A retract is never gated by the recipient's clause,
+and a release is never re-checked: the clause in force when the park lands is
+the one that judges it, and a cap tightened afterwards cannot strand an open
+entry. An approval-vote execution of an already-parked transfer is likewise
+not re-gated. A wallet can check a park against the recipient's clause before
+submitting with `checktx estimate`, which returns the same refusal, and can
+tell whether the feature is active from the `recipient_policy_active` flag in
+the `checktx` response. See [WALLET_USAGE.md](../WALLET_USAGE.md#recipient-clauses)
+for the clause syntax.
 
 ## Timing caveats
 
@@ -247,7 +292,6 @@ fields are unsigned 64-bit integers. `sender_pubkey` must be the signer.
 
 - Custom inputs (`--input`) on a retractable transfer.
 - Co-signed retractable transfers.
-- Recipient refusal: the recipient cannot decline an open entry.
 - Partial retraction or editing an open entry.
 - Multi-leg or split payments.
 - Heartbeat blocks: the chain does not mine empty blocks on a schedule.

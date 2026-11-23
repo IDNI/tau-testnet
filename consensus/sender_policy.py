@@ -1,4 +1,5 @@
-"""The sender's own o5 clause as a second, independent block condition.
+"""The sender's own o5 clause as a second, independent block condition, and
+the recipient's o5 clause as a third (issues #47/#76).
 
 Every call site (apply, admission, approval preview) goes through here so the
 inputs, the failure mapping and the evaluator choice cannot drift apart.
@@ -116,3 +117,121 @@ def clause_builds(body, *, pool: str, timeout=_SESSION_DEFAULT) -> tuple[bool, s
     """
     result = evaluator(pool).validate(body, timeout=timeout)
     return result.ok, result.error
+
+
+# --- Recipient policy (issues #47/#76) ---------------------------------------
+#
+# A transfer is judged by the RECIPIENT's o5 clause as well as the sender's,
+# once per transfer output, at admission and at apply. The clause is fetched
+# by the same (pubkey, stream) key as the sender's; the evaluation, the
+# failure mapping and the cap probe below are shared by both paths so they
+# cannot drift apart.
+#
+# The guarded (accumulated) o5 output stays sender-scoped: the shared spec
+# has no per-account separation, so a second guarded pass with i12 re-fed to
+# the recipient would re-judge the sender's own rules as if the recipient
+# were the sender, and would break the fee model's one-evaluation-per-transfer
+# contract. The recipient gate is clause-only, by design.
+
+# Probes are bounded: a binary search over the hold range plus verification
+# and monotonicity spot-checks. A time hold is at most
+# MAX_RELEASE_WINDOW_SECONDS (7,776,000, ~23 probes); a blocks hold at most
+# MAX_RELEASE_WINDOW_BLOCKS (100,000, ~17 probes) -- see
+# consensus/retractable.py. 32 covers both with room for the spot-checks.
+MAX_HOLD_PROBES = 32
+
+
+def probe_hold_cap(body, values: dict, *, pool: str, timeout=_SESSION_DEFAULT,
+                   hold_stream: int, hold_value: int):
+    """The max hold `body` allows, or None when there is no clean cap to report.
+
+    Called ONLY on the refusal path: `body` already blocked at `hold_value`.
+    Re-evaluates the clause with only the hold stream varied and
+    binary-searches the flip point (allow -> block). Deterministic: the probe
+    sequence is a pure function of (body, hold_value), so admission and apply
+    report the same cap for the same hold.
+
+    Returns None when:
+    - the clause also blocks at hold 0 (the equivalent plain transfer): the
+      refusal is not about the hold at all, so there is no cap to report;
+    - the threshold cannot be verified (threshold allows, threshold+1 blocks);
+    - monotonicity spot-checks fail: a genuine cap allows everything below
+      it and blocks everything above it, so a clause that blocks below the
+      threshold or allows above it has no single cap. The checks are spot
+      checks, not a proof: a clause crafted to be non-monotone only between
+      the sampled points can still pass, but the reported cap is always a
+      genuine flip point (it allows, and one more blocks);
+    - the probe budget runs out (unreachable for a validated park).
+    """
+    if not body or hold_value <= 0:
+        return None
+    probed: dict = {}
+
+    def blocks_at(hold: int):
+        """Whether the clause blocks at this hold, or None when the probe
+        budget is spent (the caller then reports no cap)."""
+        if hold in probed:
+            return probed[hold]
+        if len(probed) >= MAX_HOLD_PROBES:
+            return None
+        trial = dict(values)
+        trial.pop(f"i{hold_stream}", None)
+        trial[hold_stream] = str(hold)
+        blocked, _ = clause_blocks(body, trial, pool=pool, timeout=timeout)
+        probed[hold] = blocked
+        return blocked
+
+    # Hold 0 is the equivalent plain transfer: if the clause blocks that too,
+    # the refusal is not about the hold.
+    if blocks_at(0) is not False:
+        return None
+    if blocks_at(hold_value) is not True:
+        return None
+    lo, hi = 0, hold_value  # allows(lo), blocks(hi)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        verdict = blocks_at(mid)
+        if verdict is None:
+            return None
+        if verdict:
+            hi = mid
+        else:
+            lo = mid
+    # lo allows and lo + 1 blocks by construction (the invariant). Spot-check
+    # monotonicity: a genuine cap allows everything below it and blocks
+    # everything above it.
+    if lo > 1 and blocks_at(lo // 2) is not False:
+        return None
+    if hi < hold_value and blocks_at((hi + hold_value) // 2) is not True:
+        return None
+    return lo
+
+
+def recipient_blocks(clause_for, recipient: str, values: dict, *, pool: str,
+                     timeout=_SESSION_DEFAULT, hold_stream=None, hold_value=0):
+    """(blocked, detail, cap) for the RECIPIENT's o5 clause on one transfer.
+
+    The recipient-side gate, shared by admission and apply. `clause_for` is
+    the path's clause lookup (TipAdmissionView.clause_for at admission, the
+    block lifecycle manager's rule_offers.clause_for at apply); the
+    evaluation, the failure mapping and the cap probe are identical on both.
+
+    The gate is inert while tau_defs.RECIPIENT_POLICY_ACTIVE is off: no
+    clause is evaluated and every transfer passes. A recipient with no clause
+    passes (clause_blocks returns (False, "") for no body).
+
+    `hold_stream`/`hold_value` name the park's hold (17/seconds or 27/blocks)
+    when this transfer is a retractable park; 0/absent for a plain transfer.
+    When the clause blocks a park, the cap is probed (probe_hold_cap) and
+    returned; otherwise `cap` is None. Probing runs only on the refusal path,
+    never on the happy path.
+    """
+    if not tau_defs.RECIPIENT_POLICY_ACTIVE:
+        return False, "", None
+    body = clause_for(recipient, tau_defs.USER_POLICY_STREAM_INDEX)
+    blocked, detail = clause_blocks(body, values, pool=pool, timeout=timeout)
+    if not blocked or hold_value <= 0 or hold_stream is None:
+        return blocked, detail, None
+    cap = probe_hold_cap(body, values, pool=pool, timeout=timeout,
+                         hold_stream=hold_stream, hold_value=hold_value)
+    return True, detail, cap

@@ -38,6 +38,8 @@ from .retractable import (
     RetractableBook,
     TX_TYPE_RETRACTABLE_TRANSFER,
     RetractableShapeError,
+    hold_lengths,
+    hold_stream_and_value,
     parse_retract_transfer,
     parse_retractable_transfer,
 )
@@ -1464,6 +1466,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
         cooldown_active = getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False)
 
+        # Recipient policy (issues #47/#76): while off, no hold stream is fed
+        # and no recipient clause is evaluated, so a pre-activation node
+        # evaluates byte-identical inputs. A module constant, like the
+        # cooldown flag: flipping it is a coordinated upgrade, not config.
+        recipient_policy_active = getattr(
+            tau_defs, "RECIPIENT_POLICY_ACTIVE", False
+        )
+
         # Co-signature approval slots. Read from the lifecycle manager this apply
         # is mutating -- which is the deep copy of the PARENT manager, so an
         # activation recorded in block H governs H+1 onward and never changes the
@@ -1785,7 +1795,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 return True
 
             def _transfer_input_map(from_addr, to_addr, amount,
-                                    slot_values=None, overrides=None):
+                                    slot_values=None, overrides=None,
+                                    hold_seconds=0, hold_blocks=0):
                 """The per-transfer Tau input map. ONE definition, on purpose.
 
                 The overlay ORDER is load-bearing (tau_defs documents it): the
@@ -1795,6 +1806,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 two paths. Every apply-side caller -- an ordinary transfer, a
                 parked-transfer fee measurement, a released transfer -- goes
                 through here so there is nothing to keep in step by hand.
+
+                `hold_seconds`/`hold_blocks` are the retractable park's hold
+                (0/0 for a plain transfer), fed on i17/i27 while recipient
+                policy is active so the recipient's clause can cap it.
                 """
                 values = {
                     1: str(amount),
@@ -1819,6 +1834,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # commands/sendtx.py. Reserved, so a sender cannot pre-fill one.
                 for slot, slot_val in (slot_values or {}).items():
                     values[slot] = slot_val
+                # Hold streams (i17 seconds / i27 blocks), fed after the slots
+                # and before i5, byte-identically to admission. Fed only while
+                # recipient policy is active, so a pre-activation node stays
+                # byte-identical; 0 on both for a plain transfer.
+                if recipient_policy_active:
+                    values[tau_defs.HOLD_SECONDS_STREAM_INDEX] = str(hold_seconds)
+                    values[tau_defs.HOLD_BLOCKS_STREAM_INDEX] = str(hold_blocks)
                 values[5] = str(block_timestamp)
                 return values
 
@@ -1882,7 +1904,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
-                                          escrow=False):
+                                          escrow=False, hold_seconds=0,
+                                          hold_blocks=0, recipient_gate=True):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -1904,6 +1927,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                 `escrow` stages only the debit: the credit belongs to the
                 retractable book until it releases.
+
+                `hold_seconds`/`hold_blocks` are the retractable park's hold
+                (0/0 for a plain transfer), fed on i17/i27 so the recipient's
+                clause can cap it. `recipient_gate` False skips the recipient
+                gate: the approval-vote path passes False, because the transfer
+                was already admitted when it parked and the gate applies at
+                park time, not at execution.
                 """
                 nonlocal accepted_in_block, hard_reject, execution_success
                 try:
@@ -1917,6 +1947,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # carries none). Defaulting to custom_tau_inputs keeps the
                         # ordinary path identical.
                         overrides=custom_tau_inputs if overrides is None else overrides,
+                        hold_seconds=hold_seconds, hold_blocks=hold_blocks,
                     )
 
                     if not _session.ready(timeout=5):
@@ -2003,6 +2034,62 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 f"Transfer rejected by the sender's own policy clause (o5={own_o5})"
                             )
                             return False
+
+                        # --- Recipient Policy Check (o5, clause mode) ---
+                        # The recipient's own clause judges the transfer TO
+                        # them, after the sender-side checks, through the
+                        # shared gate (consensus/sender_policy.py::
+                        # recipient_blocks), which is inert while
+                        # RECIPIENT_POLICY_ACTIVE is off. A block is a hard
+                        # reject like the sender's: no fee, no balance
+                        # movement, no sequence consumed. When the clause
+                        # blocks a park for its hold, the receipt carries
+                        # the recipient's cap (probed on the refusal path
+                        # only). The approval-vote path passes
+                        # recipient_gate=False: the transfer was already
+                        # admitted when it parked, and the gate applies at
+                        # park time, not execution.
+                        if recipient_gate:
+                            hold_stream, hold_value = hold_stream_and_value(
+                                hold_seconds, hold_blocks
+                            )
+                            recipient_blocks, recipient_o5, recipient_cap = (
+                                sender_policy.recipient_blocks(
+                                    lifecycle_mgr.rule_offers.clause_for,
+                                    to_addr, tau_input_stream_values,
+                                    pool="apply",
+                                    timeout=getattr(_session, "request_budget", None),
+                                    hold_stream=hold_stream,
+                                    hold_value=hold_value,
+                                )
+                            )
+                            if recipient_blocks:
+                                logger.info(
+                                    "Transfer rejected by the recipient's policy clause for %s->%s (o5=%s)",
+                                    str(from_addr)[:10], str(to_addr)[:10], recipient_o5,
+                                )
+                                if not replay_mode:
+                                    accepted_in_block = False
+                                    hard_reject = True
+                                execution_success = False
+                                if recipient_cap is not None:
+                                    unit = (
+                                        "seconds"
+                                        if hold_stream == tau_defs.HOLD_SECONDS_STREAM_INDEX
+                                        else "blocks"
+                                    )
+                                    tx_receipt["reason"] = "recipient_max_hold"
+                                    tx_receipt["logs"].append(
+                                        f"Transfer rejected by the recipient's max-hold cap "
+                                        f"({recipient_cap} {unit}; hold {hold_value} {unit}) "
+                                        f"(o5={recipient_o5})"
+                                    )
+                                else:
+                                    tx_receipt["reason"] = "recipient_policy_block"
+                                    tx_receipt["logs"].append(
+                                        f"Transfer rejected by the recipient's policy clause (o5={recipient_o5})"
+                                    )
+                                return False
 
                     current_from = _read_bal(from_addr)
                     if current_from < amount:
@@ -2511,12 +2598,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     # False for a vote so nothing is settled.
                                     # No sequence increment for the request's
                                     # sender either -- the request consumed one.
+                                    # The recipient gate is skipped here
+                                    # (recipient_gate=False): this transfer was
+                                    # already admitted when the request parked,
+                                    # and the recipient gate applies at park
+                                    # time, not when a vote executes it -- a
+                                    # recipient clause tightened after parking
+                                    # must not strand an approved transfer.
                                     guard = (accepted_in_block, hard_reject, execution_success)
                                     released = _execute_fee_era_transfer(
                                         entry.sender_pubkey, entry.recipient_pubkey,
                                         entry.amount,
                                         slot_values=prospective,
                                         overrides=entry.custom_inputs,
+                                        recipient_gate=False,
                                     )
                                     if released:
                                         approvals.resolve(vote.request_id, STATUS_EXECUTED)
@@ -2588,11 +2683,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["reason"] = "retractable_not_parked"
                             accepted_in_block = False
                         else:
+                            # The park's hold, on the same clocks
+                            # can_admit_park just used: the block's own
+                            # height / timestamp (authoritative). The
+                            # recipient's clause reads it on i17/i27 and
+                            # may refuse the park for exceeding its cap.
+                            park_hold_seconds, park_hold_blocks = hold_lengths(
+                                park.kind, park.release_at,
+                                int(block_height or 0), int(block_timestamp or 0),
+                            )
                             escrowed = _execute_fee_era_transfer(
                                 park.sender_pubkey, park.recipient_pubkey, park.amount,
                                 slot_values=_approval_slot_values(),
                                 overrides={},
                                 escrow=True,
+                                hold_seconds=park_hold_seconds,
+                                hold_blocks=park_hold_blocks,
                             )
                             fee_already_measured = True
                             if escrowed and accepted_in_block and not hard_reject:

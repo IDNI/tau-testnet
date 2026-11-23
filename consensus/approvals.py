@@ -167,6 +167,45 @@ def screen_slot_widths(body: str) -> Optional[str]:
     return None
 
 
+def screen_hold_widths(body: str) -> Optional[str]:
+    """None when every recipient hold-stream mention is typed bv[64], else the reason.
+
+    The same reject-unless-annotated contract as the approval slots, for the
+    hold-length streams i17 (seconds) and i27 (blocks): one clause typing i17
+    at bv[64] and another at bv[24] makes get_interpreter fail for everyone.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(body or "")
+    holds = set(tau_defs.hold_stream_indices())
+    width = tau_defs.HOLD_STREAM_BV_WIDTH
+
+    typed: Dict[int, Set[int]] = {}
+    for match in _SLOT_TYPED_RE.finditer(scrubbed):
+        idx, w = int(match.group(1)), int(match.group(2))
+        if idx in holds:
+            typed.setdefault(idx, set()).add(w)
+            if w != width:
+                return (
+                    f"i{idx} is a recipient hold stream and must be typed bv[{width}], "
+                    f"found bv[{w}]"
+                )
+
+    # Every *occurrence* must be one of the typed ones, so count them.
+    for match in _SLOT_OCCURRENCE_RE.finditer(scrubbed):
+        idx = int(match.group(1))
+        if idx not in holds:
+            continue
+        tail = scrubbed[match.end():]
+        if not re.match(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*%d\s*\]" % width, tail):
+            return (
+                f"every mention of recipient hold stream i{idx} must be written "
+                f"i{idx}[t]:bv[{width}]; an untyped mention lets the engine "
+                f"infer a conflicting width process-wide"
+            )
+    return None
+
+
 # --- User-policy / custom-fee width screening (o5, o8) ----------------------
 #
 # Same reject-unless-annotated contract as the approval slots, for the shared
