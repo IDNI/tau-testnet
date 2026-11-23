@@ -1222,7 +1222,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_approval_subparsers(sub)
     _add_policy_subparsers(sub)
     _add_retractable_subparsers(sub)
-    _add_standing_subparsers(sub)
     _add_payout_subparsers(sub)
     _add_node_subparsers(sub)
 
@@ -2424,173 +2423,6 @@ def cmd_retractable_id(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-# --- Standing payments ------------------------------------------------------
-
-
-def _standing_first_due(args, tip: int, now: int) -> int:
-    """first_due from whichever --first-due-* flag is set, checked against the tip."""
-    if args.every_blocks is not None:
-        if args.first_due_height is not None:
-            height = int(args.first_due_height)
-        elif args.first_due_in is not None:
-            height = (tip or _tip_height(args)) + 1 + int(args.first_due_in)
-        else:
-            raise _PayloadError("a block schedule needs --first-due-height or --first-due-in")
-        if height <= (tip or _tip_height(args)) + 1:
-            raise _PayloadError(
-                f"first due height {height} is not after the next block; "
-                "the authorization would be mined at or past its first payment."
-            )
-        return height
-    if args.first_due_time is not None:
-        when = int(args.first_due_time)
-    elif args.first_due_after is not None:
-        when = now + int(args.first_due_after)
-    else:
-        raise _PayloadError("a time schedule needs --first-due-time or --first-due-after")
-    if when <= now + 1:
-        raise _PayloadError(f"first due time {when} is already (almost) past.")
-    return when
-
-
-def _standing_interval(args) -> dict:
-    for flag, field in (("every_blocks", "interval_blocks"),
-                        ("every_seconds", "interval_seconds"),
-                        ("every_months", "interval_months")):
-        value = getattr(args, flag, None)
-        if value is not None:
-            return {field: int(value)}
-    raise _PayloadError("give one of --every-blocks, --every-seconds, --every-months")
-
-
-def cmd_standing_create(args: argparse.Namespace) -> int:
-    from consensus.standing import StandingShapeError, parse_standing_payment_create
-
-    created = {}
-
-    def _build(sender_pubkey, sequence_number, expire_at_height, tip):
-        now = int(_now())
-        payload = tx_mod.build_standing_payment_create_tx(
-            sender_pubkey=sender_pubkey,
-            sequence_number=sequence_number,
-            expiration_time=now + args.expiry,
-            expire_at_height=expire_at_height,
-            recipient_pubkey=args.to,
-            amount=int(args.amount),
-            first_due=_standing_first_due(args, tip, now),
-            periods=int(args.periods),
-            **_standing_interval(args),
-        )
-        try:
-            created["id"] = parse_standing_payment_create(payload).standing_id.hex()
-        except StandingShapeError as exc:
-            raise _PayloadError(str(exc))
-        return payload
-
-    status = _submit_rule_tx(args, _build, pass_tip=True)
-    if status == EXIT_OK and created.get("id"):
-        print(f"standing payment id: {created['id']}",
-              file=sys.stderr if args.json else sys.stdout)
-    return status
-
-
-def cmd_standing_cancel(args: argparse.Namespace) -> int:
-    def _build(sender_pubkey, sequence_number, expire_at_height):
-        return tx_mod.build_standing_payment_cancel_tx(
-            sender_pubkey=sender_pubkey,
-            sequence_number=sequence_number,
-            expiration_time=int(_now()) + args.expiry,
-            expire_at_height=expire_at_height,
-            standing_id=args.standing_id,
-        )
-
-    return _submit_rule_tx(args, _build)
-
-
-def cmd_standing_list(args: argparse.Namespace) -> int:
-    try:
-        address = _address_or_key(args)
-    except _PayloadError as exc:
-        print_error(str(exc))
-        return EXIT_LOCAL
-    return _simple_query(args, f"getstandingpayments {address} {getattr(args, 'role', 'all')}")
-
-
-def cmd_standing_show(args: argparse.Namespace) -> int:
-    return _simple_query(args, f"getstandingpayment {args.standing_id}")
-
-
-def _add_standing_subparsers(sub) -> None:
-    """`tau-testnet standing ...` -- payments the network makes on a schedule."""
-    p_st = sub.add_parser(
-        "standing",
-        parents=[_GLOBAL_PARENT],
-        help="Standing payments (create, cancel, inspect)",
-    )
-    ssub = p_st.add_subparsers(dest="standing_command", required=True)
-    common = [_GLOBAL_PARENT]
-
-    def _key_group(parser, required=True):
-        src = parser.add_mutually_exclusive_group(required=required)
-        src.add_argument("--key", help="Logical name of a saved key")
-        src.add_argument("--privkey", help="Private key (hex or decimal)")
-
-    def _tx_flags(parser, fee=True):
-        if fee:
-            parser.add_argument("--fee", default=None, help=FEE_HELP)
-        parser.add_argument(
-            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
-            help="Seconds until expiration_time (default: %(default)s)",
-        )
-        parser.add_argument("--expire-in", type=_block_count, default=1000,
-                            help="Blocks the transaction may land in, from the next one")
-        parser.add_argument("--expire-at-height", type=int,
-                            help="Absolute expiry height (overrides --expire-in)")
-
-    p_new = ssub.add_parser(
-        "create", parents=common,
-        help="Sign once: pay a fixed amount to a fixed recipient every period",
-    )
-    _key_group(p_new)
-    p_new.add_argument("--to", required=True, help="Recipient public key (96 hex)")
-    p_new.add_argument("--amount", required=True, type=int, help="Amount per period")
-    p_new.add_argument("--periods", required=True, type=int,
-                       help="How many periods the authorization covers (its end)")
-    every = p_new.add_mutually_exclusive_group(required=True)
-    every.add_argument("--every-blocks", type=int, metavar="N")
-    every.add_argument("--every-seconds", type=int, metavar="N")
-    every.add_argument("--every-months", type=int, metavar="N",
-                       help="Calendar months in UTC; a missing day pays on the last day")
-    first = p_new.add_mutually_exclusive_group(required=True)
-    first.add_argument("--first-due-height", type=int, metavar="HEIGHT")
-    first.add_argument("--first-due-in", type=_block_count, metavar="BLOCKS",
-                       help="First payment this many blocks after the next one")
-    first.add_argument("--first-due-time", type=int, metavar="UNIX")
-    first.add_argument("--first-due-after", type=_block_count, metavar="SECONDS",
-                       help="First payment this many seconds from now")
-    _tx_flags(p_new)
-    p_new.set_defaults(func=cmd_standing_create)
-
-    p_cancel = ssub.add_parser("cancel", parents=common,
-                               help="Stop every later payment of an authorization")
-    _key_group(p_cancel)
-    p_cancel.add_argument("standing_id", help="Standing payment id (64 hex)")
-    # A cancel is fee-exempt, so a fee limit changes nothing.
-    _tx_flags(p_cancel, fee=False)
-    p_cancel.set_defaults(func=cmd_standing_cancel)
-
-    p_list = ssub.add_parser("list", parents=common,
-                             help="Standing payments an address pays or receives")
-    p_list.add_argument("--address", help="Address (default: your key's)")
-    _key_group(p_list, required=False)
-    p_list.add_argument("--role", choices=["in", "out", "all"], default="all")
-    p_list.set_defaults(func=cmd_standing_list)
-
-    p_show = ssub.add_parser("show", parents=common, help="One standing payment and its history")
-    p_show.add_argument("standing_id", help="Standing payment id (64 hex)")
-    p_show.set_defaults(func=cmd_standing_show)
-
-
 # --- Payout rules -----------------------------------------------------------
 
 _KIND_PAYOUT_SET = 6
@@ -2617,13 +2449,53 @@ def _payout_fields(args, tip: int, now: int) -> dict:
         expires_at = clock + int(args.ends_in)
     if expires_at <= clock:
         raise _PayloadError(f"the rule would end at {expires_at}, not after {clock}")
+    due_at = getattr(args, "due_at", None)
+    due_every = getattr(args, "due_every", None)
+    due_months = getattr(args, "due_months", None)
+    if due_every is not None and due_months is not None:
+        raise _PayloadError("give one of --due-every and --due-months, not both")
+    if (due_every is not None or due_months is not None) and due_at is None:
+        raise _PayloadError("a repeating rule needs its first due point (--due-at)")
+    if getattr(args, "on_arrival", False) and not getattr(args, "per_sale", False):
+        raise _PayloadError("--on-arrival needs --per-sale")
     return {
         "rule_text": rule_text, "slots": slots,
         "cap_per_execution": int(args.cap_per_execution),
         "cap_per_period": int(args.cap_per_period),
         "expires_at": expires_at, **period,
         **({"per_sale": True} if getattr(args, "per_sale", False) else {}),
+        **({"sealed": True} if getattr(args, "sealed", False) else {}),
+        **({"periods_from": int(args.periods_from)}
+           if getattr(args, "periods_from", None) is not None else {}),
+        **({"due_at": int(due_at)} if due_at is not None else {}),
+        **({"due_every": int(due_every)} if due_every is not None else {}),
+        **({"due_months": int(due_months)} if due_months is not None else {}),
+        **({"on_arrival": True} if getattr(args, "on_arrival", False) else {}),
+        **({"max_fee_per_execution": int(args.max_fee_per_execution)}
+           if getattr(args, "max_fee_per_execution", None) is not None else {}),
     }
+
+
+def _payout_optional_terms(parser) -> None:
+    """The optional terms `payout set` and `payout update` share."""
+    parser.add_argument("--sealed", action="store_true",
+                        help="Seal the account: until the rule ends, the node "
+                             "takes no transaction the account signs")
+    parser.add_argument("--periods-from", type=int, metavar="HEIGHT|UNIX",
+                        help="Count periods from here, not from the install")
+    parser.add_argument("--due-at", type=int, metavar="HEIGHT|UNIX",
+                        help="First due point, on the period's clock: the node "
+                             "runs the rule itself there (needs a fixed slot)")
+    parser.add_argument("--due-every", type=int, metavar="N",
+                        help="With --due-at: repeat every N on the period's clock")
+    parser.add_argument("--due-months", type=int, metavar="N",
+                        help="With --due-at: repeat every N calendar months (UTC, "
+                             "needs --period-seconds)")
+    parser.add_argument("--on-arrival", action="store_true",
+                        help="With --per-sale: the node runs the rule once per "
+                             "arrival, for every kind of credit")
+    parser.add_argument("--max-fee-per-execution", type=int, metavar="N",
+                        help="Cap the fee_limit of a manual payout_execute")
 
 
 def cmd_payout_set(args: argparse.Namespace) -> int:
@@ -2667,14 +2539,17 @@ def cmd_payout_set(args: argparse.Namespace) -> int:
 
 def cmd_payout_revoke(args: argparse.Namespace) -> int:
     if args.request:
-        return _submit_rule_change(args, _KIND_PAYOUT_REVOKE, "", "")
+        return _submit_rule_change(args, _KIND_PAYOUT_REVOKE,
+                                   getattr(args, "rule_id", "") or "", "")
 
     def _build(sender_pubkey, sequence_number, expire_at_height):
+        rule_id = (args.rule_id or _installed_rule_id(args, sender_pubkey)).strip().lower()
         return tx_mod.build_payout_rule_revoke_tx(
             sender_pubkey=sender_pubkey,
             sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry,
             expire_at_height=expire_at_height,
+            rule_id=rule_id,
         )
 
     if args.expire_in is None:
@@ -2691,7 +2566,43 @@ def _installed_rule_id(args, account: str) -> str:
     data = (parse_json_response(raw) or {}).get("data") or {}
     if not data.get("installed"):
         raise _PayloadError(f"{account} has no payout rule installed")
-    return data["rule"]["rule_id"]
+    if data.get("rule"):
+        return data["rule"]["rule_id"]
+    rules = data.get("rules") or []
+    if len(rules) == 1:
+        return rules[0]["rule_id"]
+    raise _PayloadError(f"{account} has {len(rules)} payout rules installed; "
+                        "pass --rule-id to name one")
+
+
+def cmd_payout_update(args: argparse.Namespace) -> int:
+    """Replace one installed rule with new terms (same lineage, version + 1).
+
+    No rule-change request kind exists for an update: a guarded account
+    updates by revoking the rule and setting a new one instead.
+    """
+    from consensus.payout import PayoutShapeError, parse_payout_rule_update
+
+    if args.expire_in is None:
+        args.expire_in = 1000
+
+    def _build(sender_pubkey, sequence_number, expire_at_height, tip):
+        rule_id = (args.rule_id or _installed_rule_id(args, sender_pubkey)).strip().lower()
+        payload = tx_mod.build_payout_rule_update_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            rule_id=rule_id,
+            **_payout_fields(args, tip, int(_now())),
+        )
+        try:
+            parse_payout_rule_update(payload)
+        except PayoutShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    return _submit_rule_tx(args, _build, pass_tip=True)
 
 
 def cmd_payout_execute(args: argparse.Namespace) -> int:
@@ -2746,7 +2657,7 @@ def _add_payout_subparsers(sub) -> None:
     p_pay = sub.add_parser(
         "payout",
         parents=[_GLOBAL_PARENT],
-        help="Payout rules (set, revoke, execute, show)",
+        help="Payout rules (set, update, revoke, execute, show)",
     )
     psub = p_pay.add_subparsers(dest="payout_command", required=True)
     common = [_GLOBAL_PARENT]
@@ -2789,7 +2700,7 @@ def _add_payout_subparsers(sub) -> None:
 
     p_set = psub.add_parser(
         "set", parents=common,
-        help="Install (or replace) your account's payout rule",
+        help="Install a new payout rule (an account may hold several)",
     )
     _key_group(p_set)
     body = p_set.add_mutually_exclusive_group(required=True)
@@ -2810,11 +2721,44 @@ def _add_payout_subparsers(sub) -> None:
     p_set.add_argument("--per-sale", action="store_true",
                        help="Pay only against sales the chain recorded (transfers into "
                             "the account), once per sale; the rule reads i27 and i28")
+    _payout_optional_terms(p_set)
     _tx_flags(p_set, request=True)
     p_set.set_defaults(func=cmd_payout_set)
 
-    p_rev = psub.add_parser("revoke", parents=common, help="Remove your payout rule")
+    p_update = psub.add_parser(
+        "update", parents=common,
+        help="Replace one installed rule with new terms (same lineage)",
+    )
+    _key_group(p_update)
+    body = p_update.add_mutually_exclusive_group(required=True)
+    body.add_argument("--file", help="File containing the rule (one always clause)")
+    body.add_argument("--body", help="Rule text")
+    p_update.add_argument("--rule-id",
+                          help="Rule to replace (default: the account's only rule)")
+    p_update.add_argument("--slot", action="append", metavar="PUBKEY|open",
+                          help="One slot, in order: a fixed recipient, or open. Repeatable.")
+    p_update.add_argument("--cap-per-execution", required=True, type=int)
+    p_update.add_argument("--cap-per-period", required=True, type=int)
+    period = p_update.add_mutually_exclusive_group(required=True)
+    period.add_argument("--period-blocks", type=int, metavar="N")
+    period.add_argument("--period-seconds", type=int, metavar="N")
+    ends = p_update.add_mutually_exclusive_group(required=True)
+    ends.add_argument("--ends-at", type=int, metavar="HEIGHT|UNIX",
+                      help="Last moment, on the period's clock")
+    ends.add_argument("--ends-in", type=int, metavar="N",
+                      help="Blocks or seconds from now, on the period's clock")
+    p_update.add_argument("--per-sale", action="store_true",
+                          help="Pay only against sales the chain recorded (transfers into "
+                               "the account), once per sale; the rule reads i27 and i28")
+    _payout_optional_terms(p_update)
+    _tx_flags(p_update)
+    p_update.set_defaults(func=cmd_payout_update)
+
+    p_rev = psub.add_parser("revoke", parents=common, help="Remove one of your payout rules")
     _key_group(p_rev)
+    p_rev.add_argument("--rule-id",
+                       help="Rule to remove (default: the account's only rule; "
+                            "with --request, the body names it)")
     _tx_flags(p_rev, fee=False, request=True)
     p_rev.set_defaults(func=cmd_payout_revoke)
 

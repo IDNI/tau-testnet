@@ -783,91 +783,29 @@ def build_retract_transfer_tx(
     }
 
 
-_STANDING_INTERVAL_FIELDS = ("interval_blocks", "interval_seconds", "interval_months")
-
-
-def build_standing_payment_create_tx(
-    *,
-    sender_pubkey: str,
-    sequence_number: int,
-    expiration_time: int,
-    expire_at_height: int,
-    recipient_pubkey: str,
-    amount: int,
-    first_due: int,
-    periods: int,
-    interval_blocks: int | None = None,
-    interval_seconds: int | None = None,
-    interval_months: int | None = None,
-    fee_limit: str | int = "0",
-) -> dict:
-    """Construct a ``tx_type='standing_payment_create'`` payload (without signature).
-
-    Exactly one interval. Admission refuses a create that could be mined at or
-    after its own first due point, so the deadline is clamped to it:
-    ``expire_at_height`` to ``first_due`` for a block schedule, ``expiration_time``
-    below ``first_due`` for a time schedule.
-    """
-    if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
-        raise ValueError("recipient_pubkey must be a 96-character hex public key")
-    for name, value in (("amount", amount), ("first_due", first_due), ("periods", periods)):
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ValueError(f"{name} must be a positive integer")
-    given = {
-        name: value for name, value in zip(
-            _STANDING_INTERVAL_FIELDS, (interval_blocks, interval_seconds, interval_months)
-        ) if value is not None
-    }
-    if len(given) != 1:
-        raise ValueError("give exactly one of interval_blocks, interval_seconds, interval_months")
-    (name, interval), = given.items()
-    if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    expire_at_height = _check_expire_at_height(expire_at_height)
-    if name == "interval_blocks":
-        expire_at_height = min(expire_at_height, first_due)
-    else:
-        expiration_time = min(expiration_time, first_due - 1)
-    return {
-        "tx_type": "standing_payment_create",
-        "sender_pubkey": sender_pubkey,
-        "sequence_number": sequence_number,
-        "expiration_time": expiration_time,
-        "expire_at_height": expire_at_height,
-        "fee_limit": str(fee_limit),
-        "recipient_pubkey": recipient_pubkey.lower(),
-        "amount": amount,
-        name: interval,
-        "first_due": first_due,
-        "periods": periods,
-    }
-
-
-def build_standing_payment_cancel_tx(
-    *,
-    sender_pubkey: str,
-    sequence_number: int,
-    expiration_time: int,
-    expire_at_height: int,
-    standing_id: str,
-    fee_limit: str | int = "0",
-) -> dict:
-    """Construct a ``tx_type='standing_payment_cancel'`` payload (without signature).
-
-    Feeless. It must be INCLUDED in a block before the next due point to stop
-    that payment, so send it with margin.
-    """
-    if not isinstance(standing_id, str) or len(standing_id) != 64:
-        raise ValueError("standing_id must be a 64-character hex string")
-    return {
-        "tx_type": "standing_payment_cancel",
-        "sender_pubkey": sender_pubkey,
-        "sequence_number": sequence_number,
-        "expiration_time": expiration_time,
-        "expire_at_height": _check_expire_at_height(expire_at_height),
-        "fee_limit": str(fee_limit),
-        "standing_id": standing_id.lower(),
-    }
+def _payout_optional_terms_tx(tx: dict, *, sealed: bool = False,
+                              periods_from: int | None = None,
+                              due_at: int | None = None,
+                              due_every: int | None = None,
+                              due_months: int | None = None,
+                              on_arrival: bool = False,
+                              max_fee_per_execution: int | None = None) -> dict:
+    """The optional terms of a payout rule, added only when set."""
+    if sealed:
+        tx["sealed"] = True
+    if periods_from is not None:
+        tx["periods_from"] = int(periods_from)
+    if due_at is not None:
+        tx["due_at"] = int(due_at)
+    if due_every is not None:
+        tx["due_every"] = int(due_every)
+    if due_months is not None:
+        tx["due_months"] = int(due_months)
+    if on_arrival:
+        tx["on_arrival"] = True
+    if max_fee_per_execution is not None:
+        tx["max_fee_per_execution"] = int(max_fee_per_execution)
+    return tx
 
 
 def build_payout_rule_set_tx(
@@ -884,6 +822,13 @@ def build_payout_rule_set_tx(
     period_blocks: int | None = None,
     period_seconds: int | None = None,
     per_sale: bool = False,
+    sealed: bool = False,
+    periods_from: int | None = None,
+    due_at: int | None = None,
+    due_every: int | None = None,
+    due_months: int | None = None,
+    on_arrival: bool = False,
+    max_fee_per_execution: int | None = None,
     fee_limit: str | int = "0",
 ) -> dict:
     """Construct a ``tx_type='payout_rule_set'`` payload (without signature).
@@ -924,6 +869,68 @@ def build_payout_rule_set_tx(
         tx["period_seconds"] = int(period_seconds)
     if per_sale:
         tx["per_sale"] = True
+    return _payout_optional_terms_tx(
+        tx, sealed=sealed, periods_from=periods_from, due_at=due_at,
+        due_every=due_every, due_months=due_months, on_arrival=on_arrival,
+        max_fee_per_execution=max_fee_per_execution)
+
+
+def build_payout_rule_update_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    rule_id: str,
+    rule_text: str,
+    slots: list,
+    cap_per_execution: int,
+    cap_per_period: int,
+    expires_at: int,
+    period_blocks: int | None = None,
+    period_seconds: int | None = None,
+    per_sale: bool = False,
+    sealed: bool = False,
+    periods_from: int | None = None,
+    due_at: int | None = None,
+    due_every: int | None = None,
+    due_months: int | None = None,
+    on_arrival: bool = False,
+    max_fee_per_execution: int | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='payout_rule_update'`` payload (without signature).
+
+    Like a set, plus the id of the version it replaces. The node assigns
+    version + 1 and keeps the lineage; the old version is resolved as
+    superseded, never mutated.
+    """
+    if not isinstance(rule_id, str) or len(rule_id) != 64:
+        raise ValueError("rule_id must be a 64-character hex string")
+    tx = build_payout_rule_set_tx(
+        sender_pubkey=sender_pubkey,
+        sequence_number=sequence_number,
+        expiration_time=expiration_time,
+        expire_at_height=expire_at_height,
+        rule_text=rule_text,
+        slots=slots,
+        cap_per_execution=cap_per_execution,
+        cap_per_period=cap_per_period,
+        expires_at=expires_at,
+        period_blocks=period_blocks,
+        period_seconds=period_seconds,
+        per_sale=per_sale,
+        sealed=sealed,
+        periods_from=periods_from,
+        due_at=due_at,
+        due_every=due_every,
+        due_months=due_months,
+        on_arrival=on_arrival,
+        max_fee_per_execution=max_fee_per_execution,
+        fee_limit=fee_limit,
+    )
+    tx["tx_type"] = "payout_rule_update"
+    tx["rule_id"] = rule_id.lower()
     return tx
 
 
@@ -933,9 +940,12 @@ def build_payout_rule_revoke_tx(
     sequence_number: int,
     expiration_time: int,
     expire_at_height: int,
+    rule_id: str,
     fee_limit: str | int = "0",
 ) -> dict:
     """Construct a ``tx_type='payout_rule_revoke'`` payload (without signature). Feeless."""
+    if not isinstance(rule_id, str) or len(rule_id) != 64:
+        raise ValueError("rule_id must be a 64-character hex string")
     return {
         "tx_type": "payout_rule_revoke",
         "sender_pubkey": sender_pubkey,
@@ -943,6 +953,7 @@ def build_payout_rule_revoke_tx(
         "expiration_time": expiration_time,
         "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
+        "rule_id": rule_id.lower(),
     }
 
 
