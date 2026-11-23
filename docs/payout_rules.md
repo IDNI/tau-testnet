@@ -366,7 +366,7 @@ Apply reasons in receipts: `payout_rule_not_set`, `payout_rule_not_revoked`,
 Every field above is in the signed bytes (`per_sale` and `sale_id` when present). `recipients` keys are slot numbers,
 `data` keys are k for input `i40+k`. `genesis_hash` is the hash of block 0 of the
 network (`getsequence` returns it, the CLI fills it in): all three types are bound to
-one network like standing payments (`consensus/network_binding.py`), so a rule or an
+one network (`consensus/network_binding.py`), so a rule or an
 execution signed for another network is refused here.
 
 ## Consensus notes
@@ -440,6 +440,5 @@ replay could not run the rule; nothing moves, and the state hash says so.
 ## Not in this release
 
 - More than one rule per account.
-- Paying a rule's amounts in the end-of-block sweep without an execution (that
-  is what standing payments are for).
+- Running a rule without an execution (every payment needs one).
 - Executor data wider than `bv[24]`.

@@ -551,16 +551,6 @@ def _retractable_state(lm) -> dict:
     }
 
 
-def _standing_state(lm) -> dict:
-    book = lm.standing_payments
-    count, acc = book.resolved_state()
-    return {
-        "rows": book.rows(),
-        "resolved_count": count,
-        "resolved_acc": acc.hex(),
-    }
-
-
 def _payout_state(lm) -> dict:
     book = lm.payout_rules
     count, acc = book.resolved_state()
@@ -594,18 +584,6 @@ def _record_payout_events(block, next_snapshot) -> None:
             )
     except Exception:
         logger.exception("could not record payout rule events")
-
-
-def _record_standing_events(block, next_snapshot) -> None:
-    """Best-effort history write, from the snapshot like the retractable events."""
-    try:
-        events = (getattr(next_snapshot, "metadata", None) or {}).get("standing_events")
-        if events:
-            db.record_standing_events(
-                block.block_hash, block.header.block_number, list(events)
-            )
-    except Exception:
-        logger.exception("could not record standing payment events")
 
 
 def _record_retractable_events(block, next_snapshot) -> None:
@@ -666,7 +644,6 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
         approval_slots_active=lm.approval_slots_active,
         retractable_transfers=_retractable_state(lm),
-        standing_payments=_standing_state(lm),
         payout_rules=_payout_state(lm),
         eligibility_mode=lm.eligibility_mode,
         fee_beneficiary=lm.fee_beneficiary,
@@ -1148,7 +1125,6 @@ def _process_new_block_locked(block: Block) -> bool:
                 _swap_in_memory_state(next_snapshot, block)
 
             _record_retractable_events(block, next_snapshot)
-            _record_standing_events(block, next_snapshot)
             _record_payout_events(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
@@ -1431,7 +1407,6 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                                       reason="state_hash invariant mismatch")
 
             _record_retractable_events(block, next_snapshot)
-            _record_standing_events(block, next_snapshot)
             _record_payout_events(block, next_snapshot)
 
             if _enabled:
@@ -2304,18 +2279,6 @@ def _restore_retractables(lm) -> None:
         raise DatabaseError(f"corrupt retractable transfer state: {exc}") from exc
 
 
-def _restore_standing_payments(lm) -> None:
-    """Rehydrate the standing-payment book; a row that does not recompute its id,
-    or whose progress the sweep could not have produced, refuses to load."""
-    from consensus.standing import StandingBook
-
-    rows, resolved_count, resolved_acc = db.load_standing_state()
-    try:
-        lm.standing_payments = StandingBook.restore(rows, resolved_count, resolved_acc)
-    except ValueError as exc:
-        raise DatabaseError(f"corrupt standing payment state: {exc}") from exc
-
-
 def _restore_payout_rules(lm) -> None:
     """Rehydrate the payout-rule book; a row that does not recompute its id,
     or whose progress is impossible, refuses to load."""
@@ -2460,7 +2423,6 @@ def load_state_from_db() -> bool:
         _restore_approvals(_lifecycle_manager)
         _restore_rule_change_requests(_lifecycle_manager)
         _restore_retractables(_lifecycle_manager)
-        _restore_standing_payments(_lifecycle_manager)
         _restore_payout_rules(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
@@ -2530,7 +2492,6 @@ def commit_state_to_db(block_hash: str, block_number: int):
         )
         approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
         retractable_snapshot = _retractable_state(_lifecycle_manager)
-        standing_snapshot = _standing_state(_lifecycle_manager)
         payout_snapshot = _payout_state(_lifecycle_manager)
 
     db.save_canonical_state_atomically(
@@ -2550,7 +2511,6 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_change_requests=rule_change_requests_list,
         approval_slots_active=approval_slots_active_snapshot,
         retractable_transfers=retractable_snapshot,
-        standing_payments=standing_snapshot,
         payout_rules=payout_snapshot,
     )
 
@@ -3049,7 +3009,6 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 ),
                 approval_slots_active=_lifecycle_manager.approval_slots_active,
                 retractable_transfers=_retractable_state(_lifecycle_manager),
-                standing_payments=_standing_state(_lifecycle_manager),
                 payout_rules=_payout_state(_lifecycle_manager),
             )
     except Exception as exc:

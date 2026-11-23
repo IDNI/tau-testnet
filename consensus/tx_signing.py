@@ -42,10 +42,6 @@ from consensus.payout import (
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_RULE_SET,
 )
-from consensus.standing import (
-    TX_TYPE_STANDING_PAYMENT_CANCEL,
-    TX_TYPE_STANDING_PAYMENT_CREATE,
-)
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
     TX_TYPE_RULE_OFFER_ACCEPT,
@@ -136,21 +132,6 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
-    elif tx_type == TX_TYPE_STANDING_PAYMENT_CREATE:
-        # Every term the sweep will act on is signed: it pays later, from
-        # hash-bound state, with no signature of the payer in sight, so an
-        # unsigned field would let a proposer change who is paid, how much or
-        # when. The three interval fields are all listed so that naming a
-        # different one changes the bytes.
-        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
-        signing_dict["amount"] = payload.get("amount")
-        signing_dict["interval_blocks"] = payload.get("interval_blocks")
-        signing_dict["interval_seconds"] = payload.get("interval_seconds")
-        signing_dict["interval_months"] = payload.get("interval_months")
-        signing_dict["first_due"] = payload.get("first_due")
-        signing_dict["periods"] = payload.get("periods")
-    elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
-        signing_dict["standing_id"] = payload.get("standing_id")
     elif tx_type == TX_TYPE_PAYOUT_RULE_SET:
         # Every term an executor will run against: the rule text, who may be
         # paid, both caps, the period and the end. Both period fields are

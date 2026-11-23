@@ -285,12 +285,6 @@ tau-testnet retractable list --key alice --role out
 tau-testnet retractable show <retractable_id>
 tau-testnet retractable retract --key alice <retractable_id>
 
-# standing payments (sign once; paid every period from the payer's balance until the end or a cancel)
-tau-testnet standing create --key alice --to <recipient_pubkey> --amount 25 --periods 12 --every-months 1 --first-due-after 3600
-tau-testnet standing list --key alice --role out
-tau-testnet standing show <standing_id>
-tau-testnet standing cancel --key alice <standing_id>
-
 # payout rules (a Tau rule pays out the account's money when anyone executes it, inside signed caps)
 tau-testnet payout set --key treasury --file payout.tau --slot <bob_pubkey> --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 --ends-in 100000
 tau-testnet payout execute --key carol --account <treasury_pubkey> --data 0=300
@@ -506,7 +500,7 @@ state_hash = BLAKE3(
   - Transaction → `SHA-256` of canonical JSON of `{sender_pubkey, sequence_number, expiration_time, expire_at_height, fee_limit, tx_type, …type-specific}`. `tx_type` **is** signed, so a `user_tx` signature cannot be replayed as a governance vote. `expire_at_height` is signed whenever present, and required on anything new: the wall-clock `expiration_time` is rechecked at apply against the block **timestamp**, which the proposer picks, so the height is the deadline a proposer cannot move.
   - Block header → `SHA-256` of `BlockHeader.canonical_bytes()`, verified by `Block.verify_consensus_proof()`.
 
-> ⚠️ **No cross-network / version domain separation (replay risk).** Signed payloads do **not** include `network_id`, `genesis_hash`, or a protocol version, and there is no explicit `tx`-vs-`block` domain tag (they are separated only implicitly by incompatible encodings). A transaction signed for one Tau network is cryptographically valid on any other network where the same keypair is funded. **Do not reuse account/validator keys across networks.** Adding explicit domain tags (e.g. `TAU_TESTNET_TX_V1 | network_id | genesis_hash | tx_type | body`) is planned and will be a breaking signature-format change. Exception: the transaction types listed in `consensus/network_binding.py` (standing payments) already sign `genesis_hash` and are refused on every other network.
+> ⚠️ **No cross-network / version domain separation (replay risk).** Signed payloads do **not** include `network_id`, `genesis_hash`, or a protocol version, and there is no explicit `tx`-vs-`block` domain tag (they are separated only implicitly by incompatible encodings). A transaction signed for one Tau network is cryptographically valid on any other network where the same keypair is funded. **Do not reuse account/validator keys across networks.** Adding explicit domain tags (e.g. `TAU_TESTNET_TX_V1 | network_id | genesis_hash | tx_type | body`) is planned and will be a breaking signature-format change. Exception: the transaction types listed in `consensus/network_binding.py` (the three payout types) already sign `genesis_hash` and are refused on every other network.
 
 ---
 
@@ -652,38 +646,6 @@ Timing caveats:
 
 **Upgrade.** This adds a field to the consensus metadata hash with no activation flag, so it needs a regenesis and every node on the same build. An older binary forks at the first park block.
 
-## Standing payments
-
-Long-form guide: [docs/standing_payments.md](docs/standing_payments.md).
-
-A `standing_payment_create` is an authorization signed once: pay a fixed `amount` to a fixed recipient every period, for `periods` periods. Each payment is made by an end-of-block sweep, with no further transaction. Nothing is reserved: the money stays in the payer's balance until a payment is made.
-
-```bash
-tau-testnet standing create --key alice --to <recipient_pubkey> --amount 25 --periods 12 \
-    --every-months 1 --first-due-time 1798761600                        # calendar months, UTC
-tau-testnet standing create --key alice --to <recipient_pubkey> --amount 10 --periods 52 \
-    --every-seconds 604800 --first-due-after 3600                       # weekly, first in an hour
-tau-testnet standing create --key alice --to <recipient_pubkey> --amount 5 --periods 10 \
-    --every-blocks 1000 --first-due-in 50                               # by height
-tau-testnet standing list --key alice --role out
-tau-testnet standing show <standing_id>                                  # open, ended or cancelled, with history
-tau-testnet standing cancel --key alice <standing_id>
-```
-
-Semantics:
-
-- **Schedule.** Every `interval_blocks` blocks, `interval_seconds` seconds of block time, or `interval_months` calendar months (UTC; a day the month lacks becomes its last day, and every due point is derived from `first_due`, so there is no drift). Period `p` is payable from its due point until the next one.
-- **One payment per period, no catch-up.** A period whose window closes unpaid is missed.
-- **No funds.** Nothing is paid (never a part, never a debt); the period is retried in each later block of its window, then missed.
-- **Policy.** Every payment re-checks the payer's current `o5` clause as a transfer in that block, with the approval slots empty. A block misses the period, with no retry.
-- **Fees.** One fee when the authorization is created; payments and the cancel are fee-free.
-- **Cancel.** Payer only, takes effect in its own block: a payment due in that block is not made. There is no edit; cancel and create again.
-- **One network.** Both transaction types sign `genesis_hash` (the hash of block 0; `getsequence` returns it and the CLI fills it in). One signed for another network is refused at admission (`WRONG_NETWORK`) and at block apply.
-- **Caps.** 16 open per payer, 4096 in total, 32 handled per block. The shortest height interval (128 blocks) lets every entry be reached once per period even when the book is full.
-- **Reads.** `getstandingpayments <address> [out|in|all]` (with `semantics`, the node's rules and limits), `getstandingpayment <id>` (with `history`), and `gettxstatus`.
-
-**Upgrade.** The book root is folded into the consensus metadata as `standing_payments_root` only once the book has held an entry, so **no regenesis** is needed. Nodes must upgrade before the first create; an older binary diverges loudly at that block.
-
 ## Payout rules
 
 Long-form guide: [docs/payout_rules.md](docs/payout_rules.md).
@@ -706,6 +668,7 @@ Semantics:
 - **Per sale.** A rule installed with `per_sale` (`--per-sale`) pays only against sales the chain recorded: every signed transfer into the account is an open sale (id = its transaction hash). An execution names one (`--sale <tx_hash>`), the rule reads its amount and payer (`i27`, `i28`), and a paid sale is closed, so a royalty is paid once per sale and never on the claimant's word. At most 64 open per rule.
 - **Policy.** The account's `o5` clause is not consulted: the payout rule is its own authorization. Installing, replacing and revoking are rule changes (kinds 6 and 7) that a rule-change guard judges; a guarded account uses `--request`. Payout rule + blocking `o5` + guard = escrow.
 - **Fees.** The account pays one fee to install; each execution's executor pays its fee after the legs; revoke is fee-free. A refused execution is not included.
+- **One network.** All three types sign `genesis_hash` (the hash of block 0; `getsequence` returns it and the CLI fills it in). One signed for another network is refused at admission (`WRONG_NETWORK`) and at block apply.
 - **Caps.** One rule per account, 4096 in total, 8 slots, 16 executions per block.
 - **Reads.** `getpayoutrule <address>` (with `history` and `semantics`) and `gettxstatus`.
 

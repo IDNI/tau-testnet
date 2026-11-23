@@ -21,8 +21,6 @@ APPLY_REASON_WRONG_NETWORK = "wrong_network"
 
 # Kept as plain strings so this module imports nothing from the books it guards.
 BOUND_TX_TYPES = frozenset({
-    "standing_payment_create",
-    "standing_payment_cancel",
     "payout_rule_set",
     "payout_rule_revoke",
     "payout_execute",

@@ -27,7 +27,7 @@ from consensus.payout import parse_payout_rule_set, payout_rule_body
 from consensus.policy_mock import MockPolicyEvaluator
 
 from consensus.network_binding import BOUND_TX_TYPES, chain_genesis_hash
-from tests.test_standing_apply import ALICE, BOB, CAROL, PROPOSER, Chain, HEIGHT, TS
+from tests.chain_harness import ALICE, BOB, CAROL, PROPOSER, Chain, HEIGHT, TS
 
 PEOPLE = (ALICE, BOB, CAROL)
 RULES = {

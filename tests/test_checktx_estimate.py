@@ -170,11 +170,6 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
-    if kind == "standing_payment_create":
-        return _envelope(kind, SENDER, fee_limit, recipient_pubkey=RECIPIENT,
-                         amount=100, interval_blocks=128,
-                         first_due=NEXT_HEIGHT + 20, periods=3,
-                         genesis_hash=chain_genesis_hash())
     if kind == "payout_rule_set":
         return _envelope(kind, SENDER, fee_limit, genesis_hash=chain_genesis_hash(),
                          **_payout_fields())
@@ -194,8 +189,7 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request", "standing_payment_create", "payout_rule_set",
-               "payout_execute"]
+               "rule_change_request", "payout_rule_set", "payout_execute"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

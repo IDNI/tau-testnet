@@ -29,7 +29,7 @@ from consensus.payout import (
 from consensus.tx_signing import signing_message_bytes
 
 from tests.test_payout_apply import _events, _executed, _reason, evs, exec_tx, set_tx  # noqa: F401
-from tests.test_standing_apply import (
+from tests.chain_harness import (
     ALICE, BOB, CAROL, HEIGHT, PROPOSER, SKS, TS, Chain, Oracle, _sign, spend_tx,
 )
 from tests import test_payout_integration as integ
