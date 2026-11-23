@@ -351,25 +351,27 @@ def test_royalty_5pct_arrival_pays_once_native():
     the crediting transaction's settlement id; replaying the same
     credit under the same id lands the credit again but pays no
     second royalty."""
-    ch = Chain({ALICE: 10_000, BOB: 0, CAROL: 0, PROPOSER: 0})
+    ch = Chain({ALICE: 10_000, BOB: 1_000, CAROL: 0, PROPOSER: 0})
     _install_payout_clause(ch, BOB, TEMPLATE_ROYALTY_5PCT_CLAUSE)
     install = install_tx(owner=BOB, sk=SK_BOB, recipients=[CAROL],
                          extra={"on_arrival": True})
     ch.block([install], height=20, ts=NOW)
     assert ch.accepted(install), ch.receipt(install)
 
+    before = dict(ch.bal)
     tx = transfer_tx(BOB, 101, SK_ALICE, sender=ALICE, seq=0,
                      tx_id="credit-101")
     ch.block([tx], height=21, ts=NOW)
     assert ch.accepted(tx), ch.receipt(tx)
     assert ch.bal[CAROL] == 5
-    assert ch.bal[BOB] == 101 - 5
+    assert ch.bal[BOB] - before[BOB] == 101 - 5
 
+    before = dict(ch.bal)
     replay = transfer_tx(BOB, 101, SK_ALICE, sender=ALICE, seq=1,
                          tx_id="credit-101")
     ch.block([replay], height=22, ts=NOW)
     assert ch.accepted(replay), ch.receipt(replay)
     assert ch.bal[CAROL] == 5
-    assert ch.bal[BOB] == 101 - 5 + 101
+    assert ch.bal[BOB] - before[BOB] == 101
     assert ch.payout_book.get(BOB).settlements == [
         arrival_settlement_id("credit-101")]
