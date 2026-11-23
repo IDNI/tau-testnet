@@ -72,10 +72,10 @@ def test_parse_accepts_kind_6_with_a_policy_body():
     assert req.body == UPDATE_BODY
 
 
-def test_parse_refuses_kind_7_and_an_empty_or_neutral_update():
+def test_parse_refuses_kind_13_and_an_empty_or_neutral_update():
     _, why = parse_rule_change_request_checked(
-        _tx(_request(7, text=OTHER_TEXT)))
-    assert "kind must be 1..6" in why
+        _tx(_request(13, text=OTHER_TEXT)))
+    assert "kind must be 1..12" in why
     _, why = parse_rule_change_request_checked(
         _tx(_request(KIND_UPDATE, text="")))
     assert "needs a non-empty rule_text" in why

@@ -538,6 +538,13 @@ class RuleChangeRequest:
             return ""
         if self.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
             return self.rule_text
+        if self.kind in _RULE_CHANGE_PAYLOAD_KINDS:
+            # The canonical payload text of the entry this body installs:
+            # two spellings of the same entry are the same change.
+            try:
+                return payload_body(self.kind, self.rule_text, self.sender_pubkey)
+            except ValueError:
+                return self.rule_text
         from consensus.rule_offers import clause_body_v1
 
         return clause_body_v1(self.rule_text)
@@ -577,16 +584,142 @@ class RuleChangeCancel:
         return self.request_id.hex()
 
 
+_RULE_CHANGE_PAYLOAD_KINDS = frozenset({
+    tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+    tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
+    tau_defs.RULE_CHANGE_KIND_SET_STANDING,
+    tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING,
+})
 _RULE_CHANGE_BODY_KINDS = frozenset({
     tau_defs.RULE_CHANGE_KIND_SET_POLICY,
     tau_defs.RULE_CHANGE_KIND_SET_GUARD,
     tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
     # An update carries a new policy body, exactly as a set does.
     tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY,
+    # Kinds 7/8/10/11 carry the payload of the entry they install.
+    *_RULE_CHANGE_PAYLOAD_KINDS,
 })
 _RULE_CHANGE_KINDS = frozenset(range(
-    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY + 1
+    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING + 1
 ))
+
+
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def payout_payload_entry(text: str, sender_pubkey: str):
+    """The payout-rule entry a kind 7/8 body installs. Raises ValueError."""
+    from consensus.payout_rules import (
+        PayoutRuleShapeError,
+        parse_install_payout_rule,
+    )
+
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        raise ValueError("the payout payload is not a JSON object")
+    if not isinstance(payload, dict):
+        raise ValueError("the payout payload is not a JSON object")
+    tx = dict(payload)
+    tx["sender_pubkey"] = sender_pubkey
+    try:
+        return parse_install_payout_rule(tx)
+    except PayoutRuleShapeError as exc:
+        raise ValueError(str(exc))
+
+
+def payout_payload_text(entry) -> str:
+    """The canonical body text of a payout-rule entry (tx field names)."""
+    from consensus.payout_rules import FORM_TAU_RULE
+
+    obj: Dict[str, Any] = {
+        "payout_form": entry.form,
+        "payout_recipients": list(entry.recipients),
+        "payout_max_per_execution": entry.max_per_execution,
+        "payout_max_per_period": entry.max_per_period,
+        "payout_period_seconds": entry.period_seconds,
+        "payout_period_anchor_ts": entry.period_anchor_ts,
+        "payout_version": entry.version,
+    }
+    if entry.form == FORM_TAU_RULE:
+        obj["payout_clause"] = entry.clause_text
+    else:
+        obj["payout_legs"] = [
+            [leg.recipient_pubkey, leg.mode, leg.value] for leg in entry.legs
+        ]
+    return _canonical_json(obj)
+
+
+def standing_payload_entry(text: str, sender_pubkey: str):
+    """The standing-payment entry a kind 10/11 body installs. Raises ValueError."""
+    from consensus.standing_payments import (
+        StandingPaymentShapeError,
+        parse_create_standing_payment,
+    )
+
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        raise ValueError("the standing payload is not a JSON object")
+    if not isinstance(payload, dict):
+        raise ValueError("the standing payload is not a JSON object")
+    tx = dict(payload)
+    tx["sender_pubkey"] = sender_pubkey
+    try:
+        return parse_create_standing_payment(tx)
+    except StandingPaymentShapeError as exc:
+        raise ValueError(str(exc))
+
+
+def standing_payload_text(entry) -> str:
+    """The canonical body text of a standing-payment entry (tx field names)."""
+    from consensus.standing_payments import FORM_TAU_CLAUSE, SCHEDULE_NAME_TO_KIND
+
+    schedule_name = {v: k for k, v in SCHEDULE_NAME_TO_KIND.items()}[
+        entry.schedule_kind
+    ]
+    obj: Dict[str, Any] = {
+        "standing_recipient_pubkey": entry.recipient_pubkey,
+        "standing_amount": entry.amount,
+        "standing_schedule": schedule_name,
+        "standing_signed_day": entry.signed_day,
+        "standing_anchor_ts": entry.anchor_ts,
+        "standing_window_seconds": entry.window_seconds,
+        "standing_final_ts": entry.final_ts,
+        "standing_max_occurrences": entry.max_occurrences,
+        "standing_max_total": entry.max_total,
+        "standing_fee_limit": entry.fee_limit,
+        "standing_policy_version_ref": entry.policy_version_ref,
+        "standing_allow_catch_up": int(entry.allow_catch_up),
+        "standing_version": entry.version,
+        "standing_form": entry.form,
+        "standing_due_retry_seconds": entry.due_retry_seconds,
+    }
+    if entry.form == FORM_TAU_CLAUSE:
+        obj["standing_clause"] = entry.clause_text
+    return _canonical_json(obj)
+
+
+def payload_entry(kind: int, text: str, sender_pubkey: str):
+    """The book entry a payload kind's body installs. Raises ValueError."""
+    if kind in (
+        tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+        tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
+    ):
+        return payout_payload_entry(text, sender_pubkey)
+    return standing_payload_entry(text, sender_pubkey)
+
+
+def payload_body(kind: int, text: str, sender_pubkey: str) -> str:
+    """The canonical body of a payload kind. Raises ValueError."""
+    entry = payload_entry(kind, text, sender_pubkey)
+    if kind in (
+        tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+        tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
+    ):
+        return payout_payload_text(entry)
+    return standing_payload_text(entry)
 
 
 def parse_rule_change_request_checked(
@@ -611,7 +744,7 @@ def parse_rule_change_request_checked(
         if isinstance(val, bool) or not isinstance(val, int):
             return None, "kind, sequence_number and expire_at_height must be integers"
     if kind not in _RULE_CHANGE_KINDS:
-        return None, "kind must be 1..6"
+        return None, f"kind must be 1..{tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING}"
 
     rule_text = tx.get("rule_text", "")
     if rule_text is None:
@@ -635,10 +768,18 @@ def parse_rule_change_request_checked(
         offer_id = ""
     if not isinstance(offer_id, str):
         return None, "offer_id must be a string"
-    if kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+    if kind in (
+        tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
+        tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING,
+    ):
+        # Kind 3 names the offer it accepts; kind 12 names the standing
+        # authorization it cancels. Both are 64 hex digits.
         offer_id = offer_id.strip().lower()
         if len(offer_id) != 64 or any(c not in "0123456789abcdef" for c in offer_id):
-            return None, "offer_id must be 64 hex digits"
+            return None, ("offer_id must be 64 hex digits"
+                          if kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER
+                          else "offer_id must be the 64-hex id of the standing "
+                               "authorization to cancel")
     elif offer_id != "":
         return None, "this kind carries no offer_id"
 
@@ -650,6 +791,25 @@ def parse_rule_change_request_checked(
         return None, str(exc)
 
     if has_body:
+        if kind in _RULE_CHANGE_PAYLOAD_KINDS:
+            # The body is the payload of the entry this change installs;
+            # the book's own parse is the shape check, and the stored
+            # body is its canonical spelling (see RuleChangeRequest.body).
+            try:
+                payload_entry(kind, rule_text, sender_n)
+            except ValueError as exc:
+                return None, f"rule_text is not a valid payload for this kind: {exc}"
+            if payload_body(kind, rule_text, sender_n) != rule_text:
+                return None, "rule_text is not the canonical spelling of its payload"
+            return RuleChangeRequest(
+                sender_pubkey=sender_n,
+                sequence_number=seq,
+                kind=kind,
+                rule_text=rule_text,
+                offer_id=offer_id,
+                approvers=approvers,
+                expire_at_height=expire_at,
+            ), ""
         try:
             body = clause_body_v1(rule_text)
         except RuleOfferShapeError as exc:

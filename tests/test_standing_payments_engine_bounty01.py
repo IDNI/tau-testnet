@@ -501,6 +501,11 @@ class _TipView(TipAdmissionView):
     def _tip_standing_book(self):
         return self._book
 
+    def clause_for(self, acceptor_pubkey, target_stream):
+        # This view's world has no registered clauses (and no database):
+        # no account here carries a rule-change guard.
+        return None
+
     def get_balance(self, pubkey):
         return self._balances.get(pubkey, 0)
 

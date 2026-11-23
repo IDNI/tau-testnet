@@ -869,6 +869,15 @@ class StandingPaymentBook:
     def get(self, auth_id: bytes) -> Optional[StandingPaymentEntry]:
         return self._entries.get(bytes(auth_id))
 
+    def get_for_series(
+        self, series_key: Tuple[str, str, int, int]
+    ) -> Optional[StandingPaymentEntry]:
+        """The current version of one authorization series, or None."""
+        current_id = self._series.get(series_key)
+        if current_id is None:
+            return None
+        return self._entries.get(current_id)
+
     def authorization_count(self) -> int:
         return len(self._entries)
 

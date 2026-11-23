@@ -73,6 +73,13 @@ KIND_NAMES = {
     tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER: "accept_offer",
     tau_defs.RULE_CHANGE_KIND_SET_GUARD: "set_guard",
     tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD: "revoke_guard",
+    tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY: "update_policy",
+    tau_defs.RULE_CHANGE_KIND_SET_PAYOUT: "set_payout_rule",
+    tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT: "update_payout_rule",
+    tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT: "revoke_payout_rule",
+    tau_defs.RULE_CHANGE_KIND_SET_STANDING: "set_standing_payment",
+    tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING: "update_standing_payment",
+    tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING: "cancel_standing_payment",
 }
 
 

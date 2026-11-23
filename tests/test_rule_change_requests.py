@@ -417,7 +417,7 @@ def test_admission_reports_a_rule_change_code_for_shape_failures():
     result = _admit(_tx(_request(KIND_SET, approvers={17: BOB})), _lm())
     assert result.code == "INVALID_RULE_CHANGE_REQUEST"
     tx = _tx(_request())
-    tx["kind"] = 9
+    tx["kind"] = 13
     assert _admit(tx, _lm()).code == "INVALID_RULE_CHANGE_REQUEST"
 
 

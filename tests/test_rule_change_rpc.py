@@ -404,7 +404,7 @@ def test_preview_revoke_policy_passes_the_screen_with_a_policy():
 
 
 @pytest.mark.parametrize("draft", [
-    _draft(9),
+    _draft(13),
     _draft(KIND_SET, rule_text=""),
     _draft(KIND_REVOKE, rule_text=SET_TEXT),
     _draft(KIND_ACCEPT, offer_id="nothex"),

@@ -147,6 +147,25 @@ RULE_CHANGE_KIND_REVOKE_GUARD = 5
 # site; see consensus/approvals.py, consensus/admission.py and
 # consensus/engine.py.
 RULE_CHANGE_KIND_UPDATE_POLICY = 6
+# Kinds 7..12 (Bounty 01, FIX 5B): the payment books' lifecycle as rule
+# changes. Installing, replacing and removing a payout rule (#63) and
+# creating, updating and cancelling a standing payment (#34) are changes
+# to the rules that govern an account's money, so the account's
+# rule-change guard judges them (i1 = kind) exactly as it judges a
+# policy change: a direct transaction the guard blocks is refused, and
+# the change is filed as a rule-change request instead, released by
+# co-signature or the time escape. Kinds 7/10 write version 1 (no rule /
+# no series entry may exist), kinds 8/11 carry the next version of an
+# existing rule / series, kind 9 removes the sender's payout rule, and
+# kind 12 cancels the standing authorization named in offer_id. The
+# bodies of kinds 7/8/10/11 are the canonical payload texts of the entry
+# they install (see consensus/approvals.py); kinds 9 and 12 carry none.
+RULE_CHANGE_KIND_SET_PAYOUT = 7
+RULE_CHANGE_KIND_UPDATE_PAYOUT = 8
+RULE_CHANGE_KIND_REVOKE_PAYOUT = 9
+RULE_CHANGE_KIND_SET_STANDING = 10
+RULE_CHANGE_KIND_UPDATE_STANDING = 11
+RULE_CHANGE_KIND_CANCEL_STANDING = 12
 
 # Blocks after which a parked rule-change request may release without approvals.
 RULE_CHANGE_DELAY_BLOCKS = 1000

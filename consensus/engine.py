@@ -312,6 +312,17 @@ def _standing_payment_book(lm) -> Optional[StandingPaymentBook]:
     return book if isinstance(book, StandingPaymentBook) else None
 
 
+def _guard_blocks_change(lm, sender, kind, timestamp, timeout):
+    """(blocked, detail) from the sender's rule-change guard for one of the
+    payment-book changes (kinds 7..12, FIX 5B): the guard judges a payout
+    or standing change exactly as it judges a policy change."""
+    offers = lm.rule_offers
+    return sender_policy.rule_change_blocked(
+        lambda who, idx: offers.accepted_clauses.get((who, idx)),
+        sender, kind, int(timestamp or 0), pool="apply", timeout=timeout,
+    )
+
+
 def _payout_rule_book(lm) -> Optional[PayoutRuleBook]:
     """The payout-rule book, or None when the manager does not carry one.
 
@@ -572,7 +583,8 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
         if entry is None or entry.status != STATUS_OPEN:
             continue
         processed += 1
-        problem = _write_rule_change(lm, rid, entry, int(height), timeout)
+        problem = _write_rule_change(lm, rid, entry, int(height), timeout,
+                                     timestamp=timestamp)
         if problem:
             approvals.resolve_rule_change(rid, STATUS_FAILED)
             logger.info("Rule-change request %s failed at release: %s", rid.hex(), problem)
@@ -583,7 +595,95 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
     return events
 
 
-def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
+_PAYMENT_BOOK_KINDS = frozenset({
+    tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+    tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
+    tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT,
+    tau_defs.RULE_CHANGE_KIND_SET_STANDING,
+    tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING,
+    tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING,
+})
+
+
+def _write_payment_book_change(lm, entry, height, timestamp) -> Optional[str]:
+    """Apply one payment-book rule change (kinds 7..12, FIX 5B) at release.
+
+    Every check runs before the first write, mirroring _write_rule_change.
+    A payment change touches nothing else the account has, so unlike a
+    policy change it fails no other open request. The checks are the
+    books' own can_* functions — the same ones the direct transactions
+    and admission call — so a released change lands exactly what a
+    direct transaction would have landed.
+    """
+    from consensus.approvals import payload_entry
+
+    sender = entry.sender_pubkey
+    kind = entry.kind
+    ts = int(timestamp or 0)
+    if kind in (
+        tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+        tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
+        tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT,
+    ):
+        book = _payout_rule_book(lm)
+        if book is None:
+            return "the payout book is not available"
+        if kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
+            if book.get(sender) is None:
+                return "there is no payout rule to revoke"
+            ok, reason = book.can_remove(sender, ts)
+            if not ok:
+                return reason
+            book.remove(sender, ts)
+            return None
+        try:
+            new_entry = payload_entry(kind, entry.body, sender)
+        except ValueError as exc:
+            return str(exc)
+        existing = book.get(sender)
+        if kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT and existing is not None:
+            return "a payout rule already exists; an update (kind 8) replaces it"
+        if kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT and existing is None:
+            return "there is no payout rule to update"
+        ok, reason = book.can_install(new_entry, ts)
+        if not ok:
+            return reason
+        book.install(new_entry, ts)
+        return None
+
+    book = _standing_payment_book(lm)
+    if book is None:
+        return "the standing-payment book is not available"
+    if kind == tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING:
+        auth_id = bytes.fromhex(entry.offer_id)
+        target = book.get(auth_id)
+        if target is None:
+            return "there is no standing payment with this id"
+        if target.payer_pubkey != sender:
+            return "only the payer may cancel a standing payment"
+        ok, reason = book.can_cancel(auth_id, ts)
+        if not ok:
+            return reason
+        book.cancel(auth_id, ts)
+        return None
+    try:
+        new_entry = payload_entry(kind, entry.body, sender)
+    except ValueError as exc:
+        return str(exc)
+    existing = book.get_for_series(new_entry.series_key)
+    if kind == tau_defs.RULE_CHANGE_KIND_SET_STANDING and existing is not None:
+        return ("this series already has an authorization; "
+                "an update (kind 11) replaces it")
+    if kind == tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING and existing is None:
+        return "there is no standing authorization to update"
+    ok, reason = book.can_create(new_entry, ts)
+    if not ok:
+        return reason
+    book.create(new_entry, ts)
+    return None
+
+
+def _write_rule_change(lm, rid, entry, height, timeout, *, timestamp=0) -> Optional[str]:
     """Apply one request to the block's lifecycle. None on success, else why not.
 
     Every check runs before the first write, so a failure leaves nothing behind.
@@ -592,6 +692,8 @@ def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
     approvals = lm.approval_requests
     sender = entry.sender_pubkey
     kind = entry.kind
+    if kind in _PAYMENT_BOOK_KINDS:
+        return _write_payment_book_change(lm, entry, height, timestamp)
     policy_key = (sender, tau_defs.USER_POLICY_STREAM_INDEX)
     guard_key = (sender, tau_defs.RULE_CHANGE_GUARD_INDEX)
 
@@ -2846,6 +2948,72 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     accept=True, rule_text=request.rule_text))
                                 if not accepted:
                                     precondition = why
+                        elif request.kind in (
+                            tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+                            tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
+                            tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT,
+                        ):
+                            # Mirror of admission's precondition: the payout
+                            # book's own checks against current state.
+                            from consensus.approvals import payload_entry as _payload_entry
+                            pr_book_now = _payout_rule_book(lifecycle_mgr)
+                            if pr_book_now is None:
+                                precondition = "the payout book is not available"
+                            elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
+                                if pr_book_now.get(request.sender_pubkey) is None:
+                                    precondition = "there is no payout rule to revoke"
+                                else:
+                                    _, precondition = pr_book_now.can_remove(
+                                        request.sender_pubkey, int(block_timestamp or 0))
+                            else:
+                                pr_new = _payload_entry(
+                                    request.kind, request.rule_text,
+                                    request.sender_pubkey)
+                                pr_existing = pr_book_now.get(request.sender_pubkey)
+                                if (request.kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT
+                                        and pr_existing is not None):
+                                    precondition = ("a payout rule already exists; "
+                                                    "an update (kind 8) replaces it")
+                                elif (request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT
+                                        and pr_existing is None):
+                                    precondition = "there is no payout rule to update"
+                                else:
+                                    _, precondition = pr_book_now.can_install(
+                                        pr_new, int(block_timestamp or 0))
+                        elif request.kind in (
+                            tau_defs.RULE_CHANGE_KIND_SET_STANDING,
+                            tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING,
+                            tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING,
+                        ):
+                            from consensus.approvals import payload_entry as _payload_entry
+                            sp_book_now = _standing_payment_book(lifecycle_mgr)
+                            if sp_book_now is None:
+                                precondition = "the standing-payment book is not available"
+                            elif request.kind == tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING:
+                                sp_target = sp_book_now.get(bytes.fromhex(request.offer_id))
+                                if sp_target is None:
+                                    precondition = "there is no standing payment with this id"
+                                elif sp_target.payer_pubkey != request.sender_pubkey:
+                                    precondition = "only the payer may cancel a standing payment"
+                                else:
+                                    _, precondition = sp_book_now.can_cancel(
+                                        bytes.fromhex(request.offer_id),
+                                        int(block_timestamp or 0))
+                            else:
+                                sp_new = _payload_entry(
+                                    request.kind, request.rule_text,
+                                    request.sender_pubkey)
+                                sp_existing = sp_book_now.get_for_series(sp_new.series_key)
+                                if (request.kind == tau_defs.RULE_CHANGE_KIND_SET_STANDING
+                                        and sp_existing is not None):
+                                    precondition = ("this series already has an authorization; "
+                                                    "an update (kind 11) replaces it")
+                                elif (request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING
+                                        and sp_existing is None):
+                                    precondition = "there is no standing authorization to update"
+                                else:
+                                    _, precondition = sp_book_now.can_create(
+                                        sp_new, int(block_timestamp or 0))
                         if precondition:
                             problem = (precondition, "rule_change_request_invalid")
                     if problem is not None:
@@ -3231,6 +3399,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if accepted_in_block and not hard_reject:
                     sp_book = _lifecycle_for_write().standing_payments
                     sp_ts = int(block_timestamp or 0)
+                    sp_guard_refused = False
                     if tx_type == TX_TYPE_CREATE_STANDING_PAYMENT:
                         try:
                             sp_entry = parse_create_standing_payment(tx)
@@ -3242,9 +3411,26 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 reason = "sender is not the payer"
                             else:
                                 _, reason = sp_book.can_create(sp_entry, sp_ts)
+                                if not reason:
+                                    # A create is a rule change (kind 10 for
+                                    # a new series, kind 11 for its next
+                                    # version): the payer's guard judges it.
+                                    sp_kind = (
+                                        tau_defs.RULE_CHANGE_KIND_SET_STANDING
+                                        if sp_book.get_for_series(sp_entry.series_key) is None
+                                        else tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING)
+                                    guard_blocked, guard_detail = _guard_blocks_change(
+                                        _lifecycle_for_write(), sp_entry.payer_pubkey,
+                                        sp_kind, sp_ts,
+                                        getattr(_session, "request_budget", None))
+                                    if guard_blocked:
+                                        reason = f"rule-change guard blocks: {guard_detail}"
+                                        sp_guard_refused = True
                         if sp_entry is None or reason:
                             tx_receipt["logs"].append(f"Standing payment create ignored: {reason}")
-                            tx_receipt["reason"] = "standing_payment_not_created"
+                            tx_receipt["reason"] = (
+                                RULE_CHANGE_NEEDS_APPROVAL_REASON if sp_guard_refused
+                                else "standing_payment_not_created")
                             accepted_in_block = False
                         else:
                             pending_standing_create = sp_entry
@@ -3265,9 +3451,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 reason = "sender is not the payer"
                             else:
                                 _, reason = sp_book.can_cancel(sp_auth_id, sp_ts)
+                                if not reason:
+                                    # A cancellation is a rule change
+                                    # (kind 12): the payer's guard judges it.
+                                    guard_blocked, guard_detail = _guard_blocks_change(
+                                        _lifecycle_for_write(), sp_entry.payer_pubkey,
+                                        tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING,
+                                        sp_ts,
+                                        getattr(_session, "request_budget", None))
+                                    if guard_blocked:
+                                        reason = f"rule-change guard blocks: {guard_detail}"
+                                        sp_guard_refused = True
                         if sp_auth_id is None or reason:
                             tx_receipt["logs"].append(f"Standing payment cancel ignored: {reason}")
-                            tx_receipt["reason"] = "standing_payment_not_cancelled"
+                            tx_receipt["reason"] = (
+                                RULE_CHANGE_NEEDS_APPROVAL_REASON if sp_guard_refused
+                                else "standing_payment_not_cancelled")
                             accepted_in_block = False
                         else:
                             pending_standing_cancel = sp_auth_id
@@ -3423,6 +3622,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if accepted_in_block and not hard_reject:
                     pr_book = _lifecycle_for_write().payout_rules
                     pr_ts = int(block_timestamp or 0)
+                    pr_guard_refused = False
                     if tx_type == TX_TYPE_INSTALL_PAYOUT_RULE:
                         try:
                             pr_entry = parse_install_payout_rule(tx)
@@ -3434,9 +3634,26 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 reason = "sender is not the rule owner"
                             else:
                                 _, reason = pr_book.can_install(pr_entry, pr_ts)
+                                if not reason:
+                                    # An install is a rule change (kind 7
+                                    # for a first rule, kind 8 for its next
+                                    # version): the owner's guard judges it.
+                                    pr_kind = (
+                                        tau_defs.RULE_CHANGE_KIND_SET_PAYOUT
+                                        if pr_book.get(pr_entry.owner_pubkey) is None
+                                        else tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT)
+                                    guard_blocked, guard_detail = _guard_blocks_change(
+                                        _lifecycle_for_write(), pr_entry.owner_pubkey,
+                                        pr_kind, pr_ts,
+                                        getattr(_session, "request_budget", None))
+                                    if guard_blocked:
+                                        reason = f"rule-change guard blocks: {guard_detail}"
+                                        pr_guard_refused = True
                         if pr_entry is None or reason:
                             tx_receipt["logs"].append(f"Payout rule install ignored: {reason}")
-                            tx_receipt["reason"] = "payout_rule_not_installed"
+                            tx_receipt["reason"] = (
+                                RULE_CHANGE_NEEDS_APPROVAL_REASON if pr_guard_refused
+                                else "payout_rule_not_installed")
                             accepted_in_block = False
                         else:
                             pending_payout_install = pr_entry
@@ -3454,9 +3671,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 reason = "sender is not the rule owner"
                             else:
                                 _, reason = pr_book.can_remove(pr_owner, pr_ts)
+                                if not reason:
+                                    # A removal is a rule change (kind 9):
+                                    # the owner's guard judges it.
+                                    guard_blocked, guard_detail = _guard_blocks_change(
+                                        _lifecycle_for_write(), pr_owner,
+                                        tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT,
+                                        pr_ts,
+                                        getattr(_session, "request_budget", None))
+                                    if guard_blocked:
+                                        reason = f"rule-change guard blocks: {guard_detail}"
+                                        pr_guard_refused = True
                         if pr_owner is None or reason:
                             tx_receipt["logs"].append(f"Payout rule removal ignored: {reason}")
-                            tx_receipt["reason"] = "payout_rule_not_removed"
+                            tx_receipt["reason"] = (
+                                RULE_CHANGE_NEEDS_APPROVAL_REASON if pr_guard_refused
+                                else "payout_rule_not_removed")
                             accepted_in_block = False
                         else:
                             pending_payout_removal = pr_owner

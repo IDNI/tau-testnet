@@ -557,18 +557,21 @@ def build_rule_change_request_tx(
 ) -> dict:
     """Construct a ``tx_type='rule_change_request'`` payload (without signature).
 
-    Kinds 1 and 4 carry the clause in ``rule_text``; kind 3 carries the exact
-    offered text and the offer id; kinds 2 and 5 carry neither. Zero approvers is
+    Kinds 1, 4 and 6 carry the clause in ``rule_text``; kind 3 carries the exact
+    offered text and the offer id; kinds 7, 8, 10 and 11 carry the canonical
+    payload text of the payout rule / standing authorization they install;
+    kind 12 carries the id of the standing authorization it cancels in
+    ``offer_id``; kinds 2, 5 and 9 carry neither. Zero approvers is
     valid: the time escape alone can release the request.
     """
-    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5):
-        raise ValueError("kind must be 1..5")
-    has_body = kind in (1, 3, 4)
+    if isinstance(kind, bool) or kind not in range(1, 13):
+        raise ValueError("kind must be 1..12")
+    has_body = kind in (1, 3, 4, 6, 7, 8, 10, 11)
     if has_body and not (isinstance(rule_text, str) and rule_text.strip()):
         raise ValueError("this kind needs a non-empty rule text")
     if not has_body and rule_text:
         raise ValueError("this kind carries no rule text")
-    if kind == 3:
+    if kind in (3, 12):
         if not isinstance(offer_id, str) or len(offer_id) != 64:
             raise ValueError("offer_id must be a 64-character hex string")
     elif offer_id:

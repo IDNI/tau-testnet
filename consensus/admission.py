@@ -1498,6 +1498,63 @@ def _rule_change_precondition_error(request, tip_view: TipAdmissionView) -> Opti
         )
         if rebuilt.hex() != request.offer_id:
             return "rule text does not match the offer digest"
+    elif request.kind in (
+        tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+        tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
+        tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT,
+    ):
+        # The payout book's own checks, against the tip's one-entry book —
+        # the same functions block apply calls. Kind 7 writes version 1
+        # (no rule may exist), kind 8 the next version of the sender's
+        # rule, kind 9 removes it.
+        row = tip_view.get_payout_rule_for_owner(sender)
+        book = _tip_payout_book(row)
+        if request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
+            if row is None:
+                return "there is no payout rule to revoke"
+            ok, reason = book.can_remove(sender, tip_view.next_block_timestamp)
+            return None if ok else reason
+        from consensus.approvals import payload_entry
+
+        entry = payload_entry(request.kind, request.rule_text, sender)
+        if request.kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT and row is not None:
+            return "a payout rule already exists; an update (kind 8) replaces it"
+        if request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT and row is None:
+            return "there is no payout rule to update"
+        ok, reason = book.can_install(entry, tip_view.next_block_timestamp)
+        return None if ok else reason
+    elif request.kind in (
+        tau_defs.RULE_CHANGE_KIND_SET_STANDING,
+        tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING,
+        tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING,
+    ):
+        # The standing book's own checks, as for the payout kinds. Kind 10
+        # creates version 1 of a series, kind 11 the next version, kind 12
+        # cancels the authorization named in offer_id.
+        if request.kind == tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING:
+            auth_id = bytes.fromhex(request.offer_id)
+            row = tip_view.get_standing_payment(auth_id)
+            if row is None:
+                return "there is no standing payment with this id"
+            if str(row.get("payer_pubkey", "")).lower() != sender:
+                return "only the payer may cancel a standing payment"
+            ok, reason = _tip_standing_book(row).can_cancel(
+                auth_id, tip_view.next_block_timestamp)
+            return None if ok else reason
+        from consensus.approvals import payload_entry
+
+        entry = payload_entry(request.kind, request.rule_text, sender)
+        row = tip_view.get_standing_payment_for_series(
+            entry.payer_pubkey, entry.recipient_pubkey,
+            entry.schedule_kind, entry.anchor_ts)
+        if request.kind == tau_defs.RULE_CHANGE_KIND_SET_STANDING and row is not None:
+            return ("this series already has an authorization; "
+                    "an update (kind 11) replaces it")
+        if request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING and row is None:
+            return "there is no standing authorization to update"
+        ok, reason = _tip_standing_book(row).can_create(
+            entry, tip_view.next_block_timestamp)
+        return None if ok else reason
     return None
 
 
@@ -1906,6 +1963,16 @@ def validate_create_standing_payment_payload(
     if not ok:
         return format_error(f"create_standing_payment rejected: {reason}")
 
+    # A create is a rule change (kind 10 for a new series, kind 11 for
+    # the next version of an existing one): the payer's guard judges it.
+    refusal = _rule_change_refusal(
+        tip_view, entry.payer_pubkey,
+        tau_defs.RULE_CHANGE_KIND_SET_STANDING if row is None
+        else tau_defs.RULE_CHANGE_KIND_UPDATE_STANDING,
+    )
+    if refusal is not None:
+        return refusal
+
     return success({"auth_id": entry.auth_id.hex()})
 
 
@@ -1938,6 +2005,13 @@ def validate_cancel_standing_payment_payload(
         auth_id, tip_view.next_block_timestamp)
     if not ok:
         return format_error(f"cancel_standing_payment rejected: {reason}")
+
+    # A cancellation is a rule change (kind 12): the payer's guard judges it.
+    refusal = _rule_change_refusal(
+        tip_view, row["payer_pubkey"], tau_defs.RULE_CHANGE_KIND_CANCEL_STANDING,
+    )
+    if refusal is not None:
+        return refusal
 
     return success({"auth_id": auth_id.hex()})
 
@@ -2094,6 +2168,16 @@ def validate_install_payout_rule_payload(
     if not ok:
         return format_error(f"install_payout_rule rejected: {reason}")
 
+    # An install is a rule change (kind 7 for a first rule, kind 8 for
+    # the next version of an existing one): the owner's guard judges it.
+    refusal = _rule_change_refusal(
+        tip_view, entry.owner_pubkey,
+        tau_defs.RULE_CHANGE_KIND_SET_PAYOUT if row is None
+        else tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
+    )
+    if refusal is not None:
+        return refusal
+
     return success({"rule_id": entry.rule_id.hex()})
 
 
@@ -2126,6 +2210,13 @@ def validate_remove_payout_rule_payload(
         owner, tip_view.next_block_timestamp)
     if not ok:
         return format_error(f"remove_payout_rule rejected: {reason}")
+
+    # A removal is a rule change (kind 9): the owner's guard judges it.
+    refusal = _rule_change_refusal(
+        tip_view, owner, tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT,
+    )
+    if refusal is not None:
+        return refusal
 
     return success({"rule_id": row["rule_id"]})
 
