@@ -254,11 +254,12 @@ def test_forged_hold_key_shapes_are_forced_in_every_shape():
 
 # Admits 0..101 and 5000..6000 seconds, refuses between and above: the
 # lower band's edge is NOT the cap, however clean it looks at two points.
+# Refusal form, like CAP_BODY: refuse exactly the holds outside both
+# bands, so plain transfers and other contexts are untouched.
 HOLED_BODY = (
-    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] <= { #x0065 }:bv[64]) || "
-    "(i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] >= { #x1388 }:bv[64] && "
-    "i17[t]:bv[64] <= { #x1770 }:bv[64])) "
-    "? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24])"
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > { #x0065 }:bv[64] && "
+    "(i17[t]:bv[64] < { #x1388 }:bv[64] || i17[t]:bv[64] > { #x1770 }:bv[64]))) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
 )
 
 
@@ -266,8 +267,9 @@ def holed_verdict(inputs):
     ctx = int(inputs.get("i16") or 0)
     hold = int(inputs.get("i17") or 0)
     if ctx == 2:
-        return "1" if (hold <= 101 or 5000 <= hold <= 6000) else "0"
-    return "0"
+        refused = hold > 101 and (hold < 5000 or hold > 6000)
+        return "0" if refused else "1"
+    return "1"
 
 
 def test_a_holed_clause_quotes_no_cap():

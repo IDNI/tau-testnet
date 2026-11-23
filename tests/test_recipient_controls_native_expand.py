@@ -953,11 +953,12 @@ TIMELOCK_CAP_BODY = (
 )
 
 # Admits 0..101 and 5000..6000 seconds, refuses between and above.
+# Refusal form, like CAP_BODY: refuse exactly the holds outside both
+# bands, so plain transfers and other contexts are untouched.
 HOLED_BODY = (
-    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] <= { #x0065 }:bv[64]) || "
-    "(i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] >= { #x1388 }:bv[64] && "
-    "i17[t]:bv[64] <= { #x1770 }:bv[64])) "
-    "? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24])"
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > { #x0065 }:bv[64] && "
+    "(i17[t]:bv[64] < { #x1388 }:bv[64] || i17[t]:bv[64] > { #x1770 }:bv[64]))) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
 )
 
 # The seconds branch caps the hold at the payment amount (i1) — a change
