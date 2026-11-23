@@ -5,6 +5,9 @@ every key-signed transaction from the account -- transfers, replaces,
 revokes -- and the seal lifts only when the rule expires. Payout executions
 by OTHER executors still pay out: the money keeps flowing, the key-holder
 just cannot move it or change the rule.
+
+Moved from tests/test_routes_sealed.py (rules-form pivot, 23 Nov 2026): the
+seal lives in the payout rule, not in a receive route.
 """
 import pytest
 
@@ -12,9 +15,9 @@ from consensus import sender_policy
 from consensus.policy_mock import MockPolicyEvaluator
 
 from tests.test_payout_apply import (
-    _events, _executed, _reason, exec_tx, revoke_tx, rid, set_tx,
+    _events, _executed, _reason, exec_tx, revoke_tx, rid, ridb, set_tx,
 )
-from tests.test_standing_apply import (
+from tests.chain_harness import (
     ALICE, BOB, CAROL, HEIGHT, PROPOSER, TS, Chain, Oracle, _logs, spend_tx,
 )
 from tests.test_payout_apply import evs  # noqa: F401
@@ -49,7 +52,7 @@ def test_sealed_blocks_replace_and_revoke_while_it_runs(evs):
     again = set_tx(seq=1, sealed=True)
     result = ch.block([again], height=HEIGHT + 1, ts=TS + 1)
     assert _reason(result, again) == "account_sealed"
-    rev = revoke_tx(sender=ALICE, seq=1)
+    rev = revoke_tx(sender=ALICE, seq=1, rule_id=rid(tx))
     result = ch.block([rev], height=HEIGHT + 1, ts=TS + 1)
     assert _reason(result, rev) == "account_sealed"
     oracle.check(ch)
@@ -63,7 +66,7 @@ def test_executions_by_others_still_pay_out_while_sealed(evs):
     ch.block([exe], height=HEIGHT + 3, ts=TS + 3)
     _executed(oracle, fee=5, legs=[(BOB, 40)], ts=TS + 3)
     oracle.check(ch)
-    assert ch.lm.payout_rules.state_of(ALICE).paid_total == 40
+    assert ch.lm.payout_rules.state_of(ALICE, ridb(tx)).paid_total == 40
 
 
 def test_the_seal_lifts_when_the_rule_expires(evs):

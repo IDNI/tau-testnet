@@ -29,7 +29,7 @@ from consensus.payout import (
 from consensus.tx_signing import signing_message_bytes
 
 from tests.test_payout_apply import _events, _executed, _reason, evs, exec_tx, set_tx  # noqa: F401
-from tests.test_standing_apply import (
+from tests.chain_harness import (
     ALICE, BOB, CAROL, HEIGHT, PROPOSER, SKS, TS, Chain, Oracle, _sign, spend_tx,
 )
 from tests import test_payout_integration as integ
@@ -93,9 +93,10 @@ def test_a_signed_transfer_into_the_account_is_recorded_as_a_sale(royalty):
     ch, oracle, _rule = _store()
     buy = _sell(ch, oracle)
     oracle.check(ch)
-    state = ch.lm.payout_rules.state_of(ALICE)
-    assert state.open_sales == ((bytes.fromhex(_sale_id(buy)), CAROL, 101, HEIGHT + 1),)
-    assert any("Sale recorded" in line for o in ch.last.outcomes for line in o.receipt_logs)
+    state = ch.lm.payout_rules.state_of(ALICE, parse_payout_rule_set(_rule).rule_id)
+    assert state.open_sales == ((bytes.fromhex(_sale_id(buy)), CAROL, 101, HEIGHT + 1, "user_tx"),)
+    # The engine records the sale silently (no receipt log line): the open
+    # sale in the book is the proof it was recorded.
 
 
 def test_a_5_percent_royalty_on_101_pays_5_once(royalty):
@@ -110,7 +111,7 @@ def test_a_5_percent_royalty_on_101_pays_5_once(royalty):
     event = _events(ch)[0]
     assert event["outcome"] == "executed" and event["total"] == 5
     assert event["sale_id"] == sale
-    state = ch.lm.payout_rules.state_of(ALICE)
+    state = ch.lm.payout_rules.state_of(ALICE, parse_payout_rule_set(rule).rule_id)
     assert state.open_sales == () and state.paid_total == 5
 
     # the same sale again: refused, not included, nothing moves
@@ -119,7 +120,7 @@ def test_a_5_percent_royalty_on_101_pays_5_once(royalty):
     assert _reason(result, again) == "payout_not_executed"
     assert any("not an open sale" in line for o in result.outcomes for line in o.receipt_logs)
     oracle.check(ch)
-    assert ch.lm.payout_rules.state_of(ALICE).paid_total == 5
+    assert ch.lm.payout_rules.state_of(ALICE, parse_payout_rule_set(rule).rule_id).paid_total == 5
 
 
 def test_the_rule_reads_the_sale_amount_and_payer(royalty):
@@ -140,7 +141,7 @@ def test_each_sale_is_paid_on_its_own(royalty):
     _executed(oracle, executor=BOB, legs=[(BOB, 15)], ts=TS + 3)
     _executed(oracle, executor=BOB, legs=[(BOB, 5)], ts=TS + 3)
     oracle.check(ch)
-    assert ch.lm.payout_rules.state_of(ALICE).open_sales == ()
+    assert ch.lm.payout_rules.state_of(ALICE, parse_payout_rule_set(rule).rule_id).open_sales == ()
 
 
 def test_two_legs_of_one_transaction_are_one_sale(royalty):
@@ -152,7 +153,7 @@ def test_two_legs_of_one_transaction_are_one_sale(royalty):
     ch.block([buy], height=HEIGHT + 1, ts=TS + 1)
     oracle.spend(CAROL, ALICE, 101, ts=TS + 1)
     oracle.check(ch)
-    (sale,) = ch.lm.payout_rules.state_of(ALICE).open_sales
+    (sale,) = ch.lm.payout_rules.state_of(ALICE, parse_payout_rule_set(rule).rule_id).open_sales
     assert sale[0].hex() == _sale_id(buy) and sale[2] == 101
 
 
@@ -173,7 +174,8 @@ def test_a_refused_execution_leaves_the_sale_open(royalty):
     tx = _pay(rule, sale)                    # 5 is over the cap per execution of 4
     result = ch.block([tx], height=HEIGHT + 2, ts=TS + 2)
     assert _reason(result, tx) == "payout_not_executed"
-    assert ch.lm.payout_rules.state_of(ALICE).sale(bytes.fromhex(sale)) is not None
+    assert ch.lm.payout_rules.state_of(
+        ALICE, parse_payout_rule_set(rule).rule_id).sale(bytes.fromhex(sale)) is not None
     oracle.check(ch)
 
 
@@ -183,7 +185,8 @@ def test_a_rule_without_per_sale_refuses_a_sale_id(evs):
     ch.block([rule])
     oracle.create(rule, fee=0)
     buy = _sell(ch, oracle)
-    assert ch.lm.payout_rules.state_of(ALICE).open_sales == ()     # no sale recorded
+    assert ch.lm.payout_rules.state_of(
+        ALICE, parse_payout_rule_set(rule).rule_id).open_sales == ()  # no sale recorded
     tx = _pay(rule, _sale_id(buy), data={"0": 5})
     result = ch.block([tx], height=HEIGHT + 2, ts=TS + 2)
     assert _reason(result, tx) == "payout_not_executed"
@@ -198,7 +201,8 @@ def test_a_transfer_before_the_rule_or_from_the_account_itself_is_no_sale(royalt
     rule = set_tx(rule=ROYALTY, per_sale=True, cap_exec=100, cap_period=1_000)
     ch.block([rule], height=HEIGHT + 1, ts=TS + 1)
     oracle.create(rule, fee=0)
-    assert ch.lm.payout_rules.state_of(ALICE).open_sales == ()
+    assert ch.lm.payout_rules.state_of(
+        ALICE, parse_payout_rule_set(rule).rule_id).open_sales == ()
 
 
 def test_sales_move_the_state_hash_and_the_same_blocks_agree(royalty):
@@ -218,8 +222,9 @@ def test_a_block_does_not_touch_its_parents_sales(royalty):
     ch, oracle, rule = _store()
     parent = ch.lm.payout_rules
     _sell(ch, oracle)
-    assert parent.state_of(ALICE).open_sales == ()
-    assert ch.lm.payout_rules.state_of(ALICE).open_sales != ()
+    rid = parse_payout_rule_set(rule).rule_id
+    assert parent.state_of(ALICE, rid).open_sales == ()
+    assert ch.lm.payout_rules.state_of(ALICE, rid).open_sales != ()
 
 
 # --- the book ------------------------------------------------------------------------
@@ -273,11 +278,12 @@ def test_malformed_sale_ids_are_refused():
 
 def test_open_sales_are_bounded_and_the_rest_are_counted_missed():
     book = PayoutBook()
-    book.install(_terms(), 10)
+    terms = _terms()
+    book.install(terms, 10)
     for n in range(MAX_OPEN_SALES):
         assert book.note_sale(integ.A, n.to_bytes(32, "big"), integ.C, 10, 11) == "recorded"
     assert book.note_sale(integ.A, b"\xff" * 32, integ.C, 10, 12) == "missed"
-    state = book.state_of(integ.A)
+    state = book.state_of(integ.A, terms.rule_id)
     assert len(state.open_sales) == MAX_OPEN_SALES and state.sales_missed == 1
     # the same id twice, the account paying itself and an account without a
     # per-sale rule record nothing
@@ -297,8 +303,8 @@ def test_a_paid_sale_closes_and_the_root_follows_the_sales():
     exe = parse_payout_execute(integ.execute(terms.rule_id.hex(), sale_id="07" * 32))
     _, state = book.check_execution(exe, 12, 0)
     assert state.sale(b"\x07" * 32)[2] == 101
-    book.record(integ.A, 5, 12, 0, b"\x07" * 32)
-    assert book.state_of(integ.A).open_sales == ()
+    book.record(integ.A, terms.rule_id, 5, 12, 0, b"\x07" * 32)
+    assert book.state_of(integ.A, terms.rule_id).open_sales == ()
     with pytest.raises(PayoutRefused, match="not an open sale"):
         book.check_execution(exe, 13, 0)
     assert book.root() not in (empty, recorded)
@@ -316,19 +322,26 @@ def test_restore_refuses_impossible_sales():
                   (-1, ()),                                          # negative misses
                   (0, ((b"\x07" * 31, integ.C, 5, 11),))):           # short id
         with pytest.raises(ValueError, match="sales"):
-            PayoutBook.restore([row[:16] + (sales,)], *book.resolved_state())
+            PayoutBook.restore([row[:17] + (sales,) + row[18:]], *book.resolved_state())
 
 
 @pytest.mark.usefixtures("isolated_chain_state")
 def test_open_sales_survive_a_restart(temp_database):
     lm = integ._seed()
     book = lm.payout_rules
-    book.install(_terms(account=integ.C), 50)
+    terms = _terms(account=integ.C)
+    book.install(terms, 50)
     book.note_sale(integ.C, b"\x09" * 32, integ.A, 333, 51)
     meta = lm.consensus_meta_hash()
     reloaded = integ._reload().payout_rules
-    assert reloaded.store_rows() == book.store_rows()
-    assert reloaded.state_of(integ.C).open_sales == ((b"\x09" * 32, integ.A, 333, 51),)
+    # store_rows() emits insertion order within an account; the db load
+    # re-sorts by (account, rule_id), so compare order-insensitively. The
+    # root (the real commitment) must match exactly.
+    key = lambda row: (row[1], row[0])
+    assert sorted(reloaded.store_rows(), key=key) == sorted(book.store_rows(), key=key)
+    assert reloaded.root() == book.root()
+    assert reloaded.state_of(integ.C, terms.rule_id).open_sales == (
+        (b"\x09" * 32, integ.A, 333, 51, "user_tx"),)
     assert chain_state._lifecycle_manager.consensus_meta_hash() == meta
 
 

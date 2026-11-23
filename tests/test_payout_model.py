@@ -12,22 +12,31 @@ commitments. For every execution it applies the documented rules directly:
   * the account pays the legs; then the executor pays the fee from what it
     holds after them (an executor that is also a recipient may pay from that).
 
-Hypothesis drives installs, replacements, revokes, executions (with random data
+Hypothesis drives installs, revokes, executions (with random data
 and named recipients), transfers and height gaps through the REAL `apply_block`
 (signature checks stubbed), and after every block the node's balances and book
 must equal the model's. Any divergence shrinks to a minimal program.
+
+One account may hold several rules at once: the model keeps every rule of an
+account, keyed by its id, and the strategy always aims at the account's first
+(one rule per account is what the strategy exercises; the multi-rule book
+itself is covered by tests/test_payout_multirule.py).
 """
 import itertools
 from unittest.mock import patch
 
+import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 
 from consensus import sender_policy
-from consensus.payout import parse_payout_rule_set, payout_rule_body
+from consensus.payout import (
+    PayoutShapeError, PayoutTerms, parse_payout_rule_set, parse_payout_spec,
+    payout_rule_body, payout_spec_text,
+)
 from consensus.policy_mock import MockPolicyEvaluator
 
 from consensus.network_binding import BOUND_TX_TYPES, chain_genesis_hash
-from tests.test_standing_apply import ALICE, BOB, CAROL, PROPOSER, Chain, HEIGHT, TS
+from tests.chain_harness import ALICE, BOB, CAROL, PROPOSER, Chain, HEIGHT, TS
 
 PEOPLE = (ALICE, BOB, CAROL)
 RULES = {
@@ -55,24 +64,30 @@ def _scripted(inputs):
 class Model:
     def __init__(self, balances):
         self.bal = dict(balances)
-        self.rules = {}     # account -> dict(terms, anchor, index, spent, n, paid)
+        self.rules = {}     # account -> {rule_id: dict(terms, anchor, index, spent, n, paid)}
 
     def install(self, terms, height):
-        self.rules[terms.account_pubkey] = {"t": terms, "anchor": height, "index": 0,
-                                            "spent": 0, "n": 0, "paid": 0}
+        self.rules.setdefault(terms.account_pubkey, {})[terms.rule_id] = {
+            "t": terms, "anchor": height, "index": 0, "spent": 0, "n": 0, "paid": 0}
 
     def expire(self, height):
         """Rules whose end the block reached; the node removes them after the
         block's transactions, and no execution in that block may use them."""
-        gone = {a: r for a, r in self.rules.items() if r["t"].expires_at <= height}
-        for account in gone:
-            del self.rules[account]
+        gone = {}
+        for account, recs in list(self.rules.items()):
+            dead = {rid: r for rid, r in recs.items() if r["t"].expires_at <= height}
+            for rid in dead:
+                del recs[rid]
+            if dead:
+                gone[account] = dead
+            if not recs:
+                del self.rules[account]
         return gone
 
     def execute(self, executor, account, rule_id, data, named, height):
         """True when the execution lands (and pays its fee)."""
-        r = self.rules.get(account)
-        if r is None or r["t"].rule_id != rule_id or height >= r["t"].expires_at:
+        r = self.rules.get(account, {}).get(rule_id)
+        if r is None or height >= r["t"].expires_at:
             return False
         t = r["t"]
         if any(k >= len(t.slots) or t.slots[k] or who == account for k, who in named.items()):
@@ -130,7 +145,8 @@ def _gap(gap, model, height, focus):
     boundary or the end of a rule: the rule the step first executes, if any."""
     if isinstance(gap, int) or not model.rules:
         return gap if isinstance(gap, int) else 1
-    r = model.rules.get(focus) or model.rules[min(model.rules)]
+    recs = model.rules.get(focus) or model.rules[min(model.rules)]
+    r = next(iter(recs.values()))
     t = r["t"]
     if gap.startswith("edge"):
         index = (height - r["anchor"]) // t.period
@@ -197,7 +213,8 @@ def test_node_equals_the_reference_model(program):
                 focus = s["executions"][0][1] if s["executions"] else None
                 height += _gap(s["gap"], model, height, focus)
                 ended = model.expire(height)
-                stale.update({a: r["t"].rule_id for a, r in ended.items()})
+                stale.update({a: next(iter(recs.values()))["t"].rule_id
+                              for a, recs in ended.items()})
                 txs = []
                 # Installs and revokes are judged before the block in the model:
                 # they land at the head of the block.
@@ -214,17 +231,19 @@ def test_node_equals_the_reference_model(program):
                     if ok:
                         txs.append(tx)
                         seq[who] += 1
-                        old = model.rules.get(who)
-                        if old:
-                            stale[who] = old["t"].rule_id
                         model.bal[who] -= FEE
                         model.bal["proposer"] = model.bal.get("proposer", 0) + FEE
                         model.install(parse_payout_rule_set(tx), height)
                 if s["revoke"] and s["revoke"] in model.rules and not s["install"]:
                     who = s["revoke"]
-                    txs.append(_tx(who, seq[who], height, "payout_rule_revoke", fee_limit="0"))
+                    rid = next(iter(model.rules[who]))   # the account's oldest rule
+                    txs.append(_tx(who, seq[who], height, "payout_rule_revoke",
+                                   fee_limit="0", rule_id=rid.hex()))
                     seq[who] += 1
-                    stale[who] = model.rules.pop(who)["t"].rule_id
+                    stale[who] = rid
+                    del model.rules[who][rid]
+                    if not model.rules[who]:
+                        del model.rules[who]
                 if s["topup"]:
                     frm, to, amount = s["topup"]
                     if frm != to and model.bal.get(frm, 0) >= amount + FEE:
@@ -235,16 +254,18 @@ def test_node_equals_the_reference_model(program):
                         model.bal[to] = model.bal.get(to, 0) + amount
                         model.bal["proposer"] = model.bal.get("proposer", 0) + FEE
                 for executor, account, p0, p1, name, stale_pick in s["executions"]:
-                    r = model.rules.get(account)
+                    recs = model.rules.get(account)
+                    r = next(iter(recs.values())) if recs else None
                     if (stale_pick == 0 or r is None) and account in stale:
-                        rule_id = stale[account]      # replaced, revoked or ended
+                        rule_id = stale[account]      # revoked or ended
                     elif r is not None:
                         rule_id = r["t"].rule_id
                     else:
                         continue
                     # A rule that ended at this height still sits in the node's
                     # book during the block: aim at it as if it were live.
-                    r = r or ended.get(account)
+                    r = r or (next(iter(ended[account].values()))
+                              if account in ended else None)
                     named = _named(name, r, account)
                     if r is not None:
                         d0 = _amount(p0, r, model, account, height)
@@ -284,10 +305,35 @@ def test_node_equals_the_reference_model(program):
                 assert node == want
                 assert ch.bal.get(PROPOSER, 0) == model.bal.get("proposer", 0)
                 book = ch.lm.payout_rules
-                assert set(book.terms) == set(model.rules)
-                for account, r in model.rules.items():
-                    state = book.state_of(account)
-                    assert book.get(account).rule_id == r["t"].rule_id
-                    assert (state.executions, state.paid_total) == (r["n"], r["paid"])
+                assert set(book.terms) == {
+                    (a, rid) for a, recs in model.rules.items() for rid in recs}
+                for account, recs in model.rules.items():
+                    for rid, r in recs.items():
+                        state = book.state_of(account, rid)
+                        assert book.get(account, rid).rule_id == r["t"].rule_id
+                        assert (state.executions, state.paid_total) == (r["n"], r["paid"])
     finally:
         sender_policy.set_evaluator("payout_apply", None)
+
+
+def test_sealed_and_unsealed_terms_have_different_ids():
+    base = {"account_pubkey": ALICE, "sequence_number": 1, "body": "x",
+            "slots": (BOB,), "cap_per_execution": 100, "cap_per_period": 250,
+            "kind": 0, "period": 10, "expires_at": HEIGHT + 500}
+    plain = PayoutTerms(**base)
+    sealed = PayoutTerms(**base, sealed=True)
+    assert plain.rule_id != sealed.rule_id
+    assert plain.sealed is False and sealed.sealed is True
+
+
+def test_sealed_is_part_of_the_payout_spec_text():
+    fields = {"rule_text": "always ( o30[t]:bv[24] = i40[t]:bv[24] ).",
+              "slots": [BOB], "cap_per_execution": 100, "cap_per_period": 250,
+              "period_blocks": 10, "expires_at": HEIGHT + 500, "sealed": True}
+    text = payout_spec_text(fields, 4)
+    terms = parse_payout_spec(text, ALICE)
+    assert terms.sealed is True and terms.sequence_number == 4
+    assert payout_spec_text(fields) != payout_spec_text(
+        {k: v for k, v in fields.items() if k != "sealed"})
+    with pytest.raises(PayoutShapeError, match="sealed must be true or left out"):
+        parse_payout_spec(payout_spec_text({**fields, "sealed": False}, 4), ALICE)

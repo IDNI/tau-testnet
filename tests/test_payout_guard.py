@@ -80,7 +80,7 @@ def test_an_install_parks_then_releases_on_the_co_signature():
     assert chain.entry(req).status == STATUS_EXECUTED
     terms = chain.lm.payout_rules.get(ALICE)
     assert terms is not None and terms.body == BODY and terms.sequence_number == 0
-    assert chain.lm.payout_rules.state_of(ALICE).anchor == HEIGHT + 1
+    assert chain.lm.payout_rules.state_of(ALICE, terms.rule_id).anchor == HEIGHT + 1
     assert [e["outcome"] for e in _payout_events(result)] == ["installed"]
 
 

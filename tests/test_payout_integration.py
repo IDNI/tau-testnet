@@ -82,10 +82,25 @@ def execute(default_id, **over):
     return tx
 
 
-def revoke(signer=A):
+def revoke(signer=A, rule_id="00" * 32):
     return {"tx_type": "payout_rule_revoke", "genesis_hash": chain_genesis_hash(),
             "sender_pubkey": signer, "sequence_number": 2,
-            "expiration_time": FAR, "expire_at_height": NEXT_HEIGHT + 5, "fee_limit": "0"}
+            "expiration_time": FAR, "expire_at_height": NEXT_HEIGHT + 5, "fee_limit": "0",
+            "rule_id": rule_id}
+
+
+def update(default_id, **over):
+    """A payout_rule_update naming `default_id`, with the rule fields of rule_set."""
+    rule_id = over.pop("rule_id", default_id)
+    tx = {
+        "tx_type": "payout_rule_update", "genesis_hash": chain_genesis_hash(),
+        "sender_pubkey": A, "sequence_number": 2,
+        "expiration_time": FAR, "expire_at_height": NEXT_HEIGHT + 5, "fee_limit": "10",
+        "rule_id": rule_id, "rule_text": RULE, "slots": [B], "cap_per_execution": 100,
+        "cap_per_period": 300, "period_blocks": 10, "expires_at": NEXT_HEIGHT + 1000,
+    }
+    tx.update(over)
+    return tx
 
 
 @pytest.fixture
@@ -126,7 +141,8 @@ def test_the_abi_widths():
     assert abi_width("i2") == 24 and abi_width("i13") == 384 and abi_width("i26") == 24
     assert abi_width("i30", 2) == 384 and abi_width("i32", 2) is None
     assert abi_width("o31", 2) == 24 and abi_width("o32", 2) is None
-    assert abi_width("i40") == abi_width("i47") == 24 and abi_width("i48") is None
+    assert abi_width("i40") == abi_width("i47") == 24
+    assert abi_width("i48") == abi_width("i49") == 64   # the kept clocks
     assert abi_width("o5") is None and abi_width("i1") is None and abi_width("i0") is None
 
 
@@ -296,16 +312,20 @@ def test_book_full_and_duplicate(tip_view, book, monkeypatch):
     monkeypatch.setattr(payout, "MAX_PAYOUT_RULES_TOTAL", 1)
     other = rule_set(sender_pubkey=C, slots=[B])
     assert validate_payout_rule_set_payload(other, tip_view).code == "PAYOUT_BOOK_FULL"
-    # Replacing your own rule needs no free room.
-    assert validate_payout_rule_set_payload(rule_set(sequence_number=2), tip_view).is_valid
+    # A second rule for your own account needs free room too: installing
+    # never replaces, so the full book refuses it as well.
+    assert validate_payout_rule_set_payload(
+        rule_set(sequence_number=2), tip_view).code == "PAYOUT_BOOK_FULL"
     assert terms.account_pubkey == A
 
 
 def test_revoke_admission(tip_view, book):
     assert validate_payout_rule_revoke_payload(revoke(), tip_view).code == "NO_PAYOUT_RULE"
-    _installed(book)
-    assert validate_payout_rule_revoke_payload(revoke(), tip_view).is_valid
-    assert not validate_payout_rule_revoke_payload(revoke(signer=B), tip_view).is_valid
+    terms = _installed(book)
+    assert validate_payout_rule_revoke_payload(
+        revoke(rule_id=terms.rule_id.hex()), tip_view).is_valid
+    assert not validate_payout_rule_revoke_payload(
+        revoke(signer=B, rule_id=terms.rule_id.hex()), tip_view).is_valid
 
 
 def test_execute_admission_reports_the_legs(tip_view, book, evaluator):
@@ -321,7 +341,7 @@ def test_execute_admission_reports_the_legs(tip_view, book, evaluator):
 @pytest.mark.parametrize("over, why", [
     ({"data": {"0": 101}}, "cap per execution"),
     ({"data": {"0": 0}}, "pays nothing"),
-    ({"rule_id": "00" * 32}, "not the one named"),
+    ({"rule_id": "00" * 32}, "no payout rule with that id"),
     ({"recipients": {"0": C}}, "fixed recipient"),
 ])
 def test_execute_refusals(tip_view, book, over, why):
@@ -330,11 +350,14 @@ def test_execute_refusals(tip_view, book, over, why):
     assert result.code == "PAYOUT_REFUSED" and why in result.error
 
 
-def test_the_dispatcher_routes_all_three_types(tip_view, book):
+def test_the_dispatcher_routes_all_four_types(tip_view, book):
     terms = _installed(book)
     assert validate_mempool_admission(rule_set(sequence_number=2), tip_view).is_valid
     assert validate_mempool_admission(execute(terms.rule_id.hex()), tip_view).is_valid
-    assert validate_mempool_admission(revoke(), tip_view).is_valid
+    assert validate_mempool_admission(
+        update(terms.rule_id.hex()), tip_view).is_valid
+    assert validate_mempool_admission(
+        revoke(rule_id=terms.rule_id.hex()), tip_view).is_valid
 
 
 CORPUS = [
@@ -397,9 +420,11 @@ def test_apply_refuses_a_slot_or_recipient_that_is_not_a_key():
 
 def test_lanes_and_tau_needs():
     assert classify_lane(rule_set()) == LANE_SLOW
+    assert classify_lane(update("00" * 32)) == LANE_SLOW
     assert classify_lane(execute("00" * 32)) == LANE_FAST
     assert classify_lane(revoke()) == LANE_FAST
-    assert {"payout_rule_set", "payout_execute"} <= TAU_EVALUATING_TX_TYPES
+    assert {"payout_rule_set", "payout_rule_update",
+            "payout_execute"} <= TAU_EVALUATING_TX_TYPES
     assert "payout_rule_revoke" not in TAU_EVALUATING_TX_TYPES
 
 
@@ -408,9 +433,11 @@ def test_engine_and_admission_agree_on_who_pays_a_fee():
     from consensus import engine
 
     assert engine.FEE_BEARING_TX_TYPES == sendtx.FEE_BEARING_TX_TYPES
-    assert {"payout_rule_set", "payout_execute"} <= sendtx.FEE_BEARING_TX_TYPES
+    assert {"payout_rule_set", "payout_rule_update",
+            "payout_execute"} <= sendtx.FEE_BEARING_TX_TYPES
     assert "payout_rule_revoke" not in sendtx.FEE_BEARING_TX_TYPES
-    assert {"payout_rule_set", "payout_rule_revoke", "payout_execute"} <= sendtx.KNOWN_TX_TYPES
+    assert {"payout_rule_set", "payout_rule_update", "payout_rule_revoke",
+            "payout_execute"} <= sendtx.KNOWN_TX_TYPES
 
 
 # --- the book and the meta hash --------------------------------------------------------
@@ -426,22 +453,22 @@ def test_an_unused_book_leaves_the_meta_hash_as_it_was():
 def test_the_book_is_bound_once_used_and_stays_bound():
     lm = ConsensusLifecycleManager()
     empty = lm.consensus_meta_hash()
-    _installed(lm.payout_rules)
+    terms = _installed(lm.payout_rules)
     opened = lm.consensus_meta_hash()
-    lm.payout_rules.record(A, 10, NEXT_HEIGHT, TIP_TS)
+    lm.payout_rules.record(A, terms.rule_id, 10, NEXT_HEIGHT, TIP_TS)
     spent = lm.consensus_meta_hash()
-    lm.payout_rules.revoke(A)
+    lm.payout_rules.revoke(A, terms.rule_id)
     closed = lm.consensus_meta_hash()
     assert len({empty, opened, spent, closed}) == 4
 
 
 def test_a_copy_does_not_leak_into_its_original(book):
-    _installed(book)
+    terms = _installed(book)
     root = book.root()
     clone = copy.deepcopy(book)
-    clone.record(A, 10, NEXT_HEIGHT, TIP_TS)
+    clone.record(A, terms.rule_id, 10, NEXT_HEIGHT, TIP_TS)
     clone.install(parse_payout_rule_set(rule_set(sender_pubkey=C)), NEXT_HEIGHT)
-    clone.revoke(A)
+    clone.revoke(A, terms.rule_id)
     assert book.root() == root and book.get(A) is not None and book.get(C) is None
 
 
@@ -457,11 +484,11 @@ def test_expiry_takes_both_clocks_in_order(book):
 
 def test_a_period_rolls_over_from_the_anchor(book):
     terms = _installed(book, period_blocks=10)
-    state = book.record(A, 30, NEXT_HEIGHT + 8, TIP_TS)
+    state = book.record(A, terms.rule_id, 30, NEXT_HEIGHT + 8, TIP_TS)
     assert state.period_at(terms, NEXT_HEIGHT + 8) == 0
     assert state.spent_at(terms, NEXT_HEIGHT + 8) == 30
     assert state.spent_at(terms, NEXT_HEIGHT + 9) == 0        # anchor + 10
-    state = book.record(A, 5, NEXT_HEIGHT + 9, TIP_TS)
+    state = book.record(A, terms.rule_id, 5, NEXT_HEIGHT + 9, TIP_TS)
     assert (state.period_index, state.spent_in_period, state.paid_total) == (1, 5, 35)
 
 
@@ -486,14 +513,15 @@ def _seed():
     lm.recompute_approval_threshold()
     chain_state._lifecycle_manager = lm
     book = lm.payout_rules
-    _installed(book, slots=[B, ""], rule_text="always ( (o30[t]:bv[24] = i40[t]:bv[24]) "
+    terms_a = _installed(book, slots=[B, ""], rule_text="always ( (o30[t]:bv[24] = i40[t]:bv[24]) "
                "&& (o31[t]:bv[24] = i41[t]:bv[24]) ).")
-    book.record(A, 25, NEXT_HEIGHT + 3, TIP_TS)
+    book.record(A, terms_a.rule_id, 25, NEXT_HEIGHT + 3, TIP_TS)
     book.install(parse_payout_rule_set(rule_set(
         sender_pubkey=C, period_blocks=None, period_seconds=60, expires_at=TIP_TS + 600)),
         TIP_TS)
-    book.install(parse_payout_rule_set(rule_set(sender_pubkey=B, slots=[C])), NEXT_HEIGHT)
-    book.revoke(B)
+    terms_b = parse_payout_rule_set(rule_set(sender_pubkey=B, slots=[C]))
+    book.install(terms_b, NEXT_HEIGHT)
+    book.revoke(B, terms_b.rule_id)
     return lm
 
 
@@ -525,7 +553,7 @@ def test_a_tampered_row_refuses_to_load(temp_database, column, value):
     _seed()
     chain_state.commit_state_to_db("head-hash", 60)
     with db._db_conn as conn:
-        conn.execute(f"UPDATE payout_rules_v1 SET {column} = ? WHERE account_pubkey = ?",
+        conn.execute(f"UPDATE payout_rules_v2 SET {column} = ? WHERE account_pubkey = ?",
                      (value, A))
     chain_state._lifecycle_manager = ConsensusLifecycleManager(active_validators=["d" * 96])
     with pytest.raises(DatabaseError, match="payout"):
@@ -548,7 +576,7 @@ def test_getpayoutrule_shows_the_rule_and_its_history(temp_database, container, 
     lm = ConsensusLifecycleManager(active_validators=[A])
     chain_state._lifecycle_manager = lm
     terms = _installed(lm.payout_rules)
-    lm.payout_rules.record(A, 30, NEXT_HEIGHT, TIP_TS)
+    lm.payout_rules.record(A, terms.rule_id, 30, NEXT_HEIGHT, TIP_TS)
     monkeypatch.setattr(getpayoutrule, "_tip", lambda: ("head", NEXT_HEIGHT + 1,
                                                         lm.payout_rules))
     data = call(getpayoutrule, f"getpayoutrule {A}", container)["data"]
@@ -567,7 +595,7 @@ def test_getpayoutrule_shows_the_rule_and_its_history(temp_database, container, 
                "legs": [{"slot": 0, "recipient_pubkey": B, "amount": 30}]}]
     db.record_payout_events("blk", NEXT_HEIGHT, events)
     monkeypatch.setattr(db, "get_canonical_confirmation", lambda h, n: (h == "blk", 1))
-    lm.payout_rules.revoke(A)
+    lm.payout_rules.revoke(A, terms.rule_id)
     db.record_payout_events("blk2", NEXT_HEIGHT + 1, [
         {"account_pubkey": A, "rule_id": terms.rule_id.hex(), "outcome": "revoked",
          "tx_id": "t3"}])
@@ -621,8 +649,9 @@ def test_history_names_transactions_by_hash_on_every_path():
 
 # --- gossip and the command line ----------------------------------------------------------
 
-def test_gossip_routes_and_snapshots_all_three_types():
-    for t in ("payout_rule_set", "payout_rule_revoke", "payout_execute"):
+def test_gossip_routes_and_snapshots_all_four_types():
+    for t in ("payout_rule_set", "payout_rule_update", "payout_rule_revoke",
+             "payout_execute"):
         assert NetworkService.topic_for_tx_type(t) == "tau/payout/1.0.0"
         assert t in _SNAPSHOT_TX_TYPES
 
@@ -637,6 +666,24 @@ def test_the_cli_builders_make_what_the_node_parses():
         expires_at=NEXT_HEIGHT + 1000)
     terms = parse_payout_rule_set(built)
     assert terms.slots == (B, "")
+    upd = tx_mod.build_payout_rule_update_tx(
+        sender_pubkey=A, sequence_number=2, expiration_time=FAR,
+        expire_at_height=NEXT_HEIGHT + 5, rule_id=terms.rule_id.hex(),
+        rule_text=RULE, slots=[B], cap_per_execution=50, cap_per_period=300,
+        period_blocks=10, expires_at=NEXT_HEIGHT + 1000, sealed=True,
+        max_fee_per_execution=7)
+    from consensus.payout import parse_payout_rule_update
+    account, old_id, new_terms = parse_payout_rule_update(upd)
+    assert (account, old_id) == (A, terms.rule_id)
+    assert new_terms.sealed is True and new_terms.max_fee_per_execution == 7
+    rev = tx_mod.build_payout_rule_revoke_tx(
+        sender_pubkey=A, sequence_number=3, expiration_time=FAR,
+        expire_at_height=NEXT_HEIGHT + 5, rule_id=terms.rule_id.hex())
+    assert rev["rule_id"] == terms.rule_id.hex()
+    with pytest.raises(ValueError, match="rule_id"):
+        tx_mod.build_payout_rule_revoke_tx(
+            sender_pubkey=A, sequence_number=3, expiration_time=FAR,
+            expire_at_height=NEXT_HEIGHT + 5, rule_id="zz")
     exe = tx_mod.build_payout_execute_tx(
         sender_pubkey=C, sequence_number=0, expiration_time=FAR,
         expire_at_height=NEXT_HEIGHT + 5, account_pubkey=A, rule_id=terms.rule_id.hex(),
@@ -672,6 +719,19 @@ def test_the_cli_parses_the_payout_commands():
     assert args.recipient == [f"1={B}"] and args.data == ["0=40"]
     assert parser.parse_args(["payout", "show", A]).address == A
     assert parser.parse_args(["payout", "revoke", "--key", "k"]).request is False
+    args = parser.parse_args(["payout", "update", "--key", "k", "--rule-id", "ab" * 32,
+                              "--body", RULE, "--slot", B, "--cap-per-execution", "5",
+                              "--cap-per-period", "9", "--period-blocks", "10",
+                              "--ends-in", "100", "--sealed", "--due-at", "60",
+                              "--due-every", "256", "--max-fee-per-execution", "7"])
+    assert args.rule_id == "ab" * 32 and args.sealed is True
+    assert args.due_at == 60 and args.due_every == 256
+    assert args.max_fee_per_execution == 7
+    args = parser.parse_args(["payout", "set", "--key", "k", "--body", RULE, "--slot", B,
+                              "--cap-per-execution", "5", "--cap-per-period", "9",
+                              "--period-blocks", "10", "--ends-in", "100",
+                              "--on-arrival", "--per-sale"])
+    assert args.on_arrival is True and args.per_sale is True
 
 
 def test_payout_revoke_without_fee_sends_fee_limit_0_and_asks_for_no_estimate(monkeypatch):
@@ -689,9 +749,11 @@ def test_payout_revoke_without_fee_sends_fee_limit_0_and_asks_for_no_estimate(mo
     monkeypatch.setattr(tx_mod, "estimate_fee", no_estimate)
     monkeypatch.setattr(tx_mod, "submit_tx", lambda payload, **_k: sent.append(payload)
                         or '{"status": "ok", "data": {"tx_hash": "ab"}}')
-    args = cli.build_parser().parse_args(["payout", "revoke", "--privkey", "1"])
+    args = cli.build_parser().parse_args(
+        ["payout", "revoke", "--privkey", "1", "--rule-id", "ab" * 32])
     assert args.func(args) == cli.EXIT_OK
     assert [(t["tx_type"], t["fee_limit"]) for t in sent] == [("payout_rule_revoke", "0")]
+    assert sent[0]["rule_id"] == "ab" * 32
     assert sent[0]["genesis_hash"] == chain_genesis_hash()
 
 

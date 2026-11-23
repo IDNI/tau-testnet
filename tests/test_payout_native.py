@@ -153,7 +153,7 @@ def test_a_5_percent_royalty_on_101_pays_5_once(real):
     outputs = sender_policy.payout_outputs(rule.body, values, pool=POOL_APPLY)
     legs = settle(rule, state, exe, outputs, height=HEIGHT, ts=TS, balance=10_000)
     assert legs == [(0, BOB, 5)]
-    book.record(ACCOUNT, 5, HEIGHT, TS, sale)
+    book.record(ACCOUNT, terms.rule_id, 5, HEIGHT, TS, sale)
     with pytest.raises(PayoutRefused, match="not an open sale"):
         book.check_execution(exe, HEIGHT + 1, TS + 1)
 
@@ -300,7 +300,7 @@ class _Escrow:
         outputs = sender_policy.payout_outputs(rule.body, values, pool=POOL_APPLY)
         legs = settle(rule, state, exe, outputs, height=height, ts=TS, balance=self.balance)
         total = sum(amount for _, _, amount in legs)
-        self.book.record(ACCOUNT, total, height, TS)
+        self.book.record(ACCOUNT, self.terms.rule_id, total, height, TS)
         self.balance -= total
         return {slot: amount for slot, _who, amount in legs}
 
@@ -367,12 +367,17 @@ def test_the_work_escrow_refuses_everything_else(real):
     assert escrow.balance == 0
 
 
-# --- one rule at a time in the pool -------------------------------------------------
+# --- the rules share one pool -----------------------------------------------------
 #
-# On the pinned engine (tau-lang c3ea334) an interpreter that is stepped after another
-# one was built and probed in the same process sometimes refused the step, about 5
-# steps in 100 for the first rule below. The payout pools keep one interpreter at a
-# time (`tau_policy.pool_options`), so these never fail.
+# On the pinned engine then (tau-lang c3ea334) an interpreter that was stepped
+# after another one was built and probed in the same process sometimes refused
+# the step, about 5 steps in 100 for the first rule below, so the payout pools
+# kept one interpreter at a time (`tau_policy.pool_options`, cache_size 1).
+# On tau-lang 0.8.5 the fault is gone: 6,120 interleaved steps with a shared
+# cache (1,716 builds, 61-66 live interpreters) gave zero wrong answers
+# (proof: /data/home/tau-rules-form/proof-cache.py), so the workaround was
+# dropped (gap 5) and the pools share their cache like every other pool.
+# These tests prove the shared pool still answers every rule like its model.
 
 
 def _divide(by):
@@ -386,7 +391,7 @@ def test_a_rule_answers_the_same_after_every_other_rule_that_is_built(real):
         assert real.validate(_divide(by)).ok
         assert real.outputs(fifth, {"i27": "100"})["o30"] == "20", by
         assert real.outputs(fifth, {"i27": "101"})["o30"] == "20", by
-    assert real.stats()["live"] == 1
+    assert real.stats()["live"] > 1  # the cache is shared, not one-rule
 
 
 def test_rules_in_turn_in_one_pool_all_answer_like_their_model(real):
