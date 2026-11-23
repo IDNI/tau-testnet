@@ -55,9 +55,8 @@ from tau_speculation import WorkerLost
 import test_approval_apply as ap
 import test_retractable_apply as parks
 
-# The `+ {0}` keeps this off the literal-threshold path. These tests decide
-# the verdict in the mock, and the literal path would read `{1}` out of the
-# text instead of asking the mock where the cap actually is.
+# Arithmetic, so the mock decides and a refusal carries no number. A literal
+# comparison would be read off the text instead of the mock.
 HOLD = (
     "(i17[t]:bv[64] + {0}:bv[64] > {1}:bv[64]) ? "
     "(o5[t]:bv[24] = { #x000000 }:bv[24]) : "
@@ -214,25 +213,31 @@ def _main_inputs(calls):
 
 # --- the refusal search -----------------------------------------------------
 
+def _literal(limit):
+    return f"(i17[t]:bv[64] > {{{int(limit)}}}:bv[64])"
+
+
 @pytest.mark.parametrize("cap", [0, 1, 2, 599, 600, MAX_RELEASE_WINDOW_SECONDS - 1])
 def test_a_seconds_threshold_reports_that_cap_and_not_one_past_it(cap):
-    _use(_over(1 + cap))
-    assert recipient_refusal(HOLD, {}, 1 + cap, pool="apply") is None
+    body = _literal(1 + cap)
+    _use(_over(1 + cap), body)
+    assert recipient_refusal(body, {}, 1 + cap, pool="apply") is None
     if cap == MAX_RELEASE_WINDOW_SECONDS - 1:
         refused = TIME_CODE_MAX
     else:
         refused = 1 + cap + 1
-    refusal = recipient_refusal(HOLD, {}, refused, pool="apply")
+    refusal = recipient_refusal(body, {}, refused, pool="apply")
     assert refusal.code == MAX_HOLD
     assert refusal.details == {"max_hold_seconds": cap}
 
 
 @pytest.mark.parametrize("cap", [0, 1, 2, 10, MAX_RELEASE_WINDOW_BLOCKS - 1])
 def test_a_blocks_threshold_reports_that_cap_and_still_allows_a_time_park(cap):
-    _use(_over(HEIGHT_CODE_BASE + cap))
-    assert recipient_refusal(HOLD, {}, 1 + 3600, pool="apply") is None
-    assert recipient_refusal(HOLD, {}, HEIGHT_CODE_BASE + cap, pool="apply") is None
-    refusal = recipient_refusal(HOLD, {}, HEIGHT_CODE_BASE + cap + 1, pool="apply")
+    body = _literal(HEIGHT_CODE_BASE + cap)
+    _use(_over(HEIGHT_CODE_BASE + cap), body)
+    assert recipient_refusal(body, {}, 1 + 3600, pool="apply") is None
+    assert recipient_refusal(body, {}, HEIGHT_CODE_BASE + cap, pool="apply") is None
+    refusal = recipient_refusal(body, {}, HEIGHT_CODE_BASE + cap + 1, pool="apply")
     assert refusal.code == MAX_HOLD
     assert refusal.details == {"max_hold_blocks": cap}
     if cap == 0:
@@ -240,13 +245,20 @@ def test_a_blocks_threshold_reports_that_cap_and_still_allows_a_time_park(cap):
         assert "max_hold_seconds" not in refusal.details
 
 
-def test_the_search_stops_at_the_boundary_instead_of_scanning_the_window():
-    ev = _use(_over(601))
-    refusal = recipient_refusal(HOLD, {3: "payer"}, 1 + 3600, pool="apply")
+def test_a_direct_comparison_names_the_cap_and_arithmetic_is_not_searched():
+    body = _literal(601)
+    ev = _use(_over(601), body)
+    refusal = recipient_refusal(body, {3: "payer"}, 1 + 3600, pool="apply")
     assert refusal.details == {"max_hold_seconds": 600}
     assert len(ev.verdict_calls) < 48
     assert ev.verdict_calls[0][1]["i17"] == str(1 + 3600)
     assert ev.verdict_calls[0][1]["i3"] == "payer"
+
+    added = _use(_over(601))
+    refused = recipient_refusal(HOLD, {3: "payer"}, 1 + 3600, pool="apply")
+    assert refused.code == POLICY_BLOCK
+    assert refused.details == {}
+    assert len(added.verdict_calls) == 2
 
 
 def test_the_callers_input_map_is_not_modified():
@@ -259,8 +271,8 @@ def test_the_callers_input_map_is_not_modified():
 def test_a_hole_below_the_apparent_cap_is_not_quoted_as_a_maximum():
     """Allow, then block, then allow again up to 600 seconds, then block.
 
-    A plain binary search reports 600. The point halfway back to the short
-    end is inside the hole, so there is no single cap.
+    The clause does arithmetic, so the refusal carries no number. A search
+    of this mock would have reported 600.
     """
     def decide(inputs):
         code = int(inputs["i17"])
@@ -274,10 +286,10 @@ def test_a_hole_below_the_apparent_cap_is_not_quoted_as_a_maximum():
 
 
 def test_a_hole_above_the_apparent_cap_is_not_quoted_as_a_maximum():
-    """Allow up to 100 seconds, block the rest, except one code on the probe
-    between that threshold and the far end of the window.
+    """Allow up to 100 seconds, then one later code, and block the rest.
 
-    Without that probe the search would report a cap of 99 seconds.
+    The clause does arithmetic, so the refusal carries no number. A search
+    that missed the later allow would have reported 99 seconds.
     """
     hole = (101 + TIME_CODE_MAX) // 2
 
@@ -345,7 +357,7 @@ def test_the_admission_pool_and_the_apply_pool_do_not_share_a_verdict():
     assert recipient_refusal(HOLD, {}, 1, pool="admission").code == POLICY_BLOCK
 
 
-def test_the_probe_timeout_reaches_the_evaluator():
+def test_the_verdict_timeout_reaches_the_evaluator():
     seen = {}
 
     class _Spy:
@@ -651,8 +663,9 @@ def test_a_time_park_is_measured_on_the_block_clock():
 
 
 def test_a_seconds_cap_refuses_a_long_time_park_and_a_height_park_at_apply():
-    _install(_over(601))
-    ch = _arm(parks.Chain(parks._balances(), fee=7))
+    cap = _literal(601)
+    _install(_over(601), cap)
+    ch = _arm(parks.Chain(parks._balances(), fee=7), body=cap)
     late = parks.park_tx(amount=500, at_time=parks.TS + 3600)
     result = ch.block([late])
     assert late["tx_id"] in result.invalid_tx_ids
@@ -662,7 +675,7 @@ def test_a_seconds_cap_refuses_a_long_time_park_and_a_height_park_at_apply():
     assert ch.bal[parks.PROPOSER] == 0
     assert ch.book.open == {}
 
-    ch = _arm(parks.Chain(parks._balances(), fee=7))
+    ch = _arm(parks.Chain(parks._balances(), fee=7), body=cap)
     height = parks.park_tx(amount=500, at_height=parks.HEIGHT + 10)
     result = ch.block([height])
     assert _reason(result, height) == MAX_HOLD
@@ -674,8 +687,9 @@ def test_a_seconds_cap_refuses_a_long_time_park_and_a_height_park_at_apply():
 
 
 def test_a_hold_inside_the_cap_is_escrowed_and_the_flag_stays_on():
-    _install(_over(601))
-    ch = _arm(parks.Chain(parks._balances(), fee=7))
+    cap = _literal(601)
+    _install(_over(601), cap)
+    ch = _arm(parks.Chain(parks._balances(), fee=7), body=cap)
     oracle = parks.Oracle(parks._balances())
     tx = parks.park_tx(amount=500, at_time=parks.TS + 600)
     result = ch.block([tx])

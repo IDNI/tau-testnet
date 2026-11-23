@@ -17,10 +17,11 @@ That refusal reports ``max_hold_blocks=0`` and, when the seconds side is itself
 one cap, ``max_hold_seconds`` as well.
 
 The number comes from the clause. When every ``i17`` mention is a direct
-comparison with a ``bv[64]`` literal, the verdict can change only at those
-literals, so the node evaluates those points and reports a number only for a
-single threshold. Anything else is probed. Either way the work is bounded, and
-a hole is not quoted as a cap. Admission and apply call this same helper, so
+comparison with a ``bv[64]`` literal, or with another ``bv[64]`` input this
+payment fixes, the verdict can change only at those points. The node
+evaluates them and reports a number only for a single threshold. Arithmetic
+is still enforced, and the refusal carries no number: searching the window
+cannot prove there is no hole. Admission and apply call this same helper, so
 the apply receipt carries the number ``checktx`` shows.
 
 The recipient pass sets approval slots the transfer map already carries to 0.
@@ -70,9 +71,9 @@ POLICY_BLOCK = "recipient_policy_block"
 MAX_HOLD = "RECIPIENT_MAX_HOLD"
 INACTIVE = "RECIPIENT_CONTROLS_INACTIVE"
 
-# Points one unit may be evaluated at while naming a cap. A direct comparison
-# past this gets no number: the payment is still refused, and the probe is not
-# asked to guess. A normal cap is a handful of literals, so it fits.
+# Points one unit may be evaluated at while naming a cap. Past this the
+# payment is still refused and no number is reported. A normal cap is a
+# handful of comparisons, so it fits.
 MAX_CAP_POINTS = 24
 
 _LIT_BODY = r"#[xX][0-9a-fA-F]+|#[bB][01]+|\d+"
@@ -85,6 +86,16 @@ _I17_TYPED = (
 _CMP_OP = r"\s*(?:!=|<=|>=|=|<|>)\s*"
 _DIRECT_RE = re.compile(
     r"(?:" + _I17_TYPED + _CMP_OP + _LIT_BV + r")|(?:" + _LIT_BV + _CMP_OP + _I17_TYPED + r")"
+)
+# The other side of a comparison with i17. i17 itself is excluded: its value
+# is what the search varies, so it is not a fixed change point.
+_OTHER_STREAM = (
+    r"i(?!" + str(STREAM) + r"\b)(\d+)"
+    r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*" + str(WIDTH) + r"\s*\]"
+)
+_STREAM_RE = re.compile(
+    r"(?:" + _I17_TYPED + _CMP_OP + _OTHER_STREAM + r")"
+    r"|(?:" + _OTHER_STREAM + _CMP_OP + _I17_TYPED + r")"
 )
 # Arithmetic would move the change points off the written literals. &&, ||, !
 # and -> are comparisons' connectives, not arithmetic.
@@ -272,11 +283,11 @@ def _literal_value(text: str) -> Optional[int]:
 def comparison_literals(body: str) -> Optional[tuple]:
     """The ``bv[64]`` literals ``i17`` is compared with, or None.
 
-    None means the shape is not a direct comparison: arithmetic, or an ``i17``
-    mention that is not a comparison with a literal. The probe names the cap
-    in that case. A tuple means every ``i17`` mention is such a comparison.
-    Other ``bv[64]`` literals, such as a time lock on ``i5``, do not move
-    those change points: every input but ``i17`` is fixed while the cap is read.
+    None means the shape is not a direct comparison: arithmetic, a comparison
+    with another stream, or an ``i17`` mention that is not a comparison with a
+    literal. A tuple means every ``i17`` mention is such a comparison. Other
+    ``bv[64]`` literals, such as a time lock on ``i5``, do not move those
+    change points: every input but ``i17`` is fixed while the cap is read.
     """
     text = strip_clause_comments(body or "")
     mentions = len(_MENTION_RE.findall(text))
@@ -302,8 +313,7 @@ def _threshold_cap(literals, low: int, high: int, hold_of, blocked) -> Optional[
 
     Zero means every code in the unit blocks. None means the window is open,
     the points are not one threshold, or there are too many of them to name
-    a number. The probe is not a fallback here: a hole between the literals
-    is the case the probe can miss.
+    a number. A hole between the points is not a cap.
     """
     points = {low, high}
     for literal in literals:
@@ -354,6 +364,45 @@ def _recipient_view(values: dict, hold_code: int) -> dict:
     return trial
 
 
+def change_points(body: str, values: dict) -> Optional[tuple]:
+    """Where an ``i17`` verdict can change for this payment, or None.
+
+    None means the points are not known: arithmetic, a comparison with ``i17``
+    itself, a stream this payment does not fix to an integer, or an ``i17``
+    mention that is not a direct comparison. There is no search behind None.
+    A tuple is every such point. A comparison with another ``bv[64]`` input
+    uses the value the recipient pass will actually feed, including an
+    approval slot zeroed because it is the sender's co-signer.
+    """
+    text = strip_clause_comments(body or "")
+    mentions = len(_MENTION_RE.findall(text))
+    if mentions == 0:
+        return None
+    scrubbed = re.sub(r"\{[^}]*\}", "{}", text)
+    if _ARITHMETIC_RE.search(scrubbed):
+        return None
+    found = []
+    for match in _DIRECT_RE.finditer(text):
+        raw = next(group for group in match.groups() if group is not None)
+        value = _literal_value(raw)
+        if value is None:
+            return None
+        found.append(value)
+    fed = sender_policy.clause_inputs(_recipient_view(values, CODE_PLAIN))
+    for match in _STREAM_RE.finditer(text):
+        raw = next(group for group in match.groups() if group is not None)
+        seen = fed.get(f"i{int(raw)}")
+        if seen is None:
+            return None
+        value = _literal_value(seen)
+        if value is None:
+            return None
+        found.append(value)
+    if len(found) != mentions:
+        return None
+    return tuple(found)
+
+
 def recipient_refusal(body, values: dict, hold_code: int, *, pool: str,
                       timeout=_SESSION_DEFAULT) -> Optional[RecipientRefusal]:
     """The recipient pass. None when the clause allows the payment.
@@ -361,13 +410,13 @@ def recipient_refusal(body, values: dict, hold_code: int, *, pool: str,
     A block at the plain-payment code is an allow-list (or anything else that
     is not a hold cap): ``recipient_policy_block``, with no invented maximum.
     A block that appears only once the hold is long enough is ``RECIPIENT_MAX_HOLD``.
-    When every ``i17`` mention is a direct comparison with a literal, the cap is
-    the single threshold those literals draw, and a hole among them is not
-    quoted. Any other clause is probed, and a probe that disagrees is not
-    quoted either. A height park that every height code refuses also carries
-    the seconds cap when that side is one threshold, so a 10-minute rule is
-    not reported as instant-only. Past ``MAX_CAP_POINTS`` the refusal stands
-    and carries no number.
+    When every ``i17`` mention is a direct comparison with a literal or with
+    another input this payment fixes, the cap is the single threshold those
+    points draw, and a hole among them is not quoted. Anything else, including
+    arithmetic, is refused with no number. A height park that every height
+    code refuses also carries the seconds cap when that side is one threshold,
+    so a 10-minute rule is not reported as instant-only. Past
+    ``MAX_CAP_POINTS`` the refusal stands and carries no number.
     """
     if not isinstance(body, str) or not body or not clause_reads_hold_stream(body):
         return None
@@ -401,38 +450,19 @@ def recipient_refusal(body, values: dict, hold_code: int, *, pool: str,
             {},
         )
 
-    literals = comparison_literals(body)
+    points = change_points(body, values)
 
     def cap_of(low: int, high: int, hold_of) -> Optional[int]:
         """The single threshold in ``low..high``, or None when there is not one.
 
-        A direct comparison is read off its literals. Anything else is probed.
+        The points come from the clause and from inputs this payment fixes.
         None covers an open window, a hole, a short hold refused while a longer
-        one is allowed, and a literal set larger than ``MAX_CAP_POINTS``. Zero
-        is a real cap: every code in the unit blocks.
+        one is allowed, arithmetic, and a point set larger than
+        ``MAX_CAP_POINTS``. Zero is a real cap: every code in the unit blocks.
         """
-        if literals is not None:
-            return _threshold_cap(literals, low, high, hold_of, blocked)
-        low_blocks = blocked(low)
-        high_blocks = blocked(high)
-        if low_blocks and high_blocks:
-            if not blocked((low + high) // 2):
-                return None
-            return 0
-        if low_blocks or not high_blocks:
+        if points is None:
             return None
-        left, right = low, high
-        while left + 1 < right:
-            mid = (left + right) // 2
-            if blocked(mid):
-                right = mid
-            else:
-                left = mid
-        if left > low and blocked((low + left) // 2):
-            return None
-        if right < high and not blocked((right + high) // 2):
-            return None
-        return int(hold_of(left))
+        return _threshold_cap(points, low, high, hold_of, blocked)
 
     name, low, high, hold_of = unit
     cap = cap_of(low, high, hold_of)

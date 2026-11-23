@@ -26,6 +26,8 @@ NEXT_HEIGHT = 50
 TIP_TS = 1_700_000_000
 FAR = 9_999_999_999
 HOLD = "i17[t]:bv[64]"
+CAP_0 = "(i17[t]:bv[64] > {1}:bv[64])"
+CAP_600 = "(i17[t]:bv[64] > {601}:bv[64])"
 OUTBOUND = "o5[t]:bv[24] = {0}:bv[24]"
 
 
@@ -206,8 +208,8 @@ def test_a_queued_payment_the_recipient_blocks_names_no_maximum(node):
 def test_a_plain_payment_under_a_zero_cap_is_queued_and_a_park_is_not(node):
     sendtx, script, _clock, opened = node
     _arm(True)
-    _register(RECIPIENT, HOLD)
-    _install(HOLD, _over(1))
+    _register(RECIPIENT, CAP_0)
+    _install(CAP_0, _over(1))
     admitted = _queue(sendtx, _pay())
     assert admitted["ok"], admitted
     assert _mempool() == [admitted["tx_hash"]]
@@ -225,8 +227,8 @@ def test_a_plain_payment_under_a_zero_cap_is_queued_and_a_park_is_not(node):
 def test_a_queued_park_past_the_seconds_cap_names_that_cap(node):
     sendtx, script, _clock, opened = node
     _arm(True)
-    _register(RECIPIENT, HOLD)
-    mock = _install(HOLD, _over(601))
+    _register(RECIPIENT, CAP_600)
+    mock = _install(CAP_600, _over(601))
     result = _queue(sendtx, _time_park(opened, 3600))
     assert result["ok"] is False
     assert result["code"] == MAX_HOLD
@@ -242,8 +244,8 @@ def test_a_queued_park_past_the_seconds_cap_names_that_cap(node):
 def test_a_queued_height_park_past_a_seconds_cap_names_zero_blocks(node):
     sendtx, script, _clock, _opened = node
     _arm(True)
-    _register(RECIPIENT, HOLD)
-    mock = _install(HOLD, _over(601))
+    _register(RECIPIENT, CAP_600)
+    mock = _install(CAP_600, _over(601))
     result = _queue(sendtx, _park())
     assert result["ok"] is False
     assert result["code"] == MAX_HOLD
@@ -262,8 +264,8 @@ def test_a_queued_height_park_past_a_seconds_cap_names_zero_blocks(node):
 def test_a_queued_park_inside_the_cap_is_admitted(node):
     sendtx, script, _clock, opened = node
     _arm(True)
-    _register(RECIPIENT, HOLD)
-    mock = _install(HOLD, _over(601))
+    _register(RECIPIENT, CAP_600)
+    mock = _install(CAP_600, _over(601))
     result = _queue(sendtx, _time_park(opened, 600))
     assert result["ok"], result
     assert [call[1]["i17"] for call in mock.verdict_calls] == ["601"]
@@ -274,8 +276,8 @@ def test_a_queued_park_inside_the_cap_is_admitted(node):
 def test_the_admission_clock_is_the_next_block_timestamp(node):
     sendtx, script, clock, opened = node
     _arm(True)
-    _register(RECIPIENT, HOLD)
-    _install(HOLD, _over(601))
+    _register(RECIPIENT, CAP_600)
+    _install(CAP_600, _over(601))
     release = opened + 700
     payload = _park(release_at_time=release, expiration_time=release - 1)
     refused = _queue(sendtx, payload)

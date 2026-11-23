@@ -241,6 +241,8 @@ inbound rule does not block your own sends:
 - **Up to 10 minutes:** block when `i17 > 601`. A 600-second park passes. A longer time park is refused with `max_hold_seconds=600`. A height park is refused with `max_hold_blocks=0` and `max_hold_seconds=600`, because that comparison still accepts a 10-minute time park.
 - **No height park, any time park:** block when `i17 > 7776001`. The refusal is `max_hold_blocks=0` and does not name a seconds cap.
 
+The number is reported only when every `i17` mention is a direct comparison with a literal, or with another `bv[64]` input this payment fixes. A clause that does arithmetic on `i17` is still enforced, and the refusal carries no number.
+
 The approval slots `i18`–`i25` are the sender's co-signers. The recipient pass reads a slot the transfer already carries as `0`; the sender's own clause still sees the keys. A slot the transfer does not carry stays absent.
 
 `getrecipientpolicy <recipient>` reports the flag and whether the clause judges incoming payments. `getrecipientpolicy <recipient> <sender> <amount> [<hold> <seconds|blocks>]` asks the same helper admission and apply use, so a refused hold comes back with the same cap. A hold of `0` is a plain payment. The answer is advisory: apply measures a real park against the block that carries it.

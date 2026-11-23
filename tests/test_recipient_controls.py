@@ -27,6 +27,7 @@ from consensus.recipient_policy import (
     TIME_CODE_MAX,
     audit_hold_stream,
     clause_reads_hold_stream,
+    change_points,
     comparison_literals,
     controls_active,
     park_hold_code,
@@ -106,15 +107,16 @@ def test_an_outbound_clause_is_not_asked_about_an_incoming_payment():
 
 
 def test_cap_zero_admits_a_plain_payment_and_refuses_every_park():
-    _use(_over(CODE_PLAIN))
-    assert recipient_refusal(HOLD, {}, CODE_PLAIN, pool="apply") is None
+    body = _literal(CODE_PLAIN)
+    _use(_over(CODE_PLAIN), body)
+    assert recipient_refusal(body, {}, CODE_PLAIN, pool="apply") is None
     for code in (2, 601):
-        refusal = recipient_refusal(HOLD, {}, code, pool="apply")
+        refusal = recipient_refusal(body, {}, code, pool="apply")
         assert refusal.code == MAX_HOLD
         assert refusal.details == {"max_hold_seconds": 0}
         assert "straight away" in refusal.message
     height = recipient_refusal(
-        HOLD, {}, park_hold_code(KIND_HEIGHT, 20, 10, 0), pool="apply",
+        body, {}, park_hold_code(KIND_HEIGHT, 20, 10, 0), pool="apply",
     )
     assert height.code == MAX_HOLD
     assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 0}
@@ -122,13 +124,14 @@ def test_cap_zero_admits_a_plain_payment_and_refuses_every_park():
 
 
 def test_a_600_second_cap_allows_600_and_refuses_an_hour():
-    _use(_over(CAP_600))
-    assert recipient_refusal(HOLD, {}, 601, pool="apply") is None
-    refusal = recipient_refusal(HOLD, {}, 1 + 3600, pool="apply")
+    body = _literal(CAP_600)
+    _use(_over(CAP_600), body)
+    assert recipient_refusal(body, {}, 601, pool="apply") is None
+    refusal = recipient_refusal(body, {}, 1 + 3600, pool="apply")
     assert refusal.code == MAX_HOLD
     assert refusal.details == {"max_hold_seconds": 600}
     assert "600 seconds" in refusal.message
-    height = recipient_refusal(HOLD, {}, HEIGHT_CODE_BASE + 10, pool="apply")
+    height = recipient_refusal(body, {}, HEIGHT_CODE_BASE + 10, pool="apply")
     assert height.code == MAX_HOLD
     assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 600}
     assert "600 seconds" in height.message
@@ -312,8 +315,7 @@ def test_a_seconds_cap_past_the_release_window_still_refuses_a_height_park():
 
 def test_a_time_lock_literal_stays_on_the_exact_path():
     """i5 is bv[64] too. That literal is not an i17 change point, so the cap
-    is still read off the i17 comparison. Falling through to the probe here
-    is how a hole next to a time lock gets quoted.
+    is still read off the i17 comparison.
     """
     body = "(i17[t]:bv[64] > {601}:bv[64]) && (i5[t]:bv[64] > {100}:bv[64])"
     assert comparison_literals(body) == (601,)
@@ -351,8 +353,7 @@ def test_a_hex_literal_and_an_implication_are_still_one_threshold():
 def test_a_hole_between_the_literals_is_not_quoted():
     """Allow up to 100 seconds, and again from 4999 to 5999 seconds.
 
-    The quarter probes sit elsewhere, so the probe would report 100. The
-    literals are the change points, and the second allow cancels the number.
+    The literals are the change points, and the second allow cancels the number.
     """
     body = (
         "(i17[t]:bv[64] <= {101}:bv[64]) || "
@@ -371,7 +372,7 @@ def test_a_hole_between_the_literals_is_not_quoted():
     assert refusal.details == {}
 
 
-def test_too_many_literals_refuse_without_a_number_or_a_probe():
+def test_too_many_literals_refuse_without_a_number():
     limits = range(100, 100 + MAX_CAP_POINTS)
     body = " && ".join(_literal(limit) for limit in limits)
     ev = _use(_over(601), body)
@@ -381,23 +382,60 @@ def test_too_many_literals_refuse_without_a_number_or_a_probe():
     assert len(ev.verdict_calls) == 2
 
 
-def test_arithmetic_and_a_stream_comparison_fall_back_to_the_probe():
+def test_arithmetic_is_enforced_and_not_numbered():
     added = "(i17[t]:bv[64] + {0}:bv[64] > {601}:bv[64])"
     assert comparison_literals(added) is None
-    _use(_over(601), added)
-    assert recipient_refusal(added, {}, 1 + 3600, pool="apply").details == {
-        "max_hold_seconds": 600,
-    }
+    ev = _use(_over(601), added)
+    refusal = recipient_refusal(added, {}, 1 + 3600, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
+    assert len(ev.verdict_calls) == 2
 
+
+def test_a_comparison_with_another_input_names_that_inputs_value():
     other = "(i17[t]:bv[64] > i26[t]:bv[64])"
     assert comparison_literals(other) is None
 
     def decide(inputs):
-        return 0 if int(inputs["i17"]) > int(inputs["i26"]) else 1
+        raw = inputs.get("i26")
+        if raw is None:
+            return 0 if int(inputs["i17"]) > CODE_PLAIN else 1
+        return 0 if int(inputs["i17"]) > int(raw) else 1
 
-    _use(decide, other)
+    ev = _use(decide, other)
+    assert change_points(other, {26: "601"}) == (601,)
+    assert change_points(other, {"i26": "{ #x0259 }:bv[64]"}) == (601,)
+    assert change_points(other, {26: "601", "i26": "1"}) == (1,)
+    assert change_points("(i26[t]:bv[64] >= i17[t]:bv[64])", {26: "10"}) == (10,)
+    assert change_points("(i17[t]:bv[64] > i17[t]:bv[64])", {17: "5"}) is None
+    cosigner = "{ #x" + PAYER + " }:bv[384]"
+    assert change_points("(i17[t]:bv[64] > i18[t]:bv[64])", {18: cosigner}) == (0,)
+    assert recipient_refusal(other, {26: "601"}, 601, pool="apply") is None
     refusal = recipient_refusal(other, {26: "601"}, 1 + 3600, pool="apply")
     assert refusal.details == {"max_hold_seconds": 600}
+    assert len(ev.verdict_calls) <= 12
+    height = recipient_refusal(other, {26: "601"}, HEIGHT_CODE_BASE + 10, pool="apply")
+    assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 600}
+
+    missing = recipient_refusal(other, {}, 1 + 3600, pool="apply")
+    assert missing.code == POLICY_BLOCK
+    assert missing.details == {}
+
+    holed = (
+        "(i17[t]:bv[64] <= i26[t]:bv[64]) || "
+        "((i17[t]:bv[64] >= {5000}:bv[64]) && (i17[t]:bv[64] <= {6000}:bv[64]))"
+    )
+
+    def band(inputs):
+        code = int(inputs["i17"])
+        if code <= int(inputs["i26"]) or 5000 <= code <= 6000:
+            return 1
+        return 0
+
+    _use(band, holed)
+    refusal = recipient_refusal(holed, {26: "101"}, 200, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
 
 
 def test_getrecipientpolicy_reports_the_same_cap_the_helper_does(monkeypatch):
