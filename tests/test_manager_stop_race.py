@@ -91,3 +91,25 @@ def test_a_shutdown_during_the_engine_build_leaves_no_engine(monkeypatch):
         tau_manager.request_shutdown()
         tau_manager.server_should_stop.clear()
         tau_manager.set_state_restore_callback(None)
+
+
+def test_a_shutdown_during_a_rebuild_leaves_no_engine():
+    tau_manager.server_should_stop.clear()
+    restored = []
+    tau_manager.set_state_restore_callback(lambda: restored.append(True))
+
+    class _Interface:
+        def __init__(self, *a, **k):
+            tau_manager.request_shutdown()
+
+    try:
+        with patch("tau_native.TauInterface", _Interface):
+            tau_manager.kill_tau_process()
+        assert not tau_manager.tau_ready.is_set(), "a stopped rebuild published readiness"
+        assert not tau_manager.tau_process_ready.is_set()
+        assert tau_manager.tau_direct_interface is None, "a stopped rebuild kept its engine"
+        assert not restored, "a stopped rebuild restored the state"
+    finally:
+        tau_manager.request_shutdown()
+        tau_manager.server_should_stop.clear()
+        tau_manager.set_state_restore_callback(None)
