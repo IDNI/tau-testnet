@@ -136,6 +136,17 @@ RULE_CHANGE_KIND_REVOKE_POLICY = 2
 RULE_CHANGE_KIND_ACCEPT_OFFER = 3
 RULE_CHANGE_KIND_SET_GUARD = 4
 RULE_CHANGE_KIND_REVOKE_GUARD = 5
+# Kind 6 (Bounty 01, FIX 5): UPDATE_POLICY — a guarded update of an
+# account's existing o5 policy. Unlike revoke+set, an update never leaves
+# the account without a policy, so the lineage is one unbroken chain:
+# SET, then UPDATE, then UPDATE... — the executed-request chain IS the
+# policy's history, and a per-policy version (recorded on the rule-offers
+# book) counts its writes. The precondition is "a policy must exist";
+# a neutral body is a revoke (kind 2), not an update, exactly as for
+# kind 1. Parsed, admitted and applied mirroring SET_POLICY at every
+# site; see consensus/approvals.py, consensus/admission.py and
+# consensus/engine.py.
+RULE_CHANGE_KIND_UPDATE_POLICY = 6
 
 # Blocks after which a parked rule-change request may release without approvals.
 RULE_CHANGE_DELAY_BLOCKS = 1000
@@ -310,6 +321,27 @@ STANDING_PAID_STREAM_INDEX = 17
 # by construction, not by the reservation screen.
 TAU_INPUT_STREAM_PAYOUT_PERIOD_PAID = "i26"
 PAYOUT_PERIOD_PAID_STREAM_INDEX = 26
+
+# --- Grant total spent (issue #34, Bounty 01, FIX 5) -------------------------
+# i27: the total a Tau-form grant has already spent, fed ONLY into that
+# grant's own input map (consensus/grants.grant_clause_inputs) at draw —
+# admission and apply build that map through the same function, so the
+# value cannot differ between them. A grant clause computes its
+# cumulative released amount from it (spent so far plus the next
+# period's release); the book re-checks the answer against the
+# declared schedule, exactly as a payout clause's legs are re-checked
+# against its declared set and caps.
+#
+# Deliberately NOT in RESERVED_STREAMS, for the same reason i26 is not:
+# that set screens the TRANSFER input merge, where i27 is live sender
+# custom-input space — reserving it there would break parked-request
+# custom inputs. The grant evaluation never merges sender operations
+# into its map (the draw branch carries no operations and the map is
+# built solely from book/engine state), so no sender channel can write
+# this stream in a grant evaluation: write protection here is by
+# construction, not by the reservation screen.
+TAU_INPUT_STREAM_GRANT_SPENT = "i27"
+GRANT_SPENT_STREAM_INDEX = 27
 
 # --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
 # Proposer BLS pubkey fed so a consensus rule can test set membership itself

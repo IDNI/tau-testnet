@@ -1279,6 +1279,13 @@ def compute_payout_rule_book_root(records: list, settlements: list) -> bytes:
 # --- Grants (Bounty 01, stages 2-5) --------------------------------------------
 
 DOMAIN_GRANT_V1 = b"tau.grant.v1"
+# The Tau-form (clause) grant's own domain (Bounty 01, FIX 5): a grant
+# whose release schedule is the funder's Tau clause, not the declared
+# program. The clause TEXT and the signed periods_from anchor are hashed
+# with the declared terms, so a tampered clause or anchor is a different,
+# unknown grant — and no Tau-form id can ever collide with a declared-form
+# id over the same terms, mirroring the standing-payment Tau domain.
+DOMAIN_GRANT_TAU_V1 = b"tau.grant.tau.v1"
 DOMAIN_GRANT_SHARED_CAP_V1 = b"tau.grant.shared_cap.v1"
 DOMAIN_GRANT_BOOK_V1 = b"tau.grant.book.v1"
 
@@ -1325,6 +1332,54 @@ def compute_grant_id(
     return blake3(bytes(out)).digest()
 
 
+def compute_grant_tau_id(
+    funder_pubkey: Any,
+    beneficiary_pubkey: Any,
+    total_amount: int,
+    release_per_period: int,
+    schedule_kind: int,
+    signed_day: int,
+    start_ts: int,
+    deadline_ts: int,
+    locked_until_ts: int,
+    window_start_ts: int,
+    window_end_ts: int,
+    inactivity_seconds: int,
+    version: int,
+    form: int,
+    clause_text: str,
+    periods_from_ts: int,
+) -> bytes:
+    """BLAKE3 of a Tau-form (clause) grant. Returns 32 bytes.
+
+    The Tau-form counterpart of compute_grant_id, under its own domain:
+    every signed term of the declared form is hashed the same way, and
+    the funder's clause TEXT plus the signed periods_from anchor are
+    hashed with them — the clause is a signed field of the grant, so a
+    tampered clause is a different, unknown grant, and no Tau-form id
+    can ever collide with a declared-form id over the same terms.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_GRANT_TAU_V1.decode()))
+    out.extend(encode_pubkey48(funder_pubkey))
+    out.extend(encode_pubkey48(beneficiary_pubkey))
+    out.extend(encode_uint64(int(total_amount)))
+    out.extend(encode_uint64(int(release_per_period)))
+    out.extend(encode_uint64(int(schedule_kind)))
+    out.extend(encode_uint64(int(signed_day)))
+    out.extend(encode_uint64(int(start_ts)))
+    out.extend(encode_uint64(int(deadline_ts)))
+    out.extend(encode_uint64(int(locked_until_ts)))
+    out.extend(encode_uint64(int(window_start_ts)))
+    out.extend(encode_uint64(int(window_end_ts)))
+    out.extend(encode_uint64(int(inactivity_seconds)))
+    out.extend(encode_uint64(int(version)))
+    out.extend(encode_uint64(int(form)))
+    out.extend(encode_string(str(clause_text or "")))
+    out.extend(encode_uint64(int(periods_from_ts)))
+    return blake3(bytes(out)).digest()
+
+
 def encode_grant_record(
     grant_id: Any,
     funder_pubkey: Any,
@@ -1345,6 +1400,9 @@ def encode_grant_record(
     refunded: int,
     refunded_amount: int,
     refunded_ts: int,
+    form: int = 1,
+    clause_text: str = "",
+    periods_from_ts: int = 0,
 ) -> bytes:
     """One grant for the book root: signed fields + live progress.
 
@@ -1372,6 +1430,13 @@ def encode_grant_record(
     out.extend(encode_uint64(int(refunded)))
     out.extend(encode_uint64(int(refunded_amount)))
     out.extend(encode_uint64(int(refunded_ts)))
+    if int(form) != 1:
+        # The Tau form's signed fields, appended only for Tau-form
+        # records: a declared-form record stays byte-identical to the
+        # encoding before the clause form existed.
+        out.extend(encode_uint64(int(form)))
+        out.extend(encode_string(str(clause_text or "")))
+        out.extend(encode_uint64(int(periods_from_ts)))
     return bytes(out)
 
 
