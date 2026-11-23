@@ -30,16 +30,19 @@ RECYCLE_STEPS = 20_000
 RECYCLE_RSS_BYTES = 1 << 30
 POOL_NAMES = ("apply", "admission", "payout_apply", "payout_admission")
 
-# The payout pools keep one interpreter at a time and never pin one. On the
-# pinned engine (tau-lang c3ea334) an interpreter that is stepped after another
-# one was built and probed in the same process sometimes refuses the step, and
-# in a few runs answered 0: about 5 steps in 100 for `o30 = i27 / 5` after a
-# second rule was validated, and never on tau-lang 0.8.5. Two nodes could then
-# disagree about a payout. With one interpreter at a time a rule is stepped on
-# an interpreter built after every other build, and every run answered right.
-# The price is one build each time the rule changes. Once the pin moves to an
-# engine without the fault this can go back to the default.
-SINGLE_INTERPRETER_POOLS = ("payout_apply", "payout_admission")
+# The payout pools USED to keep one interpreter at a time (cache_size 1).
+# On the pinned engine then (tau-lang c3ea334) an interpreter that was stepped
+# after another one was built and probed in the same process sometimes refused
+# the step, and in a few runs answered 0: about 5 steps in 100 for `o30 = i27 / 5`
+# after a second rule was validated, and never on tau-lang 0.8.5. Two nodes could
+# then disagree about a payout. The workaround cost one build each time the rule
+# changed. Re-proven 23 Nov 2026 on the pinned engine (tau-lang v0.8.5,
+# 6ea436e): 6,120 interleaved steps with a SHARED cache (cache_size 256, 1,716
+# builds, 61-66 live interpreters) answered every step right — the fault is
+# gone on 0.8.5, so the pools use the default cache again. Proof:
+# /data/home/tau-rules-form/proof-cache.py + proof-cache.log. If the pin ever
+# moves to an engine that shows the fault again, reinstate the single-
+# interpreter pools and re-run that proof first.
 NEVER_PIN_SECONDS = float("inf")
 
 # Without an injected probe, worker memory is read this often (in requests).
@@ -335,8 +338,6 @@ _pools_lock = threading.Lock()
 
 def pool_options(pool: str) -> dict:
     """The evaluator options the node uses for `pool`."""
-    if pool in SINGLE_INTERPRETER_POOLS:
-        return {"cache_size": 1, "pin_build_seconds": NEVER_PIN_SECONDS}
     return {}
 
 
