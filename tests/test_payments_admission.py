@@ -175,17 +175,18 @@ def test_payout_execute_replay_is_refused_at_admission(tip, books):
         owner=ALICE, candidates=((BOB, 500), (CAROL, 500)),
         max_per_execution=1000, max_per_period=1000,
         period_kind="week", anchor_ts=TS, sequence_number=0,
+        clause="o30 = 1:bv[64]",
     )
     rule_id = books.payouts.install(terms)
     ledger = DictLedger({ALICE: 10_000})
-    books.payouts.execute(rule_id, "sale-1", {}, lambda inputs: [(0, 200)],
+    books.payouts.execute(rule_id, "sale-1", 200, lambda ctx: [(0, 200)],
                           ts=TS, ledger=ledger)
 
     tx = _base("payout_rule_execute", ALICE, seq=1)
     tx.update({
         "payout_rule_id": rule_id.hex(),
         "event_id": "sale-1",
-        "legs": [[0, 200]],
+        "gross": 200,
     })
     result = validate_mempool_admission(tx, tip)
     assert result.is_valid is False
@@ -193,6 +194,30 @@ def test_payout_execute_replay_is_refused_at_admission(tip, books):
 
     tx["event_id"] = "sale-2"
     assert validate_mempool_admission(tx, tip).is_valid is True
+
+
+def test_payout_execute_by_a_third_party_is_admitted(tip, books):
+    # Execution is open: the legs come from the rule's clause at apply,
+    # never from the transaction, so a non-owner executor is admitted
+    # exactly like the owner.
+    terms = PayoutTerms(
+        owner=ALICE, candidates=((BOB, 500), (CAROL, 500)),
+        max_per_execution=1000, max_per_period=1000,
+        period_kind="week", anchor_ts=TS, sequence_number=0,
+        clause="o30 = 1:bv[64]",
+    )
+    rule_id = books.payouts.install(terms)
+
+    tx = _base("payout_rule_execute", BOB, seq=0)
+    tx.update({
+        "payout_rule_id": rule_id.hex(),
+        "event_id": "sale-9",
+        "gross": 200,
+    })
+    result = validate_mempool_admission(tx, tip)
+    assert result.is_valid is True
+    assert result.data["executor"] == BOB
+    assert result.data["gross"] == 200
 
 
 # --- routes ---------------------------------------------------------------------

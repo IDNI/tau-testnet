@@ -70,9 +70,9 @@ def _populated():
     rule_id = books.payouts.install(PayoutTerms(
         owner=A, candidates=((B, 500), (C, 500)), max_per_execution=1000,
         max_per_period=1000, period_kind="week", anchor_ts=TS0,
-        sequence_number=0,
+        sequence_number=0, clause="o30 = 1:bv[64]",
     ))
-    books.payouts.execute(rule_id, "sale-1", {}, lambda inputs: [(0, 200)],
+    books.payouts.execute(rule_id, "sale-1", 200, lambda ctx: [(0, 200)],
                           ts=TS0, ledger=ledger)
     books.grants.set_shared_cap(A, 5000)
     grant_id = books.grants.create(GrantTerms(

@@ -438,6 +438,7 @@ def test_payments_books_root_gating_and_restore():
             candidates=((pk(6), 1000),),
             max_per_execution=500,
             max_per_period=1000,
+            clause="o30 = 1:bv[64]",
         )
     )
     grant_ledger = DictLedger({pk(7): 10000})

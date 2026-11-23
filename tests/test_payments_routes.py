@@ -112,11 +112,12 @@ def test_route_applies_identically_online_or_offline():
                 max_per_period=500,
                 period_kind="week",
                 anchor_ts=0,
+                clause="o30 = 1:bv[64]",
             ))
             scratch = DictLedger({pk(2): 500})
             payouts.execute(
-                rule_id, "unrelated-event", {},
-                lambda _inputs: [(0, 50)],
+                rule_id, "unrelated-event", 50,
+                lambda _ctx: [(0, 50)],
                 ts=100, ledger=scratch,
             )
             assert scratch.balance(pk(8)) == 50

@@ -10,7 +10,17 @@ PolicyGate/FeeOracle seams are adapted to here. The native Tau bindings
 are not built in this sandbox; the engine harness itself needs no native
 code beyond those two patched entry points, same as the retractable
 suite.
+
+Payout executions step the rule's clause through a second double,
+``ScriptedPayoutEvaluator``, installed on the codebase's own evaluator
+override seam (``sender_policy.set_evaluator("payout", ...)`` -- the seam
+the retractable suites use for their pools). It stands in for
+``tau_policy.PolicyEvaluator.outputs``: it receives the exact input map
+the engine's ``_PayoutRuleEvaluator`` builds (clause_inputs form) and
+answers with Tau-literal output text on the convention's streams, which
+the production adapter then decodes and the production book enforces.
 """
+import contextlib
 import hashlib
 import itertools
 from unittest.mock import patch
@@ -18,7 +28,9 @@ from unittest.mock import patch
 from py_ecc.bls import G2Basic
 
 from block import Block
+from consensus import sender_policy
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
+from consensus.fees import _parse_tau_int
 from consensus.governance import ConsensusLifecycleManager
 from consensus.payments import (
     FEE_SINK_PUBKEY,
@@ -89,12 +101,69 @@ def standing_terms():
     )
 
 
+# The payout rule's signed clause body in these tests. The scripted
+# evaluator below never parses Tau; the body is the script key, exactly
+# as the production adapter looks the evaluator up by the installed
+# rule's body text.
+PAYOUT_CLAUSE_BODY = "payout test rule: legs on o31.. by the convention"
+
+
 def payout_terms():
     return PayoutTerms(
         owner=ALICE, candidates=((BOB, 500), (CAROL, 500)),
         max_per_execution=1000, max_per_period=1000,
         period_kind="week", anchor_ts=TS, sequence_number=0,
+        clause=PAYOUT_CLAUSE_BODY,
     )
+
+
+def _tau_bv(value):
+    """One output value in the literal text form a Tau step returns."""
+    return f"{{ #x{value:x} }}:bv[64]"
+
+
+def leg_outputs(legs):
+    """The convention's output map for (candidate_index, amount) legs:
+    the count on o30, then the pairs on o31/o32, o33/o34, ..."""
+    outputs = {"o30": _tau_bv(len(legs))}
+    for k, (index, amount) in enumerate(legs):
+        outputs[f"o{31 + 2 * k}"] = _tau_bv(index)
+        outputs[f"o{32 + 2 * k}"] = _tau_bv(amount)
+    return outputs
+
+
+class ScriptedPayoutEvaluator:
+    """TEST DOUBLE for tau_policy.PolicyEvaluator.outputs, installed on
+    the "payout" pool through sender_policy.set_evaluator -- the same
+    override seam the retractable suites use. Scripts are callables from
+    the clause input map ({"i1": gross text, "i13": fingerprint text,
+    ...}) to an output map of Tau-literal text. An unscripted body is a
+    test bug and raises, so a payout can never silently evaluate through
+    an unintended path."""
+
+    def __init__(self):
+        self._scripts = {}
+        self.calls = []
+
+    def script(self, body, fn):
+        self._scripts[body] = fn
+        return self
+
+    def outputs(self, body, inputs, *, timeout=None):
+        self.calls.append((body, dict(inputs or {})))
+        fn = self._scripts.get(body)
+        if fn is None:
+            raise AssertionError(f"no payout script for clause body {body!r}")
+        return fn(dict(inputs or {}))
+
+
+@contextlib.contextmanager
+def payout_evaluator(double):
+    sender_policy.set_evaluator("payout", double)
+    try:
+        yield double
+    finally:
+        sender_policy.set_evaluator("payout", None)
 
 
 class Chain:
@@ -248,46 +317,197 @@ def test_standing_create_signed_by_a_non_payer_is_refused():
 
 # --- payout rules ------------------------------------------------------------
 
-def test_payout_install_and_execute_pays_each_event_exactly_once():
-    ch = Chain({ALICE: 10_000, BOB: 0, CAROL: 0, PROPOSER: 0})
-    terms = payout_terms()
-
-    install = _base("payout_rule_install", ALICE, 0)
+def _payout_install_tx(terms, seq=0):
+    install = _base("payout_rule_install", ALICE, seq)
     install.update({
         "owner": ALICE,
         "candidates": [[pub, cap] for pub, cap in terms.candidates],
-        "max_per_execution": 1000, "max_per_period": 1000,
+        "max_per_execution": terms.max_per_execution,
+        "max_per_period": terms.max_per_period,
         "period_kind": "week", "anchor_ts": TS,
+        "clause": terms.clause,
     })
-    result = ch.block([_sign(install, SK_ALICE)], HEIGHT, TS)
+    return _sign(install, SK_ALICE)
+
+
+def _payout_execute_tx(terms, event_id, gross, sender, sk, seq):
+    execute = _base("payout_rule_execute", sender, seq)
+    execute.update({
+        "payout_rule_id": terms.rule_id.hex(),
+        "event_id": event_id,
+        "gross": gross,
+    })
+    return _sign(execute, sk)
+
+
+def test_payout_install_and_execute_pays_each_event_exactly_once():
+    ch = Chain({ALICE: 10_000, BOB: 0, CAROL: 0, PROPOSER: 0})
+    terms = payout_terms()
+    double = ScriptedPayoutEvaluator().script(
+        PAYOUT_CLAUSE_BODY, lambda inputs: leg_outputs([(0, 200), (1, 300)]))
+
+    result = ch.block([_payout_install_tx(terms)], HEIGHT, TS)
     assert result.outcomes[0].status == "applied"
     assert ch.bal[ALICE] == 10_000 - 3
 
-    execute = _base("payout_rule_execute", ALICE, 1)
-    execute.update({
-        "payout_rule_id": terms.rule_id.hex(),
-        "event_id": "sale-1",
-        "legs": [[0, 200], [1, 300]],
-    })
-    result = ch.block([_sign(execute, SK_ALICE)], HEIGHT + 1, TS + 10)
+    # The execute transaction carries no legs: the legs above come from
+    # the rule's outputs when the node steps its clause on gross 500.
+    # Execution is fee-bearing and the executor (here the owner) pays it.
+    with payout_evaluator(double):
+        result = ch.block(
+            [_payout_execute_tx(terms, "sale-1", 500, ALICE, SK_ALICE, 1)],
+            HEIGHT + 1, TS + 10)
     assert result.outcomes[0].status == "applied"
     rule_state = ch.books().payouts.rules[terms.rule_id]
     assert set(rule_state.settled_events) == {"sale-1"}
     assert ch.bal[BOB] == 200 and ch.bal[CAROL] == 300
-    assert ch.bal[ALICE] == 10_000 - 3 - 500
+    assert ch.bal[ALICE] == 10_000 - 3 - 500 - 3
+    assert ch.bal[PROPOSER] == 6
 
     # The same event submitted again is refused at the shared check: the
-    # rule already settled it, so nobody is paid twice.
-    replay = _base("payout_rule_execute", ALICE, 2)
-    replay.update({
-        "payout_rule_id": terms.rule_id.hex(),
-        "event_id": "sale-1",
-        "legs": [[0, 200], [1, 300]],
-    })
-    result = ch.block([_sign(replay, SK_ALICE)], HEIGHT + 2, TS + 20)
+    # rule already settled it, so nobody is paid twice -- and the refused
+    # transaction's fee unwinds with the rejection.
+    with payout_evaluator(double):
+        result = ch.block(
+            [_payout_execute_tx(terms, "sale-1", 500, ALICE, SK_ALICE, 2)],
+            HEIGHT + 2, TS + 20)
     assert result.outcomes[0].status == "invalid"
     assert result.outcomes[0].reason == "payment_not_applied"
     assert ch.bal[BOB] == 200 and ch.bal[CAROL] == 300
+    assert ch.bal[ALICE] == 10_000 - 3 - 500 - 3
+    assert ch.bal[PROPOSER] == 6
+
+
+def test_payout_third_party_executor_settles_once_and_pays_the_fee():
+    ch = Chain({ALICE: 10_000, BOB: 0, CAROL: 1_000, PROPOSER: 0})
+    terms = payout_terms()
+    double = ScriptedPayoutEvaluator().script(
+        PAYOUT_CLAUSE_BODY, lambda inputs: leg_outputs([(0, 200), (1, 300)]))
+
+    result = ch.block([_payout_install_tx(terms)], HEIGHT, TS)
+    assert result.outcomes[0].status == "applied"
+
+    # Carol -- neither the owner nor a bystander to the rule, just any
+    # account -- executes Alice's rule. The payout debits the OWNER; the
+    # execution fee debits the EXECUTOR; Carol is also candidate 1, so
+    # her leg lands on top of her fee payment.
+    with payout_evaluator(double):
+        result = ch.block(
+            [_payout_execute_tx(terms, "sale-1", 500, CAROL, SK_CAROL, 0)],
+            HEIGHT + 1, TS + 10)
+    assert result.outcomes[0].status == "applied"
+    assert ch.bal[BOB] == 200 and ch.bal[CAROL] == 1_000 - 3 + 300
+    assert ch.bal[ALICE] == 10_000 - 3 - 500
+    assert ch.bal[PROPOSER] == 6
+
+    # A replay by yet another account is refused the same way: the event
+    # is settled, whoever asks.
+    with payout_evaluator(double):
+        result = ch.block(
+            [_payout_execute_tx(terms, "sale-1", 500, BOB, SK_BOB, 0)],
+            HEIGHT + 2, TS + 20)
+    assert result.outcomes[0].status == "invalid"
+    assert result.outcomes[0].reason == "payment_not_applied"
+    assert ch.bal[BOB] == 200 and ch.bal[ALICE] == 10_000 - 3 - 500
+
+
+def test_payout_clause_output_outside_candidate_set_refuses_everything():
+    ch = Chain({ALICE: 10_000, BOB: 0, CAROL: 0, PROPOSER: 0})
+    terms = payout_terms()
+    # The rule's (scripted) answer names candidate index 7; the signed
+    # candidate set has exactly two entries, so the whole execution must
+    # refuse -- no partial legs, no settlement record.
+    legs = {"current": [(7, 100)]}
+    double = ScriptedPayoutEvaluator().script(
+        PAYOUT_CLAUSE_BODY, lambda inputs: leg_outputs(legs["current"]))
+
+    result = ch.block([_payout_install_tx(terms)], HEIGHT, TS)
+    assert result.outcomes[0].status == "applied"
+
+    with payout_evaluator(double):
+        result = ch.block(
+            [_payout_execute_tx(terms, "sale-1", 100, ALICE, SK_ALICE, 1)],
+            HEIGHT + 1, TS + 10)
+    assert result.outcomes[0].status == "invalid"
+    assert result.outcomes[0].reason == "payment_not_applied"
+    rule_state = ch.books().payouts.rules[terms.rule_id]
+    assert rule_state.settled_events == {}
+    assert ch.bal[BOB] == 0 and ch.bal[CAROL] == 0
+    assert ch.bal[ALICE] == 10_000 - 3 and ch.bal[PROPOSER] == 3
+
+    # The event was never settled, so once the rule answers inside its
+    # candidate set the same event settles normally. (The refused
+    # transaction consumed no sequence number, so the retry reuses 1.)
+    legs["current"] = [(0, 100)]
+    with payout_evaluator(double):
+        result = ch.block(
+            [_payout_execute_tx(terms, "sale-1", 100, ALICE, SK_ALICE, 1)],
+            HEIGHT + 2, TS + 20)
+    assert result.outcomes[0].status == "applied"
+    assert ch.bal[BOB] == 100
+
+
+def test_payout_clause_output_over_candidate_cap_refuses_everything():
+    ch = Chain({ALICE: 10_000, BOB: 0, CAROL: 0, PROPOSER: 0})
+    terms = payout_terms()
+    # Bob's signed per-candidate cap is 500; the rule answers 600 for him
+    # (and a perfectly valid 100 for Carol). Atomic-or-none: Carol's leg
+    # settles nothing either.
+    double = ScriptedPayoutEvaluator().script(
+        PAYOUT_CLAUSE_BODY, lambda inputs: leg_outputs([(0, 600), (1, 100)]))
+
+    result = ch.block([_payout_install_tx(terms)], HEIGHT, TS)
+    assert result.outcomes[0].status == "applied"
+
+    with payout_evaluator(double):
+        result = ch.block(
+            [_payout_execute_tx(terms, "sale-1", 700, ALICE, SK_ALICE, 1)],
+            HEIGHT + 1, TS + 10)
+    assert result.outcomes[0].status == "invalid"
+    assert result.outcomes[0].reason == "payment_not_applied"
+    rule_state = ch.books().payouts.rules[terms.rule_id]
+    assert rule_state.settled_events == {}
+    assert ch.bal[BOB] == 0 and ch.bal[CAROL] == 0
+    assert ch.bal[ALICE] == 10_000 - 3 and ch.bal[PROPOSER] == 3
+
+
+def test_payout_royalty_via_rule_outputs_at_apply():
+    # gmikeyg case 2 at block level: the rule reads the gross off its i1
+    # input and outputs 5% of it; on 101 that is exactly 5, paid once.
+    # (Carol, the executor, holds 100 so she can pay the execution fee.)
+    ch = Chain({ALICE: 10_000, BOB: 0, CAROL: 100, PROPOSER: 0})
+    terms = PayoutTerms(
+        owner=ALICE, candidates=((BOB, 1000),),
+        max_per_execution=1000, max_per_period=1000,
+        period_kind="week", anchor_ts=TS, sequence_number=0,
+        clause=PAYOUT_CLAUSE_BODY,
+    )
+
+    def royalty(inputs):
+        gross = _parse_tau_int(inputs["i1"])
+        return leg_outputs([(0, gross * 5 // 100)])
+
+    double = ScriptedPayoutEvaluator().script(PAYOUT_CLAUSE_BODY, royalty)
+
+    result = ch.block([_payout_install_tx(terms)], HEIGHT, TS)
+    assert result.outcomes[0].status == "applied"
+
+    with payout_evaluator(double):
+        result = ch.block(
+            [_payout_execute_tx(terms, "sale-1", 101, CAROL, SK_CAROL, 0)],
+            HEIGHT + 1, TS + 10)
+    assert result.outcomes[0].status == "applied"
+    assert ch.bal[BOB] == 5
+    assert ch.bal[ALICE] == 10_000 - 3 - 5
+    assert ch.bal[CAROL] == 100 - 3
+
+    with payout_evaluator(double):
+        result = ch.block(
+            [_payout_execute_tx(terms, "sale-1", 101, CAROL, SK_CAROL, 1)],
+            HEIGHT + 2, TS + 20)
+    assert result.outcomes[0].status == "invalid"
+    assert ch.bal[BOB] == 5
+    assert ch.bal[CAROL] == 100 - 3
 
 
 # --- grants ------------------------------------------------------------------
