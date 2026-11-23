@@ -71,6 +71,10 @@ from consensus.payments import (
     TX_TYPE_ROUTE_INSTALL,
     TX_TYPE_ROUTE_REMOVE,
     TX_TYPE_ROUTE_UPDATE,
+    TX_TYPE_RUNNER_EXECUTE,
+    TX_TYPE_RUNNER_FUND,
+    TX_TYPE_RUNNER_INSTALL,
+    TX_TYPE_RUNNER_REMOVE,
     TX_TYPE_SHARED_CAP_SET,
     TX_TYPE_STANDING_CANCEL,
     TX_TYPE_STANDING_CREATE,
@@ -88,6 +92,13 @@ from consensus.payments import (
     parse_standing_cancel,
     parse_standing_execute,
     parse_standing_terms,
+)
+from consensus.payment_runner import (
+    TRIGGER_EXECUTE,
+    parse_runner_execute,
+    parse_runner_fund,
+    parse_runner_remove,
+    parse_runner_terms,
 )
 from consensus.periods import period_bounds
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
@@ -1655,10 +1666,11 @@ def validate_retract_transfer_payload(
 # validators' shape: parse, signer match, then the books' own can_* check
 # against the tip books -- the SAME check functions block apply runs, so
 # admission refuses what apply refuses. The two executions whose checks
-# need the engine's policy/fee measurement (standing execute, payout
-# execute) screen their Tau-free state conditions here; the measured half
-# runs at apply through the books' shared _check_execution /
-# _plan_execution, which the engine branch calls with its seams.
+# need the engine's Tau measurement (standing execute's policy/fee
+# measurement, payout execute's clause evaluation) screen their Tau-free
+# state conditions here; the measured half runs at apply through the
+# books' shared _check_execution / _plan_execution, which the engine
+# branch calls with its seams.
 
 def _tip_payment_books(tip_view: TipAdmissionView):
     books = tip_view.payment_books()
@@ -1840,7 +1852,7 @@ def _validate_payout_install(tx, tip_view):
 
 def _validate_payout_execute(tx, tip_view):
     try:
-        rule_id, event_id, _legs, _inputs = parse_payout_execute(tx)
+        rule_id, event_id, gross = parse_payout_execute(tx)
     except PaymentShapeError as exc:
         return format_error(f"Malformed payout_rule_execute: {exc}.")
     books, error = _tip_payment_books(tip_view)
@@ -1849,15 +1861,17 @@ def _validate_payout_execute(tx, tip_view):
     state = books.payouts.get(rule_id)
     if state is None:
         return format_error("Unknown payout rule.", code="UNKNOWN_PAYOUT_RULE")
-    sender = tx.get("sender_pubkey")
-    if not isinstance(sender, str) or sender != state.terms.owner:
-        return format_error("only the rule owner may execute a payout")
+    # Execution is open: ANY sender may execute an installed rule -- the
+    # legs come from the rule's clause at apply, never from the
+    # transaction -- so there is no signer/owner match to screen here;
+    # the Tau-free state condition is the settled-event marker.
     if event_id in state.settled_events:
         return format_error(
             "payout_rule_execute rejected: event already settled",
             code="PAYOUT_ALREADY_SETTLED",
         )
-    return success({"payout_rule_id": rule_id.hex(), "event_id": event_id})
+    return success({"payout_rule_id": rule_id.hex(), "event_id": event_id,
+                    "gross": gross, "executor": tx.get("sender_pubkey")})
 
 
 def _validate_grant_create(tx, tip_view):
@@ -1945,6 +1959,97 @@ def _validate_shared_cap_set(tx, tip_view):
     return success({"payer": payer, "limit": limit})
 
 
+def _validate_runner_install(tx, tip_view):
+    try:
+        terms = parse_runner_terms(tx)
+    except PaymentShapeError as exc:
+        return format_error(f"Malformed payment_rule_install: {exc}.")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.owner:
+        return format_error(
+            "payment_rule_install sender_pubkey must match the signer.")
+    for party in terms.parties:
+        err = validate_bls_pubkey(party, "rule party")
+        if err:
+            return format_error(f"payment_rule_install rejected: {err}")
+    books, error = _tip_payment_books(tip_view)
+    if error is not None:
+        return error
+    ok, reason = books.runner.can_install(terms)
+    if not ok:
+        return format_error(f"payment_rule_install rejected: {reason}")
+    return success({"rule_id": terms.rule_id.hex(), "owner": terms.owner})
+
+
+def _validate_runner_remove(tx, tip_view):
+    try:
+        owner = parse_runner_remove(tx)
+    except PaymentShapeError as exc:
+        return format_error(f"Malformed payment_rule_remove: {exc}.")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str):
+        return format_error(
+            "payment_rule_remove sender_pubkey must match the signer.")
+    books, error = _tip_payment_books(tip_view)
+    if error is not None:
+        return error
+    ok, reason = books.runner.can_remove(owner, sender)
+    if not ok:
+        return format_error(f"payment_rule_remove rejected: {reason}")
+    return success({"owner": owner})
+
+
+def _validate_runner_fund(tx, tip_view):
+    try:
+        rule_id, amount = parse_runner_fund(tx)
+    except PaymentShapeError as exc:
+        return format_error(f"Malformed payment_rule_fund: {exc}.")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str):
+        return format_error(
+            "payment_rule_fund sender_pubkey must match the signer.")
+    books, error = _tip_payment_books(tip_view)
+    if error is not None:
+        return error
+    state = books.runner.get(rule_id)
+    if state is None:
+        return format_error("Unknown payment rule.", code="UNKNOWN_PAYMENT_RULE")
+    ledger = DictLedger({state.terms.owner: tip_view.balance_of(state.terms.owner)})
+    ok, reason = books.runner.can_fund(rule_id, sender, amount, ledger=ledger)
+    if not ok:
+        return format_error(f"payment_rule_fund rejected: {reason}")
+    return success({"rule_id": rule_id.hex(), "amount": amount})
+
+
+def _validate_runner_execute(tx, tip_view):
+    try:
+        rule_id, event_id, amount = parse_runner_execute(tx)
+    except PaymentShapeError as exc:
+        return format_error(f"Malformed payment_rule_execute: {exc}.")
+    books, error = _tip_payment_books(tip_view)
+    if error is not None:
+        return error
+    state = books.runner.get(rule_id)
+    if state is None:
+        return format_error("Unknown payment rule.", code="UNKNOWN_PAYMENT_RULE")
+    # Execution is open: ANY sender may execute an installed rule — the
+    # legs come from the rule's clause at apply, never from the
+    # transaction — so the Tau-free state conditions screened here are
+    # the enabled trigger and the settled-event marker; the clause half
+    # runs at apply through the book's shared plan.
+    if TRIGGER_EXECUTE not in state.terms.triggers:
+        return format_error(
+            "payment_rule_execute rejected: the rule does not enable "
+            "the execute trigger")
+    if f"execute:{event_id}" in state.runs:
+        return format_error(
+            "payment_rule_execute rejected: event already settled",
+            code="RUNNER_EVENT_ALREADY_SETTLED",
+        )
+    return success({"rule_id": rule_id.hex(), "event_id": event_id,
+                    "amount": amount, "executor": tx.get("sender_pubkey")})
+
+
 _PAYMENT_VALIDATORS = {
     TX_TYPE_STANDING_CREATE: _validate_standing_create,
     TX_TYPE_STANDING_CANCEL: _validate_standing_cancel,
@@ -1958,6 +2063,10 @@ _PAYMENT_VALIDATORS = {
     TX_TYPE_GRANT_DRAW: _validate_grant_draw,
     TX_TYPE_GRANT_REFUND_CLAIM: _validate_grant_refund_claim,
     TX_TYPE_SHARED_CAP_SET: _validate_shared_cap_set,
+    TX_TYPE_RUNNER_INSTALL: _validate_runner_install,
+    TX_TYPE_RUNNER_REMOVE: _validate_runner_remove,
+    TX_TYPE_RUNNER_FUND: _validate_runner_fund,
+    TX_TYPE_RUNNER_EXECUTE: _validate_runner_execute,
 }
 
 

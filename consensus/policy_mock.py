@@ -23,8 +23,10 @@ class MockPolicyEvaluator:
         self._failing: dict = {}
         self._refused: dict = {}
         self._by_body: dict = {}
+        self._outputs_by_body: dict = {}
         self.validate_calls: list = []
         self.verdict_calls: list = []
+        self.outputs_calls: list = []
         self.closed = False
 
     def fail_build(self, body: str, error: str = "mock build failure") -> None:
@@ -37,6 +39,11 @@ class MockPolicyEvaluator:
     def set_verdict(self, body: str, decide) -> None:
         """`decide` is a constant o5 value (or None) or a callable (inputs) -> o5."""
         self._by_body[body] = decide
+
+    def set_outputs(self, body: str, outputs) -> None:
+        """Script the full output map for `outputs()`: a dict of stream
+        name -> value text, or a callable (inputs) -> dict."""
+        self._outputs_by_body[body] = outputs
 
     def validate(self, body: str, *, timeout=None) -> PolicyBuild:
         self.validate_calls.append(body)
@@ -60,9 +67,29 @@ class MockPolicyEvaluator:
         o5 = None if value is None else str(value)
         return PolicyVerdict(blocked=parse_o5(o5) == 0, o5=o5, built=True)
 
+    def outputs(self, body: str, inputs: dict, *, timeout=None) -> dict:
+        """Full named output map, mirroring PolicyEvaluator.outputs.
+
+        A body scripted with `set_outputs` answers from that script;
+        anything else answers with just the verdict's o5 (when the
+        verdict script produces one), like a clause that writes no
+        stream but o5."""
+        self.outputs_calls.append((body, dict(inputs or {})))
+        error = self._build_error(body)
+        if error:
+            raise PolicyBuildError(error)
+        if body in self._refused:
+            raise PolicyStepError(self._refused[body])
+        scripted = self._outputs_by_body.get(body)
+        if scripted is not None:
+            return dict(scripted(inputs) if callable(scripted) else scripted)
+        verdict = self.verdict(body, inputs, timeout=timeout)
+        return {"o5": verdict.o5} if verdict.o5 is not None else {}
+
     def stats(self) -> dict:
         return {"pool": self.pool, "builds": len(self.validate_calls),
-                "steps": len(self.verdict_calls), "spawns": 0, "recycles": 0,
+                "steps": len(self.verdict_calls) + len(self.outputs_calls),
+                "spawns": 0, "recycles": 0,
                 "retries": 0, "fresh_fallbacks": 0}
 
     def close(self) -> None:

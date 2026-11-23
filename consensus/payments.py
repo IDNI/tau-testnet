@@ -19,8 +19,11 @@ layer meets native Tau evaluation in the engine:
 - `PolicyGate.allows_debit(payer, recipient, amount)`: the payer's current
   o5 policy re-check at execution time. The book calls it exactly once per
   settled occurrence; it never caches a policy verdict.
-- The payout `clause` callable: the installed Tau clause, stepped in its
-  isolated pool, outputting (candidate_index, amount) legs.
+- The payout `clause` callable: the rule's own Tau clause -- signed as part
+  of the rule's terms at install -- stepped in its isolated pool by the
+  engine's payout evaluator, outputting (candidate_index, amount) legs
+  under the output convention defined with the payout book below. The book
+  receives only the callable, never the evaluation machinery.
 
 Everything else — books, period math, caps, catch-up, cancel, routing
 splits, escrow accounting, idempotency — is plain Python in this module.
@@ -106,24 +109,43 @@ TX_TYPE_GRANT_DRAW = "payment_grant_draw"
 TX_TYPE_GRANT_REFUND_CLAIM = "payment_grant_refund_claim"
 TX_TYPE_SHARED_CAP_SET = "payment_shared_cap_set"
 
+# The Amendment 2 runner types (consensus/payment_runner.py): ONE payment
+# rule per account, stepped on three triggers. Install/remove/fund/execute
+# are the only operations the runner adds; the books above keep their own
+# types while both shapes coexist in this build.
+TX_TYPE_RUNNER_INSTALL = "payment_rule_install"
+TX_TYPE_RUNNER_REMOVE = "payment_rule_remove"
+TX_TYPE_RUNNER_FUND = "payment_rule_fund"
+TX_TYPE_RUNNER_EXECUTE = "payment_rule_execute"
+
 PAYMENT_TX_TYPES = frozenset({
     TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_CANCEL, TX_TYPE_STANDING_EXECUTE,
     TX_TYPE_ROUTE_INSTALL, TX_TYPE_ROUTE_UPDATE, TX_TYPE_ROUTE_REMOVE,
     TX_TYPE_PAYOUT_INSTALL, TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW, TX_TYPE_GRANT_REFUND_CLAIM,
     TX_TYPE_SHARED_CAP_SET,
+    TX_TYPE_RUNNER_INSTALL, TX_TYPE_RUNNER_REMOVE, TX_TYPE_RUNNER_FUND,
+    TX_TYPE_RUNNER_EXECUTE,
 })
 
 # State-creating payment transactions pay the generic transaction fee (the
 # engine's transfer-less fee-query step), like a retractable park or a rule
-# offer: they are user-initiated and spam-sensitive. The rest are exempt --
-# cancel/remove mirror retract (the creation already paid), the execute /
-# draw / refund-claim triggers move the payer's own money under fees the
-# BOOK charges against signed bounds, so a second network fee would drift
-# against those bounds.
+# offer: they are user-initiated and spam-sensitive. Payout EXECUTION pays
+# it too: execution is open to any account and steps a Tau clause, so the
+# executor -- the transaction's sender, never the rule owner -- pays the
+# same fee-query step, which is also the spam price of an open trigger.
+# The rest are exempt -- cancel/remove mirror retract (the creation
+# already paid), and the standing execute / draw / refund-claim triggers
+# move the payer's own money under fees the BOOK charges against signed
+# bounds, so a second network fee would drift against those bounds.
 PAYMENT_FEE_BEARING_TX_TYPES = frozenset({
     TX_TYPE_STANDING_CREATE, TX_TYPE_ROUTE_INSTALL, TX_TYPE_ROUTE_UPDATE,
-    TX_TYPE_PAYOUT_INSTALL, TX_TYPE_GRANT_CREATE, TX_TYPE_SHARED_CAP_SET,
+    TX_TYPE_PAYOUT_INSTALL, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_GRANT_CREATE,
+    TX_TYPE_SHARED_CAP_SET,
+    # Runner: install and fund create state, execute is an open trigger
+    # that steps a Tau clause (the executor pays, as for payout execute).
+    # Remove is exempt, mirroring cancel/remove above.
+    TX_TYPE_RUNNER_INSTALL, TX_TYPE_RUNNER_FUND, TX_TYPE_RUNNER_EXECUTE,
 })
 
 _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
@@ -312,31 +334,24 @@ def parse_payout_terms(tx: Dict[str, Any]) -> "PayoutTerms":
         period_kind=tx.get("period_kind", "week"),
         anchor_ts=tx.get("anchor_ts", 0),
         sequence_number=_field(tx, "sequence_number"),
+        clause=_field(tx, "clause"),
     )
 
 
-def parse_payout_execute(
-    tx: Dict[str, Any],
-) -> Tuple[bytes, str, Tuple[Tuple[int, int], ...], Dict[str, Any]]:
-    """(rule id, event id, signed legs, clause inputs) for one execution.
+def parse_payout_execute(tx: Dict[str, Any]) -> Tuple[bytes, str, int]:
+    """(rule id, event id, gross) for one execution.
 
-    The legs are the payout clause seam in its current transaction form --
-    see the engine's `_signed_legs_clause`: until the native (index,
-    amount) stream encoding is chosen (design question (a)), the legs are
-    the owner's signed data and the book enforces everything around them.
-    """
+    The execute transaction carries NO legs and NO clause inputs: the legs
+    are whatever the rule's clause outputs when the node steps it on this
+    gross / event / executor context (the convention above PayoutTerms),
+    and the book enforces everything around those outputs. Anyone may
+    submit this transaction; the sender is the executor and pays the
+    network fee (see PAYMENT_FEE_BEARING_TX_TYPES)."""
     event_id = _field(tx, "event_id")
     if not isinstance(event_id, str) or not event_id:
         raise PaymentShapeError("event_id must be a non-empty string")
-    legs = []
-    for index, amount in _pairs(tx, "legs"):
-        if not _is_int(index) or not _is_int(amount):
-            raise PaymentShapeError("legs entries must be [index, amount] integers")
-        legs.append((index, amount))
-    inputs = tx.get("inputs", {})
-    if not isinstance(inputs, dict):
-        raise PaymentShapeError("inputs must be an object")
-    return _id_field(tx, "payout_rule_id"), event_id, tuple(legs), inputs
+    gross = _amount(_field(tx, "gross"), "gross")
+    return _id_field(tx, "payout_rule_id"), event_id, gross
 
 
 def parse_grant_terms(tx: Dict[str, Any]) -> "GrantTerms":
@@ -1058,19 +1073,67 @@ class RouteBook:
 
 
 # --- Rule-computed payouts (#63) -----------------------------------------------
+#
+# THE PAYOUT OUTPUT CONVENTION (this design's one new consensus surface,
+# design question (a) -- the encoding chosen here, from this codebase's own
+# stream idioms). The rule's clause is part of its signed terms. At
+# execution the node steps that clause ONCE in its isolated evaluator pool
+# (the same facility that steps o5 policy clauses), feeding one value per
+# input stream and reading the legs from the step's output streams:
+#
+#   inputs   i1  = the execution's gross amount (the slot a transfer's
+#                  amount rides, so a clause reads it the same way)
+#            i3  = the rule owner's pubkey, as a bv[384] literal (the
+#                  debited account, in the slot transfers use for the
+#                  paying account)
+#            i5  = the block timestamp (the consensus clock slot)
+#            i12 = the executor's pubkey, as a bv[384] literal (the
+#                  node-injected transaction-sender slot)
+#            i13 = the settlement fingerprint: the first 8 bytes of
+#                  blake3(event_id) as a decimal integer -- the first user
+#                  custom stream, so a rule may vary its legs per
+#                  settlement without the book interpreting event ids
+#   outputs  o30 = the leg count N (0..MAX_PAYOUT_CANDIDATES)
+#            o(31 + 2k) = leg k's candidate index, o(32 + 2k) = its
+#                  amount, for k in 0..N-1 -- the leg streams o31..o46
+#
+# Streams 30..46 are unassigned in this codebase (the assigned outputs are
+# the core/consensus/user streams o1..o9) and a payout clause is stepped in
+# isolation, never merged into the accumulated spec, so the layout cannot
+# collide with another rule's streams. Leg values are bv[64] quantities,
+# decoded with the fee layer's strict Tau-int decode: an absent count, an
+# absent pair member, an undecodable or negative value, or a count above
+# the bound makes the clause output MALFORMED and refuses the whole
+# execution -- the rule can settle nothing with a broken answer. The
+# engine's evaluator adapter (consensus/engine.py) owns the stepping and
+# the decode; in this layer the clause is an injected callable and the
+# BOOK enforces everything around its outputs — candidate set,
+# per-candidate caps, per-execution and per-period caps, owner balance,
+# atomicity, pays-once.
+PAYOUT_INPUT_GROSS_STREAM = 1
+PAYOUT_INPUT_OWNER_STREAM = 3
+PAYOUT_INPUT_TIMESTAMP_STREAM = 5
+PAYOUT_INPUT_EXECUTOR_STREAM = 12
+PAYOUT_INPUT_SETTLEMENT_STREAM = 13
+PAYOUT_OUTPUT_COUNT_STREAM = 30
+PAYOUT_OUTPUT_LEG_BASE_STREAM = 31
+MAX_PAYOUT_LEGS = MAX_PAYOUT_CANDIDATES
+MAX_PAYOUT_CLAUSE_BYTES = 8192   # the rule-offer bound, reused
 
-# The payout clause seam: the installed Tau clause, stepped in its isolated
-# pool, outputs per leg a (candidate_index, amount) pair. In this layer the
-# clause is an injected callable; the BOOK enforces everything around it —
-# candidate set, caps, balance, atomicity, pays-once.
+# The payout clause seam: the callable the engine's evaluator adapter
+# hands the book. It receives the execution context the book builds --
+# {"gross": int, "event_id": str} -- and returns (candidate_index,
+# amount) legs, or raises PaymentRefused when the clause cannot be
+# evaluated or its output is malformed.
 PayoutClause = Callable[[Dict[str, Any]], List[Tuple[int, int]]]
 
 
 @dataclass(frozen=True)
 class PayoutTerms:
     """An installed payout rule: the owner signs a bounded candidate list
-    (<= 8 accounts, each with its own cap). The rule may pay ONLY listed
-    candidates; it selects WHICH of them, and how much, per execution."""
+    (<= 8 accounts, each with its own cap) AND the Tau clause body that
+    computes the legs. The rule may pay ONLY listed candidates; the clause
+    selects WHICH of them, and how much, per execution."""
 
     owner: str
     candidates: Tuple[Tuple[str, int], ...]   # (pubkey, per-candidate cap)
@@ -1079,6 +1142,11 @@ class PayoutTerms:
     period_kind: str = "week"
     anchor_ts: int = 0
     sequence_number: int = 0
+    # The clause BODY (the text inside `always ( ... ).`), in the same
+    # form the clause registry stores for an o5 clause. It is part of the
+    # signed terms: the rule_id commits to it, and execution steps exactly
+    # this text. Empty until install screens it (see can_install).
+    clause: str = ""
 
     def __post_init__(self) -> None:
         _pubkey(self.owner, "owner")
@@ -1099,6 +1167,12 @@ class PayoutTerms:
             raise PaymentShapeError(f"unknown period kind: {self.period_kind!r}")
         _u64(self.anchor_ts, "anchor_ts")
         _u64(self.sequence_number, "sequence_number")
+        if not isinstance(self.clause, str):
+            raise PaymentShapeError("payout clause must be text")
+        if len(self.clause.encode("utf-8")) > MAX_PAYOUT_CLAUSE_BYTES:
+            raise PaymentShapeError(
+                f"payout clause exceeds {MAX_PAYOUT_CLAUSE_BYTES} bytes"
+            )
 
     @property
     def rule_id(self) -> bytes:
@@ -1112,6 +1186,7 @@ class PayoutTerms:
         out.extend(encode_string(self.period_kind))
         out.extend(encode_uint64(self.anchor_ts))
         out.extend(encode_uint64(self.sequence_number))
+        out.extend(encode_string(self.clause))
         return compute_payment_entry_id("tau.payment.payout_rule.v1", bytes(out))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1122,6 +1197,7 @@ class PayoutTerms:
             "max_per_period": self.max_per_period,
             "period_kind": self.period_kind, "anchor_ts": self.anchor_ts,
             "sequence_number": self.sequence_number,
+            "clause": self.clause,
         }
 
     @classmethod
@@ -1133,6 +1209,7 @@ class PayoutTerms:
             max_per_period=d["max_per_period"],
             period_kind=d["period_kind"], anchor_ts=d["anchor_ts"],
             sequence_number=d["sequence_number"],
+            clause=d.get("clause", ""),
         )
 
 
@@ -1164,6 +1241,8 @@ class PayoutBook:
     def can_install(self, terms: PayoutTerms) -> Tuple[bool, str]:
         """The shared admission/apply check for installing a rule;
         `install` raises exactly these reasons."""
+        if not terms.clause.strip():
+            return False, "payout rule carries no clause body"
         if terms.rule_id in self.rules:
             return False, "payout rule already exists"
         owned = sum(1 for s in self.rules.values() if s.terms.owner == terms.owner)
@@ -1181,22 +1260,24 @@ class PayoutBook:
         return terms.rule_id
 
     def _plan_execution(
-        self, state: PayoutState, event_id: str, inputs: Dict[str, Any],
+        self, state: PayoutState, event_id: str, gross: int,
         clause: PayoutClause, *, ts: int, ledger: DictLedger,
     ) -> Tuple[List[Tuple[str, int]], int, int]:
         """Every execution check, in order; returns (legs, total, period).
 
         This ONE plan backs both admission (`can_execute`) and apply
-        (`execute`), so the two cannot disagree. It runs the clause: the
-        clause is a pure evaluation by contract, so planning an execution
-        settles nothing and records nothing.
+        (`execute`), so the two cannot disagree. It runs the clause on the
+        execution context ({"gross", "event_id"}): the clause is a pure
+        evaluation by contract, so planning an execution settles nothing
+        and records nothing.
         """
         terms = state.terms
         if not isinstance(event_id, str) or not event_id:
             raise PaymentShapeError("event_id must be a non-empty string")
+        _amount(gross, "gross")
         if event_id in state.settled_events:
             raise PaymentRefused("event already settled")
-        raw_legs = clause(dict(inputs))
+        raw_legs = clause({"gross": gross, "event_id": event_id})
         if not isinstance(raw_legs, (list, tuple)):
             raise PaymentRefused("payout clause output is not a leg list")
         per_candidate: Dict[int, int] = {}
@@ -1234,7 +1315,7 @@ class PayoutBook:
         return legs, total, period
 
     def can_execute(
-        self, rule_id: bytes, event_id: str, inputs: Dict[str, Any],
+        self, rule_id: bytes, event_id: str, gross: int,
         clause: PayoutClause, *, ts: int, ledger: DictLedger,
     ) -> Tuple[bool, str]:
         """Admission-side verdict for one payout execution."""
@@ -1242,14 +1323,14 @@ class PayoutBook:
         if state is None:
             return False, "unknown payout rule"
         try:
-            self._plan_execution(state, event_id, inputs, clause,
+            self._plan_execution(state, event_id, gross, clause,
                                  ts=ts, ledger=ledger)
         except (PaymentRefused, PaymentShapeError) as exc:
             return False, str(exc)
         return True, ""
 
     def execute(
-        self, rule_id: bytes, event_id: str, inputs: Dict[str, Any],
+        self, rule_id: bytes, event_id: str, gross: int,
         clause: PayoutClause, *, ts: int, ledger: DictLedger,
     ) -> PayoutReceipt:
         """Run one payout execution. Pays ONCE per event: the event
@@ -1264,7 +1345,7 @@ class PayoutBook:
         if state is None:
             raise PaymentRefused("unknown payout rule")
         legs, total, period = self._plan_execution(
-            state, event_id, inputs, clause, ts=ts, ledger=ledger)
+            state, event_id, gross, clause, ts=ts, ledger=ledger)
         terms = state.terms
         ledger.debit(terms.owner, total)
         for pubkey, amount in legs:
@@ -1800,11 +1881,37 @@ def capability_report() -> Dict[str, Any]:
             "max_candidates": MAX_PAYOUT_CANDIDATES,
             "settlement": "atomic_or_none",
             "idempotency": "pays_once_per_event_id",
+            "execution": "open_to_any_executor",
+            "executor_pays": "network_fee_query_step",
+            "owner_charged_for_execution": False,
+            "leg_source": "payout_clause_outputs_at_execution",
+            "output_convention": {
+                "input_streams": {
+                    "gross": PAYOUT_INPUT_GROSS_STREAM,
+                    "owner": PAYOUT_INPUT_OWNER_STREAM,
+                    "block_timestamp": PAYOUT_INPUT_TIMESTAMP_STREAM,
+                    "executor": PAYOUT_INPUT_EXECUTOR_STREAM,
+                    "settlement_fingerprint": PAYOUT_INPUT_SETTLEMENT_STREAM,
+                },
+                "leg_count_stream": PAYOUT_OUTPUT_COUNT_STREAM,
+                "leg_stream_base": PAYOUT_OUTPUT_LEG_BASE_STREAM,
+                "leg_layout": "(candidate_index, amount) pairs",
+                "max_legs": MAX_PAYOUT_LEGS,
+            },
         },
     }
 
 
 # --- The composed books ----------------------------------------------------------
+
+
+def _runner_book_cls():
+    """The Amendment 2 runner book class, imported lazily: payment_runner
+    imports THIS module for the shared ledger/validation vocabulary, so a
+    top-level import here would cycle. By the time any ProgrammablePayments
+    instance is built, both modules are fully loaded."""
+    from consensus.payment_runner import RunnerBook
+    return RunnerBook
 
 
 class ProgrammablePayments:
@@ -1820,11 +1927,15 @@ class ProgrammablePayments:
         self.routes = RouteBook()
         self.payouts = PayoutBook()
         self.grants = GrantBook()
+        # The Amendment 2 runner (consensus/payment_runner.py), composed
+        # alongside the books while both shapes coexist in this build.
+        self.runner = _runner_book_cls()()
 
     def is_empty(self) -> bool:
         return (
             self.standing.is_empty() and self.routes.is_empty()
             and self.payouts.is_empty() and self.grants.is_empty()
+            and self.runner.is_empty()
         )
 
     def has_due(self, height: int, ts: int) -> bool:
@@ -1832,15 +1943,24 @@ class ProgrammablePayments:
         next block's payment sweep would settle or refund something.
         (Height is accepted for shape parity; payment periods run on the
         block timestamp, so only `ts` decides.)"""
-        return self.standing.has_due(ts) or self.grants.has_due(ts)
+        return (
+            self.standing.has_due(ts) or self.grants.has_due(ts)
+            or self.runner.has_due(ts)
+        )
 
     def root(self) -> bytes:
-        return compute_payments_book_root([
+        sections = [
             self.standing.root_blobs(),
             self.routes.root_blobs(),
             self.payouts.root_blobs(),
             self.grants.root_blobs(),
-        ])
+        ]
+        # The runner section joins the root ONLY once a rule exists, so a
+        # books-only state's root stays byte-identical to the books-only
+        # build (the section count is part of the root preimage).
+        if not self.runner.is_empty():
+            sections.append(self.runner.root_blobs())
+        return compute_payments_book_root(sections)
 
     def snapshot_rows(self) -> Dict[str, Any]:
         return {
@@ -1848,6 +1968,7 @@ class ProgrammablePayments:
             "routes": self.routes.snapshot_rows(),
             "payouts": self.payouts.snapshot_rows(),
             "grants": self.grants.snapshot_rows(),
+            "runner": self.runner.snapshot_rows(),
         }
 
     @classmethod
@@ -1857,4 +1978,9 @@ class ProgrammablePayments:
         books.routes = RouteBook.restore(rows["routes"])
         books.payouts = PayoutBook.restore(rows["payouts"])
         books.grants = GrantBook.restore(rows["grants"])
+        # Tolerant: rows written before the runner existed carry no
+        # "runner" section and restore as an empty runner book.
+        runner_rows = rows.get("runner")
+        if runner_rows is not None:
+            books.runner = _runner_book_cls().restore(runner_rows)
         return books

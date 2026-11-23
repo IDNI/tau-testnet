@@ -44,8 +44,16 @@ from .retractable import (
 from .payments import (
     CREDIT_CLASS_CLAIMED_PAYMENT,
     CREDIT_CLASS_PLAIN_TRANSFER,
+    MAX_PAYOUT_LEGS,
     PAYMENT_FEE_BEARING_TX_TYPES,
     PAYMENT_TX_TYPES,
+    PAYOUT_INPUT_EXECUTOR_STREAM,
+    PAYOUT_INPUT_GROSS_STREAM,
+    PAYOUT_INPUT_OWNER_STREAM,
+    PAYOUT_INPUT_SETTLEMENT_STREAM,
+    PAYOUT_INPUT_TIMESTAMP_STREAM,
+    PAYOUT_OUTPUT_COUNT_STREAM,
+    PAYOUT_OUTPUT_LEG_BASE_STREAM,
     DictLedger,
     PaymentRefused,
     PaymentShapeError,
@@ -58,6 +66,10 @@ from .payments import (
     TX_TYPE_ROUTE_INSTALL,
     TX_TYPE_ROUTE_REMOVE,
     TX_TYPE_ROUTE_UPDATE,
+    TX_TYPE_RUNNER_EXECUTE,
+    TX_TYPE_RUNNER_FUND,
+    TX_TYPE_RUNNER_INSTALL,
+    TX_TYPE_RUNNER_REMOVE,
     TX_TYPE_SHARED_CAP_SET,
     TX_TYPE_STANDING_CANCEL,
     TX_TYPE_STANDING_CREATE,
@@ -73,6 +85,17 @@ from .payments import (
     parse_standing_cancel,
     parse_standing_execute,
     parse_standing_terms,
+)
+from .payment_runner import (
+    RUNNER_INPUT_HELD_STREAM,
+    RUNNER_INPUT_MISSED_STREAM,
+    RUNNER_INPUT_PERIOD_SETTLED_STREAM,
+    RUNNER_INPUT_TRIGGER_STREAM,
+    TRIGGER_ARRIVAL,
+    parse_runner_execute,
+    parse_runner_fund,
+    parse_runner_remove,
+    parse_runner_terms,
 )
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
@@ -123,6 +146,7 @@ _LIFECYCLE_TX_TYPES = frozenset(
     | set(RULE_CHANGE_TX_TYPES)
 )
 from consensus.tx_checks import apply_tx_error
+from blake3 import blake3
 from consensus import bls
 from consensus.tx_signing import verify_tx_signature
 import tau_native
@@ -316,6 +340,9 @@ def _release_due_retractables(lm, balances, sequences, height, timestamp) -> Lis
 #   for the life of one transaction or one sweep, never across blocks: the
 #   verdict the design wants is the payer's CURRENT policy, re-read at
 #   every settlement.
+# * Payout clause -> `_PayoutRuleEvaluator`, which steps the rule's signed
+#   clause body in the isolated policy-evaluator pool and decodes the legs
+#   from its output streams (the convention in consensus/payments.py).
 # * DictLedger -> the block's balance overlay (sweep) or the transaction's
 #   staged writes (tx actions), so a payment movement unwinds with exactly
 #   the state it belongs to.
@@ -400,22 +427,180 @@ class _BlockPaymentLedger(DictLedger):
         self.balances[pubkey] = self.balance(pubkey) + amount
 
 
-def _signed_legs_clause(legs):
-    """The payout clause seam in its current engine form.
+class _PayoutRuleEvaluator:
+    """The payout clause seam: steps ONE installed rule's clause and
+    decodes its legs, under the output convention in consensus/payments.py.
 
-    Until the native (index, amount) stream encoding is chosen -- design
-    question (a), the maintainers' call -- no facility in this codebase
-    steps an isolated clause and reads multi-leg outputs from it (the
-    policy evaluator's verdict is an o5 block/allow, nothing more). The
-    legs therefore travel as the rule owner's SIGNED transaction data,
-    which is why payout execution is owner-only at apply, and the book
-    enforces everything around them: candidate set, per-candidate /
-    per-execution / per-period caps, owner balance, atomicity, pays-once.
-    When the encoding lands, only this adapter changes.
+    The clause is stepped in the isolated policy-evaluator pool (pool
+    "payout") -- the same facility that steps o5 policy clauses, extended
+    to report the step's full output map (tau_policy.PolicyEvaluator.
+    outputs) -- fed the convention's input streams: i1 gross, i3 owner,
+    i5 block timestamp, i12 executor, i13 settlement fingerprint (the
+    first 8 bytes of blake3(event_id), so a rule may vary per settlement
+    without the book interpreting event ids). The legs are read from o30
+    (leg count) and the (candidate index, amount) pairs on o31..o46 with
+    the fee layer's strict Tau-int decode.
+
+    Failure discipline mirrors the policy path: a clause that does not
+    build or refuses to step, and any malformed output (absent count,
+    absent pair member, undecodable or negative value, count above the
+    bound), raises PaymentRefused with a clear reason -- the whole
+    execution is refused and nothing settles. Loss of the evaluator itself
+    propagates, as it does on the policy path: it says nothing about this
+    execution. The book then enforces everything around the decoded legs
+    (candidate set, per-candidate caps, per-execution and per-period caps,
+    owner balance, atomic-or-none, pays-once).
     """
-    def clause(inputs):
-        return list(legs)
-    return clause
+
+    POOL = "payout"
+
+    def __init__(self, body: str, *, owner: str, executor: str, ts: int) -> None:
+        self._body = body
+        self._owner = owner
+        self._executor = executor
+        self._ts = ts
+
+    def clause(self):
+        """The PayoutClause callable the book consumes for one execution."""
+        def run(context):
+            return self._legs(
+                gross=int(context["gross"]),
+                event_id=str(context["event_id"]),
+            )
+        return run
+
+    def _legs(self, *, gross: int, event_id: str) -> List[Tuple[int, int]]:
+        fingerprint = int.from_bytes(
+            blake3(event_id.encode("utf-8")).digest()[:8], "big")
+        # Pubkeys ride as bv[384] literals, in the exact form the
+        # transfer input map builds for i3/i4/i12.
+        values = {
+            PAYOUT_INPUT_GROSS_STREAM: str(gross),
+            PAYOUT_INPUT_OWNER_STREAM: "{ #x" + self._owner + " }:bv[384]",
+            PAYOUT_INPUT_TIMESTAMP_STREAM: str(self._ts),
+            PAYOUT_INPUT_EXECUTOR_STREAM: "{ #x" + self._executor + " }:bv[384]",
+            PAYOUT_INPUT_SETTLEMENT_STREAM: str(fingerprint),
+        }
+        outputs, detail = sender_policy.clause_outputs(
+            self._body, values, pool=self.POOL)
+        if outputs is None:
+            raise PaymentRefused(
+                f"payout clause cannot be evaluated: {detail}")
+        count = _payout_output_int(outputs, PAYOUT_OUTPUT_COUNT_STREAM)
+        if count is None:
+            raise PaymentRefused(
+                "payout clause output is malformed: no leg count on "
+                f"o{PAYOUT_OUTPUT_COUNT_STREAM}")
+        if count < 0 or count > MAX_PAYOUT_LEGS:
+            raise PaymentRefused(
+                f"payout clause output is malformed: leg count {count} "
+                f"outside 0..{MAX_PAYOUT_LEGS}")
+        legs: List[Tuple[int, int]] = []
+        for k in range(count):
+            index_stream = PAYOUT_OUTPUT_LEG_BASE_STREAM + 2 * k
+            amount_stream = index_stream + 1
+            index = _payout_output_int(outputs, index_stream)
+            amount = _payout_output_int(outputs, amount_stream)
+            if index is None or amount is None or index < 0 or amount < 0:
+                raise PaymentRefused(
+                    "payout clause output is malformed: leg "
+                    f"{k} is incomplete on o{index_stream}/o{amount_stream}")
+            legs.append((index, amount))
+        return legs
+
+
+def _payout_output_int(outputs: Dict[str, Any], stream: int) -> Optional[int]:
+    """One payout output stream as an integer, via the fee layer's strict
+    Tau-int decode; None when the stream is absent or undecodable (the
+    caller treats both as malformed clause output, never as zero)."""
+    raw = outputs.get(f"o{stream}")
+    if raw is None:
+        return None
+    return fees._parse_tau_int(raw)
+
+
+def _decode_clause_legs(outputs: Dict[str, Any], *, kind: str) -> List[Tuple[int, int]]:
+    """The A1 leg decode, shared by the payout and runner evaluators:
+    o30 = leg count, (index, amount) pairs on o31..o46, strict Tau-int
+    values. Any malformation raises PaymentRefused — the whole run is
+    refused and nothing settles."""
+    count = _payout_output_int(outputs, PAYOUT_OUTPUT_COUNT_STREAM)
+    if count is None:
+        raise PaymentRefused(
+            f"{kind} clause output is malformed: no leg count on "
+            f"o{PAYOUT_OUTPUT_COUNT_STREAM}")
+    if count < 0 or count > MAX_PAYOUT_LEGS:
+        raise PaymentRefused(
+            f"{kind} clause output is malformed: leg count {count} "
+            f"outside 0..{MAX_PAYOUT_LEGS}")
+    legs: List[Tuple[int, int]] = []
+    for k in range(count):
+        index_stream = PAYOUT_OUTPUT_LEG_BASE_STREAM + 2 * k
+        amount_stream = index_stream + 1
+        index = _payout_output_int(outputs, index_stream)
+        amount = _payout_output_int(outputs, amount_stream)
+        if index is None or amount is None or index < 0 or amount < 0:
+            raise PaymentRefused(
+                f"{kind} clause output is malformed: leg "
+                f"{k} is incomplete on o{index_stream}/o{amount_stream}")
+        legs.append((index, amount))
+    return legs
+
+
+class _RunnerRuleEvaluator:
+    """The runner clause seam: steps ONE installed payment rule's clause
+    on a run's fact context and decodes its legs, under the Amendment 2
+    fact layout in consensus/payment_runner.py.
+
+    The clause is stepped in the same isolated policy-evaluator pool as
+    payout clauses (pool "payout"), fed the A1 streams (i1 amount, i3
+    owner, i5 block timestamp, i12 executor, i13 run fingerprint)
+    extended by the runner facts (i14 trigger kind, i15 missed periods,
+    i16 held/available balance, i17 amount settled this period). Legs
+    are decoded from o30/o31..o46 by the shared A1 decode. Failure
+    discipline mirrors `_PayoutRuleEvaluator`: a clause that does not
+    build or refuses to step, and any malformed output, raises
+    PaymentRefused with a clear reason; loss of the evaluator itself
+    propagates. The book then enforces everything around the decoded
+    legs (party set, caps, coverage, shared cap, atomic-or-none,
+    exactly-once).
+    """
+
+    POOL = "payout"
+
+    def __init__(self, body: str, *, owner: str, ts: int) -> None:
+        self._body = body
+        self._owner = owner
+        self._ts = ts
+
+    def clause(self):
+        """The RunnerClause callable the book consumes for one run."""
+        def run(context):
+            return self._legs(context)
+        return run
+
+    def _legs(self, context: Dict[str, Any]) -> List[Tuple[int, int]]:
+        # Pubkeys ride as bv[384] literals, in the exact form the
+        # transfer input map builds for i3/i4/i12.
+        values = {
+            PAYOUT_INPUT_GROSS_STREAM: str(int(context["amount"])),
+            PAYOUT_INPUT_OWNER_STREAM: "{ #x" + self._owner + " }:bv[384]",
+            PAYOUT_INPUT_TIMESTAMP_STREAM: str(self._ts),
+            PAYOUT_INPUT_EXECUTOR_STREAM:
+                "{ #x" + str(context["executor"]) + " }:bv[384]",
+            PAYOUT_INPUT_SETTLEMENT_STREAM: str(int(context["fingerprint"])),
+            RUNNER_INPUT_TRIGGER_STREAM: str(int(context["trigger"])),
+            RUNNER_INPUT_MISSED_STREAM: str(int(context["missed"])),
+            RUNNER_INPUT_HELD_STREAM: str(int(context["held"])),
+            RUNNER_INPUT_PERIOD_SETTLED_STREAM:
+                str(int(context["period_settled"])),
+        }
+        outputs, detail = sender_policy.clause_outputs(
+            self._body, values, pool=self.POOL)
+        if outputs is None:
+            raise PaymentRefused(
+                f"payment rule clause cannot be evaluated: {detail}")
+        return _decode_clause_legs(outputs, kind="payment rule")
 
 
 def _apply_payment_action(books, action, *, ts, ledger, seams, sender):
@@ -456,9 +641,9 @@ def _apply_payment_action(books, action, *, ts, ledger, seams, sender):
         books.payouts.install(data)
         return kind, data.rule_id.hex()
     if kind == "payout_execute":
-        rule_id, event_id, inputs, clause = data
+        rule_id, event_id, gross, clause = data
         receipt = books.payouts.execute(
-            rule_id, event_id, inputs, clause, ts=ts, ledger=ledger)
+            rule_id, event_id, gross, clause, ts=ts, ledger=ledger)
         return kind, (rule_id.hex(), event_id, receipt.total)
     if kind == "grant_create":
         books.grants.create(data, ledger=ledger)
@@ -475,6 +660,22 @@ def _apply_payment_action(books, action, *, ts, ledger, seams, sender):
         payer, limit = data
         books.grants.set_shared_cap(payer, limit)
         return kind, (payer, limit)
+    if kind == "runner_install":
+        books.runner.install(data)
+        return kind, data.rule_id.hex()
+    if kind == "runner_remove":
+        books.runner.remove(data, sender)
+        return kind, data
+    if kind == "runner_fund":
+        rule_id, amount = data
+        books.runner.fund(rule_id, sender, amount, ledger=ledger)
+        return kind, (rule_id.hex(), amount)
+    if kind == "runner_execute":
+        rule_id, event_id, amount, clause, height = data
+        record = books.runner.execute(
+            rule_id, event_id, amount, clause,
+            executor=sender, ts=ts, height=height, ledger=ledger)
+        return kind, (rule_id.hex(), event_id, record.total)
     raise ValueError(f"unknown payment action: {kind}")
 
 
@@ -1205,6 +1406,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         payment_refunds = list(
             (exec_result.snapshot.metadata or {}).get("payment_refunds") or []
         )
+        payment_runner_runs = list(
+            (exec_result.snapshot.metadata or {}).get("payment_runner_runs") or []
+        )
 
         # 3. Post-State Materialization Layer
         
@@ -1363,6 +1567,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "retractable_events": retractable_events,
                 "payment_settlements": payment_settlements,
                 "payment_refunds": payment_refunds,
+                "payment_runner_runs": payment_runner_runs,
             }
         )
 
@@ -1378,6 +1583,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "retractable_events": retractable_events,
                 "payment_settlements": payment_settlements,
                 "payment_refunds": payment_refunds,
+                "payment_runner_runs": payment_runner_runs,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -2317,7 +2523,54 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             and 1 <= amount <= tau_defs.MAX_TRANSFER_VALUE:
                         pbooks = getattr(
                             lifecycle_mgr, "programmable_payments", None)
-                        if isinstance(pbooks, ProgrammablePayments) \
+                        # --- Payment runner, arrival trigger (Amendment 2) ---
+                        # An account whose payment rule enables the arrival
+                        # trigger splits the credit through the RULE: the
+                        # clause's legs are staged as FINAL credits by
+                        # apply_arrival (they never pass through this
+                        # function, so a leg can never trigger the
+                        # destination's own rule — the runner invariant),
+                        # and the unwritten remainder stays with the
+                        # account. The transfer's ONE fee is the step fee
+                        # already measured above, so the run is charged 0,
+                        # the route book's one-fee discipline. The split is
+                        # part of applying the credit — no transfer can
+                        # bypass it — so a clause that refuses or answers
+                        # malformed output refuses the whole transfer
+                        # (fail-closed, like an o5 clause block): the book
+                        # plans before it moves anything, so nothing
+                        # half-applies. The runner takes precedence over a
+                        # books route for the same account: one account,
+                        # one receive-side instruction.
+                        if isinstance(pbooks, ProgrammablePayments):
+                            rstate = pbooks.runner.get_by_owner(to_addr)
+                            if rstate is not None \
+                                    and TRIGGER_ARRIVAL in rstate.terms.triggers:
+                                clause = _RunnerRuleEvaluator(
+                                    rstate.terms.clause,
+                                    owner=to_addr,
+                                    ts=int(block_timestamp or 0),
+                                ).clause()
+                                receipt = pbooks.runner.apply_arrival(
+                                    to_addr, from_addr, amount, clause,
+                                    fee=0,
+                                    ts=int(block_timestamp or 0),
+                                    height=int(block_height or 0),
+                                    ledger=_StagedPaymentLedger(
+                                        _read_bal, staged_writes),
+                                    run_key=str(tx_id),
+                                )
+                                routed = True
+                                tx_receipt.setdefault(
+                                    "runner_receipts", []).append((
+                                        receipt.owner, receipt.gross,
+                                        receipt.net, receipt.legs))
+                                tx_receipt["logs"].append(
+                                    f"Transfer split by payment rule: "
+                                    f"{receipt.net} to recipient, legs "
+                                    f"{list(receipt.legs)}"
+                                )
+                        if not routed and isinstance(pbooks, ProgrammablePayments) \
                                 and pbooks.routes.get(to_addr) is not None:
                             receipt = pbooks.routes.apply_credit(
                                 from_addr, to_addr, amount,
@@ -3068,28 +3321,34 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         + terms.rule_id.hex()
                                     )
                             elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
-                                rule_id, event_id, legs, inputs = parse_payout_execute(tx)
+                                rule_id, event_id, gross = parse_payout_execute(tx)
                                 rule_state = books.payouts.get(rule_id)
                                 if rule_state is None:
                                     pay_reason = "unknown payout rule"
-                                elif not isinstance(sender, str) \
-                                        or sender != rule_state.terms.owner:
-                                    # The legs are the owner's signed data until
-                                    # the native clause encoding lands (see
-                                    # _signed_legs_clause), so only the owner
-                                    # may submit an execution.
-                                    pay_reason = "only the rule owner may execute a payout"
+                                elif not isinstance(sender, str):
+                                    pay_reason = "payout executor must be an account"
                                 else:
-                                    clause = _signed_legs_clause(legs)
+                                    # Execution is OPEN: the legs come from
+                                    # stepping the rule's signed clause (see
+                                    # _PayoutRuleEvaluator), never from the
+                                    # transaction, so any account may submit
+                                    # the execution; the sender is the
+                                    # executor and pays the network fee (the
+                                    # type is fee-bearing), never the owner.
+                                    clause = _PayoutRuleEvaluator(
+                                        rule_state.terms.clause,
+                                        owner=rule_state.terms.owner,
+                                        executor=sender, ts=pay_ts,
+                                    ).clause()
                                     ok, pay_reason = books.payouts.can_execute(
-                                        rule_id, event_id, inputs, clause,
+                                        rule_id, event_id, gross, clause,
                                         ts=pay_ts,
                                         ledger=_StagedPaymentLedger(
                                             _read_bal, staged_writes))
                                     if ok:
                                         pending_payment_action = (
                                             "payout_execute",
-                                            (rule_id, event_id, inputs, clause))
+                                            (rule_id, event_id, gross, clause))
                                         tx_receipt["logs"].append(
                                             "Payout executed: " + rule_id.hex()
                                         )
@@ -3156,6 +3415,81 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         "Shared payment cap registered: "
                                         + cap_payer[:16] + "…"
                                     )
+                            elif tx_type == TX_TYPE_RUNNER_INSTALL:
+                                terms = parse_runner_terms(tx)
+                                if not isinstance(sender, str) or sender != terms.owner:
+                                    pay_reason = "sender is not the signer"
+                                else:
+                                    _, pay_reason = books.runner.can_install(terms)
+                                if not pay_reason:
+                                    pending_payment_action = ("runner_install", terms)
+                                    tx_receipt["logs"].append(
+                                        "Payment rule installed: "
+                                        + terms.rule_id.hex()
+                                    )
+                            elif tx_type == TX_TYPE_RUNNER_REMOVE:
+                                owner = parse_runner_remove(tx)
+                                if not isinstance(sender, str):
+                                    pay_reason = "sender is not the signer"
+                                else:
+                                    _, pay_reason = books.runner.can_remove(
+                                        owner, sender)
+                                if not pay_reason:
+                                    pending_payment_action = ("runner_remove", owner)
+                                    tx_receipt["logs"].append(
+                                        "Payment rule removed: " + owner[:16] + "…"
+                                    )
+                            elif tx_type == TX_TYPE_RUNNER_FUND:
+                                rule_id, fund_amount = parse_runner_fund(tx)
+                                if not isinstance(sender, str):
+                                    pay_reason = "sender is not the signer"
+                                else:
+                                    _, pay_reason = books.runner.can_fund(
+                                        rule_id, sender, fund_amount,
+                                        ledger=_StagedPaymentLedger(
+                                            _read_bal, staged_writes))
+                                if not pay_reason:
+                                    pending_payment_action = (
+                                        "runner_fund", (rule_id, fund_amount))
+                                    tx_receipt["logs"].append(
+                                        "Payment rule funded: " + rule_id.hex()
+                                    )
+                            elif tx_type == TX_TYPE_RUNNER_EXECUTE:
+                                rule_id, event_id, run_amount = \
+                                    parse_runner_execute(tx)
+                                rule_state = books.runner.get(rule_id)
+                                if rule_state is None:
+                                    pay_reason = "unknown payment rule"
+                                elif not isinstance(sender, str):
+                                    pay_reason = "rule executor must be an account"
+                                else:
+                                    # Execution is OPEN, exactly as for
+                                    # payout rules: the legs come from
+                                    # stepping the rule's signed clause
+                                    # (see _RunnerRuleEvaluator), never
+                                    # from the transaction; the sender is
+                                    # the executor and pays the network
+                                    # fee (the type is fee-bearing).
+                                    clause = _RunnerRuleEvaluator(
+                                        rule_state.terms.clause,
+                                        owner=rule_state.terms.owner,
+                                        ts=pay_ts,
+                                    ).clause()
+                                    ok, pay_reason = books.runner.can_execute(
+                                        rule_id, event_id, run_amount, clause,
+                                        executor=sender, ts=pay_ts,
+                                        height=int(block_height or 0),
+                                        ledger=_StagedPaymentLedger(
+                                            _read_bal, staged_writes))
+                                    if ok:
+                                        pending_payment_action = (
+                                            "runner_execute",
+                                            (rule_id, event_id, run_amount,
+                                             clause, int(block_height or 0)))
+                                        tx_receipt["logs"].append(
+                                            "Payment rule executed: "
+                                            + rule_id.hex()
+                                        )
                         except PaymentShapeError as exc:
                             pay_reason = f"invalid {tx_type} ({exc})"
                         if pay_reason:
@@ -3853,6 +4187,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # commit. apply_block remains authoritative, as for releases.
         payment_settlements = []
         payment_refunds = []
+        payment_runner_runs = []
         if (target_balances is not None and target_sequences is not None
                 and target_lifecycle is not None
                 and parent_balances is not None and block_height is not None):
@@ -3883,6 +4218,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     payment_refunds.append((
                         record.grant_id.hex(), record.to,
                         record.amount, record.fee))
+                # The runner's clock trigger, in the same sweep: due
+                # standing-payment rules fire, and grant rules fire
+                # their deadline refund run. The clause factory binds
+                # each rule's signed clause to the sweep's timestamp;
+                # fees are the sweep's measured oracle, charged to the
+                # account against each rule's signed bound.
+                for record in sweep_books.runner.sweep_clock(
+                        ts=int(block_timestamp or 0),
+                        height=int(block_height or 0),
+                        ledger=sweep_ledger, fees=sweep_seams,
+                        clause_factory=lambda terms: _RunnerRuleEvaluator(
+                            terms.clause, owner=terms.owner,
+                            ts=int(block_timestamp or 0)).clause()):
+                    payment_runner_runs.append((
+                        record.rule_id.hex(), record.key,
+                        record.total, record.fee))
 
         # Create new snapshot
         new_snapshot = TauStateSnapshot(
@@ -3890,7 +4241,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             tau_bytes=current_tau_bytes,
             metadata={**snapshot.metadata, "poa": True, "last_tx_count": len(accepted_txs),
                       "payment_settlements": payment_settlements,
-                      "payment_refunds": payment_refunds},
+                      "payment_refunds": payment_refunds,
+                      "payment_runner_runs": payment_runner_runs},
         )
         
         return TauExecutionResult(
