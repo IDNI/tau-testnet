@@ -509,7 +509,7 @@ class TipAdmissionView:
         (auth_id, payer, recipient, amount, kind, day, anchor, window,
          final_ts, max_occ, max_total, fee_limit, policy_ref, catch_up,
          version, settled, total_paid, last_exec, cancelled,
-         cancelled_ts, form, clause_text) = row
+         cancelled_ts, form, clause_text, due_retry_seconds) = row
         ts = self.next_block_timestamp
         occurrences, total = book.total_executed(entry.auth_id)
         return {
@@ -530,6 +530,17 @@ class TipAdmissionView:
             "version": version,
             "form": form,
             "clause_text": clause_text,
+            "due_retry_seconds": due_retry_seconds,
+            "retries_owed": [
+                {
+                    "period_index": retry.period_index,
+                    "due_ts": retry.due_ts,
+                    "retry_until": retry.retry_until,
+                    "recorded_height": retry.recorded_height,
+                }
+                for retry in book.owed_retries()
+                if retry.auth_id == entry.auth_id
+            ],
             "settled_periods": list(settled),
             "total_paid": total_paid,
             "last_execution_ts": last_exec,

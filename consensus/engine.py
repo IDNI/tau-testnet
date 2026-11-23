@@ -79,6 +79,8 @@ from .receive_routes import (
 )
 from .standing_payments import (
     FORM_TAU_CLAUSE as STANDING_FORM_TAU_CLAUSE,
+    INSUFFICIENT_FUNDS_REASON_PREFIX as STANDING_INSUFFICIENT_FUNDS_PREFIX,
+    MAX_DUE_RETRIES_PER_BLOCK as STANDING_MAX_DUE_RETRIES_PER_BLOCK,
     STANDING_PAYMENT_TX_TYPES,
     TX_TYPE_CANCEL_STANDING_PAYMENT,
     TX_TYPE_CREATE_STANDING_PAYMENT,
@@ -383,6 +385,146 @@ def _refund_expired_grants(lm, balances, sequences, timestamp) -> List[Dict[str,
             "beneficiary_pubkey": entry.beneficiary_pubkey,
             "amount": amount,
         })
+    return events
+
+
+def _retry_due_standing_payments(
+    lm, balances, sequences, height, timestamp
+) -> List[Dict[str, Any]]:
+    """Run owed standing-payment retries; notice newly short due points.
+
+    FIX 5 (due_retry, the #160 term), in three passes over the block
+    that just settled its transactions:
+
+    1. Drop retries that are no longer live (their window closed, the
+       next due point came, or the rule ended). Dropping is not a run
+       and does not count toward the per-block cap.
+    2. Attempt live retries owed from an EARLIER block — never the
+       block that owed them — longest waiting first, at most
+       MAX_DUE_RETRIES_PER_BLOCK a block. A retry is a run like the
+       one at the due point: no executor, the balance the block has
+       reached (after this block's transactions and grant refunds),
+       the rule's caps. It settles fee-free, like every sweep
+       movement. Still short, it stays owed for the next block; any
+       other refusal drops it.
+    3. Discover newly short due points: for every Tau-form
+       authorization carrying a retry term, evaluate each due, unpaid
+       period inside its retry window. One found short is recorded
+       owed for a later block — never settled in the discovery block.
+
+    The discovery pass is load-bearing, not a convenience: in this
+    tree a refused execution never reaches apply (admission refuses
+    it first), so an executor's attempt alone could almost never owe
+    a retry — only the admission/apply race would. The node observes
+    the shortfall itself, at the end of the block, exactly as the
+    competitor's node-side due-point run does. A due point the node
+    finds payable is left alone: settling un-attempted due points is
+    the node sweep's job (FIX 3, awaiting the o5 decision), not the
+    retry's. Retries do not wake an idle chain: this runs only when
+    apply_block runs, i.e. when a block is produced.
+    """
+    book = _standing_payment_book(lm)
+    if book is None:
+        return []
+    events: List[Dict[str, Any]] = []
+    grant = faucet.amount(lm)
+    ts = int(timestamp)
+
+    def _step_clause(entry, payer_balance):
+        """The legs a retry run's clause names, or None when the clause
+        did not build or named nothing settleable. No executor submits
+        a retry, so the input map's submitter is empty."""
+        outputs, _detail = sender_policy.clause_outputs(
+            entry.clause_text,
+            standing_clause_inputs(
+                entry, "", ts, payer_balance,
+                book.period_paid_total(entry.auth_id, ts),
+            ),
+            pool="apply",
+        )
+        if outputs is None:
+            return None
+        legs, _why = decode_standing_clause_legs(entry, outputs)
+        return legs
+
+    # 1. Dead retries go, with their history marker.
+    for retry in book.owed_retries():
+        live, reason = book.retry_live(retry, ts)
+        if not live:
+            book.drop_retry(retry.auth_id, retry.period_index)
+            events.append({
+                "auth_id": retry.auth_id.hex(),
+                "action": "due_retry_ended",
+                "period_index": retry.period_index,
+                "reason": reason,
+            })
+
+    # 2. Live retries from earlier blocks, longest waiting first.
+    attempted = 0
+    for retry in book.owed_retries():
+        if attempted >= STANDING_MAX_DUE_RETRIES_PER_BLOCK:
+            break
+        if retry.recorded_height >= int(height):
+            # Owed in this block; a retry runs in a later block only.
+            continue
+        entry = book.get(retry.auth_id)
+        if entry is None:
+            continue
+        payer_balance = faucet.spendable(
+            balances, sequences, entry.payer_pubkey, grant
+        )
+        legs = _step_clause(entry, payer_balance)
+        if legs is None:
+            # The clause did not build: no run happened, the retry
+            # stays owed — the window, not an engine failure, ends it.
+            continue
+        decision = book.execute_retry(retry, ts, payer_balance, legs)
+        attempted += 1
+        if decision.executed:
+            balances[entry.payer_pubkey] = payer_balance - decision.amount
+            balances[entry.recipient_pubkey] = faucet.spendable(
+                balances, sequences, entry.recipient_pubkey, grant
+            ) + decision.amount
+            events.append({
+                "auth_id": entry.auth_id.hex(),
+                "action": "retry_executed",
+                "retry": True,
+                "form": entry.form,
+                "payer_pubkey": entry.payer_pubkey,
+                "recipient_pubkey": entry.recipient_pubkey,
+                "amount": decision.amount,
+                "period_index": decision.period_index,
+                "periods_collected": decision.periods_collected,
+                "total_paid": decision.total_paid_after,
+            })
+        elif decision.reason.startswith(STANDING_INSUFFICIENT_FUNDS_PREFIX):
+            # Still short: stays owed for the next block.
+            continue
+        else:
+            book.drop_retry(retry.auth_id, retry.period_index)
+            events.append({
+                "auth_id": entry.auth_id.hex(),
+                "action": "due_retry_ended",
+                "period_index": retry.period_index,
+                "reason": decision.reason,
+            })
+
+    # 3. Discover newly short due points.
+    for entry, period in book.retry_candidates(ts):
+        payer_balance = faucet.spendable(
+            balances, sequences, entry.payer_pubkey, grant
+        )
+        legs = _step_clause(entry, payer_balance)
+        if legs is None:
+            continue
+        decision = book.discovery_decision(
+            entry.auth_id, period, ts, payer_balance, legs
+        )
+        if (
+            not decision.executed
+            and decision.reason.startswith(STANDING_INSUFFICIENT_FUNDS_PREFIX)
+        ):
+            book.note_retry_owed(entry.auth_id, period, ts, int(height))
     return events
 
 
@@ -1066,6 +1208,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         refunded_grants = _refund_expired_grants(
             lm, t_bals, t_seqs, block.header.timestamp
         )
+        # Standing-payment due retries settle in the same sweep, AFTER
+        # the grant refunds (FIX 5: grants keep priority — a refund
+        # landing in this block is visible to the retry's balance).
+        # A retry attempt is a run like the one at the due point, with
+        # the balance the block has reached.
+        retried_standing = _retry_due_standing_payments(
+            lm, t_bals, t_seqs,
+            block.header.block_number, block.header.timestamp,
+        )
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
@@ -1148,6 +1299,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             )
             if event and id(tx) in accepted_obj:
                 standing_payment_events.append(event)
+        # This block's sweep retries (FIX 5): retry executions and
+        # retry endings, after the transaction events — carried the
+        # same way, for history to record.
+        standing_payment_events.extend(retried_standing)
 
         # Payout-rule events (#63): installs, removals and executions that
         # stayed accepted, in transaction order — carried on the snapshot

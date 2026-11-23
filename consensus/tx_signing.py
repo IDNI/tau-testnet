@@ -187,6 +187,11 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # authorization exactly as the amount does, so they are signed too.
         signing_dict["standing_form"] = payload.get("standing_form")
         signing_dict["standing_clause"] = payload.get("standing_clause")
+        # FIX 5: the signed retry window is a term of the clause form,
+        # so it is signed with the rest.
+        signing_dict["standing_due_retry_seconds"] = payload.get(
+            "standing_due_retry_seconds"
+        )
     elif tx_type == TX_TYPE_CANCEL_STANDING_PAYMENT:
         # The id names the exact authorization (a hash of its signed terms),
         # so signing it binds the cancellation to that authorization alone.

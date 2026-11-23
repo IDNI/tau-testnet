@@ -54,6 +54,14 @@ make two honest nodes disagree about admissibility, which forks.
   execution pays. The form is a signed field, inside the authorization
   id (a domain-separated id for the clause form), so the form an
   execution runs under is the form the payer signed.
+- FIX 5 (due_retry, the #160 term): a Tau-form authorization may carry
+  the signed term due_retry_seconds (0..366 days). A due point refused
+  only for insufficient funds is then owed a retry: the node's
+  end-of-block sweep runs it again in later blocks, at most 4 a block,
+  longest waiting first, until it pays, its retry window (due +
+  due_retry) closes, the next due point comes, or the rule ends. The
+  retry is book state (rooted like a settled-period marker); a run
+  refused for any other reason is never tried again.
 """
 from __future__ import annotations
 
@@ -140,6 +148,21 @@ STANDING_OUTPUT_FIRST_STREAM = 31
 # form's MAX_LEGS bound, shared across the stage).
 MAX_CLAUSE_LEGS = 32
 
+# FIX 5 (due_retry, the #160 term): the signed retry window of a
+# Tau-form authorization, in seconds. 0 means no retry; the bound is
+# the competitor's own — 1 second to 366 days on a seconds clock.
+MAX_DUE_RETRY_SECONDS = 366 * SECONDS_PER_DAY
+
+# FIX 5: at most this many owed due points are re-run in one block's
+# sweep, longest waiting first (the competitor's "at most 4 a block").
+MAX_DUE_RETRIES_PER_BLOCK = 4
+
+# The refusal reason that owes a retry. Both forms refuse a short
+# account with exactly this prefix, so the engine and the sweep key
+# the retry decision on it and on nothing else: a run refused for any
+# other reason is never tried again.
+INSUFFICIENT_FUNDS_REASON_PREFIX = "insufficient funds:"
+
 _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
 _AUTH_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = 0xFFFFFFFFFFFFFFFF
@@ -178,6 +201,12 @@ class StandingPaymentEntry:
     version: int
     form: int = FORM_DECLARED
     clause_text: str = ""
+    # FIX 5: the signed retry window (seconds) of a Tau-form
+    # authorization. 0 means no retry. It is a signed term of the
+    # clause form — inside the Tau-form id — so the retry window an
+    # execution runs under is the window the payer signed. Declared
+    # entries always carry 0.
+    due_retry_seconds: int = 0
 
     @property
     def auth_id(self) -> bytes:
@@ -198,6 +227,7 @@ class StandingPaymentEntry:
                 int(self.allow_catch_up),
                 self.clause_text,
                 self.version,
+                self.due_retry_seconds,
             )
         return compute_standing_payment_id(
             self.payer_pubkey,
@@ -275,6 +305,24 @@ class ExecutionDecision:
     total_paid_after: int
     legs: Tuple[Tuple[str, int], ...] = ()
     period_amounts: Tuple[Tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class StandingDueRetry:
+    """One due point owed a retry (FIX 5).
+
+    Book state, like a settled-period marker: keyed by authorization
+    and period, rooted in the book root, dropped the moment its period
+    settles, its window closes, the next due point comes, or the rule
+    ends. `recorded_height` is the block that owed it — the sweep only
+    runs a retry in a LATER block, never the block that owed it.
+    """
+
+    auth_id: bytes
+    period_index: int
+    due_ts: int
+    retry_until: int
+    recorded_height: int
 
 
 @dataclass
@@ -526,6 +574,7 @@ def parse_create_standing_payment(tx: Dict[str, Any]) -> StandingPaymentEntry:
         version=_u64_field(tx, "standing_version", default=1),
         form=form,
         clause_text=clause_text,
+        due_retry_seconds=_u64_field(tx, "standing_due_retry_seconds", default=0),
     )
 
 
@@ -605,8 +654,15 @@ def validate_standing_payment_shape(
             return (
                 f"a standing clause is at most {MAX_STANDING_CLAUSE_BYTES} bytes"
             )
+        if not 0 <= entry.due_retry_seconds <= MAX_DUE_RETRY_SECONDS:
+            return (
+                "standing_due_retry_seconds must be in "
+                f"0..{MAX_DUE_RETRY_SECONDS}"
+            )
     elif entry.clause_text:
         return "a declared-form standing payment carries no clause"
+    if entry.form == FORM_DECLARED and entry.due_retry_seconds:
+        return "a declared-form standing payment carries no due_retry"
     return None
 
 
@@ -614,9 +670,11 @@ def validate_standing_payment_shape(
 
 _EntryRow = Tuple[
     bytes, str, str, int, int, int, int, int, int, int, int, int, int, int, int,
-    Tuple[int, ...], int, int, int, int, int, str,
+    Tuple[int, ...], int, int, int, int, int, str, int,
 ]
 _FactRow = Tuple[bytes, str, int, int, int, int, int]
+# One owed due_retry, in encode_standing_retry argument order.
+_RetryRow = Tuple[bytes, int, int, int, int]
 
 
 class StandingPaymentBook:
@@ -633,6 +691,7 @@ class StandingPaymentBook:
         self._series: Dict[Tuple[str, str, int, int], bytes] = {}
         self._progress: Dict[bytes, _Progress] = {}
         self._facts: Dict[Tuple[bytes, int], PaidForPeriodFact] = {}
+        self._retries: Dict[Tuple[bytes, int], StandingDueRetry] = {}
         self._root: Optional[bytes] = None
 
     # -- copying / restoring ---------------------------------------------------
@@ -643,13 +702,17 @@ class StandingPaymentBook:
         clone._series = dict(self._series)
         clone._progress = {k: v.copy() for k, v in self._progress.items()}
         clone._facts = dict(self._facts)
+        clone._retries = dict(self._retries)
         clone._root = self._root
         memo[id(self)] = clone
         return clone
 
     @classmethod
     def restore(
-        cls, rows: Iterable[_EntryRow], facts: Iterable[_FactRow] = ()
+        cls,
+        rows: Iterable[_EntryRow],
+        facts: Iterable[_FactRow] = (),
+        retries: Iterable[_RetryRow] = (),
     ) -> "StandingPaymentBook":
         """Rebuild from stored rows; refuses any row whose id does not recompute."""
         book = cls()
@@ -658,11 +721,11 @@ class StandingPaymentBook:
             (auth_id, payer, recipient, amount, kind, day, anchor, window,
              final_ts, max_occ, max_total, fee_limit, policy_ref, catch_up,
              version, settled, total_paid, last_exec, cancelled, cancelled_ts,
-             form, clause_text) = row
+             form, clause_text, due_retry_seconds) = row
             entry = StandingPaymentEntry(
                 payer, recipient, amount, kind, day, anchor, window, final_ts,
                 max_occ, max_total, fee_limit, policy_ref, bool(catch_up), version,
-                form, clause_text,
+                form, clause_text, due_retry_seconds,
             )
             if entry.auth_id != bytes(auth_id):
                 raise ValueError(
@@ -715,6 +778,23 @@ class StandingPaymentBook:
                 raise ValueError(
                     "stored Tau-form total_paid disagrees with its facts"
                 )
+        for retry_row in retries:
+            (auth_id, period, retry_due_ts, retry_until,
+             recorded_height) = retry_row
+            entry = book._entries.get(bytes(auth_id))
+            if entry is None:
+                raise ValueError("stored retry names an unknown authorization")
+            if entry.form != FORM_TAU_CLAUSE or not entry.due_retry_seconds:
+                raise ValueError("stored retry names an authorization with no retry term")
+            if retry_due_ts != due_ts(entry, period):
+                raise ValueError("stored retry due date disagrees with its authorization")
+            if retry_until != retry_due_ts + entry.due_retry_seconds:
+                raise ValueError("stored retry window disagrees with its authorization")
+            if period in book._progress[entry.auth_id].settled_periods:
+                raise ValueError("stored retry names an already settled period")
+            book._retries[(bytes(auth_id), period)] = StandingDueRetry(
+                bytes(auth_id), period, retry_due_ts, retry_until, recorded_height,
+            )
         return book
 
     def rows(self) -> List[_EntryRow]:
@@ -745,9 +825,23 @@ class StandingPaymentBook:
                     progress.cancelled_ts,
                     entry.form,
                     entry.clause_text,
+                    entry.due_retry_seconds,
                 )
             )
         return out
+
+    def retry_rows(self) -> List[_RetryRow]:
+        """Owed due_retries, in encode_standing_retry argument order."""
+        return [
+            (
+                retry.auth_id,
+                retry.period_index,
+                retry.due_ts,
+                retry.retry_until,
+                retry.recorded_height,
+            )
+            for retry in self.owed_retries()
+        ]
 
     def fact_rows(self) -> List[_FactRow]:
         return [
@@ -765,7 +859,9 @@ class StandingPaymentBook:
 
     def root(self) -> bytes:
         if self._root is None:
-            self._root = compute_standing_payment_book_root(self.rows(), self.fact_rows())
+            self._root = compute_standing_payment_book_root(
+                self.rows(), self.fact_rows(), self.retry_rows()
+            )
         return self._root
 
     # -- queries -----------------------------------------------------------------
@@ -865,6 +961,216 @@ class StandingPaymentBook:
                 return due
             period += 1
 
+    # -- due retries (FIX 5) -------------------------------------------------------
+    #
+    # A due point refused only for insufficient funds is owed a retry:
+    # the node runs it again in a later block's sweep, at most
+    # MAX_DUE_RETRIES_PER_BLOCK a block, until it pays, its retry window
+    # closes, the next due point comes, or the rule ends. Only Tau-form
+    # authorizations carrying a due_retry_seconds term owe retries.
+
+    def note_retry_owed(
+        self, auth_id: bytes, period_index: int, ts: int, height: int
+    ) -> bool:
+        """Record that a due point is owed a retry. Idempotent per period.
+
+        False when nothing is owed: the authorization is unknown,
+        declared-form or term-less, the period is not yet due, already
+        settled or already owed, the rule has ended, the retry window
+        has already closed, or the next due point has already come.
+        The caller is the engine: an executor's attempt refused for
+        insufficient funds, or the sweep's own end-of-block evaluation
+        that found a due point short. Admission never calls this — it
+        only evaluates.
+        """
+        auth_id = bytes(auth_id)
+        entry = self._entries.get(auth_id)
+        if entry is None:
+            return False
+        if entry.form != FORM_TAU_CLAUSE or not entry.due_retry_seconds:
+            return False
+        if (auth_id, period_index) in self._retries:
+            return False
+        progress = self._progress[auth_id]
+        if progress.cancelled or period_index in progress.settled_periods:
+            return False
+        if self._capacity(entry, progress) == 0:
+            return False
+        if entry.final_ts and ts >= entry.final_ts:
+            return False
+        due = due_ts(entry, period_index)
+        if ts < due:
+            # Not a due point yet: nothing was observed short.
+            return False
+        retry_until = due + entry.due_retry_seconds
+        if ts >= retry_until:
+            return False
+        next_due = due_ts(entry, period_index + 1)
+        if (not entry.final_ts or next_due < entry.final_ts) and ts >= next_due:
+            return False
+        self._retries[(auth_id, period_index)] = StandingDueRetry(
+            auth_id, period_index, due, retry_until, int(height),
+        )
+        self._root = None
+        return True
+
+    def owed_retries(self) -> List[StandingDueRetry]:
+        """Every retry owed, longest waiting first.
+
+        Oldest due date first, ties by authorization id: the sweep
+        attempts in this order, so a retry never takes a run from an
+        older one. Deterministic across nodes — the sweep's cap and
+        order are consensus.
+        """
+        return sorted(
+            self._retries.values(),
+            key=lambda r: (r.due_ts, r.auth_id.hex()),
+        )
+
+    def retry_live(self, retry: StandingDueRetry, ts: int) -> Tuple[bool, str]:
+        """Whether a retry may still be run at `ts`, and why not."""
+        entry = self._entries.get(bytes(retry.auth_id))
+        if entry is None:
+            return False, "authorization no longer exists"
+        progress = self._progress[retry.auth_id]
+        if progress.cancelled:
+            return False, "authorization is cancelled"
+        if self._capacity(entry, progress) == 0:
+            return False, "the authorization's end condition is reached"
+        if entry.final_ts and ts >= entry.final_ts:
+            return False, "authorization has ended: the final period has passed"
+        if retry.period_index in progress.settled_periods:
+            return False, "this period is already settled"
+        if ts >= retry.retry_until:
+            return False, "the retry window for this period has closed"
+        next_due = due_ts(entry, retry.period_index + 1)
+        if (not entry.final_ts or next_due < entry.final_ts) and ts >= next_due:
+            return False, "the next due point has come"
+        return True, ""
+
+    def drop_retry(self, auth_id: bytes, period_index: int) -> bool:
+        """Forget an owed retry. True when one was owed."""
+        if self._retries.pop((bytes(auth_id), period_index), None) is None:
+            return False
+        self._root = None
+        return True
+
+    def discovery_decision(
+        self,
+        auth_id: bytes,
+        period_index: int,
+        ts: int,
+        payer_balance: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
+    ) -> ExecutionDecision:
+        """What a run of one due period would do, under the retry window.
+
+        Pure evaluation, no state change: the sweep uses it to notice a
+        due point that is short. The retry window (due + due_retry)
+        replaces the entry's execution window here — the window that
+        lapsed is exactly what the retry extends — and the liveness
+        checks are the retry's own (rule alive, period unpaid, window
+        open, next due point not yet come). A decision that would
+        execute means the period is payable, so no retry is owed; a
+        refusal for insufficient funds is what owes one.
+        """
+        entry, progress = self._entry_and_progress(auth_id)
+        if progress.cancelled:
+            return ExecutionDecision(
+                False, "authorization is cancelled", period_index, 0, 0,
+                progress.total_paid,
+            )
+        if self._capacity(entry, progress) == 0:
+            return ExecutionDecision(
+                False, "the authorization's end condition is reached",
+                period_index, 0, 0, progress.total_paid,
+            )
+        if entry.final_ts and ts >= entry.final_ts:
+            return ExecutionDecision(
+                False, "authorization has ended: the final period has passed",
+                period_index, 0, 0, progress.total_paid,
+            )
+        if period_index in progress.settled_periods:
+            return ExecutionDecision(
+                False, "this period is already settled", period_index, 0, 0,
+                progress.total_paid,
+            )
+        if ts < due_ts(entry, period_index):
+            return ExecutionDecision(
+                False, "nothing is due yet", period_index, 0, 0,
+                progress.total_paid,
+            )
+        if ts >= due_ts(entry, period_index) + entry.due_retry_seconds:
+            return ExecutionDecision(
+                False, "the retry window for this period has closed",
+                period_index, 0, 0, progress.total_paid,
+            )
+        next_due = due_ts(entry, period_index + 1)
+        if (not entry.final_ts or next_due < entry.final_ts) and ts >= next_due:
+            return ExecutionDecision(
+                False, "the next due point has come", period_index, 0, 0,
+                progress.total_paid,
+            )
+        decision, _ = self._evaluate_clause(
+            entry, progress, period_index, [period_index], payer_balance,
+            clause_legs,
+        )
+        return decision
+
+    def retry_candidates(self, ts: int) -> List[Tuple[StandingPaymentEntry, int]]:
+        """(entry, period) pairs the sweep should evaluate for discovery.
+
+        A Tau-form authorization carrying a retry term, a period that is
+        due, inside its retry window, unpaid, not already owed, and
+        whose rule is alive. Oldest due first, so the sweep notices
+        the longest-waiting shortfall first. The scan per entry stops
+        at the first period not yet due: periods are ordered, and the
+        retry window bounds how many can be in-window at once.
+        """
+        out: List[Tuple[StandingPaymentEntry, int]] = []
+        entries = sorted(
+            (
+                entry
+                for entry in self._entries.values()
+                if entry.form == FORM_TAU_CLAUSE and entry.due_retry_seconds > 0
+            ),
+            key=lambda e: e.auth_id.hex(),
+        )
+        for entry in entries:
+            progress = self._progress[entry.auth_id]
+            if progress.cancelled or self._capacity(entry, progress) == 0:
+                continue
+            if entry.final_ts and ts >= entry.final_ts:
+                continue
+            # Start at the first period whose retry window could still
+            # be open: earlier periods closed theirs before this block.
+            # The scan is then bounded by the retry window, not by the
+            # authorization's age.
+            period = max(
+                0, period_index_at(entry, ts - entry.due_retry_seconds)
+            )
+            while True:
+                due = due_ts(entry, period)
+                if entry.final_ts and due >= entry.final_ts:
+                    break
+                if due > ts:
+                    break
+                if ts < due + entry.due_retry_seconds:
+                    next_due = due_ts(entry, period + 1)
+                    next_came = (
+                        (not entry.final_ts or next_due < entry.final_ts)
+                        and ts >= next_due
+                    )
+                    if (
+                        not next_came
+                        and period not in progress.settled_periods
+                        and (entry.auth_id, period) not in self._retries
+                    ):
+                        out.append((entry, period))
+                period += 1
+        out.sort(key=lambda pair: (due_ts(pair[0], pair[1]), pair[0].auth_id.hex()))
+        return out
+
     # -- creation / update ---------------------------------------------------------
 
     def can_create(
@@ -902,6 +1208,11 @@ class StandingPaymentBook:
         if old_id is not None:
             del self._entries[old_id]
             del self._progress[old_id]
+            # A superseded version's owed retries die with it: the new
+            # version starts its own periods, and a retry belongs to
+            # the version whose due point went short.
+            for key in [k for k in self._retries if k[0] == old_id]:
+                del self._retries[key]
         self._entries[entry.auth_id] = entry
         self._series[entry.series_key] = entry.auth_id
         self._progress[entry.auth_id] = _Progress()
@@ -932,6 +1243,9 @@ class StandingPaymentBook:
         progress = self._progress[auth_id]
         progress.cancelled = True
         progress.cancelled_ts = now_ts
+        # A cancelled rule ends every retry it owed: the rule has ended.
+        for key in [k for k in self._retries if k[0] == auth_id]:
+            del self._retries[key]
         self._root = None
         return self._entries[auth_id]
 
@@ -1021,14 +1335,16 @@ class StandingPaymentBook:
         affordable = payer_balance // entry.amount
         if affordable == 0:
             return refuse(
-                "insufficient funds: the occurrence is not settled and its "
+                INSUFFICIENT_FUNDS_REASON_PREFIX
+                + " the occurrence is not settled and its "
                 "marker does not advance",
                 current,
             )
         if affordable < len(to_settle):
             if not entry.allow_catch_up:
                 return refuse(
-                    "insufficient funds: the occurrence is not settled and "
+                    INSUFFICIENT_FUNDS_REASON_PREFIX
+                    + " the occurrence is not settled and "
                     "its marker does not advance",
                     current,
                 )
@@ -1100,7 +1416,8 @@ class StandingPaymentBook:
             return refuse("the authorization's end condition is reached")
         if payer_balance < total:
             return refuse(
-                "insufficient funds: the occurrence is not settled and its "
+                INSUFFICIENT_FUNDS_REASON_PREFIX
+                + " the occurrence is not settled and its "
                 "marker does not advance"
             )
         period_amounts: List[Tuple[int, int]] = []
@@ -1184,6 +1501,21 @@ class StandingPaymentBook:
         )
         if not decision.executed:
             return decision
+        self._settle(entry, progress, decision, ts)
+        return decision
+
+    def _settle(
+        self,
+        entry: StandingPaymentEntry,
+        progress: _Progress,
+        decision: ExecutionDecision,
+        ts: int,
+    ) -> None:
+        """Record a settled execution: markers, facts, totals.
+
+        Shared by execute() and execute_retry(): settling a period
+        ends any retry it owed — a paid period is never retried.
+        """
         for period, period_amount in decision.period_amounts:
             start, end = period_bounds(entry, period)
             progress.settled_periods.add(period)
@@ -1196,9 +1528,52 @@ class StandingPaymentBook:
                 amount=period_amount,
                 execution_ts=ts,
             )
+            self._retries.pop((entry.auth_id, period), None)
         progress.total_paid += decision.amount
         progress.last_execution_ts = ts
         self._root = None
+
+    def execute_retry(
+        self,
+        retry: StandingDueRetry,
+        ts: int,
+        payer_balance: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
+    ) -> ExecutionDecision:
+        """Run one owed retry at `ts` — a run like the one at the due point.
+
+        The retry window (due_ts + due_retry_seconds) replaces the
+        entry's execution window: the window that lapsed is exactly
+        what the retry extends. The clause legs are the caller's
+        (the sweep steps the clause over the node-built input map at
+        the sweep's timestamp and balance); the book re-checks them
+        against the candidate set, the per-period cap, the end
+        condition and the balance, exactly as _evaluate_clause does
+        for a due execution. A refusal for insufficient funds leaves
+        the retry owed for the next block; any other refusal is
+        returned for the caller to drop it with.
+        """
+        entry, progress = self._entry_and_progress(retry.auth_id)
+        if (bytes(retry.auth_id), retry.period_index) not in self._retries:
+            # A retry that was never owed cannot settle a period: the
+            # sweep only ever runs what it owes, and a caller that
+            # invents a retry must not be able to pay early or twice.
+            return ExecutionDecision(
+                False, "no retry is owed for this period",
+                retry.period_index, 0, 0, progress.total_paid,
+            )
+        live, reason = self.retry_live(retry, ts)
+        if not live:
+            return ExecutionDecision(
+                False, reason, retry.period_index, 0, 0, progress.total_paid
+            )
+        decision, _settled = self._evaluate_clause(
+            entry, progress, retry.period_index, [retry.period_index],
+            payer_balance, clause_legs,
+        )
+        if not decision.executed:
+            return decision
+        self._settle(entry, progress, decision, ts)
         return decision
 
 
@@ -1252,6 +1627,17 @@ def standing_payment_capabilities() -> Dict[str, Any]:
             "candidate_set": "the signed recipient (candidate 0)",
             "max_clause_bytes": MAX_STANDING_CLAUSE_BYTES,
             "max_legs": MAX_CLAUSE_LEGS,
+            "due_retry": {
+                "term": "standing_due_retry_seconds",
+                "range_seconds": f"0..{MAX_DUE_RETRY_SECONDS}",
+                "semantics": (
+                    "a due point refused only for insufficient funds is "
+                    "run again in later blocks, at most "
+                    f"{MAX_DUE_RETRIES_PER_BLOCK} a block, until it pays, "
+                    "its retry window closes, the next due point comes, "
+                    "or the rule ends"
+                ),
+            },
         },
         "paid_for_period_fact": True,
         "paid_fact_rule_stream": {

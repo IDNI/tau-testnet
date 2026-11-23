@@ -995,6 +995,7 @@ def compute_standing_payment_tau_id(
     allow_catch_up: int,
     clause_text: str,
     version: int,
+    due_retry_seconds: int = 0,
 ) -> bytes:
     """BLAKE3 of a Tau-form (clause) standing-payment authorization.
 
@@ -1003,7 +1004,10 @@ def compute_standing_payment_tau_id(
     same way, and the payer's clause TEXT is hashed with them — the
     clause is a signed field of the authorization, so a tampered clause
     is a different, unknown authorization, and no Tau-form id can ever
-    collide with a declared-form id over the same terms.
+    collide with a declared-form id over the same terms. FIX 5 adds
+    `due_retry_seconds` (default 0, no retry): a signed term of the
+    clause form, so two authorizations that differ only in their retry
+    window are different authorizations.
     """
     out = bytearray()
     out.extend(encode_string(DOMAIN_STANDING_PAYMENT_TAU_V1.decode()))
@@ -1022,6 +1026,7 @@ def compute_standing_payment_tau_id(
     out.extend(encode_uint64(int(allow_catch_up)))
     out.extend(encode_string(str(clause_text or "")))
     out.extend(encode_uint64(int(version)))
+    out.extend(encode_uint64(int(due_retry_seconds)))
     return blake3(bytes(out)).digest()
 
 
@@ -1048,6 +1053,7 @@ def encode_standing_payment_record(
     cancelled_ts: int,
     form: int = 1,
     clause_text: str = "",
+    due_retry_seconds: int = 0,
 ) -> bytes:
     """One authorization for the book root: signed fields + live progress.
 
@@ -1082,9 +1088,13 @@ def encode_standing_payment_record(
     if int(form) != 1:
         # The Tau form's signed fields, appended only for Tau-form
         # records: a declared-form record stays byte-identical to the
-        # encoding before the clause form existed.
+        # encoding before the clause form existed. FIX 5 appends the
+        # signed due_retry term here too, so a declared record is
+        # still byte-identical and a clause-form record pins its retry
+        # window.
         out.extend(encode_uint64(int(form)))
         out.extend(encode_string(str(clause_text or "")))
+        out.extend(encode_uint64(int(due_retry_seconds)))
     return bytes(out)
 
 
@@ -1108,16 +1118,46 @@ def encode_paid_period_fact(
     return bytes(out)
 
 
-def compute_standing_payment_book_root(records: list, facts: list) -> bytes:
+def encode_standing_retry(
+    auth_id: Any,
+    period_index: int,
+    due_ts: int,
+    retry_until: int,
+    recorded_height: int,
+) -> bytes:
+    """One owed due_retry for the book root (FIX 5).
+
+    A retry is consensus state exactly like a settled-period marker:
+    two nodes that disagree about which due points are owed disagree
+    about what the next block's sweep settles, so the root must cover
+    it. Row order is (auth_id, period_index, due_ts, retry_until,
+    recorded_height).
+    """
+    out = bytearray()
+    out.extend(encode_hash32(auth_id))
+    out.extend(encode_uint64(int(period_index)))
+    out.extend(encode_uint64(int(due_ts)))
+    out.extend(encode_uint64(int(retry_until)))
+    out.extend(encode_uint64(int(recorded_height)))
+    return bytes(out)
+
+
+def compute_standing_payment_book_root(
+    records: list, facts: list, retries: list = ()
+) -> bytes:
     """BLAKE3 of the standing-payment book: records + paid-period facts.
 
     `records` are tuples in encode_standing_payment_record argument order and
     `facts` in encode_paid_period_fact argument order. Facts outlive their
     authorization (an update supersedes the entry, never the history), so
-    they are rooted separately instead of nested inside a record.
+    they are rooted separately instead of nested inside a record. FIX 5
+    adds `retries` (tuples in encode_standing_retry argument order): owed
+    due_retries are consensus state too, and default to none, so a book
+    with no retry owed roots exactly as it did before the term existed.
     """
     encoded_records = sorted(encode_standing_payment_record(*r) for r in (records or []))
     encoded_facts = sorted(encode_paid_period_fact(*f) for f in (facts or []))
+    encoded_retries = sorted(encode_standing_retry(*r) for r in (retries or []))
     out = bytearray()
     out.extend(encode_string(DOMAIN_STANDING_PAYMENT_BOOK_V1.decode()))
     out.extend(encode_uint32(len(encoded_records)))
@@ -1126,6 +1166,15 @@ def compute_standing_payment_book_root(records: list, facts: list) -> bytes:
     out.extend(encode_uint32(len(encoded_facts)))
     for blob in encoded_facts:
         out.extend(blob)
+    if encoded_retries:
+        # The retries section appears only when a retry is owed: a
+        # book with no retry owed roots exactly as it did before the
+        # term existed (the same non-default gate the metadata roots
+        # use). A non-empty retry set can never collide with an empty
+        # one — the count and the sorted blobs pin it.
+        out.extend(encode_uint32(len(encoded_retries)))
+        for blob in encoded_retries:
+            out.extend(blob)
     return blake3(bytes(out)).digest()
 
 
