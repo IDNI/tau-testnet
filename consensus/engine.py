@@ -3065,6 +3065,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         if exe is not None and not reason:
                             try:
                                 rule, state = book.check_execution(exe, height_now, ts_now)
+                                if (rule.max_fee_per_execution is not None
+                                        and fee_limit_int is not None
+                                        and fee_limit_int > rule.max_fee_per_execution):
+                                    raise PayoutRefused(
+                                        "the rule caps a manual execution's fee at "
+                                        f"{rule.max_fee_per_execution}")
                                 values = payout_execution_inputs(
                                     rule, state, exe,
                                     parent_balance=int(_parent_bal(exe.account_pubkey)),
