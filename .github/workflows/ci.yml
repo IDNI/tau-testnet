@@ -133,5 +133,6 @@ jobs:
           tests/test_grants_clause_native.py
           tests/test_standing_due_retry_native.py
           tests/test_rule_change_payment_kinds_native.py
+          tests/test_rule_change_guard_native.py
           -p no:asyncio -v
           "
