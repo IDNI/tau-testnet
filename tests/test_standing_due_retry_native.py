@@ -229,8 +229,12 @@ class TestStandingDueRetryNative(unittest.TestCase):
         # Force it in anyway, beside a real transfer so the block is
         # non-empty and the sweep runs: the execution still settles
         # nothing, and the sweep owes the retry on the real clause.
+        # The transfer comes from EXTRA, not the executor: the forced
+        # execution already holds the executor's sequence 0 in the
+        # mempool's view, so an executor transfer at sequence 0 would
+        # be refused as INVALID_SEQUENCE.
         forced = self._force_queue(blob)
-        transfer = self._transfer(EXECUTOR, SK_CAROL, RECIPIENT, 10)
+        transfer = self._transfer(EXTRA, SK_MALLORY, RECIPIENT, 10)
         res = sendtx.queue_transaction(transfer, propagate=False)
         self.assertTrue(res["ok"], f"transfer rejected: {res}")
         self._mine()
