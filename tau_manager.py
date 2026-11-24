@@ -480,11 +480,21 @@ def reexec_on_width_overflow():
         _handle_width_overflow(exc)
 
 
+def _set_unless_stopped(event: threading.Event) -> None:
+    # request_shutdown() sets the flag before it clears the event, so one of the two clears it.
+    event.set()
+    if server_should_stop.is_set():
+        event.clear()
+
+
 def start_and_manage_tau_process():
     global tau_ready, tau_process_ready, server_should_stop, tau_process_lock, tau_test_mode, restart_in_progress
     global tau_direct_interface, last_known_tau_spec
 
-    server_should_stop.clear()
+    if server_should_stop.is_set():
+        logger.info("Server shutdown requested before the Tau manager started.")
+        return
+
     tau_ready.clear()
     tau_process_ready.clear()
     restart_in_progress.clear()
@@ -494,8 +504,8 @@ def start_and_manage_tau_process():
     if is_force_test_enabled():
         logger.warning("TAU_FORCE_TEST enabled. Running in TEST MODE without Tau Engine.")
         tau_test_mode = True
-        tau_process_ready.set()
-        tau_ready.set()
+        _set_unless_stopped(tau_process_ready)
+        _set_unless_stopped(tau_ready)
         while not server_should_stop.is_set():
             time.sleep(0.05)
         logger.info("Server shutdown requested, Tau manager exiting.")
@@ -504,11 +514,16 @@ def start_and_manage_tau_process():
     logger.info("Direct Bindings Mode Enabled. Initializing Tau Native Interface...")
     try:
         tau_direct_interface = tau_native.TauInterface(config.TAU_PROGRAM_FILE)
+        # request_shutdown() sets the flag before it drops the interface, so one of the two drops it.
+        if server_should_stop.is_set():
+            tau_direct_interface = None
+            logger.info("Server shutdown requested, Tau manager exiting (during init).")
+            return
         logger.info("Tau Native Interface initialized successfully.")
         # Pick the smallest shrink width for this process from the current intern
         # table. Sticky per-stream typing means it is fixed until the next re-exec.
         tau_shrink.set_shrink_width_from_db()
-        tau_process_ready.set()
+        _set_unless_stopped(tau_process_ready)
 
         if _state_restore_callback:
             try:
@@ -525,7 +540,7 @@ def start_and_manage_tau_process():
                     time.sleep(0.05)
                 return
 
-        tau_ready.set()
+        _set_unless_stopped(tau_ready)
         
         while not server_should_stop.is_set():
             time.sleep(1)
@@ -541,6 +556,19 @@ def start_and_manage_tau_process():
             time.sleep(0.05)
         logger.info("Server shutdown requested, Tau manager exiting (native init failed).")
         return
+
+
+def start_manager_thread() -> threading.Thread:
+    """Start the manager thread. Clear the stop flag here, before the start,
+    so that a request_shutdown() right after this call is not lost."""
+    server_should_stop.clear()
+    thread = threading.Thread(
+        target=start_and_manage_tau_process,
+        name="tau-manager (start_and_manage_tau_process)",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def communicate_with_tau(
@@ -991,10 +1019,17 @@ def kill_tau_process():
         recovered_interface = tau_native.TauInterface(config.TAU_PROGRAM_FILE)
         with tau_process_lock:
             tau_direct_interface = recovered_interface
-        tau_process_ready.set()
+        # request_shutdown() sets the flag before it drops the interface, so one of the two drops it.
+        if server_should_stop.is_set():
+            with tau_process_lock:
+                tau_direct_interface = None
+            restart_in_progress.clear()
+            logger.info("Shutdown requested, Tau interface rebuild dropped.")
+            return
+        _set_unless_stopped(tau_process_ready)
         if _state_restore_callback:
             _state_restore_callback()
-        tau_ready.set()
+        _set_unless_stopped(tau_ready)
         restart_in_progress.clear()
     except Exception as e:
         logger.error("Failed to recover direct Tau interface: %s", e)
@@ -1043,5 +1078,6 @@ __all__ = [
     "set_state_restore_callback",
     "is_force_test_enabled",
     "start_and_manage_tau_process",
+    "start_manager_thread",
     "reset_tau_state",
 ]
