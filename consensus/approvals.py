@@ -305,32 +305,61 @@ def screen_hold_mentions(text: str, group=None) -> Optional[str]:
 
 
 def screen_receive_widths(text: str) -> Optional[str]:
-    """None when every mention of i17 is typed bv[64], else the reason.
+    """None when every mention of a node-fed receive stream is typed bv[64].
 
-    Same hazard as o5 and the approval slots: the node feeds i17 at bv[64] on
-    every transfer, and per-stream typing is process-global and sticky, so one
-    clause typing it bv[16] (or leaving the width to be inferred) would leave
-    the interpreter unable to build anyone's receive rule -- measured, and it
-    fails closed, which is worse than refusing the rule that caused it.
+    Same hazard as o5 and the approval slots: the node feeds these streams at
+    bv[64] on every transfer, and per-stream typing is process-global and
+    sticky, so one clause typing them bv[16] (or leaving the width to be
+    inferred) would leave the interpreter unable to build anyone's receive
+    rule -- measured, and it fails closed, which is worse than refusing the
+    rule that caused it.
     """
     from consensus.rule_offers import strip_clause_comments
 
     scrubbed = strip_clause_comments(text or "")
     width = tau_defs.RECEIVE_STREAM_BV_WIDTH
-    name = f"i{tau_defs.RECEIVE_STREAM_INDEX}"
-    mention = re.compile(rf"\b{name}\b")
     typed_tail = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
-    for match in mention.finditer(scrubbed):
-        typed = typed_tail.match(scrubbed, match.end())
-        if typed is None:
-            return (
-                f"every mention of {name} must be written "
-                f"{name}[t]:bv[{width}]; an untyped mention lets the engine "
-                f"infer a conflicting width process-wide"
-            )
-        if int(typed.group(1)) != width:
-            return f"{name} must be typed bv[{width}], found bv[{typed.group(1)}]"
+    for idx in tau_defs.active_receive_fact_streams():
+        name = f"i{idx}"
+        for match in re.compile(rf"\b{name}\b").finditer(scrubbed):
+            typed = typed_tail.match(scrubbed, match.end())
+            if typed is None:
+                return (
+                    f"every mention of {name} must be written "
+                    f"{name}[t]:bv[{width}]; an untyped mention lets the engine "
+                    f"infer a conflicting width process-wide"
+                )
+            if int(typed.group(1)) != width:
+                return f"{name} must be typed bv[{width}], found bv[{typed.group(1)}]"
     return None
+
+
+def screen_receive_fact_activation(text: str) -> Optional[str]:
+    """None when the clause only reads facts this build actually feeds.
+
+    Parts 3-5 compare conditions that bounty 01 creates. Until that lands the
+    node feeds only the hold, and a clause reading an allowance, refund or expiry
+    fact would be judged against 0 -- indistinguishable from a real "no condition
+    attached". Refusing it at deploy is the only honest answer: a rule that
+    cannot be enforced must not be installable.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    if tau_defs.RECEIVE_FACTS_ACTIVE:
+        return None
+    scrubbed = strip_clause_comments(text or "")
+    inactive = [
+        i for i in tau_defs.RECEIVE_FACT_STREAMS[1:]
+        if re.search(rf"\bi{i}\b", scrubbed)
+    ]
+    if not inactive:
+        return None
+    names = ", ".join(f"i{i}" for i in inactive)
+    return (
+        f"this node feeds only i{tau_defs.RECEIVE_STREAM_INDEX}: the payment "
+        f"facts {names} arrive with bounty 01's condition record and are not "
+        f"active on this build, so a clause reading them cannot be enforced"
+    )
 
 
 def screen_stream_widths(body: str) -> Optional[str]:

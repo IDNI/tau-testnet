@@ -39,7 +39,8 @@ _CAP_RE = re.compile(
 )
 
 
-_RECEIVE_MENTION_RE = re.compile(r"\bi%d\b" % tau_defs.RECEIVE_STREAM_INDEX)
+def _mention_re(streams) -> re.Pattern:
+    return re.compile(r"\bi(?:%s)\b" % "|".join(str(i) for i in streams))
 
 
 def mentions_receive_stream(body: str) -> bool:
@@ -53,7 +54,8 @@ def mentions_receive_stream(body: str) -> bool:
     """
     from consensus.rule_offers import strip_clause_comments
 
-    return bool(_RECEIVE_MENTION_RE.search(strip_clause_comments(body or "")))
+    streams = tau_defs.active_receive_fact_streams()
+    return bool(_mention_re(streams).search(strip_clause_comments(body or "")))
 
 
 def hold_seconds_value(hold_seconds: int) -> int:
@@ -121,7 +123,7 @@ def cap_description(body: str) -> str:
 
 
 def judge(clause_for, recipient: str, inputs: dict, value: int, *,
-          pool: str, timeout=None) -> tuple[bool, str, str]:
+          pool: str, timeout=None, facts=None) -> tuple[bool, str, str]:
     """(blocked, reason, message) for one payment judged by the RECIPIENT.
 
     Two things keep this from changing what already-deployed policy means:
@@ -141,6 +143,15 @@ def judge(clause_for, recipient: str, inputs: dict, value: int, *,
         return False, "", ""
     values = dict(inputs or {})
     values[tau_defs.RECEIVE_STREAM_INDEX] = str(int(value))
+    # The remaining payment facts (bounty 03 parts 3-5). They are fed as 0 while
+    # `RECEIVE_FACTS_ACTIVE` is False, which is the honest value: no payment
+    # carries a condition record yet, and a clause that reads them is refused at
+    # deploy in that state, so nothing can be judged against a fake zero.
+    provided = dict(facts or {})
+    for idx in tau_defs.active_receive_fact_streams():
+        if idx == tau_defs.RECEIVE_STREAM_INDEX:
+            continue
+        values[idx] = str(int(provided.get(idx, 0)))
     # The payer's approval slots belong to the payer's axis: a co-signature the
     # SENDER collected must never satisfy the recipient's rule. Zeroed rather
     # than removed so every clause sees the same shape of input map.

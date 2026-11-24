@@ -120,6 +120,41 @@ co-signed **the payer's** request; letting them through would let the payer's
 co-signature satisfy the recipient's rule, and the recipient never agreed to it.
 Zeroed rather than removed, so every clause sees the same shape of input map.
 
+## The rest of the payment facts (bounty 03, parts 3–5)
+
+Three more node-fed `bv[64]` facts exist for the receiver rules that compare the
+conditions a payment carries. They are **off on this build**:
+
+| stream | meaning |
+|---|---|
+| `i26` | allowance attached to the payment, normalised to 30 days; `0` = no cap, i.e. unlimited |
+| `i27` | refund delay: `0` never refundable, `1` refundable at once, `1+N` after `N` seconds |
+| `i28` | seconds until the funds expire; `0` = never |
+
+The conditions they describe are created by bounty 01, which has not landed, so
+`tau_defs.RECEIVE_FACTS_ACTIVE` is `False`: the node feeds only `i17`, the three
+indices stay ordinary custom inputs, and `consensus/approvals.py::screen_receive_fact_activation`
+**refuses at deploy** any clause that reads them. Judging such a clause against
+zeros would be indistinguishable from a real "no condition attached", and a rule
+that cannot be enforced must not be installable.
+
+The indices are provisional: a two-stream hold layout would put blocks on `i27`,
+and issue #47 is where that gets settled. Changing `tau_defs.RECEIVE_FACT_STREAMS`
+is the whole change; the semantics live in `consensus/recipient_policy.py`.
+
+One semantic matters more than the numbers: `0` means *no condition attached*,
+which is the most permissive case, not the strictest. A receiver asking for a
+minimum allowance must therefore exclude `0` explicitly, or it will refuse the
+one payment that has no limit at all:
+
+```text
+# at least 500 per 30 days; an unlimited payment always passes
+always ( ( (i26[t]:bv[64] != { #x0000 }:bv[64]) && (i26[t]:bv[64] < { #x01F4 }:bv[64]) ) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+
+# only money with no spending limit attached
+always ( (i26[t]:bv[64] != { #x0000 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+```
+
 ## If a second hold stream is ever added
 
 `tau_defs.HOLD_STREAM_GROUP` names the streams that together describe the hold.

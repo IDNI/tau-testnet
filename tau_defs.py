@@ -298,6 +298,45 @@ RECEIVE_STREAM_BV_WIDTH = 64
 # ordering the two families on a single tagged stream is fail-closed, while
 # letting a clause bound one unit and silently admit the other is fail-open.
 HOLD_STREAM_GROUP = (RECEIVE_STREAM_INDEX,)
+
+# --- The rest of the payment's facts (bounty 03, parts 3-5) -------------------
+# Each is one node-fed bv[64] number, so a receiver clause compares plain
+# integers instead of decoding a packed record:
+#
+#   i26  allowance attached to the payment, normalised to 30 days. 0 = none,
+#        which is UNLIMITED and therefore passes any minimum.
+#   i27  refund delay: 0 = never refundable, 1 = refundable at once, 1+N =
+#        refundable N seconds after arrival.
+#   i28  seconds until the funds expire: 0 = never expires.
+#
+# PROVISIONAL INDICES. The layout is contested on issue #47 (a two-stream hold
+# split would put blocks on i27), and the bounty is not open until 01 merges, so
+# nothing may be deployed against these numbers yet: the feed stays off
+# (`RECEIVE_FACTS_ACTIVE` False) until the maintainers settle the mapping. When
+# they do, changing the tuple is the whole change; the semantics live in
+# `consensus/recipient_policy.py`, not in these numbers.
+RECEIVE_ALLOWANCE_STREAM_INDEX = 26
+RECEIVE_REFUND_STREAM_INDEX = 27
+RECEIVE_EXPIRY_STREAM_INDEX = 28
+RECEIVE_FACT_STREAMS = (
+    RECEIVE_STREAM_INDEX,
+    RECEIVE_ALLOWANCE_STREAM_INDEX,
+    RECEIVE_REFUND_STREAM_INDEX,
+    RECEIVE_EXPIRY_STREAM_INDEX,
+)
+# Parts 3-5 are inert on this build: the conditions they compare are created by
+# bounty 01, which has not landed. While this is False the node feeds only i17,
+# and an o5 clause that mentions one of the other facts is refused at deploy
+# instead of being judged against zeros it cannot distinguish from a real
+# "no condition attached".
+RECEIVE_FACTS_ACTIVE = False
+
+
+def active_receive_fact_streams() -> tuple:
+    """The fact streams this build actually feeds, in index order."""
+    if not RECEIVE_FACTS_ACTIVE:
+        return (RECEIVE_STREAM_INDEX,)
+    return tuple(RECEIVE_FACT_STREAMS)
 RECEIVE_OUTBOUND = 0
 RECEIVE_FINAL = 1
 RECEIVE_BLOCKS_BASE = 1 << 63
@@ -388,6 +427,11 @@ def reserved_operation_keys(
     # so a sender must not be able to write it. Unconditional: the feed is part
     # of this rule set, not a per-node switch.
     keys = keys + (RECEIVE_STREAM_INDEX,)
+    if RECEIVE_FACTS_ACTIVE:
+        # The rest of the payment facts are reserved exactly while the node
+        # feeds them, the same precedent as i16: before that they are ordinary
+        # custom inputs and existing rules using them keep working.
+        keys = keys + tuple(RECEIVE_FACT_STREAMS[1:])
     if eligibility_mode == "tau_validator_set":
         keys = keys + TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS
     if COOLDOWN_STREAM_ACTIVE:
@@ -425,6 +469,8 @@ def rule_text_forbidden_input_streams(
         # -forbidden everywhere, readable only by policy rule text -- the same
         # split the approval slots use.
         readable.add(RECEIVE_STREAM_INDEX)
+        if RECEIVE_FACTS_ACTIVE:
+            readable |= set(RECEIVE_FACT_STREAMS[1:])
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
     return tuple(f"i{idx}" for idx in keys if idx not in readable)

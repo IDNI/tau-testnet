@@ -434,3 +434,45 @@ def test_a_comment_about_a_hold_stream_does_not_count_as_bounding_it():
             "(i17[t]:bv[64] > { #x0259 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24])"
             " : (o5[t]:bv[24] = { #x000001 }:bv[24])")
     assert approvals.screen_hold_mentions(body, group=(17, 27))
+
+
+MIN_ALLOWANCE = ("(i26[t]:bv[64] < { #x01F4 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24])"
+                 " : (o5[t]:bv[24] = { #x000001 }:bv[24])")
+
+
+def test_the_extra_payment_facts_are_off_and_a_clause_reading_them_is_refused():
+    """Parts 3-5 compare bounty 01's conditions; until it lands they are inert."""
+    assert tau_defs.RECEIVE_FACTS_ACTIVE is False
+    rejection = admission_mod._screen_clause_widths_and_structure(MIN_ALLOWANCE)
+    assert rejection and "i26" in rejection and "bounty 01" in rejection
+    # and a clause is not silently judged against zeros it cannot interpret
+    sender_policy.set_evaluator("apply", _Exploding())
+    assert recipient_policy.judge(
+        lambda _who, _stream: MIN_ALLOWANCE, ap.BOB, {}, 1, pool="apply"
+    ) == (False, "", "")
+
+
+def test_when_the_facts_are_on_the_node_feeds_them_and_the_clause_decides(monkeypatch):
+    monkeypatch.setattr(tau_defs, "RECEIVE_FACTS_ACTIVE", True)
+    assert tau_defs.active_receive_fact_streams() == (17, 26, 27, 28)
+    # the clause is now an opt-in receive policy, and every fact is fed
+    assert recipient_policy.mentions_receive_stream(MIN_ALLOWANCE) is True
+    ev = _judgeable(MIN_ALLOWANCE, decide="1")
+    sender_policy.set_evaluator("apply", ev)
+    blocked, _reason, _message = recipient_policy.judge(
+        lambda _who, _stream: MIN_ALLOWANCE, ap.BOB, {1: "500"},
+        recipient_policy.plain_transfer_value(), pool="apply",
+        facts={26: 600, 27: 0, 28: 0},
+    )
+    assert blocked is False
+    _body, inputs = ev.verdict_calls[-1]
+    assert inputs["i26"] == "600" and inputs["i27"] == "0" and inputs["i28"] == "0"
+    assert inputs["i17"] == str(recipient_policy.plain_transfer_value())
+
+
+def test_the_fact_widths_are_screened_when_they_are_live(monkeypatch):
+    monkeypatch.setattr(tau_defs, "RECEIVE_FACTS_ACTIVE", True)
+    bad = "(i27[t]:bv[32] < { #x01 }:bv[32]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
+    err = approvals.screen_receive_widths(bad)
+    assert err and "i27" in err and "bv[64]" in err
+    assert approvals.screen_receive_widths(MIN_ALLOWANCE) is None

@@ -189,6 +189,18 @@ def execute(raw_command: str, container):
                 "recipient_policy": True,
                 "receive_stream": f"i{tau_defs.RECEIVE_STREAM_INDEX}",
                 "receive_stream_width": tau_defs.RECEIVE_STREAM_BV_WIDTH,
+                # The rest of the payment facts (bounty 03 parts 3-5). Listed
+                # only while this build actually feeds them: a wallet must not
+                # deploy a clause against a stream the node leaves as an
+                # ordinary custom input.
+                "receive_facts_active": tau_defs.RECEIVE_FACTS_ACTIVE,
+                "receive_facts": {
+                    f"i{idx}": width
+                    for idx, width in zip(
+                        tau_defs.RECEIVE_FACT_STREAMS[1:],
+                        (tau_defs.RECEIVE_STREAM_BV_WIDTH,) * (len(tau_defs.RECEIVE_FACT_STREAMS) - 1),
+                    )
+                } if tau_defs.RECEIVE_FACTS_ACTIVE else {},
             },
         }
 
