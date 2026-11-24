@@ -310,70 +310,70 @@ APPROVAL_SLOT_BV_WIDTH = 384
 # and a parked request can outlive the mode it was admitted under.
 REQUEST_CUSTOM_INPUT_MIN = APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT
 
-# --- Recipient-side policy: the receive stream (i17) -------------------------
-# One node-fed input that lets an account's o5 clause judge payments TO it.
-# A clause that reads i17 is evaluated a second time, for every payment whose
-# recipient is its owner, after the sender's own checks:
+# --- Recipient-side policy: the receive record (i17, i50..i54) ----------------
+# A few node-fed inputs that let an account's o5 clause judge payments TO it.
+# A clause that reads any of them is evaluated a second time, for every payment
+# whose recipient is its owner, after the sender's own checks. Together they
+# describe the payment, one number per condition, so that each condition of the
+# receiver is one comparison:
 #
-#   i17 = 0        the clause judges a payment its owner SENDS. Also what a
-#                  path that does not feed the stream reads, so the receive part
-#                  of a clause never fires by accident.
-#   i17 = 1        incoming payment that is final in this block (a transfer, or
-#                  an approved parked transfer).
-#   i17 = 1 + N    incoming retractable transfer released N seconds after this
-#                  block's timestamp: the sender can still take it back for N
-#                  seconds.
-#   i17 = 10^18 + N
-#                  incoming retractable transfer released at a block HEIGHT, N
-#                  blocks after this block. A length in blocks is not a length
-#                  in seconds, so it has a range of its own, above every length
-#                  in seconds: a cap written in seconds alone refuses it, and a
-#                  rule that takes height releases names its cap in blocks.
+#   i17   the kind of payment.
+#           0  the clause judges a payment its owner SENDS. Also what a path
+#              that does not feed the record reads, so the receive part of a
+#              clause never fires by accident.
+#           1  an incoming payment, final and spendable at once.
+#           2  an incoming payment with conditions on block TIME: every number
+#              below is in seconds.
+#           3  the same on block HEIGHT: every number below is in blocks.
+#   i50   hold: how long until all of it is within the receiver's reach.
+#         0 when final, RECEIVE_NEVER when part of it never is.
+#   i51   recall: how long the sender can still take it back after it lands.
+#         0 when it cannot, RECEIVE_NEVER without end.
+#   i52   spending limit: at most i52 ...
+#   i53   ... per period of i53. Both 0 without a limit.
+#   i54   refund: how long until the earliest moment any of it can go back to
+#         the sender by itself. RECEIVE_NEVER when never.
 #
-# Host-computed, like i16, so a rule is a single comparison:
+# A payment has one clock, named by i17, and a length in blocks is never
+# converted into seconds or back: a cap written for kind 2 alone refuses a
+# payment of kind 3, and a rule that takes height releases says so.
 #
 #   only A may pay me:   always ( (i17[t]:bv[64] = { 0 }:bv[64]) || (i3[t]:bv[384] = A) ? allow : block ).
 #   instant only:        block when i17[t]:bv[64] > { 1 }:bv[64]
-#   held 600 s at most:  block when i17[t]:bv[64] > { 601 }:bv[64]
-#   held 600 s or 100 blocks at most:
-#                        block when (i17 > { 601 } && i17 < { 1000000000000000000 })
-#                                   || i17 > { 1000000000000000100 }
+#   held 600 s at most:  allow when i17 <= { 1 } || (i17 = { 2 } && i50 <= { 600 })
 #
-# A clause that does not read i17 is never asked about incoming payments, so
+# A clause that reads none of them is never asked about incoming payments, so
 # every clause registered before the feature keeps its meaning.
 #
-# Like the approval slots it is WRITE-reserved (a sender who could put "17" in
-# `operations` would answer the recipient's question for them) and READABLE
+# Like the approval slots they are WRITE-reserved (a sender who could put "17"
+# in `operations` would answer the recipient's question for them) and READABLE
 # only from a registered o5 clause, at exactly bv[64]. Both hold from
 # activation on: the flag lives in consensus state (`recipient_policy_active`,
-# a one-way governance patch), and until it is set i17 stays the ordinary
-# custom stream it was.
-RECEIVE_STREAM_INDEX = 17
+# a one-way governance patch), and until it is set they stay the ordinary
+# custom streams they were.
+RECEIVE_STREAM_INDEX = 17           # the kind
+RECEIVE_HOLD_INDEX = 50
+RECEIVE_RECALL_INDEX = 51
+RECEIVE_LIMIT_INDEX = 52
+RECEIVE_PERIOD_INDEX = 53
+RECEIVE_REFUND_INDEX = 54
+RECEIVE_RECORD_INDICES = (
+    RECEIVE_STREAM_INDEX, RECEIVE_HOLD_INDEX, RECEIVE_RECALL_INDEX,
+    RECEIVE_LIMIT_INDEX, RECEIVE_PERIOD_INDEX, RECEIVE_REFUND_INDEX,
+)
 RECEIVE_STREAM_BV_WIDTH = 64
-RECEIVE_SIDE_SENDER = 0
-RECEIVE_FINAL_NOW = 1
-# Where the lengths in blocks start. A decimal power so the number of blocks can
-# be read off the end of a rule's literal; far above any length in seconds (the
-# longest park is 90 days) and far below the width of the stream.
-RECEIVE_HOLD_BLOCKS = 10 ** 18
-_RECEIVE_VALUE_MAX = (1 << RECEIVE_STREAM_BV_WIDTH) - 1
-
-
-def receive_stream_value(hold_seconds=None, *, hold_blocks=None) -> int:
-    """The i17 value of an incoming payment.
-
-    Neither argument for a payment that is final at once. `hold_seconds` is the
-    seconds from the block's timestamp to the release of a time-based park,
-    `hold_blocks` the blocks from the block's height to the release of a
-    height-based one (neither is ever negative). A length that does not fit its
-    range reads as the longest of that range, so the two never run into each
-    other.
-    """
-    if hold_blocks is not None:
-        return min(RECEIVE_HOLD_BLOCKS + max(0, int(hold_blocks)), _RECEIVE_VALUE_MAX)
-    if hold_seconds is None:
-        return RECEIVE_FINAL_NOW
-    return min(RECEIVE_FINAL_NOW + max(0, int(hold_seconds)), RECEIVE_HOLD_BLOCKS - 1)
+RECEIVE_KIND_OWN = 0
+RECEIVE_KIND_FINAL = 1
+RECEIVE_KIND_SECONDS = 2
+RECEIVE_KIND_BLOCKS = 3
+# "Never" and "without end": the largest value of the stream.
+RECEIVE_NEVER = (1 << RECEIVE_STREAM_BV_WIDTH) - 1
+# Ceilings of the limit. They are part of the record: a receiver's rule rounds
+# a period up to its own (`(i53 + W - 1) / W`), and that sum must not wrap, so
+# a payment whose terms lie above them is refused before the receiver is asked.
+RECEIVE_LIMIT_CEILING = 16_777_215
+RECEIVE_PERIOD_CEILING_SECONDS = 31_622_400
+RECEIVE_PERIOD_CEILING_BLOCKS = 1_000_000
 
 
 # Rule-text screening contexts. Slots are readable in exactly one of them.
@@ -413,9 +413,9 @@ def reserved_operation_keys(
         # and i16 precedents.
         keys = keys + approval_slot_indices()
     if recipient_policy_active:
-        # Same rule again: i17 is reserved from the block after the receive
-        # stream is activated, and an ordinary custom stream until then.
-        keys = keys + (RECEIVE_STREAM_INDEX,)
+        # Same rule again: the inputs of the receive record are reserved from
+        # the block after it is activated, and ordinary custom streams until then.
+        keys = keys + RECEIVE_RECORD_INDICES
     return keys
 
 
@@ -441,5 +441,5 @@ def rule_text_forbidden_input_streams(
     readable = {12}
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
-        readable.add(RECEIVE_STREAM_INDEX)
+        readable |= set(RECEIVE_RECORD_INDICES)
     return tuple(f"i{idx}" for idx in keys if idx not in readable)

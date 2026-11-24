@@ -176,7 +176,7 @@ The full registry (29 names, `app/container.py`):
 | `getrequestid` | `getrequestid <json_payload>` |
 | `getapprovalslots` | `getapprovalslots <address>` — advisory, node-local |
 | `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local; `"request_type":"rule_change"` previews a policy change |
-| `getrecipientpolicy` | `getrecipientpolicy <address> [<sender> <amount>]` — whether the address judges incoming payments; the probe form is advisory, node-local |
+| `getrecipientpolicy` | `getrecipientpolicy <address> [<sender> <amount> [<terms>]]` — whether the address judges incoming payments; with a sender and an amount, whether it would take that payment, which condition fails and the bounds of its rule (advisory, node-local). `<terms>` is `seconds\|blocks [park=N] [hold=N] [recall=N] [limit=N period=N] [refund=N\|never]` |
 | `getretractable` | `getretractable <retractable_id>` — 64 hex chars |
 | `getretractables` | `getretractables <address> [in\|out\|all]` (default `all`) |
 | `getretractableid` | `getretractableid <json_payload>` |
@@ -526,14 +526,37 @@ tau-testnet policy change cancel --key alice --request-id <request_id>
 
 ### Recipient controls
 
-Whether an address judges the payments made to it (an inbound allow-list, a cap
-on how long a retractable transfer may be held), and what its rule says about
-one payment. Semantics are in [recipient_controls.md](recipient_controls.md).
+Write the rule of an account that judges the payments made to it (who may pay,
+how long a payment may be held or taken back, spending limits, refunds), ask
+whether an address has one, and ask what it says about one payment. Semantics
+are in [recipient_controls.md](recipient_controls.md).
 
 ```bash
+# write a rule from numbers; nothing is sent
+tau-testnet policy receive-rule --only-from <sender_pubkey> --max-hold 30d --max-recall 1h
+tau-testnet policy receive-rule --max-hold 10m --max-hold 100b --out policy.tau
+tau-testnet tx send --key bob --rule-file policy.tau
+
+# ask a node
 tau-testnet policy receive <address>
 tau-testnet policy receive <address> --from <sender_pubkey> --amount 25
+tau-testnet policy receive <address> --from <sender_pubkey> --amount 25 --park 2h
+tau-testnet policy receive <address> --from <sender_pubkey> --amount 25 \
+    --hold 30d --recall 1h --limit 2000 --period 30d --refund 90d
 ```
+
+`receive-rule` takes `--only-from PUBKEY` (repeatable), `--final-only`,
+`--max-hold LENGTH`, `--max-recall LENGTH`, `--min-allowance AMOUNT` with
+`--per LENGTH` (and `--average`), `--no-limits`, `--min-refund LENGTH`,
+`--no-refunds` and `--out FILE`. A `LENGTH` is a number of seconds (`600`),
+`10m`, `2h`, `30d`, `1w`, or a number of blocks (`100b`); an option that takes a
+length may be given once per clock. Numbers that contradict each other are
+refused with the reason.
+
+`receive` describes the payment to ask about with `--park LENGTH` (a
+retractable transfer released that far ahead) or with `--hold`, `--recall`,
+`--limit AMOUNT --period LENGTH` and `--refund LENGTH|never`. All lengths of one
+payment are on one clock.
 
 `guard set` and `guard revoke` are rule-change requests of kind 4 and 5; `change
 request --kind` is `set`, `revoke` or `accept`. All request commands take `--body`

@@ -195,7 +195,7 @@ class TipAdmissionView:
 
     @property
     def recipient_policy_active(self) -> bool:
-        """Whether the receive stream (i17) is reserved and fed at the canonical
+        """Whether the receive record (i17, i50 to i54) is reserved and fed at the canonical
         tip. Read from the same manager as `approval_slots_active`."""
         lm = getattr(chain_state, "_lifecycle_manager", None)
         return getattr(lm, "recipient_policy_active", False) is True

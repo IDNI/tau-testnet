@@ -206,9 +206,12 @@ in the future or is outside the window is rejected with a descriptive message
 the generic error code. A park that fails the sender's `o5` policy, the fee step
 or the balance surfaces as for an ordinary transfer.
 
-A recipient can cap how long a payment to it may be held, down to "final at
-once". A park over the cap is refused with `RECIPIENT_MAX_HOLD`, which carries
-the cap as `max_hold_seconds` (or `max_hold_blocks` for a height release); a retract is never refused. See
+A recipient can bound how long a payment to it may be held and how long its
+sender may take it back, down to "final at once". For a park both are the time
+until its release. A park beyond a bound is refused with `RECIPIENT_HOLD` or
+`RECIPIENT_RECALL`, which carries the bound as `max_hold_seconds` or
+`max_recall_seconds` (`max_hold_blocks`, `max_recall_blocks` for a height
+release); a retract is never refused. See
 [recipient_controls.md](recipient_controls.md).
 
 ## Timing caveats

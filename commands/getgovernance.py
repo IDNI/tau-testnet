@@ -170,7 +170,7 @@ def execute(raw_command: str, container):
             "vote_quorum": chain_state._lifecycle_manager.effective_quorum_policy(),
             "eligibility_mode": chain_state._lifecycle_manager.effective_eligibility_mode(),
             # Whether an account's own o5 clause is also asked about payments
-            # made TO it (the receive stream i17). False until a governance
+            # made TO it (the receive record). False until a governance
             # patch activates it; see docs/recipient_controls.md.
             "recipient_policy_active": getattr(
                 chain_state._lifecycle_manager, "recipient_policy_active", False

@@ -144,14 +144,15 @@ An operation key `N` maps to Tau input stream `iN`. The wallet supports:
 | `i13` | proposer pubkey, reserved under the `tau_validator_set` eligibility mode |
 | `i14` / `i15` | consensus stake / eligibility-mode inputs |
 | `i16` | seconds since the sender's previous transfer (`bv[64]`). Reserved **only while the network feeds it**; until then it is an ordinary custom stream. While reserved, a policy clause may not read it. |
-| `i17` | the receive stream (`bv[64]`), reserved once the chain has activated recipient-side policy; only the node fills it, and only a policy clause may read it. See [docs/recipient_controls.md](docs/recipient_controls.md) |
+| `i17`, `i50`–`i54` | the receive record (`bv[64]` each): the kind of an incoming payment and its hold, recall window, spending limit, period and refund. Reserved once the chain has activated recipient-side policy; only the node fills them, and only a policy clause may read them. See [docs/recipient_controls.md](docs/recipient_controls.md) |
 | `i18`–`i25` | co-signature approval slots, reserved once the chain has activated approvals; only the node fills them |
 
 So user-controllable custom input streams start at **`i13`**, and the streams
 above that are reserved as listed. Attempting to set a reserved stream as an
 operation key is rejected at admission (and at block apply), so a crafted
 `operations["12"]` cannot spoof the sender pubkey. Custom inputs read by an `o5`
-policy rule (see below) start at **`i26`**, above the approval slots.
+policy rule (see below) start at **`i26`**, above the approval slots; `i50`–`i54`
+are not among them once the chain has activated recipient-side policy.
 
 **Combining custom inputs with the transfer.** Custom streams are evaluated in
 the *same* Tau step as the transfer at both admission and apply, so a policy

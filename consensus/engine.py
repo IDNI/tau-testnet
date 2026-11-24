@@ -256,7 +256,7 @@ def _clause_domain_rejection(body: str, *, guard: bool = False,
     """(error, receipt reason) when admission would refuse this clause body.
 
     `receive_active` is the PARENT snapshot's `recipient_policy_active`: the
-    width of the receive stream is screened only on a chain that feeds it.
+    width of the receive record is screened only on a chain that feeds it.
     """
     # Lazy: consensus.admission imports chain_state, which imports this module.
     from consensus.admission import (
@@ -1491,7 +1491,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # activation recorded in block H governs H+1 onward and never changes the
         # meaning of the block that carried it.
         approval_slots_on = getattr(lifecycle_mgr, "approval_slots_active", False) is True
-        # Recipient-side policy (the receive stream i17), read at the same
+        # Recipient-side policy (the receive record), read at the same
         # point for the same reason: the parent's flag governs this block.
         recipient_policy_on = getattr(lifecycle_mgr, "recipient_policy_active", False) is True
 
@@ -1909,7 +1909,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
                                           escrow=False,
-                                          receive_value=tau_defs.RECEIVE_FINAL_NOW):
+                                          receive=recipient_policy.FINAL):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -1932,9 +1932,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 `escrow` stages only the debit: the credit belongs to the
                 retractable book until it releases.
 
-                `receive_value` is what the RECIPIENT's clause reads on the
-                receive stream (i17) when it is asked about this payment: final
-                now by default, the hold of a retractable park otherwise.
+                `receive` is the record the RECIPIENT's clause reads when it
+                is asked about this payment: final at once by default, the
+                hold and recall window of a retractable park otherwise.
                 """
                 nonlocal accepted_in_block, hard_reject, execution_success
                 try:
@@ -2039,15 +2039,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # After every check on the sender's side, so a payment
                         # the sender may not make is refused for the sender's
                         # reason. Asked only when the recipient's clause reads
-                        # the receive stream; same inputs, approval slots
-                        # emptied, i17 set. One refusal fails the whole
+                        # the receive record; same inputs, approval slots
+                        # emptied, the record set. One refusal fails the whole
                         # transaction, exactly like a sender-side block: nothing
                         # staged commits, the transaction is not included and no
                         # fee is charged.
                         if recipient_policy_on:
                             theirs_blocks, their_o5 = recipient_policy.recipient_blocks(
                                 lifecycle_mgr.rule_offers.clause_for, to_addr,
-                                tau_input_stream_values, receive_value,
+                                tau_input_stream_values, receive,
                                 pool="apply",
                                 timeout=getattr(_session, "request_budget", None),
                             )
@@ -2061,8 +2061,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     hard_reject = True
                                 execution_success = False
                                 tx_receipt["reason"] = recipient_policy.RECIPIENT_POLICY_BLOCK_REASON
+                                # The verdict stays one evaluation here. The
+                                # log carries the payment's terms, so that
+                                # getrecipientpolicy can name the condition.
                                 tx_receipt["logs"].append(
-                                    f"Transfer rejected by recipient policy (o5={their_o5})"
+                                    f"Transfer rejected by recipient policy (o5={their_o5}); "
+                                    f"asked as: {receive.terms() or 'final at once'}"
                                 )
                                 return False
 
@@ -2660,19 +2664,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             # for a time-based park, blocks from THIS block's
                             # height for a height-based one.
                             if park.kind == KIND_TIME:
-                                park_receive_value = tau_defs.receive_stream_value(
-                                    park.release_at - int(block_timestamp or 0)
+                                park_receive = recipient_policy.park_record(
+                                    recipient_policy.SECONDS,
+                                    park.release_at - int(block_timestamp or 0),
                                 )
                             else:
-                                park_receive_value = tau_defs.receive_stream_value(
-                                    hold_blocks=park.release_at - int(block_height or 0)
+                                park_receive = recipient_policy.park_record(
+                                    recipient_policy.BLOCKS,
+                                    park.release_at - int(block_height or 0),
                                 )
                             escrowed = _execute_fee_era_transfer(
                                 park.sender_pubkey, park.recipient_pubkey, park.amount,
                                 slot_values=_approval_slot_values(),
                                 overrides={},
                                 escrow=True,
-                                receive_value=park_receive_value,
+                                receive=park_receive,
                             )
                             fee_already_measured = True
                             if escrowed and accepted_in_block and not hard_reject:

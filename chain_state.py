@@ -1593,7 +1593,7 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
                     logger.warning(
                         "could not persist approval_slots_active from genesis",
                         exc_info=True)
-            # Likewise the receive stream (scripts/gen_genesis.py --recipient-policy).
+            # Likewise the receive record (scripts/gen_genesis.py --recipient-policy).
             if _genesis_recipient_policy_active:
                 _lifecycle_manager.activate_recipient_policy()
                 try:
@@ -2404,7 +2404,7 @@ def load_state_from_db() -> bool:
                     logger.warning(
                         "could not persist approval_slots_active from genesis",
                         exc_info=True)
-        # The receive stream's flag, rehydrated the same way and as early.
+        # The receive record's flag, rehydrated the same way and as early.
         persisted_receive = db.get_chain_state_value("recipient_policy_active", _MISSING)
         if _genesis_recipient_policy_active or (
             persisted_receive is not _MISSING and str(persisted_receive) == "1"

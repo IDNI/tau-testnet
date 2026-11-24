@@ -329,13 +329,13 @@ def screen_user_rule_text(
         recipient_policy_active=receive_active,
     )
     typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
-    receive_stream = f"i{tau_defs.RECEIVE_STREAM_INDEX}"
-    if typed_reserved_in and typed_reserved_in[0] == receive_stream:
+    receive_record = {f"i{index}" for index in tau_defs.RECEIVE_RECORD_INDICES}
+    if typed_reserved_in and typed_reserved_in[0] in receive_record:
         return UserRuleRejection(
-            f"user_tx rule text references the receive stream '{receive_stream}': "
-            f"the node feeds it only to a registered o5 policy clause, and typing "
-            f"it from another rule can pin a conflicting bitvector width "
-            f"process-wide.",
+            f"user_tx rule text references '{typed_reserved_in[0]}', an input of "
+            f"the receive record: the node feeds it only to a registered o5 "
+            f"policy clause, and typing it from another rule can pin a "
+            f"conflicting bitvector width process-wide.",
             "reserved_input_stream",
             "TX_REJECTED",
         )
@@ -444,8 +444,8 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 f"Invalid operation target '{key}'. Stream {idx} is reserved "
                 f"(i12 sender pubkey; i14/i15 consensus stake/mode inputs; "
                 f"i13 consensus proposer pubkey under tau_validator_set; "
-                f"i18-i25 co-signature approval slots and i17 the receive "
-                f"stream, which only the node may write)."
+                f"i18-i25 co-signature approval slots and i17, i50-i54 the "
+                f"receive record, which only the node may write)."
             )
 
     rule_text = operations.get("0")
@@ -1004,9 +1004,9 @@ def _screen_clause(body: str, receive_active: bool = False) -> Optional[str]:
     """The clause screen, plus the one check that depends on chain state.
 
     `_screen_clause_domains` reads the body and nothing else, so it gives the
-    same answer on every node at every height. The width of the receive stream
-    cannot be screened that way: before `recipient_policy_active` is set, i17 is
-    an ordinary custom stream that a block may already carry at any width, and
+    same answer on every node at every height. The width of the receive record
+    cannot be screened that way: before `recipient_policy_active` is set, its
+    inputs are ordinary custom streams that a block may already carry at any width, and
     refusing that at apply would split an upgraded node from the rest. So that
     one check is gated on `receive_active`, the chain's flag, which admission
     reads from the tip and apply from the parent snapshot.
@@ -1069,8 +1069,8 @@ def _screen_clause_domains(body: str) -> Optional[str]:
 
 
 def receive_stream_inactive_error(body: str, tip_view) -> Optional["AdmissionResult"]:
-    """Admission's refusal of a clause that reads i17 on a chain without the
-    receive stream, or None.
+    """Admission's refusal of a clause that reads the receive record on a chain
+    that does not feed it, or None.
 
     Admission only, never block apply: the clause would register and then never
     be asked about a single incoming payment, which is the silent failure a
@@ -1079,7 +1079,8 @@ def receive_stream_inactive_error(body: str, tip_view) -> Optional["AdmissionRes
     if recipient_policy_active(tip_view) or not reads_receive_stream(body or ""):
         return None
     return format_error(
-        f"This rule reads the receive stream i{tau_defs.RECEIVE_STREAM_INDEX}, but "
+        f"This rule reads the receive record (i{tau_defs.RECEIVE_STREAM_INDEX}, "
+        f"i{tau_defs.RECEIVE_HOLD_INDEX} to i{tau_defs.RECEIVE_REFUND_INDEX}), but "
         f"recipient-side policy is not active on this chain, so the rule would "
         f"never be asked about an incoming payment. The feature activates by "
         f"governance patch (recipient_policy_active).",

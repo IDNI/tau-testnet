@@ -424,9 +424,10 @@ only to stop accidental or lone revocations.
 | `i1` | `bv[24]` | transfer amount |
 | `i3` / `i4` | `bv[384]` | sender / recipient pubkey |
 | `i12` | `bv[384]` | sender pubkey — set by the node; a clause body must not reference it |
-| `i17` | `bv[64]` | receive stream: node-written, clause-readable; `0` = the owner's own payment, otherwise an incoming one ([recipient_controls.md](recipient_controls.md)) |
+| `i17` | `bv[64]` | receive record, the kind: node-written, clause-readable; `0` = the owner's own payment, otherwise an incoming one ([recipient_controls.md](recipient_controls.md)) |
 | `i18`–`i25` | `bv[384]` | approval slots: node-written, clause-readable, `0` = no vote |
 | `i26`+ | — | sender custom inputs |
+| `i50`–`i54` | `bv[64]` | receive record, the conditions of an incoming payment: hold, recall window, spending limit, its period, refund. Node-written, clause-readable; not custom inputs once recipient-side policy is active |
 | `o5` | `bv[24]` | user policy: `0` blocks, `1` or absent allows |
 
 The slots are **write-reserved and read-permitted**, which is the whole point: a

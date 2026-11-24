@@ -327,7 +327,7 @@ def test_a_rule_is_judged_against_the_committed_type_history(authority):
 
 # --- custom inputs reach the evaluator as values --------------------------------
 
-# Not 17: i17 is the receive stream, and a clause that reads it is refused at
+# Not 17: i17 is part of the receive record, and a clause that reads it is refused at
 # deploy on a chain that has not activated recipient-side policy.
 CUSTOM = "30"
 

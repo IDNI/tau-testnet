@@ -113,11 +113,11 @@ def validate_approval_slots_active(value: Any) -> Optional[str]:
 
 def validate_recipient_policy_active(value: Any) -> Optional[str]:
     """Receive-stream activation is a ONE-WAY switch to True, like the approval
-    slots: turning it off would un-reserve i17 while registered clauses still
-    read it, and a sender could then answer the recipient's question for them.
+    slots: turning it off would un-reserve the receive record while registered
+    clauses still read it, and a sender could then answer the recipient's question for them.
     """
     if value is not True:
-        return "must be true; the receive stream cannot be deactivated once active"
+        return "must be true; the receive record cannot be deactivated once active"
     return None
 
 
@@ -474,7 +474,7 @@ class ConsensusLifecycleManager:
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
-        # Recipient-side policy (the receive stream i17). ONE-WAY and held in
+        # Recipient-side policy (the receive record, i17 and i50 to i54). ONE-WAY and held in
         # consensus state for the same reasons, and read from the PARENT
         # snapshot the same way.
         self.recipient_policy_active: bool = False
@@ -692,7 +692,7 @@ class ConsensusLifecycleManager:
             if findings:
                 logger.error(
                     "recipient_policy_active activation REFUSED at this height; the "
-                    "effective spec already reads the receive stream: %s",
+                    "effective spec already reads the receive record: %s",
                     "; ".join(findings),
                 )
             else:
@@ -700,7 +700,7 @@ class ConsensusLifecycleManager:
         self.recompute_approval_threshold()
 
     def activate_recipient_policy(self) -> None:
-        """Turn the receive stream on. Idempotent, and there is no way back."""
+        """Turn the receive record on. Idempotent, and there is no way back."""
         self.recipient_policy_active = True
 
     def activate_approval_slots(self) -> None:

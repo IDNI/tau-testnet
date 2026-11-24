@@ -2554,7 +2554,7 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
         )
 
     if recipient_policy_active is not None:
-        # One-way activation flag of the receive stream (i17), persisted for the
+        # One-way activation flag of the receive record, persisted for the
         # same reason: a restart must not un-reserve it.
         _db_conn.execute(
             'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',

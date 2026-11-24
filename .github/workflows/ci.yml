@@ -96,6 +96,7 @@ jobs:
           tests/test_rule_scoping_native.py
           tests/test_shrink_bare_ref_native.py
           tests/test_recipient_policy_native.py
+          tests/test_recipient_rules_proofs_native.py
           tests/test_special_stream_native.py
           tests/test_tau_output_determinism.py
           tests/test_apply_lifecycle_branch_native.py

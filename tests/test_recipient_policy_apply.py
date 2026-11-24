@@ -4,9 +4,12 @@ of #76, through the real `apply_block`.
 The clause verdicts come from the Python models in `recipient_rules`, which the
 native tests hold to the real engine.
 """
+import re
+
 import pytest
 
 import tau_defs
+from commands import getrecipientpolicy
 from consensus import recipient_policy, sender_policy
 from consensus.approvals import STATUS_FAILED
 from consensus.policy_mock import MockPolicyEvaluator
@@ -61,6 +64,22 @@ def _asked_about(ev, body):
     return [inputs for called, inputs in ev.verdict_calls if called == body]
 
 
+RECORD = ["i%d" % index for index in tau_defs.RECEIVE_RECORD_INDICES]
+NEVER = str(tau_defs.RECEIVE_NEVER)
+
+
+def _record(inputs):
+    """The receive record one evaluation was asked with: kind, hold, recall,
+    limit, period, refund."""
+    return tuple(inputs.get(name) for name in RECORD)
+
+
+def _park_record(kind, length):
+    """A park: held, and open to a recall, until its release. No limit, and
+    nothing that goes back by itself."""
+    return (str(kind), str(length), str(length), "0", "0", NEVER)
+
+
 # --- #47: inbound allow-list --------------------------------------------------
 
 def test_the_listed_sender_pays_and_a_stranger_is_refused(ev):
@@ -89,8 +108,8 @@ def test_the_owner_of_an_allow_list_still_pays_anyone(ev):
     result = ch.block([spend_tx(BOB, CAROL, 40, seq=0), spend_tx(BOB, MALLORY, 2, seq=1)])
     assert not result.invalid_tx_ids
     assert ch.bal[CAROL] == 10_040 and ch.bal[MALLORY] == 10_002
-    sent = [i["i17"] for i in _asked_about(ev, body) if "i17" in i]
-    assert sent == [], "the sender pass must not feed the receive stream"
+    sent = [name for i in _asked_about(ev, body) for name in RECORD if name in i]
+    assert sent == [], "the sender pass must not feed the receive record"
 
 
 def test_an_account_without_a_policy_is_paid_by_everyone(ev):
@@ -165,7 +184,7 @@ def test_inbound_and_outbound_rules_live_in_one_unit_and_both_enforce(ev):
 
 
 def test_the_recipient_reads_the_transfer_the_sender_made(ev):
-    """Same inputs as the sender's side, approval slots emptied, i17 set."""
+    """Same inputs as the sender's side, approval slots emptied, the record set."""
     body = rules.allow_list(ALICE)
     ch = _chain(ev, {BOB: (body, rules.allow_list_model(ALICE))})
     ch.block([spend_tx(ALICE, BOB, 300, seq=0)])
@@ -173,8 +192,8 @@ def test_the_recipient_reads_the_transfer_the_sender_made(ev):
             if str(c["input_stream_values"].get(1)) == "300"][-1]
     (inputs,) = _asked_about(ev, body)
     assert inputs == sender_policy.clause_inputs(
-        recipient_policy.receive_inputs(main, tau_defs.RECEIVE_FINAL_NOW))
-    assert inputs["i17"] == "1"
+        recipient_policy.receive_inputs(main, recipient_policy.FINAL))
+    assert _record(inputs) == ("1", "0", "0", "0", "0", NEVER)
     assert inputs["i3"] == "#x" + ALICE and inputs["i4"] == "#x" + BOB
     assert all(inputs[f"i{slot}"] == "0" for slot in tau_defs.approval_slot_indices())
 
@@ -225,7 +244,8 @@ def test_a_recipient_clause_the_engine_cannot_step_refuses(ev):
 
 
 def test_nothing_is_asked_while_the_feature_is_inactive(ev):
-    """Before activation i17 is an ordinary stream and apply is unchanged."""
+    """Before activation the record's inputs are ordinary streams and apply is
+    unchanged."""
     body = rules.allow_list(ALICE)
     ch = _chain(ev, {BOB: (body, rules.allow_list_model(ALICE))}, active=False)
     result = ch.block([spend_tx(CAROL, BOB, 300, seq=0)])
@@ -237,7 +257,7 @@ def test_nothing_is_asked_while_the_feature_is_inactive(ev):
 
 def test_instant_only_takes_a_transfer_and_refuses_every_park(ev):
     """Acceptance case 1 of #76."""
-    ch = _chain(ev, {BOB: (rules.max_hold(0), rules.max_hold_model(0))})
+    ch = _chain(ev, {BOB: (rules.final_only(), rules.final_only_model())})
     result = ch.block([spend_tx(ALICE, BOB, 50, seq=0)])
     assert not result.invalid_tx_ids and ch.bal[BOB] == 10_050
 
@@ -258,7 +278,7 @@ def test_a_cap_admits_a_park_inside_it_and_refuses_one_beyond(ev):
     result = ch.block([ten_minutes])
     assert not result.invalid_tx_ids
     assert ch.book.escrow_total() == 50
-    assert _asked_about(ev, body)[-1]["i17"] == "601"
+    assert _record(_asked_about(ev, body)[-1]) == _park_record(2, 600)
 
     for release in (TS + 601, TS + 3_600):
         before = ch.snapshot()
@@ -267,14 +287,14 @@ def test_a_cap_admits_a_park_inside_it_and_refuses_one_beyond(ev):
 
 
 def test_a_park_released_at_a_height_has_no_length_in_seconds(ev):
-    """Its length is in blocks, above every length in seconds, so a cap written
-    in seconds alone refuses it, however long that cap is."""
+    """Its length is in blocks, on a clock of its own, so a cap written in
+    seconds alone refuses it, however long that cap is."""
     body = rules.max_hold(MAX_RELEASE_WINDOW_SECONDS)
     ch = _chain(ev, {BOB: (body, rules.max_hold_model(MAX_RELEASE_WINDOW_SECONDS))})
     park = park_tx(amount=50, seq=0, at_height=HEIGHT + 1)
     before = ch.snapshot()
     _refused(ch, ch.block([park]), park, before)
-    assert _asked_about(ev, body)[-1]["i17"] == str(tau_defs.RECEIVE_HOLD_BLOCKS + 1)
+    assert _record(_asked_about(ev, body)[-1]) == _park_record(3, 1)
 
 
 def test_a_cap_in_blocks_admits_a_height_release_inside_it_and_refuses_one_beyond(ev):
@@ -285,17 +305,17 @@ def test_a_cap_in_blocks_admits_a_height_release_inside_it_and_refuses_one_beyon
     result = ch.block([inside], height=HEIGHT)
     assert not result.invalid_tx_ids
     assert ch.book.escrow_total() == 50
-    assert _asked_about(ev, body)[-1]["i17"] == str(tau_defs.RECEIVE_HOLD_BLOCKS + 100)
+    assert _record(_asked_about(ev, body)[-1]) == _park_record(3, 100)
 
     # The same release point, one block later, is one block shorter.
     again = park_tx(amount=50, seq=1, at_height=HEIGHT + 100)
     assert not ch.block([again], height=HEIGHT + 1).invalid_tx_ids
-    assert _asked_about(ev, body)[-1]["i17"] == str(tau_defs.RECEIVE_HOLD_BLOCKS + 99)
+    assert _record(_asked_about(ev, body)[-1]) == _park_record(3, 99)
 
     before = ch.snapshot()
     beyond = park_tx(amount=50, seq=2, at_height=HEIGHT + 2 + 101)
     _refused(ch, ch.block([beyond], height=HEIGHT + 2), beyond, before)
-    assert _asked_about(ev, body)[-1]["i17"] == str(tau_defs.RECEIVE_HOLD_BLOCKS + 101)
+    assert _record(_asked_about(ev, body)[-1]) == _park_record(3, 101)
 
 
 def test_the_hold_is_counted_from_the_blocks_own_timestamp(ev):
@@ -305,6 +325,37 @@ def test_the_hold_is_counted_from_the_blocks_own_timestamp(ev):
     _refused(ch, ch.block([park], ts=TS), park, before)
     result = ch.block([park], height=HEIGHT + 1, ts=TS + 100)
     assert not result.invalid_tx_ids and ch.book.escrow_total() == 50
+
+
+def test_the_recall_window_is_judged_apart_from_the_hold(ev):
+    """Held at most 30 days, taken back within an hour at most: a park is open
+    to a recall until its release, so two hours are refused though the hold is
+    far inside its bound."""
+    body = rules.hold_and_recall(2_592_000, 3_600)
+    ch = _chain(ev, {BOB: (body, rules.hold_and_recall_model(2_592_000, 3_600))})
+    hour = park_tx(amount=50, seq=0, at_time=TS + 3_600)
+    assert not ch.block([hour]).invalid_tx_ids
+    assert ch.book.escrow_total() == 50
+
+    before = ch.snapshot()
+    two_hours = park_tx(amount=50, seq=1, at_time=TS + 7_200)
+    _refused(ch, ch.block([two_hours]), two_hours, before)
+    assert _record(_asked_about(ev, body)[-1]) == _park_record(2, 7_200)
+
+
+def test_every_condition_must_pass_in_one_evaluation(ev):
+    """A rule that ties the hold to the recall window: the block asks it once,
+    with the whole record, and applies its one verdict."""
+    body = rules.hold_plus_recall(3_600)
+    ch = _chain(ev, {BOB: (body, rules.hold_plus_recall_model(3_600))})
+    inside = park_tx(amount=50, seq=0, at_time=TS + 1_800)
+    assert not ch.block([inside]).invalid_tx_ids
+    assert len(_asked_about(ev, body)) == 1
+
+    before = ch.snapshot()
+    beyond = park_tx(amount=50, seq=1, at_time=TS + 2_400)
+    _refused(ch, ch.block([beyond]), beyond, before)
+    assert len(_asked_about(ev, body)) == 2, "one evaluation a payment, at apply"
 
 
 def test_without_a_cap_parks_of_any_length_pass(ev):
@@ -323,14 +374,14 @@ def test_without_a_cap_parks_of_any_length_pass(ev):
 def test_a_retract_is_never_gated_and_a_release_is_not_asked_again(ev):
     """Acceptance case 4 of #76. Bob tightens his cap to instant-only after two
     parks are open: Alice still takes one back, and the other still releases."""
-    loose, tight = rules.max_hold(600), rules.max_hold(0)
+    loose, tight = rules.max_hold(600), rules.final_only()
     ch = _chain(ev, {BOB: (loose, rules.max_hold_model(600))})
     back = park_tx(amount=70, seq=0, at_time=TS + 500)
     stays = park_tx(amount=30, seq=1, at_time=TS + 400)
     assert not ch.block([back, stays]).invalid_tx_ids
 
     ch.lm.rule_offers.accepted_clauses[(BOB, 5)] = tight
-    ev.set_verdict(tight, rules.max_hold_model(0))
+    ev.set_verdict(tight, rules.final_only_model())
     asked = len(ev.verdict_calls)
 
     result = ch.block([retract_tx(rid_of(back), seq=2)], height=HEIGHT + 1, ts=TS + 10)
@@ -343,12 +394,19 @@ def test_a_retract_is_never_gated_and_a_release_is_not_asked_again(ev):
 
 
 def test_a_refused_park_costs_the_sender_nothing(ev):
-    ch = _chain(ev, {BOB: (rules.max_hold(0), rules.max_hold_model(0))}, fee=9)
+    ch = _chain(ev, {BOB: (rules.final_only(), rules.final_only_model())}, fee=9)
     park = park_tx(amount=50, seq=0, at_time=TS + 60)
     before = ch.snapshot()
-    _refused(ch, ch.block([park]), park, before)
+    result = ch.block([park])
+    _refused(ch, result, park, before)
     assert ch.bal[ALICE] == 10_000 and ch.bal[PROPOSER] == 0
     assert ch.seq.get(ALICE, 0) == 0
+    # The log carries the payment's terms as getrecipientpolicy takes them, so
+    # the condition can be asked for; the verdict itself stays one evaluation.
+    asked_as = re.search(r"asked as: ([^|]+)", rt._logs(result)).group(1).strip()
+    record = getrecipientpolicy.parse_terms(asked_as.split())
+    assert record.kind == 2 and record.hold == record.recall > 0
+    assert len(ev.verdict_calls) == 1
 
 
 # --- parked transfers that wait for co-signatures -------------------------------
@@ -374,8 +432,9 @@ def test_an_approved_transfer_is_judged_by_the_recipient_when_it_executes(ev):
     assert lm.approval_requests.terminal_status[request.request_id] == STATUS_FAILED
     assert ap._balances(result)[ap.BOB] == 0
     assert "rejected by recipient policy" in ap._logs(result)
+    assert "asked as: final at once" in ap._logs(result)
     (inputs,) = _asked_about(ev, body)
-    assert inputs["i17"] == "1" and inputs["i18"] == "0"
+    assert _record(inputs) == ("1", "0", "0", "0", "0", NEVER) and inputs["i18"] == "0"
 
 
 def test_an_approved_transfer_to_a_willing_recipient_executes(ev):

@@ -47,7 +47,7 @@ def get_args():
     parser.add_argument(
         "--recipient-policy", action="store_true",
         help=(
-            "Activate recipient-side policy (the receive stream i17) from block "
+            "Activate recipient-side policy (the receive record, i17 and i50 to i54) from block "
             "0. For a FRESH chain only: on an existing chain this is a "
             "governance patch, which audits the live spec first. Off by default "
             "so a genesis generated without it stays byte-identical."
