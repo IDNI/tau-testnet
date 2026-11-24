@@ -432,10 +432,14 @@ class WorkerSession(EvaluatorSession):
         # representations: a granted sender's full-width literal never matches its
         # interned input value, and the simulation rejects transfers the
         # authoritative path accepts.
+        import tau_native
         import tau_shrink
-        exclude = self._excluded_streams(rule_text)
+        # The engine rejects comments and a missing trailing period; the
+        # recorded text stays the caller's, as in the in-process session.
+        engine_text = tau_native.TauInterface.preprocess_spec_text(rule_text)
+        exclude = self._excluded_streams(engine_text)
         with self._allocating():
-            prepared = tau_shrink.prepare_rule(rule_text, exclude_streams=exclude)
+            prepared = tau_shrink.prepare_rule(engine_text, exclude_streams=exclude)
             if self.plan is not None and not (
                     set(prepared.shrunk_streams) <= set(self.plan.interned)):
                 import tau_reconstruction
