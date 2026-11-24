@@ -218,11 +218,19 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["payout_period_seconds"] = payload.get("payout_period_seconds")
         signing_dict["payout_period_anchor_ts"] = payload.get("payout_period_anchor_ts")
         signing_dict["payout_version"] = payload.get("payout_version")
+        # FIX 7: the slot is a field that fixes the rule — with up to 8
+        # rules per account, an unsigned slot could be rewritten by a
+        # proposer into a different rule of the same owner than the one
+        # the owner chose to install.
+        signing_dict["payout_rule_index"] = payload.get("payout_rule_index")
     elif tx_type == TX_TYPE_REMOVE_PAYOUT_RULE:
-        # Nothing beyond the signer's identity (sender_pubkey is always
-        # signed): a removal names the signer's own rule, and there is no
-        # field a proposer could rewrite to redirect it.
-        pass
+        # The slot is signed (FIX 7): a removal names exactly one of the
+        # signer's own rules by its slot, and an unsigned slot could be
+        # rewritten by a proposer to redirect the removal to a different
+        # rule of the same owner. Nothing else needs signing — the slot
+        # plus the signer's identity (sender_pubkey is always signed)
+        # names the rule completely.
+        signing_dict["payout_rule_index"] = payload.get("payout_rule_index")
     elif tx_type == TX_TYPE_EXECUTE_PAYOUT_RULE:
         # The execution's inputs are signed: which rule, which settlement,
         # and the base amount the stored program computes over. The legs

@@ -526,7 +526,9 @@ class RuleChangeRequest:
     sequence_number: int
     kind: int
     rule_text: str
-    offer_id: str                      # 64 lowercase hex for kind 3, else ""
+    offer_id: str                      # 64 lowercase hex for kinds 3/12; for
+                                       # kind 9 the payout rule id it revokes
+                                       # (FIX 7), or "" for the slot-0 rule
     approvers: Dict[int, str]          # slot index -> approver pubkey
     expire_at_height: int
 
@@ -641,6 +643,10 @@ def payout_payload_text(entry) -> str:
         "payout_period_seconds": entry.period_seconds,
         "payout_period_anchor_ts": entry.period_anchor_ts,
         "payout_version": entry.version,
+        # FIX 7: the body names the slot it installs at, so a kind 7/8
+        # change is bound to exactly one of the owner's rules — the same
+        # unconditional-field discipline as standing_due_retry_seconds.
+        "payout_rule_index": entry.rule_index,
     }
     if entry.form == FORM_TAU_RULE:
         obj["payout_clause"] = entry.clause_text
@@ -780,6 +786,15 @@ def parse_rule_change_request_checked(
                           if kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER
                           else "offer_id must be the 64-hex id of the standing "
                                "authorization to cancel")
+    elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT and offer_id != "":
+        # FIX 7: a payout revoke names the rule it revokes by id in
+        # offer_id — the kind-12 discipline applied to the payout book.
+        # An empty offer_id stays valid and names the slot-0 rule, the
+        # only rule a pre-multi-rule revoke could have meant.
+        offer_id = offer_id.strip().lower()
+        if len(offer_id) != 64 or any(c not in "0123456789abcdef" for c in offer_id):
+            return None, ("offer_id must be the 64-hex id of the payout "
+                          "rule to revoke")
     elif offer_id != "":
         return None, "this kind carries no offer_id"
 

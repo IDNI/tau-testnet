@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from typing import Optional, Set
+from typing import List, Optional, Set
 
 import config
 import db
@@ -619,11 +619,13 @@ class TipAdmissionView:
         row = next(r for r in book.rows() if r[0] == entry.rule_id)
         (rule_id, owner, recipients, legs, max_exec, max_period,
          period_seconds, anchor, version, period_totals,
-         form, clause_text) = row
+         form, clause_text) = row[:12]
+        rule_index = int(row[12]) if len(row) > 12 else 0
         ts = self.next_block_timestamp
         period = period_index_at(entry, ts)
         return {
             "rule_id": entry.rule_id.hex(),
+            "rule_index": rule_index,
             "owner_pubkey": owner,
             "recipients": list(recipients),
             "legs": [
@@ -686,19 +688,40 @@ class TipAdmissionView:
         return self._payout_rule_view(book, entry)
 
     def get_payout_rule_for_owner(self, owner_pubkey: str) -> Optional[dict]:
-        """The payout rule one owner currently has installed, or None.
+        """The payout rule at one owner's slot 0, or None.
 
-        Install admission needs the owner's current entry so it can call
-        the book's can_install verbatim — the next-version rule lives in
-        the book, not here.
+        Slot 0 is the rule every pre-multi-rule caller means: the owner's
+        first rule. Callers that need the whole book use
+        get_payout_rules_for_owner.
         """
+        return self.get_payout_rule_for_owner_index(owner_pubkey, 0)
+
+    def get_payout_rule_for_owner_index(
+        self, owner_pubkey: str, rule_index: int
+    ) -> Optional[dict]:
+        """The payout rule at one owner's one slot (FIX 7), or None."""
         book = self._tip_payout_book()
         if book is None:
             return None
-        entry = book.get(owner_pubkey)
+        entry = book.get(owner_pubkey, int(rule_index))
         if entry is None:
             return None
         return self._payout_rule_view(book, entry)
+
+    def get_payout_rules_for_owner(self, owner_pubkey: str) -> List[dict]:
+        """Every payout rule one owner holds, in slot order (FIX 7).
+
+        Install admission needs the owner's whole book so it can call the
+        book's can_install verbatim — the per-slot version chain and the
+        slot bound live in the book, not here.
+        """
+        book = self._tip_payout_book()
+        if book is None:
+            return []
+        return [
+            self._payout_rule_view(book, entry)
+            for entry in book.get_all(owner_pubkey)
+        ]
 
     def _tip_grant_book(self) -> Optional[GrantBook]:
         lm = getattr(chain_state, "_lifecycle_manager", None)

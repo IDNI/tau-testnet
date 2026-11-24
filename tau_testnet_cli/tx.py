@@ -561,8 +561,10 @@ def build_rule_change_request_tx(
     offered text and the offer id; kinds 7, 8, 10 and 11 carry the canonical
     payload text of the payout rule / standing authorization they install;
     kind 12 carries the id of the standing authorization it cancels in
-    ``offer_id``; kinds 2, 5 and 9 carry neither. Zero approvers is
-    valid: the time escape alone can release the request.
+    ``offer_id``; kind 9 carries the id of the payout rule it revokes in
+    ``offer_id`` (FIX 7 — optional: without it, the slot-0 rule); kinds 2
+    and 5 carry neither. Zero approvers is valid: the time escape alone
+    can release the request.
     """
     if isinstance(kind, bool) or kind not in range(1, 13):
         raise ValueError("kind must be 1..12")
@@ -573,6 +575,9 @@ def build_rule_change_request_tx(
         raise ValueError("this kind carries no rule text")
     if kind in (3, 12):
         if not isinstance(offer_id, str) or len(offer_id) != 64:
+            raise ValueError("offer_id must be a 64-character hex string")
+    elif kind == 9:
+        if offer_id and (not isinstance(offer_id, str) or len(offer_id) != 64):
             raise ValueError("offer_id must be a 64-character hex string")
     elif offer_id:
         raise ValueError("this kind carries no offer id")

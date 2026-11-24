@@ -629,18 +629,29 @@ def _write_payment_book_change(lm, entry, height, timestamp) -> Optional[str]:
         if book is None:
             return "the payout book is not available"
         if kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
-            if book.get(sender) is None:
-                return "there is no payout rule to revoke"
-            ok, reason = book.can_remove(sender, ts)
+            # The revoke names its rule by id in offer_id (FIX 7) — the
+            # kind-12 discipline; an empty offer_id names the slot-0 rule.
+            if entry.offer_id:
+                target = book.get_by_id(bytes.fromhex(entry.offer_id))
+                if target is None:
+                    return "there is no payout rule to revoke"
+                if target.owner_pubkey != sender:
+                    return "only the owner may revoke a payout rule"
+                target_index = target.rule_index
+            else:
+                target_index = 0
+                if book.get(sender, 0) is None:
+                    return "there is no payout rule to revoke"
+            ok, reason = book.can_remove(sender, ts, target_index)
             if not ok:
                 return reason
-            book.remove(sender, ts)
+            book.remove(sender, ts, target_index)
             return None
         try:
             new_entry = payload_entry(kind, entry.body, sender)
         except ValueError as exc:
             return str(exc)
-        existing = book.get(sender)
+        existing = book.get(sender, new_entry.rule_index)
         if kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT and existing is not None:
             return "a payout rule already exists; an update (kind 8) replaces it"
         if kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT and existing is None:
@@ -2960,16 +2971,34 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             if pr_book_now is None:
                                 precondition = "the payout book is not available"
                             elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
-                                if pr_book_now.get(request.sender_pubkey) is None:
+                                # The revoke names its rule by id in
+                                # offer_id (FIX 7); empty names slot 0.
+                                pr_target_index = 0
+                                pr_target_missing = False
+                                if request.offer_id:
+                                    pr_target = pr_book_now.get_by_id(
+                                        bytes.fromhex(request.offer_id))
+                                    if pr_target is None:
+                                        pr_target_missing = True
+                                    elif pr_target.owner_pubkey != request.sender_pubkey:
+                                        precondition = "only the owner may revoke a payout rule"
+                                    else:
+                                        pr_target_index = pr_target.rule_index
+                                elif pr_book_now.get(request.sender_pubkey, 0) is None:
+                                    pr_target_missing = True
+                                if precondition is None and pr_target_missing:
                                     precondition = "there is no payout rule to revoke"
-                                else:
+                                elif precondition is None:
                                     _, precondition = pr_book_now.can_remove(
-                                        request.sender_pubkey, int(block_timestamp or 0))
+                                        request.sender_pubkey,
+                                        int(block_timestamp or 0),
+                                        pr_target_index)
                             else:
                                 pr_new = _payload_entry(
                                     request.kind, request.rule_text,
                                     request.sender_pubkey)
-                                pr_existing = pr_book_now.get(request.sender_pubkey)
+                                pr_existing = pr_book_now.get(
+                                    request.sender_pubkey, pr_new.rule_index)
                                 if (request.kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT
                                         and pr_existing is not None):
                                     precondition = ("a payout rule already exists; "
@@ -3636,11 +3665,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 _, reason = pr_book.can_install(pr_entry, pr_ts)
                                 if not reason:
                                     # An install is a rule change (kind 7
-                                    # for a first rule, kind 8 for its next
-                                    # version): the owner's guard judges it.
+                                    # for a first rule AT ITS SLOT, kind 8
+                                    # for that slot's next version — FIX 7):
+                                    # the owner's guard judges it.
                                     pr_kind = (
                                         tau_defs.RULE_CHANGE_KIND_SET_PAYOUT
-                                        if pr_book.get(pr_entry.owner_pubkey) is None
+                                        if pr_book.get(
+                                            pr_entry.owner_pubkey,
+                                            pr_entry.rule_index) is None
                                         else tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT)
                                     guard_blocked, guard_detail = _guard_blocks_change(
                                         _lifecycle_for_write(), pr_entry.owner_pubkey,
@@ -3662,15 +3694,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                     elif tx_type == TX_TYPE_REMOVE_PAYOUT_RULE:
                         try:
-                            pr_owner = parse_remove_payout_rule(tx)
+                            pr_removal = parse_remove_payout_rule(tx)
                         except PayoutRuleShapeError as exc:
-                            pr_owner = None
+                            pr_removal = None
                             reason = f"invalid payout rule removal ({exc})"
                         else:
+                            pr_owner, pr_index = pr_removal
                             if not isinstance(sender, str) or sender != pr_owner:
                                 reason = "sender is not the rule owner"
                             else:
-                                _, reason = pr_book.can_remove(pr_owner, pr_ts)
+                                _, reason = pr_book.can_remove(
+                                    pr_owner, pr_ts, pr_index)
                                 if not reason:
                                     # A removal is a rule change (kind 9):
                                     # the owner's guard judges it.
@@ -3682,14 +3716,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     if guard_blocked:
                                         reason = f"rule-change guard blocks: {guard_detail}"
                                         pr_guard_refused = True
-                        if pr_owner is None or reason:
+                        if pr_removal is None or reason:
                             tx_receipt["logs"].append(f"Payout rule removal ignored: {reason}")
                             tx_receipt["reason"] = (
                                 RULE_CHANGE_NEEDS_APPROVAL_REASON if pr_guard_refused
                                 else "payout_rule_not_removed")
                             accepted_in_block = False
                         else:
-                            pending_payout_removal = pr_owner
+                            pending_payout_removal = pr_removal
                             tx_receipt["logs"].append(
                                 "Payout rule removal staged: " + pr_owner[:10] + "..."
                             )
@@ -4670,6 +4704,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         "owner_pubkey": pending_payout_install.owner_pubkey,
                         "form": pending_payout_install.form,
                         "version": pending_payout_install.version,
+                        "rule_index": pending_payout_install.rule_index,
                     }
                     tx_receipt["logs"].append(
                         "Payout rule installed: "
@@ -4677,13 +4712,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                 elif pending_payout_removal is not None:
                     removed_rule = pr_book.remove(
-                        pending_payout_removal, int(block_timestamp or 0)
+                        pending_payout_removal[0],
+                        int(block_timestamp or 0),
+                        pending_payout_removal[1],
                     )
                     tx_receipt["payout_event"] = {
                         "rule_id": removed_rule.rule_id.hex(),
                         "action": "removed",
                         "owner_pubkey": removed_rule.owner_pubkey,
                         "version": removed_rule.version,
+                        "rule_index": removed_rule.rule_index,
                     }
                     tx_receipt["logs"].append(
                         "Payout rule removed: " + removed_rule.rule_id.hex()

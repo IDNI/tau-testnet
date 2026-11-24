@@ -128,6 +128,9 @@ def _admit_request(tx, lm):
     view = _rc_view(lm)
     facade = _LmView(lm)
     view.get_payout_rule_for_owner.side_effect = facade.get_payout_rule_for_owner
+    # FIX 7: admission also asks for the owner's whole book (plural).
+    view.get_payout_rules_for_owner.side_effect = facade.get_payout_rules_for_owner
+    view.get_payout_rule.side_effect = facade.get_payout_rule
     view.get_standing_payment_for_series.side_effect = (
         facade.get_standing_payment_for_series)
     view.get_standing_payment.side_effect = facade.get_standing_payment

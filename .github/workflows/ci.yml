@@ -134,5 +134,6 @@ jobs:
           tests/test_standing_due_retry_native.py
           tests/test_rule_change_payment_kinds_native.py
           tests/test_rule_change_guard_native.py
+          tests/test_multirule_native.py
           -p no:asyncio -v
           "

@@ -1,8 +1,10 @@
 """Payout rules: rule-computed payouts under declared caps (#63).
 
-An owner installs one payout rule: a declared recipient set, declared caps
-(a maximum per execution and a maximum per period), and ONE of two forms
-for computing the legs of an execution:
+An owner installs payout rules — up to MAX_RULES_PER_OWNER of them
+(FIX 7, multi-rule), each addressed by its signed slot (`rule_index`,
+0..7) and each fully independent: its own declared recipient set, declared
+caps (a maximum per execution and a maximum per period), period anchor,
+and ONE of two forms for computing the legs of an execution:
 
 - the DECLARED PROGRAM form (the original): a stored leg program the node
   computes from the execution's submitted base amount;
@@ -125,7 +127,11 @@ MAX_PAYOUT_CLAUSE_BYTES = 8192
 PAYOUT_OUTPUT_COUNT_STREAM = 30
 PAYOUT_OUTPUT_FIRST_STREAM = 31
 
-# Bounded state: one rule per owner, and the rule itself is small.
+# Bounded state: at most MAX_RULES_PER_OWNER rules per owner (FIX 7), and
+# each rule itself is small. The slot bound is what makes "a ninth rule"
+# unaddressable: slots are 0..MAX_RULES_PER_OWNER-1, and a slot outside
+# that range is a shape error everywhere (parse, book, payload).
+MAX_RULES_PER_OWNER = 8
 MAX_RECIPIENTS = 32
 MAX_LEGS = 32
 MAX_PERIOD_SECONDS = 366 * SECONDS_PER_DAY
@@ -159,7 +165,9 @@ class PayoutRuleEntry:
 
     `form` and `clause_text` default to the declared-program form, so every
     entry constructed before the Tau form existed — and every declared-form
-    entry constructed now — is byte-identical to what it was.
+    entry constructed now — is byte-identical to what it was. `rule_index`
+    (FIX 7) defaults to slot 0 the same way: every entry constructed before
+    multi-rule is the owner's slot-0 rule, exactly what it was.
     """
 
     owner_pubkey: str
@@ -172,6 +180,7 @@ class PayoutRuleEntry:
     version: int
     form: int = FORM_DECLARED_PROGRAM
     clause_text: str = ""
+    rule_index: int = 0
 
     @property
     def rule_id(self) -> bytes:
@@ -185,6 +194,7 @@ class PayoutRuleEntry:
                 self.period_seconds,
                 self.period_anchor_ts,
                 self.version,
+                self.rule_index,
             )
         return compute_payout_rule_id(
             self.owner_pubkey,
@@ -197,6 +207,7 @@ class PayoutRuleEntry:
             self.period_seconds,
             self.period_anchor_ts,
             self.version,
+            self.rule_index,
         )
 
 
@@ -480,14 +491,25 @@ def parse_install_payout_rule(tx: Dict[str, Any]) -> PayoutRuleEntry:
         version=_u64_field(tx, "payout_version", default=1),
         form=form,
         clause_text=clause_text,
+        rule_index=_u64_field(tx, "payout_rule_index", default=0),
     )
 
 
-def parse_remove_payout_rule(tx: Dict[str, Any]) -> str:
-    """Read a removal's owner from ROOT fields only; returns the owner pubkey."""
+def parse_remove_payout_rule(tx: Dict[str, Any]) -> Tuple[str, int]:
+    """Read a removal from ROOT fields only: (owner pubkey, rule slot).
+
+    The slot is a signed root field (FIX 7): a removal names exactly one
+    of the owner's rules, and the signature covers the slot, so no
+    proposer can redirect a removal to a different rule of the same
+    owner. A removal without the field names slot 0 — the only rule a
+    pre-multi-rule removal could have meant.
+    """
     if not isinstance(tx, dict):
         raise PayoutRuleShapeError("transaction must be an object")
-    return _pubkey_field(tx, "sender_pubkey")
+    return (
+        _pubkey_field(tx, "sender_pubkey"),
+        _u64_field(tx, "payout_rule_index", default=0),
+    )
 
 
 def parse_execute_payout_rule(
@@ -552,6 +574,11 @@ def validate_payout_rule_shape(
         return f"payout_period_seconds must be in 1..{MAX_PERIOD_SECONDS}"
     if entry.version < 1:
         return "payout_version must start at 1"
+    if not 0 <= entry.rule_index < MAX_RULES_PER_OWNER:
+        return (
+            f"payout_rule_index must be in 0..{MAX_RULES_PER_OWNER - 1}: "
+            f"an account holds at most {MAX_RULES_PER_OWNER} payout rules"
+        )
     return None
 
 
@@ -559,7 +586,7 @@ def validate_payout_rule_shape(
 
 _EntryRow = Tuple[
     bytes, str, Tuple[str, ...], Tuple[Tuple[str, int, int], ...],
-    int, int, int, int, int, Tuple[Tuple[int, int], ...], int, str,
+    int, int, int, int, int, Tuple[Tuple[int, int], ...], int, str, int,
 ]
 _SettlementRow = Tuple[bytes, bytes, int, int, int]
 
@@ -571,11 +598,17 @@ class PayoutRuleBook:
     the meta hash picks the book root up without a call site to forget (the
     RetractableBook pattern). Entries and settlements are frozen, so copies
     share them; only the period-total maps are duplicated.
+
+    FIX 7: entries are keyed by (owner, rule_index) — one owner holds up
+    to MAX_RULES_PER_OWNER independent rules. Period totals and
+    settlements stay keyed by rule_id, which already isolates every rule's
+    accounting from every other's: no rule can borrow another's period
+    allowance, and no replacement carries into a different slot.
     """
 
     def __init__(self) -> None:
-        self._entries: Dict[str, PayoutRuleEntry] = {}
-        self._by_id: Dict[bytes, str] = {}
+        self._entries: Dict[Tuple[str, int], PayoutRuleEntry] = {}
+        self._by_id: Dict[bytes, Tuple[str, int]] = {}
         self._period_totals: Dict[bytes, Dict[int, int]] = {}
         self._settlements: Dict[Tuple[bytes, bytes], PayoutSettlement] = {}
         self._root: Optional[bytes] = None
@@ -600,25 +633,37 @@ class PayoutRuleBook:
         rows: Iterable[_EntryRow],
         settlements: Iterable[_SettlementRow] = (),
     ) -> "PayoutRuleBook":
-        """Rebuild from stored rows; refuses any row whose id does not recompute."""
+        """Rebuild from stored rows; refuses any row whose id does not recompute.
+
+        Rows written before FIX 7 carry no slot term and restore as slot
+        0; rows written after carry it as the thirteenth element.
+        """
         book = cls()
         for row in rows:
             (rule_id, owner, recipients, legs, max_exec, max_period,
              period_seconds, anchor, version, period_totals,
-             form, clause_text) = row
+             form, clause_text) = row[:12]
+            rule_index = int(row[12]) if len(row) > 12 else 0
             entry = PayoutRuleEntry(
                 owner,
                 tuple(recipients),
                 tuple(PayoutLeg(r, m, v) for r, m, v in legs),
                 max_exec, max_period, period_seconds, anchor, version,
-                form, clause_text,
+                form, clause_text, rule_index,
             )
             if entry.rule_id != bytes(rule_id):
                 raise ValueError(
                     f"stored payout rule id does not match its fields: {entry.rule_id.hex()}"
                 )
-            if owner in book._entries:
-                raise ValueError(f"duplicate stored payout rule for owner: {owner}")
+            if not 0 <= rule_index < MAX_RULES_PER_OWNER:
+                raise ValueError(
+                    f"stored payout rule slot out of range: {rule_index}"
+                )
+            key = (owner, rule_index)
+            if key in book._entries:
+                raise ValueError(
+                    f"duplicate stored payout rule for owner slot: {owner}#{rule_index}"
+                )
             totals: Dict[int, int] = {}
             for index, total in period_totals:
                 if index in totals:
@@ -626,8 +671,8 @@ class PayoutRuleBook:
                 if total < 0:
                     raise ValueError("stored period total is negative")
                 totals[int(index)] = int(total)
-            book._entries[owner] = entry
-            book._by_id[entry.rule_id] = owner
+            book._entries[key] = entry
+            book._by_id[entry.rule_id] = key
             book._period_totals[entry.rule_id] = totals
         for rule_id, settlement_id, base, total, exec_ts in settlements:
             record = PayoutSettlement(
@@ -660,6 +705,7 @@ class PayoutRuleBook:
                     tuple(sorted(totals.items())),
                     entry.form,
                     entry.clause_text,
+                    entry.rule_index,
                 )
             )
         return out
@@ -679,15 +725,31 @@ class PayoutRuleBook:
 
     # -- queries -----------------------------------------------------------------
 
-    def get(self, owner_pubkey: str) -> Optional[PayoutRuleEntry]:
-        return self._entries.get(owner_pubkey)
+    def get(
+        self, owner_pubkey: str, rule_index: int = 0
+    ) -> Optional[PayoutRuleEntry]:
+        """One owner's rule at one slot (slot 0 by default)."""
+        return self._entries.get((owner_pubkey, int(rule_index)))
+
+    def get_all(self, owner_pubkey: str) -> List[PayoutRuleEntry]:
+        """Every rule one owner holds, in slot order."""
+        return [
+            entry
+            for (owner, _index), entry in sorted(
+                self._entries.items(), key=lambda item: item[0][1]
+            )
+            if owner == owner_pubkey
+        ]
 
     def get_by_id(self, rule_id: bytes) -> Optional[PayoutRuleEntry]:
-        owner = self._by_id.get(bytes(rule_id))
-        return self._entries.get(owner) if owner is not None else None
+        key = self._by_id.get(bytes(rule_id))
+        return self._entries.get(key) if key is not None else None
 
     def rule_count(self) -> int:
         return len(self._entries)
+
+    def rule_count_for_owner(self, owner_pubkey: str) -> int:
+        return sum(1 for owner, _ in self._entries if owner == owner_pubkey)
 
     def is_empty(self) -> bool:
         """True while no rule and no settlement exists.
@@ -745,7 +807,13 @@ class PayoutRuleBook:
             return False, problem
         if entry.rule_id in self._by_id:
             return False, "this payout rule already exists"
-        existing = self._entries.get(entry.owner_pubkey)
+        # The version chain runs PER SLOT (FIX 7): a rule's replacement is
+        # the next version at the same slot, and a first rule at an empty
+        # slot is version 1 whatever the owner's other slots hold. The
+        # slot bound in the shape check is the per-account bound: with
+        # slots 0..MAX_RULES_PER_OWNER-1 the only addresses a rule can
+        # take, a ninth rule has no address and is refused there.
+        existing = self._entries.get((entry.owner_pubkey, entry.rule_index))
         if existing is not None:
             if entry.version != existing.version + 1:
                 return (
@@ -775,7 +843,12 @@ class PayoutRuleBook:
         ok, reason = self.can_install(entry, now_ts)
         if not ok:
             raise ValueError(reason)
-        old = self._entries.get(entry.owner_pubkey)
+        # The carry's source is the replaced rule AT THE SAME SLOT only
+        # (FIX 7): what a rule paid in its current period carries into its
+        # own replacement — never into a rule at another slot, whose
+        # period accounting is its own.
+        key = (entry.owner_pubkey, entry.rule_index)
+        old = self._entries.get(key)
         carried = 0
         if old is not None:
             old_period = period_index_at(old, now_ts)
@@ -784,8 +857,8 @@ class PayoutRuleBook:
         if old is not None:
             del self._by_id[old.rule_id]
             self._period_totals.pop(old.rule_id, None)
-        self._entries[entry.owner_pubkey] = entry
-        self._by_id[entry.rule_id] = entry.owner_pubkey
+        self._entries[key] = entry
+        self._by_id[entry.rule_id] = key
         totals: Dict[int, int] = {}
         if carried:
             first = period_index_at(entry, now_ts)
@@ -805,17 +878,26 @@ class PayoutRuleBook:
         self._root = None
         return entry.rule_id
 
-    def can_remove(self, owner_pubkey: str, now_ts: int) -> Tuple[bool, str]:
-        if owner_pubkey not in self._entries:
+    def can_remove(
+        self, owner_pubkey: str, now_ts: int, rule_index: int = 0
+    ) -> Tuple[bool, str]:
+        if not 0 <= rule_index < MAX_RULES_PER_OWNER:
+            return False, (
+                f"payout_rule_index must be in 0..{MAX_RULES_PER_OWNER - 1}"
+            )
+        if (owner_pubkey, int(rule_index)) not in self._entries:
             return False, "no payout rule installed for this account"
         return True, ""
 
-    def remove(self, owner_pubkey: str, now_ts: int) -> PayoutRuleEntry:
-        """Remove the owner's rule. Its settlements stay recorded."""
-        ok, reason = self.can_remove(owner_pubkey, now_ts)
+    def remove(
+        self, owner_pubkey: str, now_ts: int, rule_index: int = 0
+    ) -> PayoutRuleEntry:
+        """Remove the owner's rule at one slot. Its settlements stay recorded,
+        and the owner's rules at every other slot are untouched."""
+        ok, reason = self.can_remove(owner_pubkey, now_ts, rule_index)
         if not ok:
             raise ValueError(reason)
-        entry = self._entries.pop(owner_pubkey)
+        entry = self._entries.pop((owner_pubkey, int(rule_index)))
         del self._by_id[entry.rule_id]
         self._period_totals.pop(entry.rule_id, None)
         self._root = None
@@ -998,4 +1080,10 @@ def payout_rule_capabilities() -> Dict[str, Any]:
         "fee": "the submitter pays the ordinary fee",
         "max_recipients": MAX_RECIPIENTS,
         "max_legs": MAX_LEGS,
+        "max_rules_per_owner": MAX_RULES_PER_OWNER,
+        "rule_addressing": (
+            "each rule is addressed by its signed payout_rule_index slot "
+            f"(0..{MAX_RULES_PER_OWNER - 1}); caps, period totals, "
+            "settlements and the replacement carry are per rule"
+        ),
     }

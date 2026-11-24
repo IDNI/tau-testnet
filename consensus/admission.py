@@ -1503,23 +1503,41 @@ def _rule_change_precondition_error(request, tip_view: TipAdmissionView) -> Opti
         tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
         tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT,
     ):
-        # The payout book's own checks, against the tip's one-entry book —
-        # the same functions block apply calls. Kind 7 writes version 1
-        # (no rule may exist), kind 8 the next version of the sender's
-        # rule, kind 9 removes it.
-        row = tip_view.get_payout_rule_for_owner(sender)
-        book = _tip_payout_book(row)
+        # The payout book's own checks, against the tip book holding ALL
+        # the sender's rules — the same functions block apply calls. Kind
+        # 7 writes version 1 at the body's slot (that slot must be empty),
+        # kind 8 the next version of the rule at that slot, kind 9 removes
+        # the rule its offer_id names (FIX 7; an empty offer_id names the
+        # slot-0 rule).
+        rows = tip_view.get_payout_rules_for_owner(sender)
+        book = _tip_payout_book(rows)
         if request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
-            if row is None:
-                return "there is no payout rule to revoke"
-            ok, reason = book.can_remove(sender, tip_view.next_block_timestamp)
+            if request.offer_id:
+                target_row = tip_view.get_payout_rule(
+                    bytes.fromhex(request.offer_id))
+                if target_row is None:
+                    return "there is no payout rule to revoke"
+                if str(target_row.get("owner_pubkey", "")).lower() != sender:
+                    return "only the owner may revoke a payout rule"
+                target_index = int(target_row.get("rule_index", 0))
+            else:
+                target_index = 0
+                if book.get(sender, 0) is None:
+                    return "there is no payout rule to revoke"
+            ok, reason = book.can_remove(
+                sender, tip_view.next_block_timestamp, target_index)
             return None if ok else reason
         from consensus.approvals import payload_entry
 
         entry = payload_entry(request.kind, request.rule_text, sender)
-        if request.kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT and row is not None:
+        target = next(
+            (r for r in rows
+             if int(r.get("rule_index", 0)) == entry.rule_index),
+            None,
+        )
+        if request.kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT and target is not None:
             return "a payout rule already exists; an update (kind 8) replaces it"
-        if request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT and row is None:
+        if request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT and target is None:
             return "there is no payout rule to update"
         ok, reason = book.can_install(entry, tip_view.next_block_timestamp)
         return None if ok else reason
@@ -2092,50 +2110,60 @@ def validate_execute_standing_payment_payload(
 
 # --- Payout rules --------------------------------------------------------------
 
-def _tip_payout_book(row: Optional[Dict]) -> PayoutRuleBook:
-    """A book holding exactly one tip payout rule (the facade's row).
+def _tip_payout_book(row) -> PayoutRuleBook:
+    """A book rebuilt from tip payout-rule rows (the facade's views).
 
     Admission and apply must reach the same verdict, and the verdicts live
-    in the book's can_install/can_remove/evaluate_execution; rebuilding the
-    one-entry book from the tip view lets admission call them verbatim
-    instead of re-implementing the version, cap and settlement rules a
-    second time. The row carries the rule's settlements and period totals,
-    so the rebuilt book also answers the settlement-idempotency and
+    in the book's can_install/can_remove/evaluate_execution; rebuilding
+    the book from the tip view lets admission call them verbatim instead
+    of re-implementing the version, cap and settlement rules a second
+    time. Each row carries its rule's settlements and period totals, so
+    the rebuilt book also answers the settlement-idempotency and
     per-period-cap questions identically.
+
+    Accepts one row dict, a list of row dicts (FIX 7: all of an owner's
+    rules, so an install is judged against the owner's whole book — the
+    per-slot version chain and the slot bound need the neighbours), or
+    None for an empty book.
     """
     if row is None:
         return PayoutRuleBook()
-    entry_row = (
-        bytes.fromhex(row["rule_id"]),
-        row["owner_pubkey"],
-        tuple(row["recipients"]),
-        tuple(
-            (leg["recipient_pubkey"], int(leg["mode"]), int(leg["value"]))
-            for leg in row["legs"]
-        ),
-        int(row["max_per_execution"]),
-        int(row["max_per_period"]),
-        int(row["period_seconds"]),
-        int(row["period_anchor_ts"]),
-        int(row["version"]),
-        tuple(
-            (int(t["period_index"]), int(t["total"]))
-            for t in row.get("period_totals", [])
-        ),
-        int(row.get("form", 1)),
-        str(row.get("clause_text", "")),
-    )
-    settlement_rows = [
-        (
-            bytes.fromhex(row["rule_id"]),
-            bytes.fromhex(s["settlement_id"]),
-            int(s["base_amount"]),
-            int(s["total"]),
-            int(s["execution_ts"]),
+    rows = [row] if isinstance(row, dict) else list(row)
+    entry_rows = []
+    settlement_rows = []
+    for r in rows:
+        entry_rows.append((
+            bytes.fromhex(r["rule_id"]),
+            r["owner_pubkey"],
+            tuple(r["recipients"]),
+            tuple(
+                (leg["recipient_pubkey"], int(leg["mode"]), int(leg["value"]))
+                for leg in r["legs"]
+            ),
+            int(r["max_per_execution"]),
+            int(r["max_per_period"]),
+            int(r["period_seconds"]),
+            int(r["period_anchor_ts"]),
+            int(r["version"]),
+            tuple(
+                (int(t["period_index"]), int(t["total"]))
+                for t in r.get("period_totals", [])
+            ),
+            int(r.get("form", 1)),
+            str(r.get("clause_text", "")),
+            int(r.get("rule_index", 0)),
+        ))
+        settlement_rows.extend(
+            (
+                bytes.fromhex(r["rule_id"]),
+                bytes.fromhex(s["settlement_id"]),
+                int(s["base_amount"]),
+                int(s["total"]),
+                int(s["execution_ts"]),
+            )
+            for s in r.get("settlements", [])
         )
-        for s in row.get("settlements", [])
-    ]
-    return PayoutRuleBook.restore([entry_row], settlement_rows)
+    return PayoutRuleBook.restore(entry_rows, settlement_rows)
 
 
 def validate_install_payout_rule_payload(
@@ -2162,17 +2190,22 @@ def validate_install_payout_rule_payload(
         if err:
             return format_error(f"install_payout_rule rejected: {err}")
 
-    row = tip_view.get_payout_rule_for_owner(entry.owner_pubkey)
-    ok, reason = _tip_payout_book(row).can_install(
+    rows = tip_view.get_payout_rules_for_owner(entry.owner_pubkey)
+    ok, reason = _tip_payout_book(rows).can_install(
         entry, tip_view.next_block_timestamp)
     if not ok:
         return format_error(f"install_payout_rule rejected: {reason}")
 
-    # An install is a rule change (kind 7 for a first rule, kind 8 for
-    # the next version of an existing one): the owner's guard judges it.
+    # An install is a rule change (kind 7 for a first rule AT ITS SLOT,
+    # kind 8 for the next version of the rule at that slot — FIX 7): the
+    # owner's guard judges it.
+    target = next(
+        (r for r in rows if int(r.get("rule_index", 0)) == entry.rule_index),
+        None,
+    )
     refusal = _rule_change_refusal(
         tip_view, entry.owner_pubkey,
-        tau_defs.RULE_CHANGE_KIND_SET_PAYOUT if row is None
+        tau_defs.RULE_CHANGE_KIND_SET_PAYOUT if target is None
         else tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
     )
     if refusal is not None:
@@ -2191,7 +2224,7 @@ def validate_remove_payout_rule_payload(
     tip's one-entry book, shared with apply.
     """
     try:
-        owner = parse_remove_payout_rule(tx)
+        owner, rule_index = parse_remove_payout_rule(tx)
     except PayoutRuleShapeError as exc:
         return format_error(f"Malformed remove_payout_rule: {exc}.")
 
@@ -2200,14 +2233,20 @@ def validate_remove_payout_rule_payload(
         return format_error(
             "remove_payout_rule sender_pubkey must match the signer.")
 
-    row = tip_view.get_payout_rule_for_owner(owner)
+    # The removal names one slot (FIX 7); the tip row at that slot is the
+    # rule it removes, and the owner's other rules are not consulted.
+    row = next(
+        (r for r in tip_view.get_payout_rules_for_owner(owner)
+         if int(r.get("rule_index", 0)) == rule_index),
+        None,
+    )
     if row is None:
         return format_error(
             "No payout rule installed for this account.",
             code="UNKNOWN_PAYOUT_RULE",
         )
     ok, reason = _tip_payout_book(row).can_remove(
-        owner, tip_view.next_block_timestamp)
+        owner, tip_view.next_block_timestamp, rule_index)
     if not ok:
         return format_error(f"remove_payout_rule rejected: {reason}")
 
