@@ -68,30 +68,43 @@ class TestSelfAdvertisedAddrs:
             return svc, host
 
     def test_announce_addrs_win(self):
+        from network.peer_addrs import PeerAddrPolicy
         from network.service import NetworkService
         svc = object.__new__(NetworkService)
         svc._config = MagicMock()
         svc._config.announce_addrs = ["/ip4/1.2.3.4/tcp/4001"]
+        svc._addr_policy = PeerAddrPolicy(allow_private=False)
         assert NetworkService._self_advertised_addrs(svc) == ["/ip4/1.2.3.4/tcp/4001"]
 
-    def test_fallback_to_host_addrs(self):
+    @pytest.mark.parametrize(
+        "allow_private, expected",
+        [
+            (False, ["/ip4/34.251.82.246/tcp/4001"]),
+            (True, ["/ip4/10.0.0.1/tcp/4001", "/ip4/34.251.82.246/tcp/4001"]),
+        ],
+    )
+    def test_fallback_to_usable_host_addrs(self, allow_private, expected):
+        from network.peer_addrs import PeerAddrPolicy
         from network.service import NetworkService
         svc = object.__new__(NetworkService)
         cfg = MagicMock()
         cfg.announce_addrs = []
         svc._config = cfg
+        svc._addr_policy = PeerAddrPolicy(allow_private=allow_private)
         host = MagicMock()
-        host.get_addrs.return_value = ["/ip4/10.0.0.1/tcp/4001"]
+        host.get_addrs.return_value = ["/ip4/10.0.0.1/tcp/4001", "/ip4/34.251.82.246/tcp/4001"]
         with patch.object(NetworkService, "host", new=property(lambda self: host)):
-            assert NetworkService._self_advertised_addrs(svc) == ["/ip4/10.0.0.1/tcp/4001"]
+            assert NetworkService._self_advertised_addrs(svc) == expected
 
     def test_magicmock_spec_config_falls_back(self):
         # A MagicMock(spec=NetworkConfig) yields a truthy MagicMock for
         # announce_addrs; the isinstance guard must reject it.
         from network.config import NetworkConfig
+        from network.peer_addrs import PeerAddrPolicy
         from network.service import NetworkService
         svc = object.__new__(NetworkService)
         svc._config = MagicMock(spec=NetworkConfig)
+        svc._addr_policy = PeerAddrPolicy(allow_private=False)
         host = MagicMock()
         host.get_addrs.return_value = []
         with patch.object(NetworkService, "host", new=property(lambda self: host)):

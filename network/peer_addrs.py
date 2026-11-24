@@ -128,6 +128,23 @@ class PeerAddrPolicy:
         return list(self._bootstrap_addrs.get(str(peer_id), ()))
 
 
+def self_advertised_addrs(config: Any, policy: PeerAddrPolicy, host: Any) -> List[Any]:
+    """Addrs that a node tells its peers to dial.
+
+    Configured announce addrs win. Else only the bound addrs that `policy`
+    accepts, so a node on `0.0.0.0` with no announce addr sends none.
+    """
+    announce = getattr(config, "announce_addrs", None)
+    if isinstance(announce, (list, tuple)) and announce:
+        return list(announce)
+    try:
+        bound = list(host.get_addrs() or [])
+        own_id = host.get_id()
+    except Exception:
+        return []
+    return policy.filter(own_id, bound)
+
+
 class FilteringPeerStore(PeerStore):
     """Peerstore that stores only the addrs that `PeerAddrPolicy` accepts.
 

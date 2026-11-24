@@ -1,4 +1,4 @@
-"""A node does not store or dial non-public addrs that other peers advertise."""
+"""A node does not store, dial or send non-public addrs of public peers."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,6 +9,7 @@ from libp2p.crypto.ed25519 import create_new_key_pair
 from libp2p.identity.identify.pb.identify_pb2 import Identify
 from libp2p.identity.update import update_peerstore_from_identify
 from libp2p.peer.id import ID
+from libp2p.peer.peerinfo import PeerInfo
 from libp2p.peer.peerstore import PeerStore
 
 from network.config import BootstrapPeer, NetworkConfig
@@ -284,3 +285,62 @@ async def test_bootstrap_dial_at_configured_private_addr():
     peerstore.add_addrs(boot, [multiaddr.Multiaddr(LOOPBACK)], 600)
     order = await _dial_bootstrap(config, peerstore, boot, [PRIVATE])
     assert order == [PRIVATE]
+
+
+def _own_host(*bound: str) -> MagicMock:
+    host = MagicMock()
+    host.get_id.return_value = _new_pid()
+    host.get_addrs.return_value = [multiaddr.Multiaddr(a) for a in bound]
+    return host
+
+
+def _advertised(config: NetworkConfig, host: MagicMock):
+    svc = _service(config)
+    with patch.object(NetworkService, "host", new=property(lambda self: host)):
+        return NetworkService._self_advertised_addrs(svc)
+
+
+def test_node_on_unspecified_addr_without_announce_sends_no_addr():
+    assert _advertised(_config(), _own_host(UNSPECIFIED, LOOPBACK)) == []
+
+
+def test_node_sends_its_announce_addr():
+    config = _config()
+    config.announce_addrs = [multiaddr.Multiaddr(PUBLIC)]
+    assert _advertised(config, _own_host(UNSPECIFIED)) == [PUBLIC]
+
+
+def test_node_sends_its_public_bound_addr():
+    assert _advertised(_config(), _own_host(UNSPECIFIED, PUBLIC)) == [PUBLIC]
+
+
+def test_local_network_node_sends_its_private_addr():
+    assert _advertised(_config(listen=(PRIVATE,)), _own_host(PRIVATE)) == [PRIVATE]
+
+
+def test_handshake_dht_peers_hold_only_usable_addrs():
+    svc = _service(_config())
+    mixed, local_only = _new_pid(), _new_pid()
+    bucket = SimpleNamespace(peers=[
+        PeerInfo(mixed, [multiaddr.Multiaddr(UNSPECIFIED), multiaddr.Multiaddr(PUBLIC)]),
+        PeerInfo(local_only, [multiaddr.Multiaddr(LOOPBACK)]),
+    ])
+    svc._dht_manager = MagicMock()
+    svc._dht_manager.routing_table.buckets = [bucket]
+    svc._dht_manager.dht.value_store.get.return_value = None
+    host = _own_host(UNSPECIFIED)
+    with patch.object(NetworkService, "host", new=property(lambda self: host)), \
+         patch.object(NetworkService, "get_id", lambda self: host.get_id()):
+        payload = NetworkService._build_handshake_payload(svc)
+    assert payload["dht_peers"] == [{"peer_id": str(mixed), "addrs": [PUBLIC]}]
+
+
+def test_dht_self_provider_entry_holds_only_usable_addrs():
+    from network.dht_manager import DHTManager
+
+    dm = DHTManager(_config())
+    dm._dht = MagicMock()
+    dm._host = _own_host(UNSPECIFIED, PUBLIC)
+    assert dm.put_record_sync(b"state:abc", b"v")
+    (_, provider), _ = dm._dht.provider_store.add_provider.call_args
+    assert [str(a) for a in provider.addrs] == [PUBLIC]

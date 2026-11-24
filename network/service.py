@@ -16,7 +16,7 @@ from .host import HostManager, NetworkListenError
 from .dht_manager import DHTManager
 from .discovery import DiscoveryManager
 from .gossip import GossipManager
-from .peer_addrs import PeerAddrPolicy
+from .peer_addrs import PeerAddrPolicy, self_advertised_addrs
 from .protocols import REQUEST_READ_TIMEOUT
 from commands import sendtx
 
@@ -414,15 +414,11 @@ class NetworkService:
                 await close_stream_safely(stream)
 
     def _self_advertised_addrs(self) -> List[str]:
-        """Addrs we tell peers to dial: configured announce addrs (NAT/public)
-        or the bound listeners as fallback."""
-        announce = getattr(self._config, "announce_addrs", None)
-        if isinstance(announce, (list, tuple)) and announce:
-            return [str(a) for a in announce]
         try:
-            return [str(a) for a in self.host.get_addrs()]
+            host = self.host
         except Exception:
-            return []
+            host = None
+        return [str(a) for a in self_advertised_addrs(self._config, self._addr_policy, host)]
 
     def _build_handshake_payload(self) -> Dict[str, Any]:
         # Basic payload
@@ -474,9 +470,14 @@ class NetworkService:
                                     addrs = self.host.get_peerstore().addrs(pid)
                                 except Exception:
                                     addrs = []
+                            # The routing table keeps its own unfiltered copy of
+                            # the addrs that the KadDHT learns from FIND_NODE.
+                            usable = self._addr_policy.filter(pid, addrs)
+                            if not usable:
+                                continue
                             peers.append({
                                 "peer_id": str(pid),
-                                "addrs": [str(a) for a in addrs]
+                                "addrs": [str(a) for a in usable]
                             })
                 
                 # Cap peers list (outbound cap) to avoid sending too many (e.g. 100)
