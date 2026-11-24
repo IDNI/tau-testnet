@@ -73,7 +73,8 @@ FAKE = textwrap.dedent('''
                 out.update(phase="build", built=not hit, build_seconds=0.001,
                            pinned=False, pid=os.getpid())
                 if op == "step":
-                    if "STEPFAIL" in text:
+                    if "STEPFAIL_WARM" in text and len(built) > 1 or (
+                            "STEPFAIL" in text and "STEPFAIL_WARM" not in text):
                         out.update(ok=False, phase="step", error="fake step failure")
                     else:
                         steps += 1
@@ -317,17 +318,23 @@ def test_warm_build_failure_that_fails_fresh_is_the_answer(make):
     assert stats["fresh_fallbacks"] == 1 and stats["spawns"] == 2
 
 
-def test_refused_step_in_a_warm_worker_is_answered_at_once(make):
+def test_warm_step_refusal_succeeds_in_a_fresh_worker(make):
     ev = make()
     ev.verdict("PASS", {})
     warm = ev.worker_pid()
+    result = ev.verdict("STEPFAIL_WARM BLOCK", {})
+    assert result.blocked
+    assert ev.worker_pid() != warm
+    assert ev.stats()["fresh_fallbacks"] == 1
+
+
+def test_warm_step_refusal_that_fails_fresh_is_the_answer(make):
+    ev = make()
+    ev.verdict("PASS", {})
     with pytest.raises(tau_policy.PolicyStepError):
         ev.verdict("STEPFAIL", {})
-    assert ev.worker_pid() == warm
     stats = ev.stats()
-    assert stats["fresh_fallbacks"] == 0 and stats["spawns"] == 1
-    assert ev.verdict("BLOCK", {}).blocked
-    assert ev.worker_pid() == warm
+    assert stats["fresh_fallbacks"] == 1 and stats["spawns"] == 2
 
 
 def test_refused_step_in_a_fresh_worker_is_not_retried(make):
