@@ -787,6 +787,9 @@ class TestPolicyWidthScreen:
         assert payload["stream_widths"] == dict(tau_defs.HOST_STREAM_WIDTHS)
         assert payload["stream_widths"] == {
             "i1": 24, "i2": 24, "o5": 24, "o8": 24, "o9": 24,
+            # Recipient controls (#47/#76): i17 is node-fed on every transfer, so
+            # its width is frozen here too and a wallet learns it from the host.
+            "i17": 64,
         }
 
 

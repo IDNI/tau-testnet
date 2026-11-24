@@ -272,6 +272,68 @@ _STREAM_MENTION_RE = re.compile(r"\b([io])(\d+)\b")
 _STREAM_TYPED_TAIL_RE = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
 
 
+def screen_hold_mentions(text: str, group=None) -> Optional[str]:
+    """None when a clause that mentions a hold stream mentions all of them.
+
+    A clause that caps the hold must bound **every** stream the node feeds for
+    it. With one unit-tagged stream this is automatic: a bound in seconds
+    already refuses block-based parks, so the worst case is refusing money you
+    would have accepted. With two streams it is not: a rule that bounds the
+    seconds stream and forgets the block stream silently *admits* a park of any
+    length, which is the failure this bounty exists to prevent. Authors will not
+    always remember the second stream, so the node refuses the rule at deploy
+    time instead of failing open at payment time.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    streams = tuple(tau_defs.HOLD_STREAM_GROUP if group is None else group)
+    if len(streams) < 2:
+        return None
+    scrubbed = strip_clause_comments(text or "")
+    mentioned = [i for i in streams if re.search(rf"\bi{i}\b", scrubbed)]
+    if not mentioned or len(mentioned) == len(streams):
+        return None
+    missing = [i for i in streams if i not in mentioned]
+    have = ", ".join(f"i{i}" for i in mentioned)
+    lack = ", ".join(f"i{i}" for i in missing)
+    return (
+        f"a clause that caps how long a payment may be held must bound every "
+        f"hold stream: this one mentions {have} but not {lack}. Bound the "
+        f"missing stream too (i17 = 1 refuses every timed park, i27 = 1 every "
+        f"block-based one) or drop the cap"
+    )
+
+
+def screen_receive_widths(text: str) -> Optional[str]:
+    """None when every mention of a node-fed receive stream is typed bv[64].
+
+    Same hazard as o5 and the approval slots: the node feeds these streams at
+    bv[64] on every transfer, and per-stream typing is process-global and
+    sticky, so one clause typing them bv[16] (or leaving the width to be
+    inferred) would leave the interpreter unable to build anyone's receive
+    rule -- measured, and it fails closed, which is worse than refusing the
+    rule that caused it.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(text or "")
+    width = tau_defs.RECEIVE_STREAM_BV_WIDTH
+    typed_tail = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
+    for idx in tau_defs.active_receive_fact_streams():
+        name = f"i{idx}"
+        for match in re.compile(rf"\b{name}\b").finditer(scrubbed):
+            typed = typed_tail.match(scrubbed, match.end())
+            if typed is None:
+                return (
+                    f"every mention of {name} must be written "
+                    f"{name}[t]:bv[{width}]; an untyped mention lets the engine "
+                    f"infer a conflicting width process-wide"
+                )
+            if int(typed.group(1)) != width:
+                return f"{name} must be typed bv[{width}], found bv[{typed.group(1)}]"
+    return None
+
+
 def screen_stream_widths(body: str) -> Optional[str]:
     """None when every input/output mention carries one explicit width, else the reason.
 

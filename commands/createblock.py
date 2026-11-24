@@ -97,6 +97,9 @@ def execute_batch(transactions: List[Dict], reserved_ids: List[int], block_times
                 # authoritative.
                 3: "{ #x" + str(from_addr) + " }:bv[384]",
                 4: "{ #x" + str(to_addr) + " }:bv[384]",
+                # Receive stream: outbound judgement here, same as engine.apply
+                # feeds on the sender pass (recipient-side policy, #47/#76).
+                17: str(tau_defs.RECEIVE_OUTBOUND),
                 5: str(block_timestamp),
             }
             tau_input_stream_values.update(custom_inputs)
