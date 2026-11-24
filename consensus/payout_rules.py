@@ -63,6 +63,21 @@ make two honest nodes disagree about admissibility, which forks.
   per-period cap, settles nothing. The period is a fixed-length window
   from the rule's signed anchor (period_seconds), the standing book's
   fixed-schedule arithmetic; per-period paid totals are book state.
+- Shared cap (FIX 8): a rule may additionally name a shared cap —
+  `shared_cap_id` + `shared_cap_amount`, both signed fields inside the
+  rule id. Every rule of the SAME owner naming the same id draws on one
+  limit: the sum of what all of them have paid in their current periods
+  (at the execution's timestamp, each on its own period clock) plus the
+  execution's total may not exceed the shared amount the EXECUTING rule
+  declares. The per-rule caps still bind first — the shared cap is a
+  third ceiling, never a way around the other two, and it never crosses
+  owners. Usage is counted from CURRENT book membership and CURRENT
+  period totals only: a rule that leaves the book (removal, expiry of
+  its period, supersession by a non-member) stops counting, and a
+  superseding member inherits the slot's paid total through the FIX 5C
+  carry, so replacement cannot launder usage out of the group either.
+  An execution the shared cap refuses settles nothing, exactly like the
+  other caps — no partial leg, no settlement, no debt.
 - An execution that cannot settle settles NOTHING: no leg moves, no
   settlement is recorded, no period total advances — the same discipline
   as a standing payment's insufficient-funds occurrence, so a retry with
@@ -136,6 +151,14 @@ MAX_RECIPIENTS = 32
 MAX_LEGS = 32
 MAX_PERIOD_SECONDS = 366 * SECONDS_PER_DAY
 
+# The shared cap's name (FIX 8): a short owner-chosen identifier. Rules of
+# one owner that carry the same id share one period limit; the id is a
+# signed field of each rule, so group membership is never something a
+# proposer can rewrite. Bounded and charset-pinned so the canonical
+# encodings (rule id, book record, payload body) stay unambiguous.
+MAX_SHARED_CAP_ID_CHARS = 32
+_SHARED_CAP_ID_RE = re.compile(r"^[0-9a-z_-]+$")
+
 _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
 _ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = 0xFFFFFFFFFFFFFFFF
@@ -168,6 +191,8 @@ class PayoutRuleEntry:
     entry constructed now — is byte-identical to what it was. `rule_index`
     (FIX 7) defaults to slot 0 the same way: every entry constructed before
     multi-rule is the owner's slot-0 rule, exactly what it was.
+    `shared_cap_id` / `shared_cap_amount` (FIX 8) default to no shared cap
+    the same way: an entry that names none behaves exactly as before.
     """
 
     owner_pubkey: str
@@ -181,6 +206,8 @@ class PayoutRuleEntry:
     form: int = FORM_DECLARED_PROGRAM
     clause_text: str = ""
     rule_index: int = 0
+    shared_cap_id: str = ""
+    shared_cap_amount: int = 0
 
     @property
     def rule_id(self) -> bytes:
@@ -195,6 +222,8 @@ class PayoutRuleEntry:
                 self.period_anchor_ts,
                 self.version,
                 self.rule_index,
+                self.shared_cap_id,
+                self.shared_cap_amount,
             )
         return compute_payout_rule_id(
             self.owner_pubkey,
@@ -208,6 +237,8 @@ class PayoutRuleEntry:
             self.period_anchor_ts,
             self.version,
             self.rule_index,
+            self.shared_cap_id,
+            self.shared_cap_amount,
         )
 
 
@@ -451,6 +482,13 @@ def _clause_field(tx: Dict[str, Any]) -> str:
     return value
 
 
+def _shared_cap_id_field(tx: Dict[str, Any]) -> str:
+    value = tx.get("payout_shared_cap_id", "")
+    if not isinstance(value, str):
+        raise PayoutRuleShapeError("payout_shared_cap_id must be a string")
+    return value
+
+
 def parse_install_payout_rule(tx: Dict[str, Any]) -> PayoutRuleEntry:
     """Read an installation from ROOT fields only; a nested `payload` is unsigned data.
 
@@ -492,6 +530,8 @@ def parse_install_payout_rule(tx: Dict[str, Any]) -> PayoutRuleEntry:
         form=form,
         clause_text=clause_text,
         rule_index=_u64_field(tx, "payout_rule_index", default=0),
+        shared_cap_id=_shared_cap_id_field(tx),
+        shared_cap_amount=_u64_field(tx, "payout_shared_cap_amount", default=0),
     )
 
 
@@ -579,6 +619,25 @@ def validate_payout_rule_shape(
             f"payout_rule_index must be in 0..{MAX_RULES_PER_OWNER - 1}: "
             f"an account holds at most {MAX_RULES_PER_OWNER} payout rules"
         )
+    if entry.shared_cap_id:
+        if (
+            len(entry.shared_cap_id) > MAX_SHARED_CAP_ID_CHARS
+            or not _SHARED_CAP_ID_RE.match(entry.shared_cap_id)
+        ):
+            return (
+                "payout_shared_cap_id must be 1.."
+                f"{MAX_SHARED_CAP_ID_CHARS} characters of [0-9a-z_-]"
+            )
+        if not 1 <= entry.shared_cap_amount <= tau_defs.MAX_TRANSFER_VALUE:
+            return (
+                "payout_shared_cap_amount must be in "
+                "1..MAX_TRANSFER_VALUE when a shared cap is named"
+            )
+    elif entry.shared_cap_amount:
+        return (
+            "payout_shared_cap_amount without a payout_shared_cap_id "
+            "names no shared cap"
+        )
     return None
 
 
@@ -587,6 +646,7 @@ def validate_payout_rule_shape(
 _EntryRow = Tuple[
     bytes, str, Tuple[str, ...], Tuple[Tuple[str, int, int], ...],
     int, int, int, int, int, Tuple[Tuple[int, int], ...], int, str, int,
+    str, int,
 ]
 _SettlementRow = Tuple[bytes, bytes, int, int, int]
 
@@ -604,6 +664,12 @@ class PayoutRuleBook:
     settlements stay keyed by rule_id, which already isolates every rule's
     accounting from every other's: no rule can borrow another's period
     allowance, and no replacement carries into a different slot.
+
+    FIX 8: a rule may name a shared cap. The group is not stored anywhere:
+    it is derived at evaluation time from the entries the book currently
+    holds (same owner, same non-empty shared_cap_id) and their current
+    period totals — so membership changes (install, replacement, removal)
+    are reflected exactly, with no second ledger to drift.
     """
 
     def __init__(self) -> None:
@@ -636,7 +702,10 @@ class PayoutRuleBook:
         """Rebuild from stored rows; refuses any row whose id does not recompute.
 
         Rows written before FIX 7 carry no slot term and restore as slot
-        0; rows written after carry it as the thirteenth element.
+        0; rows written after carry it as the thirteenth element. Rows
+        written before FIX 8 carry no shared-cap terms and restore with
+        no shared cap; rows written after carry them as the fourteenth
+        and fifteenth elements.
         """
         book = cls()
         for row in rows:
@@ -644,12 +713,15 @@ class PayoutRuleBook:
              period_seconds, anchor, version, period_totals,
              form, clause_text) = row[:12]
             rule_index = int(row[12]) if len(row) > 12 else 0
+            shared_cap_id = str(row[13]) if len(row) > 13 else ""
+            shared_cap_amount = int(row[14]) if len(row) > 14 else 0
             entry = PayoutRuleEntry(
                 owner,
                 tuple(recipients),
                 tuple(PayoutLeg(r, m, v) for r, m, v in legs),
                 max_exec, max_period, period_seconds, anchor, version,
                 form, clause_text, rule_index,
+                shared_cap_id, shared_cap_amount,
             )
             if entry.rule_id != bytes(rule_id):
                 raise ValueError(
@@ -706,6 +778,8 @@ class PayoutRuleBook:
                     entry.form,
                     entry.clause_text,
                     entry.rule_index,
+                    entry.shared_cap_id,
+                    entry.shared_cap_amount,
                 )
             )
         return out
@@ -796,6 +870,45 @@ class PayoutRuleBook:
         if period < 0:
             return 0
         return self.period_total(entry.rule_id, period)
+
+    def shared_cap_usage(
+        self, owner_pubkey: str, shared_cap_id: str, ts: int
+    ) -> int:
+        """What one shared-cap group has paid in its current periods (FIX 8).
+
+        The sum, over every rule the book CURRENTLY holds for this owner
+        naming this (non-empty) shared cap id, of that rule's paid total
+        in the period containing `ts` on its own clock. Derived from live
+        membership and live period totals — nothing is accumulated
+        anywhere else, so a rule leaving the book stops counting at once
+        and a replacement counts exactly what the book carried into it.
+        """
+        if not shared_cap_id:
+            return 0
+        total = 0
+        for entry in self._entries.values():
+            if entry.owner_pubkey != owner_pubkey:
+                continue
+            if entry.shared_cap_id != shared_cap_id:
+                continue
+            total += self.period_paid_total(entry, ts)
+        return total
+
+    def shared_cap_left(
+        self, entry: PayoutRuleEntry, ts: int
+    ) -> Optional[int]:
+        """Room left under `entry`'s shared cap at `ts`; None when it names none.
+
+        Never below 0: usage may stand over a lowered amount (a signed
+        mid-period update), and the room is then simply gone — the
+        left_this_period discipline of FIX 5C applied to the group.
+        """
+        if not entry.shared_cap_id:
+            return None
+        used = self.shared_cap_usage(
+            entry.owner_pubkey, entry.shared_cap_id, ts
+        )
+        return max(0, entry.shared_cap_amount - used)
 
     # -- installation / removal ----------------------------------------------------
 
@@ -966,6 +1079,22 @@ class PayoutRuleBook:
                 f"{entry.max_per_period}",
                 period,
             )
+        if entry.shared_cap_id:
+            # FIX 8: the shared cap is a third ceiling over the whole
+            # group — the executing rule's own signed amount, charged
+            # with everything the group has already paid this period
+            # (this rule's own total included, via the group sum).
+            group_paid = self.shared_cap_usage(
+                entry.owner_pubkey, entry.shared_cap_id, ts
+            )
+            if group_paid + total > entry.shared_cap_amount:
+                return refuse(
+                    f"the computed total {total} would push the shared "
+                    f"cap '{entry.shared_cap_id}' past its declared "
+                    f"amount {entry.shared_cap_amount} "
+                    f"(the group has paid {group_paid} this period)",
+                    period,
+                )
         if total > owner_balance:
             return refuse(
                 "insufficient funds: the execution settles nothing", period
@@ -1072,6 +1201,14 @@ def payout_rule_capabilities() -> Dict[str, Any]:
         "caps": (
             "declared per execution and per period; 0 leaves that "
             "dimension uncapped"
+        ),
+        "shared_cap": (
+            "a rule may name a shared cap (payout_shared_cap_id + "
+            "payout_shared_cap_amount, both signed and inside the rule "
+            "id): all of one owner's rules naming the same id draw on "
+            "that one amount per period, on top of their own caps; usage "
+            "is counted from current book membership and current period "
+            "totals, and never crosses owners"
         ),
         "settlement": (
             "recorded by settlement id; a settled execution never pays twice"

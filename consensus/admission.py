@@ -2152,6 +2152,8 @@ def _tip_payout_book(row) -> PayoutRuleBook:
             int(r.get("form", 1)),
             str(r.get("clause_text", "")),
             int(r.get("rule_index", 0)),
+            str(r.get("shared_cap_id", "")),
+            int(r.get("shared_cap_amount", 0)),
         ))
         settlement_rows.extend(
             (
@@ -2288,7 +2290,17 @@ def validate_execute_payout_rule_payload(
             "Unknown payout rule.",
             code="UNKNOWN_PAYOUT_RULE",
         )
-    book = _tip_payout_book(row)
+    # FIX 8: a rule naming a shared cap is judged against its whole
+    # group, so the book is rebuilt from ALL of the owner's rows — a
+    # one-row book cannot see the group's usage and would admit an
+    # execution the full book refuses. Rules naming no shared cap keep
+    # the one-row book verbatim: their verdict cannot depend on any
+    # other rule.
+    if row.get("shared_cap_id"):
+        book = _tip_payout_book(
+            tip_view.get_payout_rules_for_owner(row["owner_pubkey"]))
+    else:
+        book = _tip_payout_book(row)
     ts = tip_view.next_block_timestamp
     balance = tip_view.get_balance(row["owner_pubkey"])
     clause_legs = None

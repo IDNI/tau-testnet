@@ -647,6 +647,11 @@ def payout_payload_text(entry) -> str:
         # change is bound to exactly one of the owner's rules — the same
         # unconditional-field discipline as standing_due_retry_seconds.
         "payout_rule_index": entry.rule_index,
+        # FIX 8: the body names the shared cap it installs under, by the
+        # same discipline — a kind 7/8 change is bound to the rule's
+        # group exactly as it is bound to its slot.
+        "payout_shared_cap_id": entry.shared_cap_id,
+        "payout_shared_cap_amount": entry.shared_cap_amount,
     }
     if entry.form == FORM_TAU_RULE:
         obj["payout_clause"] = entry.clause_text

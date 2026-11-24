@@ -621,11 +621,15 @@ class TipAdmissionView:
          period_seconds, anchor, version, period_totals,
          form, clause_text) = row[:12]
         rule_index = int(row[12]) if len(row) > 12 else 0
+        shared_cap_id = str(row[13]) if len(row) > 13 else ""
+        shared_cap_amount = int(row[14]) if len(row) > 14 else 0
         ts = self.next_block_timestamp
         period = period_index_at(entry, ts)
         return {
             "rule_id": entry.rule_id.hex(),
             "rule_index": rule_index,
+            "shared_cap_id": shared_cap_id,
+            "shared_cap_amount": shared_cap_amount,
             "owner_pubkey": owner,
             "recipients": list(recipients),
             "legs": [
@@ -660,6 +664,18 @@ class TipAdmissionView:
                         else 0
                     ),
                 )
+            ),
+            # The shared cap's group accounting at the same instant
+            # (FIX 8): what the group has paid in its current periods and
+            # the room left under THIS rule's declared amount. None when
+            # the rule names no shared cap.
+            "shared_cap_used": (
+                None
+                if not shared_cap_id
+                else book.shared_cap_usage(owner, shared_cap_id, ts)
+            ),
+            "shared_cap_left": (
+                book.shared_cap_left(entry, ts)
             ),
             "settlements": [
                 {

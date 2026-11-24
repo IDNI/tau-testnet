@@ -223,6 +223,12 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # proposer into a different rule of the same owner than the one
         # the owner chose to install.
         signing_dict["payout_rule_index"] = payload.get("payout_rule_index")
+        # FIX 8: the shared cap the rule names is a field that fixes the
+        # rule the same way — an unsigned shared cap could be rewritten
+        # by a proposer to move the rule into another group, or out of
+        # its group entirely, under the owner's signature.
+        signing_dict["payout_shared_cap_id"] = payload.get("payout_shared_cap_id")
+        signing_dict["payout_shared_cap_amount"] = payload.get("payout_shared_cap_amount")
     elif tx_type == TX_TYPE_REMOVE_PAYOUT_RULE:
         # The slot is signed (FIX 7): a removal names exactly one of the
         # signer's own rules by its slot, and an unsigned slot could be
@@ -231,6 +237,12 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # plus the signer's identity (sender_pubkey is always signed)
         # names the rule completely.
         signing_dict["payout_rule_index"] = payload.get("payout_rule_index")
+        # FIX 8: the shared-cap terms a removal carries are signed too,
+        # so a proposer cannot rewrite which group the removal speaks
+        # for; the rule removed is still the one its (owner, slot)
+        # address — and, on the request path, its full rule id — names.
+        signing_dict["payout_shared_cap_id"] = payload.get("payout_shared_cap_id")
+        signing_dict["payout_shared_cap_amount"] = payload.get("payout_shared_cap_amount")
     elif tx_type == TX_TYPE_EXECUTE_PAYOUT_RULE:
         # The execution's inputs are signed: which rule, which settlement,
         # and the base amount the stored program computes over. The legs

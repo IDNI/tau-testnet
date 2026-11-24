@@ -1213,6 +1213,8 @@ def compute_payout_rule_id(
     period_anchor_ts: int,
     version: int,
     rule_index: int = 0,
+    shared_cap_id: str = "",
+    shared_cap_amount: int = 0,
 ) -> bytes:
     """BLAKE3 of the canonical payout rule. Returns 32 bytes.
 
@@ -1230,6 +1232,12 @@ def compute_payout_rule_id(
     rules of one owner that differ only in slot are different rules with
     different ids, and a slot-0 rule hashes exactly as before only in the
     sense that matters — the slot is a signed field, so it is inside.
+
+    FIX 8 (shared cap): `shared_cap_id` and `shared_cap_amount` — the
+    shared period cap the rule names, if any — are appended after the
+    slot, by the same discipline: a rule that draws on a shared cap is a
+    different rule from the same terms without one, and two rules naming
+    different shared caps (or different amounts) never collide.
     """
     out = bytearray()
     out.extend(encode_string(DOMAIN_PAYOUT_RULE_V1.decode()))
@@ -1242,6 +1250,8 @@ def compute_payout_rule_id(
     out.extend(encode_uint64(int(period_anchor_ts)))
     out.extend(encode_uint64(int(version)))
     out.extend(encode_uint64(int(rule_index)))
+    out.extend(encode_string(str(shared_cap_id or "")))
+    out.extend(encode_uint64(int(shared_cap_amount)))
     return blake3(bytes(out)).digest()
 
 
@@ -1255,6 +1265,8 @@ def compute_payout_rule_tau_id(
     period_anchor_ts: int,
     version: int,
     rule_index: int = 0,
+    shared_cap_id: str = "",
+    shared_cap_amount: int = 0,
 ) -> bytes:
     """BLAKE3 of a Tau-form payout rule. Returns 32 bytes.
 
@@ -1264,7 +1276,7 @@ def compute_payout_rule_tau_id(
     a tampered clause is a different, unknown rule, and no Tau-form id can
     ever collide with a declared-form id over the same terms. The FIX 7
     slot term is appended after `version`, exactly as in the declared
-    form.
+    form, and the FIX 8 shared-cap terms after the slot.
     """
     out = bytearray()
     out.extend(encode_string(DOMAIN_PAYOUT_RULE_TAU_V1.decode()))
@@ -1277,6 +1289,8 @@ def compute_payout_rule_tau_id(
     out.extend(encode_uint64(int(period_anchor_ts)))
     out.extend(encode_uint64(int(version)))
     out.extend(encode_uint64(int(rule_index)))
+    out.extend(encode_string(str(shared_cap_id or "")))
+    out.extend(encode_uint64(int(shared_cap_amount)))
     return blake3(bytes(out)).digest()
 
 
@@ -1294,6 +1308,8 @@ def encode_payout_rule_record(
     form: int = 1,
     clause_text: str = "",
     rule_index: int = 0,
+    shared_cap_id: str = "",
+    shared_cap_amount: int = 0,
 ) -> bytes:
     """One payout rule for the book root: signed fields + live period totals.
 
@@ -1303,7 +1319,8 @@ def encode_payout_rule_record(
     and (for the Tau form) the clause text are signed fields of the rule,
     so they are rooted too — appended after the totals so the declared
     form's field order is untouched. The FIX 7 slot term is appended last,
-    after the clause text, by the same discipline.
+    after the clause text, by the same discipline, and the FIX 8
+    shared-cap terms after the slot.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -1323,6 +1340,8 @@ def encode_payout_rule_record(
     out.extend(encode_uint64(int(form)))
     out.extend(encode_string(str(clause_text or "")))
     out.extend(encode_uint64(int(rule_index)))
+    out.extend(encode_string(str(shared_cap_id or "")))
+    out.extend(encode_uint64(int(shared_cap_amount)))
     return bytes(out)
 
 
