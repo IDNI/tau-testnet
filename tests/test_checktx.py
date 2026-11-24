@@ -173,6 +173,16 @@ class TestChecktx(unittest.TestCase):
         self.assertEqual(c, "UNSCOPED_USER_RULE")
         self.assertEqual(c, s)
 
+    def test_parity_sender_guarded_o5_unit(self):
+        """#42: an o5 unit behind a sender guard, the unit that once paid for
+        nothing, is refused before signing with the code that says how to fix it."""
+        guarded = ("always ((i12[t] = {#x" + SENDER + "}:bv[384]) ? "
+                   "((i1[t] > { #x0000fa }:bv[24]) ? o5[t] = { #x0000 }:bv[16] : "
+                   "o5[t] = { #x0001 }:bv[16]) : o5[t] = { #x0001 }:bv[16])")
+        c, s = self._codes_for(self._tx(operations={"0": guarded}))
+        self.assertEqual(c, "CLAUSE_SHAPE")
+        self.assertEqual(c, s)
+
     def test_parity_insufficient_funds(self):
         chain_state._balances[SENDER] = 5
         c, s = self._codes_for(self._tx())
