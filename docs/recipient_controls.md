@@ -20,8 +20,11 @@ payment, with one input swapped:
 | recipient | the recipient | "may this be paid to me, and how long may it be held?" |
 
 Everything else is fed identically, so one clause can carry outbound rules,
-inbound rules and the hold cap at once. An account with no clause on `o5` is
-never consulted on the receiving side, and the pass costs nothing.
+inbound rules and the hold cap at once. Two things keep that from changing what
+already-deployed policy means: an account with **no clause** on `o5` is never
+consulted on the receiving side, and neither is a clause that never mentions
+`i17` — reading it is the opt-in. A policy written for outbound rules (it reads
+`i3` or `i1`) must not start refusing inbound payments because a node upgraded.
 
 ## The receive stream: `i17`
 
