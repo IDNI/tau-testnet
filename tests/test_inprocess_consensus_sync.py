@@ -108,10 +108,9 @@ def _boot_callback(monkeypatch, *, persisted_spec, plan):
                                 db=db_module, chain_state=cs)
     captured = {}
     tm.set_state_restore_callback.side_effect = lambda cb: captured.setdefault("cb", cb)
+    tm.start_manager_thread.side_effect = RuntimeError("stop here")
     with patch.object(tau_authority.AuthoritativeTauOwner, "initialize"), \
-         patch("tau_admission.enable_standby"), \
-         patch("threading.Thread") as thread:
-        thread.return_value.start.side_effect = RuntimeError("stop here")
+         patch("tau_admission.enable_standby"):
         with pytest.raises(RuntimeError, match="stop here"):
             server._run_server(container)
     return captured["cb"], cs, tm
