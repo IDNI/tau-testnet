@@ -906,9 +906,10 @@ def encode_payout_entry(
     kept clocks): (periods_from, due_at, last_clock, due_done, due_every,
     due_months, on_arrival, due_index, missed, max_fee_per_execution, version,
     lineage), with (grant_amount, grant_deadline) after it for a rule that
-    carries a conditional grant. A stored row without the grant pair is the
-    old shape and encodes as before. A rule without it keeps the entry it
-    always had.
+    carries a conditional grant, and (shared_cap_id, shared_cap_amount) after
+    that for a rule that draws on a shared cap. A stored row without the
+    grant pair is the old shape and encodes as before. A rule without it
+    keeps the entry it always had.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -943,10 +944,17 @@ def encode_payout_entry(
             (periods_from, due_at, last_clock, due_done, due_every, due_months,
              on_arrival, due_index, missed, max_fee, version, lineage) = more
             grant_amount, grant_deadline = None, None
+            shared_cap_id, shared_cap_amount = None, None
         elif len(more) == 14:
             (periods_from, due_at, last_clock, due_done, due_every, due_months,
              on_arrival, due_index, missed, max_fee, version, lineage,
              grant_amount, grant_deadline) = more
+            shared_cap_id, shared_cap_amount = None, None
+        elif len(more) == 16:
+            (periods_from, due_at, last_clock, due_done, due_every, due_months,
+             on_arrival, due_index, missed, max_fee, version, lineage,
+             grant_amount, grant_deadline, shared_cap_id,
+             shared_cap_amount) = more
         else:
             raise ValueError("payout entry has a bad more")
         out.extend(b"\x01")
@@ -974,7 +982,7 @@ def encode_payout_entry(
             out.extend(encode_uint64(int(max_fee)))
         out.extend(encode_uint64(int(version)))
         out.extend(encode_hash32(bytes.fromhex(lineage)))
-        if len(more) == 14:
+        if len(more) in (14, 16):
             # A grant rule's entry carries its terms; an old-shape entry keeps
             # the bytes it always had, so its root does not move.
             for value in (grant_amount, grant_deadline):
@@ -983,6 +991,19 @@ def encode_payout_entry(
                 else:
                     out.extend(b"\x01")
                     out.extend(encode_uint64(int(value)))
+        if len(more) == 16:
+            # A shared-cap rule's entry carries its cap id and limit; the
+            # spent ledger itself is rebuilt from the open rules on restore.
+            if shared_cap_id is None:
+                out.extend(b"\x00")
+            else:
+                out.extend(b"\x01")
+                out.extend(encode_string(str(shared_cap_id)))
+            if shared_cap_amount is None:
+                out.extend(b"\x00")
+            else:
+                out.extend(b"\x01")
+                out.extend(encode_uint64(int(shared_cap_amount)))
     else:
         out.extend(b"\x00")
     return bytes(out)

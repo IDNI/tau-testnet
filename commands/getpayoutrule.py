@@ -127,7 +127,8 @@ def execute(raw_command: str, container):
         state = book.state_of(address, terms.rule_id)
         lineage = lineage_by_id.get(terms.rule_id, terms.rule_id)
         rules.append(describe(terms, state, height=next_height, ts=now,
-                              lineage=lineage))
+                              lineage=lineage,
+                              shared_spent=book.shared_spent_for(terms)))
     data = {"address": address, "block_hash": head, "installed": bool(rules),
             "rules": rules}
     if len(rules) == 1:

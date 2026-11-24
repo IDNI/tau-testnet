@@ -435,6 +435,36 @@ Rules of a grant:
 - The escrow counts toward the supply like a parked retractable transfer,
   so installing, drawing and refunding conserve supply.
 
+## Shared caps
+
+Several payout rules of one account can draw on a single limit: each rule
+names the cap with `shared_cap_id` and `shared_cap_amount`, and the book
+keeps one spent total per (account, cap id). Every settled run counts
+exactly once toward the cap, whichever rule paid it, and a run that would
+pass the limit is refused with no debt and no completion -- a due run that
+cannot pay stays in its retry window, like any other refused run. The two
+fields ride on the install transaction (and on the canonical spec text, so
+a rule-change request can carry them too); the rule id commits to both, so
+two rules that name the same cap id with different amounts are different
+rules, and the second one is refused at admission.
+
+Rules of a shared cap:
+
+- `shared_cap_id` and `shared_cap_amount` come together or not at all;
+  `shared_cap_id` is a string of 1..64 bytes, `shared_cap_amount` is in
+  `1..MAX_TRANSFER_VALUE`.
+- A cap is per account: another account may use the same cap id with its
+  own limit, and its rules draw on a separate total.
+- The cap bounds what the rules pay in total, on top of each rule's own
+  `cap_per_execution` and `cap_per_period`: a run must fit all three.
+- The room frees when a rule leaves the book -- revoked, expired,
+  superseded by an update, or refunded at a grant deadline -- because the
+  cap counts what the open rules have paid. An update resets its rule's
+  contribution, as it resets the rule's period caps.
+- The ledger is not stored separately: on restore it is rebuilt from the
+  open rules' paid totals, so it can never disagree with the stored rows,
+  and a stored book that names one cap with two limits is refused.
+
 ## Inspecting
 
 ```bash
@@ -445,8 +475,9 @@ tau-testnet getpayoutrule <address>       # raw RPC
 `getpayoutrule` answers `installed`, every rule with its terms and where it
 stands (`spent_this_period`, `left_this_period`, `executions`, `paid_total`,
 `last_height`, `version`, `lineage`, and the due / missed / open-arrival
-fields where the rule has them, and the grant / held / drawn fields where
-the rule is a grant), its history on this node (newest first,
+fields where the rule has them, the grant / held / drawn fields where the
+rule is a grant, and the shared-cap id / amount / spent / left fields where
+the rule draws on a shared cap), its history on this node (newest first,
 canonical blocks only), and `semantics`: the node's own constants, so a
 wallet can explain the feature before offering it. `gettxstatus` names what a
 confirmed payout transaction did (`payout`: the outcome, legs and, for an

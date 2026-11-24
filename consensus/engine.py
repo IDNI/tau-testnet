@@ -414,8 +414,11 @@ def _node_payout_step(lm, balances, sequences, rule, state, exe, height, timesta
                 "Replay without a policy evaluator: %s payout %s not re-run.",
                 what, rule.rule_id.hex()[:16])
             raise PayoutRefused("no evaluator during replay")
+        book = _payout_book(lm)
         legs = settle_payout(rule, state, exe, outputs, height=int(height),
-                             ts=int(timestamp), balance=have)
+                             ts=int(timestamp), balance=have,
+                             shared_spent=(book.shared_spent_for(rule)
+                                           if book is not None else 0))
         frozen = _payout_o5_blocked(
             lm, rule.account_pubkey, sum(a for _, _, a in legs), have,
             height, timestamp, timeout=timeout, replay_mode=replay_mode)
@@ -3305,6 +3308,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     rule, state, exe, outputs, height=height_now, ts=ts_now,
                                     balance=(state.held if rule.is_grant
                                              else _read_bal(exe.account_pubkey)),
+                                    shared_spent=book.shared_spent_for(rule),
                                 )
                                 frozen = _payout_o5_blocked(
                                     lifecycle_mgr, exe.account_pubkey,

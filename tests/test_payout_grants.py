@@ -406,7 +406,8 @@ def test_grant_rule_restores_with_its_escrow():
     book.install(terms, HEIGHT)
     book.record(ALICE, terms.rule_id, 1200, HEIGHT + 1, TS + 1)
     rows = book.store_rows()
-    assert len(rows[0][18]) == 14  # `more` carries the grant pair
+    assert len(rows[0][18]) == 16  # `more` carries the grant pair + shared-cap pair
+    assert rows[0][18][14:] == (None, None)  # no shared cap on this rule
     restored = PayoutBook.restore(rows, *book.resolved_state())
     assert restored.root() == book.root()
     assert restored.escrow_total() == 3800

@@ -351,13 +351,17 @@ _OPT_MAX_FEE = 6
 _OPT_VERSION = 7
 _OPT_GRANT_AMOUNT = 8
 _OPT_GRANT_DEADLINE = 9
+_OPT_SHARED_CAP_ID = 10
+_OPT_SHARED_CAP_AMOUNT = 11
 
 
 def _options_bytes(periods_from: Optional[int], due_at: Optional[int],
                    due_every: Optional[int], due_months: Optional[int],
                    on_arrival: bool, max_fee_per_execution: Optional[int],
                    version: int, grant_amount: Optional[int] = None,
-                   grant_deadline: Optional[int] = None) -> bytes:
+                   grant_deadline: Optional[int] = None,
+                   shared_cap_id: Optional[str] = None,
+                   shared_cap_amount: Optional[int] = None) -> bytes:
     out = bytearray()
     if periods_from is not None:
         out.append(_OPT_PERIODS_FROM)
@@ -385,6 +389,14 @@ def _options_bytes(periods_from: Optional[int], due_at: Optional[int],
     if grant_deadline is not None:
         out.append(_OPT_GRANT_DEADLINE)
         out.extend(int(grant_deadline).to_bytes(8, "big"))
+    if shared_cap_id is not None:
+        encoded = str(shared_cap_id).encode("utf-8")
+        out.append(_OPT_SHARED_CAP_ID)
+        out.append(len(encoded))
+        out.extend(encoded)
+    if shared_cap_amount is not None:
+        out.append(_OPT_SHARED_CAP_AMOUNT)
+        out.extend(int(shared_cap_amount).to_bytes(8, "big"))
     return bytes(out)
 
 
@@ -415,12 +427,15 @@ class PayoutTerms:
     version: int = 1                     # updates count up; 1 is the first install
     grant_amount: Optional[int] = None   # conditional grant: escrowed at install
     grant_deadline: Optional[int] = None  # ... refunded to the grantor at this point
+    shared_cap_id: Optional[str] = None  # shared cap: several rules draw on one limit
+    shared_cap_amount: Optional[int] = None  # ... the shared limit, same on every rule
 
     @property
     def options(self) -> Tuple:
         return (self.periods_from, self.due_at, self.due_every, self.due_months,
                 self.on_arrival, self.max_fee_per_execution, self.version,
-                self.grant_amount, self.grant_deadline)
+                self.grant_amount, self.grant_deadline,
+                self.shared_cap_id, self.shared_cap_amount)
 
     @property
     def is_grant(self) -> bool:
@@ -459,7 +474,8 @@ class PayoutTerms:
             _options_bytes(self.periods_from, self.due_at, self.due_every,
                            self.due_months, self.on_arrival,
                            self.max_fee_per_execution, self.version,
-                           self.grant_amount, self.grant_deadline),
+                           self.grant_amount, self.grant_deadline,
+                           self.shared_cap_id, self.shared_cap_amount),
         )
 
     @property
@@ -476,7 +492,8 @@ class PayoutTerms:
         return (self.periods_from is not None or self.due_at is not None
                 or self.due_every is not None or self.due_months is not None
                 or self.on_arrival or self.max_fee_per_execution is not None
-                or self.version != 1 or self.reads_clocks or self.is_grant)
+                or self.version != 1 or self.reads_clocks or self.is_grant
+                or self.shared_cap_id is not None)
 
     def clock(self, height: int, ts: int) -> int:
         return height if self.kind == KIND_BLOCKS else ts
@@ -526,17 +543,20 @@ class PayoutState:
     def more(self, terms: PayoutTerms, lineage: bytes) -> Optional[Tuple]:
         """(periods_from, due_at, last_clock, due_done, due_every, due_months,
         on_arrival, due_index, missed, max_fee_per_execution, version, lineage,
-        grant_amount, grant_deadline) for an extended rule; None keeps the
-        stored row the shape it always had. Held and drawn are not stored: a
-        grant rule draws every coin it pays, so on restore drawn is paid_total
-        and held is what the grant has left."""
+        grant_amount, grant_deadline, shared_cap_id, shared_cap_amount) for an
+        extended rule; None keeps the stored row the shape it always had. Held
+        and drawn are not stored: a grant rule draws every coin it pays, so on
+        restore drawn is paid_total and held is what the grant has left. The
+        shared-cap ledger is not stored either: on restore it is rebuilt from
+        the open rules' paid totals, so it can never disagree with the rows."""
         if not terms.extended:
             return None
         return (terms.periods_from, terms.due_at, self.last_clock, self.due_done,
                 terms.due_every, terms.due_months, terms.on_arrival,
                 self.due_index, self.missed, terms.max_fee_per_execution,
                 terms.version, lineage.hex(), terms.grant_amount,
-                terms.grant_deadline)
+                terms.grant_deadline, terms.shared_cap_id,
+                terms.shared_cap_amount)
 
     def spent_at(self, terms: PayoutTerms, clock: int) -> int:
         return self.spent_in_period if self.period_index == self.period_at(terms, clock) else 0
@@ -622,6 +642,11 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
     on_arrival = fields.get("on_arrival")
     if on_arrival is not None and on_arrival is not True:
         raise PayoutShapeError("on_arrival must be true or left out")
+    shared_cap_id = fields.get("shared_cap_id")
+    if shared_cap_id is not None and (
+            not isinstance(shared_cap_id, str) or not 1 <= len(shared_cap_id) <= 64
+            or len(shared_cap_id.encode("utf-8")) > 64):
+        raise PayoutShapeError("shared_cap_id must be a string of 1..64 bytes")
     return PayoutTerms(
         account_pubkey=account,
         sequence_number=sequence,
@@ -642,13 +667,16 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
         max_fee_per_execution=_opt_u64(fields, "max_fee_per_execution"),
         grant_amount=_opt_u64(fields, "grant_amount"),
         grant_deadline=_opt_u64(fields, "grant_deadline"),
+        shared_cap_id=shared_cap_id,
+        shared_cap_amount=_opt_u64(fields, "shared_cap_amount"),
     )
 
 
 SPEC_FIELDS = ("rule_text", "slots", "cap_per_execution", "cap_per_period",
                "period_blocks", "period_seconds", "expires_at", "per_sale", "sealed",
                "periods_from", "due_at", "due_every", "due_months", "on_arrival",
-               "max_fee_per_execution", "grant_amount", "grant_deadline")
+               "max_fee_per_execution", "grant_amount", "grant_deadline",
+               "shared_cap_id", "shared_cap_amount")
 
 
 def parse_payout_rule_set(tx: Dict[str, Any]) -> PayoutTerms:
@@ -1036,6 +1064,15 @@ def validate_terms_shape(terms: PayoutTerms, height: int, ts: int) -> Optional[s
             return f"grant_amount must be in 1..{tau_defs.MAX_TRANSFER_VALUE}"
         if not now < terms.grant_deadline <= terms.expires_at:
             return "grant_deadline must be in the future and no later than expires_at"
+    if (terms.shared_cap_id is None) != (terms.shared_cap_amount is None):
+        return "shared_cap_id and shared_cap_amount come together or not at all"
+    if terms.shared_cap_id is not None:
+        if (not isinstance(terms.shared_cap_id, str)
+                or not 1 <= len(terms.shared_cap_id) <= 64
+                or len(terms.shared_cap_id.encode("utf-8")) > 64):
+            return "shared_cap_id must be a string of 1..64 bytes"
+        if not 1 <= terms.shared_cap_amount <= tau_defs.MAX_TRANSFER_VALUE:
+            return f"shared_cap_amount must be in 1..{tau_defs.MAX_TRANSFER_VALUE}"
     return None
 
 
@@ -1087,10 +1124,13 @@ def parse_amount(value: Any) -> int:
 
 def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
            outputs: Dict[str, Any], *, height: int, ts: int,
-           balance: int) -> List[Tuple[int, str, int]]:
+           balance: int, shared_spent: int = 0) -> List[Tuple[int, str, int]]:
     """The legs (slot, recipient, amount) of one execution, or PayoutRefused.
 
-    All or none: every check runs before anything moves.
+    All or none: every check runs before anything moves. `shared_spent` is
+    what the rule's shared cap (if any) has already paid across every rule
+    that draws on it; the book passes it, so a cap shared by several rules
+    is enforced here, in the one place that decides the legs.
     """
     named = dict(exe.recipients)
     legs: List[Tuple[int, str, int]] = []
@@ -1119,6 +1159,12 @@ def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
         raise PayoutRefused(
             f"the rule pays {total}; with {spent} paid this period that is over "
             f"the cap per period {terms.cap_per_period}")
+    if terms.shared_cap_id is not None and \
+            shared_spent + total > terms.shared_cap_amount:
+        raise PayoutRefused(
+            f"the rule pays {total}; with {shared_spent} paid under shared cap "
+            f"{terms.shared_cap_id} that is over the shared cap "
+            f"{terms.shared_cap_amount}")
     if total > balance:
         raise PayoutRefused(f"the rule pays {total}, the account holds {balance}")
     return legs
@@ -1184,6 +1230,12 @@ class PayoutBook:
         self._grants: Dict[int, List[Tuple[int, str, bytes]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
         # (account, rule_id) with arrivals waiting for an on-arrival run.
         self._arrivals: Set[Tuple[str, bytes]] = set()
+        # Shared caps, keyed by (account, cap id): what the open rules that
+        # draw on the cap have paid in total, and the limit they share. The
+        # ledger is rebuilt from the open rules' paid totals on restore, so
+        # it can never disagree with the stored rows.
+        self._shared_spent: Dict[Tuple[str, str], int] = {}
+        self._shared_limits: Dict[Tuple[str, str], int] = {}
         self.resolved_count = 0
         self.resolved_acc = ZERO_ACC
         self._root: Optional[bytes] = None
@@ -1200,6 +1252,8 @@ class PayoutBook:
         clone._retry = {k: list(rows) for k, rows in self._retry.items()}
         clone._grants = {k: list(rows) for k, rows in self._grants.items()}
         clone._arrivals = set(self._arrivals)
+        clone._shared_spent = dict(self._shared_spent)
+        clone._shared_limits = dict(self._shared_limits)
         clone.resolved_count = self.resolved_count
         clone.resolved_acc = self.resolved_acc
         clone._root = self._root
@@ -1242,17 +1296,24 @@ class PayoutBook:
                      due_months, on_arrival, due_index, missed, max_fee, version,
                      lineage_hex) = more
                     grant_amount, grant_deadline = None, None
+                    shared_cap_id, shared_cap_amount = None, None
                 elif len(more) == 14:
                     (periods_from, due_at, last_clock, due_done, due_every,
                      due_months, on_arrival, due_index, missed, max_fee, version,
                      lineage_hex, grant_amount, grant_deadline) = more
+                    shared_cap_id, shared_cap_amount = None, None
+                elif len(more) == 16:
+                    (periods_from, due_at, last_clock, due_done, due_every,
+                     due_months, on_arrival, due_index, missed, max_fee, version,
+                     lineage_hex, grant_amount, grant_deadline, shared_cap_id,
+                     shared_cap_amount) = more
                 else:
                     raise ValueError(f"stored payout rule has a bad more: {rid.hex()}")
                 terms = PayoutTerms(account, sequence, body, tuple(slots), cap_exec,
                                     cap_period, kind, period, expires_at, sales is not None,
                                     sealed, periods_from, due_at, due_every, due_months,
                                     on_arrival, max_fee, version, grant_amount,
-                                    grant_deadline)
+                                    grant_deadline, shared_cap_id, shared_cap_amount)
                 lineage = bytes.fromhex(lineage_hex)
             rid = terms.rule_id
             if rid != bytes(stored_id):
@@ -1302,6 +1363,15 @@ class PayoutBook:
                           (terms.grant_deadline, terms.account_pubkey, terms.rule_id))
         if terms.on_arrival and state.open_sales:
             self._arrivals.add(key)
+        if terms.shared_cap_id is not None:
+            cap = (terms.account_pubkey, terms.shared_cap_id)
+            limit = self._shared_limits.get(cap)
+            if limit is not None and limit != terms.shared_cap_amount:
+                raise ValueError(
+                    f"shared cap {terms.shared_cap_id} already has a different limit")
+            self._shared_limits[cap] = terms.shared_cap_amount
+            self._shared_spent[cap] = (self._shared_spent.get(cap, 0)
+                                       + state.paid_total)
         self._root = None
 
     def _remove(self, account: str, rule_id: bytes, outcome: int) -> PayoutTerms:
@@ -1335,6 +1405,21 @@ class PayoutBook:
                 if i < len(index) and index[i] == row:
                     del index[i]
         self._arrivals.discard(key)
+        if terms.shared_cap_id is not None:
+            # The cap counts what the open rules have paid. A rule that
+            # leaves the book -- revoked, expired, superseded, refunded --
+            # takes its paid total out of the cap, so the room it used frees
+            # for the rules that remain.
+            cap = (account, terms.shared_cap_id)
+            left = max(0, self._shared_spent.get(cap, 0) - state.paid_total)
+            if left:
+                self._shared_spent[cap] = left
+            else:
+                self._shared_spent.pop(cap, None)
+                if not any(t.shared_cap_id == terms.shared_cap_id
+                           for t in self.terms.values()
+                           if t.account_pubkey == account):
+                    self._shared_limits.pop(cap, None)
         self.resolved_acc = compute_payout_resolved_acc(self.resolved_acc, rule_id, outcome)
         self.resolved_count += 1
         self._root = None
@@ -1425,6 +1510,12 @@ class PayoutBook:
             return False, "this payout rule is already installed"
         if len(self.terms) >= MAX_PAYOUT_RULES_TOTAL:
             return False, "the payout rule book is full"
+        if terms.shared_cap_id is not None:
+            limit = self._shared_limits.get((terms.account_pubkey,
+                                             terms.shared_cap_id))
+            if limit is not None and limit != terms.shared_cap_amount:
+                return False, (f"shared cap {terms.shared_cap_id} already has "
+                               f"a limit of {limit}")
         return True, ""
 
     def can_admit_revoke(self, account: str, rule_id: bytes) -> Tuple[bool, str]:
@@ -1540,10 +1631,28 @@ class PayoutBook:
                         last_clock=int(clock) if terms.extended else 0,
                         held=held, drawn=drawn)
         self.state[key] = state
+        if terms.shared_cap_id is not None:
+            # Each settled run counts exactly once toward the shared cap.
+            cap = (account, terms.shared_cap_id)
+            self._shared_spent[cap] = self._shared_spent.get(cap, 0) + total
         if terms.on_arrival and not open_sales:
             self._arrivals.discard(key)
         self._root = None
         return state
+
+    def shared_cap_limit(self, account: str, cap_id: str) -> Optional[int]:
+        """The limit of the account's open shared cap, or None when no open
+        rule draws on it."""
+        return self._shared_limits.get((account, cap_id))
+
+    def shared_spent_for(self, terms: PayoutTerms) -> int:
+        """What the rule's shared cap has already paid across every rule that
+        draws on it; 0 for a rule with no shared cap. The engine passes this
+        to settle, so the cap is enforced where the legs are decided."""
+        if terms.shared_cap_id is None:
+            return 0
+        return self._shared_spent.get((terms.account_pubkey,
+                                       terms.shared_cap_id), 0)
 
     def pays_per_sale(self, account: str, rule_id: Optional[bytes] = None) -> bool:
         if rule_id is not None:
@@ -1803,8 +1912,12 @@ class PayoutBook:
 
 
 def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
-             ts: int = 0, lineage: Optional[bytes] = None) -> Dict[str, Any]:
-    """One installed rule as a wallet reads it."""
+             ts: int = 0, lineage: Optional[bytes] = None,
+             shared_spent: Optional[int] = None) -> Dict[str, Any]:
+    """One installed rule as a wallet reads it. `shared_spent` is what the
+    rule's shared cap has already paid across every rule that draws on it;
+    the caller (getpayoutrule) passes the book's value, so a wallet can see
+    the room that is left before offering the feature."""
     clock = terms.clock(height, ts) if (height or ts) else None
     spent = state.spent_at(terms, clock) if clock is not None else state.spent_in_period
     out: Dict[str, Any] = {
@@ -1846,6 +1959,12 @@ def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
             "grant_deadline": terms.grant_deadline,
             "held": state.held,
             "drawn": state.drawn} if terms.is_grant else {}),
+        **({"shared_cap_id": terms.shared_cap_id,
+            "shared_cap_amount": terms.shared_cap_amount,
+            **({"shared_cap_spent": shared_spent,
+                "shared_cap_left": terms.shared_cap_amount - shared_spent}
+               if shared_spent is not None else {})}
+           if terms.shared_cap_id is not None else {}),
         **({"per_sale": True,
             "open_sales": [{"sale_id": sid.hex(), "payer_pubkey": payer, "amount": amount,
                             "height": h, "kind": kind}
