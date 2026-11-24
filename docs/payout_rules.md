@@ -400,6 +400,41 @@ after a late defect, to its finder and the poster. The rule reads what it has
 already paid (`i26`) to tell the two executions apart. On the real engine every
 settlement path pays exactly the locked price, and nothing after it.
 
+## Conditional grants
+
+A conditional grant is an escrow the node itself holds, without an `o5` clause
+or a guard: the grantor installs a payout rule with `grant_amount` and
+`grant_deadline`, and the node debits the grantor the granted amount at
+install. The money is not paid out; it is held in the book until the rule
+draws it or the deadline refunds it. The two fields ride on the install
+transaction (and on the canonical spec text, so a rule-change request can
+carry them too): `grant_amount` is the amount escrowed, `grant_deadline` is
+the point on the rule's own clock at which the remainder is refunded.
+
+Draws are ordinary executions (`payout_execute`): the rule decides each
+amount, under its caps, and every draw comes out of the held balance. The
+rule reads the held balance as `i2`, so it judges the escrow, not the
+grantor's account; a draw over what the grant holds is refused. At the
+deadline the node refunds the remainder to the grantor automatically and the
+rule ends, so no further draw is possible -- a draw in the deadline block
+itself is already refused. Revoking refunds the remainder the same way.
+
+Rules of a grant:
+
+- `grant_amount` and `grant_deadline` come together or not at all;
+  `grant_amount` is in `1..MAX_TRANSFER_VALUE`, and `grant_deadline` is in
+  the future and no later than `expires_at`, on the rule's own clock.
+- Installing one the grantor cannot fund is refused outright; the grantor
+  pays the install fee on top of the grant.
+- A grant rule is never updated: revoke it (the remainder is refunded) and
+  install a new one. Updating a plain rule into a grant is refused the same
+  way.
+- The payer's current `o5` clause is re-checked at every draw, as for any
+  payout; a frozen payer draws nothing. The deadline refund is not a draw
+  and is never blocked.
+- The escrow counts toward the supply like a parked retractable transfer,
+  so installing, drawing and refunding conserve supply.
+
 ## Inspecting
 
 ```bash
@@ -410,7 +445,8 @@ tau-testnet getpayoutrule <address>       # raw RPC
 `getpayoutrule` answers `installed`, every rule with its terms and where it
 stands (`spent_this_period`, `left_this_period`, `executions`, `paid_total`,
 `last_height`, `version`, `lineage`, and the due / missed / open-arrival
-fields where the rule has them), its history on this node (newest first,
+fields where the rule has them, and the grant / held / drawn fields where
+the rule is a grant), its history on this node (newest first,
 canonical blocks only), and `semantics`: the node's own constants, so a
 wallet can explain the feature before offering it. `gettxstatus` names what a
 confirmed payout transaction did (`payout`: the outcome, legs and, for an

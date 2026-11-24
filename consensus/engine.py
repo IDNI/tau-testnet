@@ -266,7 +266,13 @@ def _retractable_book(lm) -> Optional[RetractableBook]:
 
 def _escrow_total(lm) -> int:
     book = _retractable_book(lm)
-    return book.escrow_total() if book is not None else 0
+    total = book.escrow_total() if book is not None else 0
+    payout_book = _payout_book(lm)
+    if payout_book is not None:
+        # A conditional grant's held balance is escrow too: the grantor was
+        # debited at install and the remainder is refunded at the deadline.
+        total += payout_book.escrow_total()
+    return total
 
 
 def _release_due_retractables(lm, balances, sequences, height, timestamp) -> List[str]:
@@ -311,6 +317,31 @@ def _expire_payout_rules(lm, height, timestamp) -> List[Dict[str, Any]]:
         {"account_pubkey": t.account_pubkey, "rule_id": t.rule_id.hex(), "outcome": "expired"}
         for t in book.expire(int(height), int(timestamp))
     ]
+
+
+def _refund_due_grants(lm, balances, sequences, height, timestamp) -> List[Dict[str, Any]]:
+    """Refund every conditional grant whose deadline this block reached.
+
+    The node runs this after the due points and before the expiries, so a
+    grant whose deadline is its end refunds first and never expires holding
+    escrow. Each refund credits the remainder to the grantor and ends the
+    rule, so no further draw is possible. A grant with nothing left still
+    ends here, with a zero refund.
+    """
+    book = _payout_book(lm)
+    if book is None or not book.has_grants_due(int(height), int(timestamp)):
+        return []
+    grant = faucet.amount(lm)
+    events: List[Dict[str, Any]] = []
+    for terms, state in book.refund_due(int(height), int(timestamp)):
+        if state.held:
+            balances[terms.account_pubkey] = faucet.spendable(
+                balances, sequences, terms.account_pubkey, grant) + state.held
+        events.append({"account_pubkey": terms.account_pubkey,
+                       "rule_id": terms.rule_id.hex(), "outcome": "refunded",
+                       "grant_amount": terms.grant_amount, "drawn": state.drawn,
+                       "refunded": state.held})
+    return events
 
 
 def _payout_o5_blocked(lm, payer, total, have, height, timestamp, *, timeout,
@@ -361,8 +392,11 @@ def _node_payout_step(lm, balances, sequences, rule, state, exe, height, timesta
 
     `have` is the balance the block has reached for the account, which is what
     the rule reads on i2. Nothing has moved; `reason` says why nothing will.
+    A grant rule reads its held escrow as i2: the rule governs the escrowed
+    money, and the grantor's account no longer holds it.
     """
-    have = faucet.spendable(balances, sequences, rule.account_pubkey, faucet.amount(lm))
+    have = state.held if rule.is_grant else faucet.spendable(
+        balances, sequences, rule.account_pubkey, faucet.amount(lm))
     try:
         values = payout_execution_inputs(
             rule, state, exe, parent_balance=have, height=int(height), ts=int(timestamp))
@@ -400,10 +434,16 @@ def _node_payout_pay(lm, book, balances, sequences, last_ts, account, rule_id, l
     A due run's legs are arrivals for their recipients (a standing payment is
     income); an arrival run's legs are not recorded again, so a payout never
     re-triggers its own rule and a forwarding chain stops after one hop.
+
+    A grant rule's legs come out of its escrow, not the account: the grantor
+    was debited at install, so nothing is debited here and the book's held
+    balance falls in record().
     """
     grant = faucet.amount(lm)
     total = sum(a for _, _, a in legs)
-    balances[account] = have - total
+    rule = book.get(account, rule_id)
+    if rule is None or not rule.is_grant:
+        balances[account] = have - total
     for k, who, amount in legs:
         balances[who] = faucet.spendable(balances, sequences, who, grant) + amount
         if record_arrivals and due_index is not None:
@@ -554,13 +594,18 @@ def _payout_update_request_problem(lm, sender, body, offer_id, height,
 
 
 def _release_rule_changes(lm, height, timestamp, timeout,
-                          payout_events: Optional[List[Dict[str, Any]]] = None
+                          payout_events: Optional[List[Dict[str, Any]]] = None,
+                          balances: Optional[Dict[str, int]] = None
                           ) -> List[Tuple[str, str]]:
     """Write every READY rule-change request, lowest id first, up to the per-block cap.
 
     Runs after the transaction loop and before expiry, so a deferred request
     whose window closes this block expires instead of releasing. A failure is
     recorded on the request, never on the block. Returns (id, status name).
+
+    `balances` is the block's balance map: a released grant install debits it
+    and a released grant revoke refunds into it, the same money the direct
+    transactions move through staged writes.
     """
     approvals = lm.approval_requests
     if not approvals.rule_change_requests:
@@ -576,7 +621,8 @@ def _release_rule_changes(lm, height, timestamp, timeout,
             continue
         processed += 1
         problem = _write_rule_change(lm, rid, entry, int(height), timeout,
-                                     timestamp=int(timestamp), payout_events=payout_events)
+                                     timestamp=int(timestamp), payout_events=payout_events,
+                                     balances=balances)
         if problem:
             approvals.resolve_rule_change(rid, STATUS_FAILED)
             logger.info("Rule-change request %s failed at release: %s", rid.hex(), problem)
@@ -588,7 +634,7 @@ def _release_rule_changes(lm, height, timestamp, timeout,
 
 
 def _write_rule_change(lm, rid, entry, height, timeout, *, timestamp=0,
-                       payout_events=None) -> Optional[str]:
+                       payout_events=None, balances=None) -> Optional[str]:
     """Apply one request to the block's lifecycle. None on success, else why not.
 
     Every check runs before the first write, so a failure leaves nothing behind.
@@ -596,7 +642,8 @@ def _write_rule_change(lm, rid, entry, height, timeout, *, timestamp=0,
     if entry.kind in (tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
                       tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT,
                       tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT):
-        return _write_payout_change(lm, entry, height, timestamp, timeout, payout_events)
+        return _write_payout_change(lm, entry, height, timestamp, timeout, payout_events,
+                                    balances)
     offers = lm.rule_offers
     approvals = lm.approval_requests
     sender = entry.sender_pubkey
@@ -671,11 +718,18 @@ def _write_rule_change(lm, rid, entry, height, timeout, *, timestamp=0,
     return None
 
 
-def _write_payout_change(lm, entry, height, timestamp, timeout, events) -> Optional[str]:
+def _write_payout_change(lm, entry, height, timestamp, timeout, events,
+                         balances=None) -> Optional[str]:
     """Install, update or revoke a payout rule from a released rule-change request.
 
     A payout change touches nothing else the account has, so unlike a policy
     change it fails no other open request.
+
+    `balances` is the block's balance map. A grant install debits the grant
+    from it and a grant revoke refunds the remainder into it, so the escrow
+    the book records is funded exactly once. The sender necessarily has a
+    record (a rule install is a signed transaction, so its sequence is
+    recorded), so the stored balance is the spendable one here.
     """
     from consensus.payout import parse_payout_spec
 
@@ -701,10 +755,24 @@ def _write_payout_change(lm, entry, height, timestamp, timeout, events) -> Optio
             return "name the rule to revoke"
         if book.get(sender, rule_id) is None:
             return "no payout rule to revoke"
+        held = 0
+        _terms = book.get(sender, rule_id)
+        if _terms is not None and _terms.is_grant:
+            _state = book.state_of(sender, rule_id)
+            held = _state.held if _state is not None else 0
+            if held and balances is None:
+                # A refund with nowhere to go would strand the escrow, so
+                # refuse the release before the rule leaves the book. This
+                # is unreachable from apply_block, which always passes its
+                # balances; it fails closed for any other caller.
+                return "no balance map to refund the grant remainder into"
         gone = book.revoke(sender, rule_id)
+        if held:
+            balances[sender] = balances.get(sender, 0) + held
         if events is not None:
             events.append({"account_pubkey": sender, "rule_id": gone.rule_id.hex(),
-                           "outcome": "revoked"})
+                           "outcome": "revoked",
+                           **({"refunded": held} if held else {})})
         return None
     if entry.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT:
         # The offer_id names the version to replace; the body is the new
@@ -733,10 +801,22 @@ def _write_payout_change(lm, entry, height, timestamp, timeout, events) -> Optio
     built = sender_policy.evaluator(PAYOUT_POOL_APPLY).validate(terms.body, timeout=timeout)
     if not built.ok:
         return f"the payout rule does not build: {built.error[:200]}"
+    if terms.is_grant:
+        # The escrow is funded now, at release: the grantor must still hold
+        # the grant, and the debit lands beside the install, before the
+        # block's conservation check.
+        if balances is None:
+            return "a grant rule needs a balance to escrow from"
+        if balances.get(sender, 0) < terms.grant_amount:
+            return (f"the grantor holds {balances.get(sender, 0)}, less than "
+                    f"the grant {terms.grant_amount}")
     book.install(terms, terms.clock(int(height), int(timestamp)))
+    if terms.is_grant:
+        balances[sender] = balances.get(sender, 0) - terms.grant_amount
     if events is not None:
         events.append({"account_pubkey": sender, "rule_id": terms.rule_id.hex(),
-                       "outcome": "installed"})
+                       "outcome": "installed",
+                       **({"grant_amount": terms.grant_amount} if terms.is_grant else {})})
     return None
 
 
@@ -1283,6 +1363,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             timeout=getattr(_block_session, "request_budget", None),
             replay_mode=replay_mode,
         )
+        payout_refunded = _refund_due_grants(
+            lm, t_bals, t_seqs,
+            block.header.block_number, block.header.timestamp,
+        )
         payout_expired = _expire_payout_rules(
             lm, block.header.block_number, block.header.timestamp
         )
@@ -1294,6 +1378,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "request_budget", None,
             ),
             payout_events=payout_released,
+            balances=t_bals,
         )
 
         minted = faucet.granted(
@@ -1358,6 +1443,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 payout_events.append(event)
         payout_events.extend(arrival_payouts)
         payout_events.extend(due_payouts)
+        payout_events.extend(payout_refunded)
         payout_events.extend(payout_expired)
         payout_events.extend(payout_released)
 
@@ -3150,11 +3236,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                             if blocked:
                                 reason = f"rule-change guard blocks ({detail}); use a rule-change request"
+                        if terms is not None and not reason and terms.is_grant:
+                            # A conditional grant escrows at install: the
+                            # grantor must hold the grant now. The debit is
+                            # staged below, beside the install, so the fee
+                            # step that follows charges against what is left.
+                            if target_balances is None:
+                                reason = "no balance overlay to escrow from"
+                            elif _read_bal(sender) < terms.grant_amount:
+                                reason = (f"the grantor holds {_read_bal(sender)}, less than "
+                                          f"the grant {terms.grant_amount}")
                         if reason:
                             tx_receipt["logs"].append(f"Payout rule ignored: {reason}")
                             tx_receipt["reason"] = "payout_rule_not_set"
                             accepted_in_block = False
                         else:
+                            if terms.is_grant:
+                                staged_writes[sender] = _read_bal(sender) - terms.grant_amount
                             pending_payout_set = terms
                             tx_receipt["logs"].append("Payout rule set: " + terms.rule_id.hex())
                     elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
@@ -3179,9 +3277,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     raise PayoutRefused(
                                         "the rule caps a manual execution's fee at "
                                         f"{rule.max_fee_per_execution}")
+                                # A grant rule reads and spends its held
+                                # escrow, not the account: the grantor was
+                                # debited at install.
+                                have = (state.held if rule.is_grant
+                                        else int(_parent_bal(exe.account_pubkey)))
                                 values = payout_execution_inputs(
                                     rule, state, exe,
-                                    parent_balance=int(_parent_bal(exe.account_pubkey)),
+                                    parent_balance=have,
                                     height=height_now, ts=ts_now,
                                 )
                                 try:
@@ -3200,12 +3303,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     raise PayoutRefused("no evaluator during replay")
                                 legs = settle_payout(
                                     rule, state, exe, outputs, height=height_now, ts=ts_now,
-                                    balance=_read_bal(exe.account_pubkey),
+                                    balance=(state.held if rule.is_grant
+                                             else _read_bal(exe.account_pubkey)),
                                 )
                                 frozen = _payout_o5_blocked(
                                     lifecycle_mgr, exe.account_pubkey,
                                     sum(a for _, _, a in legs),
-                                    _read_bal(exe.account_pubkey),
+                                    state.held if rule.is_grant
+                                    else _read_bal(exe.account_pubkey),
                                     height_now, ts_now, timeout=budget,
                                     replay_mode=replay_mode,
                                 )
@@ -3222,7 +3327,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             total = sum(a for _, _, a in legs)
                             # Debit first, then credit through the staged view,
                             # so a recipient that is also the executor nets right.
-                            staged_writes[account] = _read_bal(account) - total
+                            # A grant draw debits no account: the escrow was
+                            # debited at install, and the book's held balance
+                            # falls when the execution is recorded below.
+                            if not rule.is_grant:
+                                staged_writes[account] = _read_bal(account) - total
                             for _, who, amount in legs:
                                 staged_writes[who] = _read_bal(who) + amount
                             pending_payout_exec = (account, exe.rule_id, total, legs, exe.sale_id)
@@ -3845,6 +3954,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     tx_receipt["payout_event"] = {
                         "account_pubkey": terms.account_pubkey, "rule_id": terms.rule_id.hex(),
                         "outcome": "installed", "tx_id": tx_id,
+                        **({"grant_amount": terms.grant_amount} if terms.is_grant else {}),
                     }
                 elif pending_payout_update is not None:
                     account, rule_id, terms = pending_payout_update
@@ -3863,10 +3973,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     }
                 elif pending_payout_revoke is not None:
                     account, rule_id = pending_payout_revoke
-                    gone = _lifecycle_for_write().payout_rules.revoke(account, rule_id)
+                    book = _lifecycle_for_write().payout_rules
+                    # A grant rule refunds its remainder on revoke, or the
+                    # escrow would strand: read the held balance before the
+                    # rule leaves the book, and stage the credit beside it.
+                    held = 0
+                    _terms = book.get(account, rule_id)
+                    if _terms is not None and _terms.is_grant:
+                        _state = book.state_of(account, rule_id)
+                        held = _state.held if _state is not None else 0
+                    gone = book.revoke(account, rule_id)
+                    if held:
+                        staged_writes[account] = _read_bal(account) + held
                     tx_receipt["payout_event"] = {
                         "account_pubkey": gone.account_pubkey, "rule_id": gone.rule_id.hex(),
                         "outcome": "revoked", "tx_id": tx_id,
+                        **({"refunded": held} if held else {}),
                     }
                 elif pending_payout_exec is not None:
                     account, rule_id, total, legs, sale_id = pending_payout_exec

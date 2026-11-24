@@ -113,6 +113,21 @@ the node takes no transaction the account signs -- not its transfers, not a
 replace or revoke of the rule itself. Executions by others still pay out, and
 the node still runs the rule at its due points and on arrival. The seal lifts
 only when the rule ends; there is no unseal.
+
+CONDITIONAL GRANTS
+------------------
+A rule installed with `grant_amount` and `grant_deadline` is a conditional
+grant: at install the grantor is debited the granted amount, which moves into
+the book's custody (escrow) -- it is not paid out, and it is not the
+grantor's spendable balance any more. Every draw the rule pays comes out of
+the held balance, under the rule's own caps, and the rule reads the held
+balance as i2, so it judges the escrow, not the grantor's account. At the
+deadline the node refunds the remainder to the grantor automatically and the
+rule ends, so no further draw is possible; revoking refunds the remainder
+the same way. A grant rule is never updated: revoke it (refunded) and
+install a new one. The escrow counts toward the supply like a parked
+retractable transfer, so the block conservation check holds across install,
+draw and refund.
 """
 from __future__ import annotations
 
@@ -156,8 +171,10 @@ OUTCOME_REVOKED = 1
 OUTCOME_EXPIRED = 2
 OUTCOME_REPLACED = 3
 OUTCOME_SUPERSEDED = 4
+OUTCOME_REFUNDED = 5
 OUTCOME_NAMES = {OUTCOME_REVOKED: "revoked", OUTCOME_EXPIRED: "expired",
-                 OUTCOME_REPLACED: "replaced", OUTCOME_SUPERSEDED: "superseded"}
+                 OUTCOME_REPLACED: "replaced", OUTCOME_SUPERSEDED: "superseded",
+                 OUTCOME_REFUNDED: "refunded"}
 
 MAX_SLOTS = 8
 MAX_DATA = 8
@@ -332,12 +349,15 @@ _OPT_DUE_MONTHS = 4
 _OPT_ON_ARRIVAL = 5
 _OPT_MAX_FEE = 6
 _OPT_VERSION = 7
+_OPT_GRANT_AMOUNT = 8
+_OPT_GRANT_DEADLINE = 9
 
 
 def _options_bytes(periods_from: Optional[int], due_at: Optional[int],
                    due_every: Optional[int], due_months: Optional[int],
                    on_arrival: bool, max_fee_per_execution: Optional[int],
-                   version: int) -> bytes:
+                   version: int, grant_amount: Optional[int] = None,
+                   grant_deadline: Optional[int] = None) -> bytes:
     out = bytearray()
     if periods_from is not None:
         out.append(_OPT_PERIODS_FROM)
@@ -359,6 +379,12 @@ def _options_bytes(periods_from: Optional[int], due_at: Optional[int],
     if version != 1:
         out.append(_OPT_VERSION)
         out.extend(int(version).to_bytes(8, "big"))
+    if grant_amount is not None:
+        out.append(_OPT_GRANT_AMOUNT)
+        out.extend(int(grant_amount).to_bytes(8, "big"))
+    if grant_deadline is not None:
+        out.append(_OPT_GRANT_DEADLINE)
+        out.extend(int(grant_deadline).to_bytes(8, "big"))
     return bytes(out)
 
 
@@ -387,11 +413,20 @@ class PayoutTerms:
     on_arrival: bool = False             # per sale: the node pays each arrival as it arrives
     max_fee_per_execution: Optional[int] = None  # a manual execution's fee_limit may not pass this
     version: int = 1                     # updates count up; 1 is the first install
+    grant_amount: Optional[int] = None   # conditional grant: escrowed at install
+    grant_deadline: Optional[int] = None  # ... refunded to the grantor at this point
 
     @property
     def options(self) -> Tuple:
         return (self.periods_from, self.due_at, self.due_every, self.due_months,
-                self.on_arrival, self.max_fee_per_execution, self.version)
+                self.on_arrival, self.max_fee_per_execution, self.version,
+                self.grant_amount, self.grant_deadline)
+
+    @property
+    def is_grant(self) -> bool:
+        """A conditional grant: the grantor's money is escrowed, draws come
+        out of the held balance, the remainder is refunded at the deadline."""
+        return self.grant_amount is not None
 
     @property
     def repeats(self) -> bool:
@@ -423,7 +458,8 @@ class PayoutTerms:
             self.expires_at, self.per_sale, self.sealed,
             _options_bytes(self.periods_from, self.due_at, self.due_every,
                            self.due_months, self.on_arrival,
-                           self.max_fee_per_execution, self.version),
+                           self.max_fee_per_execution, self.version,
+                           self.grant_amount, self.grant_deadline),
         )
 
     @property
@@ -440,7 +476,7 @@ class PayoutTerms:
         return (self.periods_from is not None or self.due_at is not None
                 or self.due_every is not None or self.due_months is not None
                 or self.on_arrival or self.max_fee_per_execution is not None
-                or self.version != 1 or self.reads_clocks)
+                or self.version != 1 or self.reads_clocks or self.is_grant)
 
     def clock(self, height: int, ts: int) -> int:
         return height if self.kind == KIND_BLOCKS else ts
@@ -464,6 +500,9 @@ class PayoutState:
     due_done: bool = False       # the node owes the rule no further due point
     due_index: int = 0           # a rule that repeats: the number of its next due point
     missed: int = 0              # due points the clock passed unpaid (never caught up)
+    # conditional grants only: held + drawn always sum to the grant amount.
+    held: int = 0                # still escrowed for the rule
+    drawn: int = 0               # paid out of the escrow so far
 
     def sale(self, sale_id: bytes) -> Optional[Tuple[bytes, str, int, int, str]]:
         for entry in self.open_sales:
@@ -486,14 +525,18 @@ class PayoutState:
 
     def more(self, terms: PayoutTerms, lineage: bytes) -> Optional[Tuple]:
         """(periods_from, due_at, last_clock, due_done, due_every, due_months,
-        on_arrival, due_index, missed, max_fee_per_execution, version, lineage)
-        for an extended rule; None keeps the stored row the shape it always had."""
+        on_arrival, due_index, missed, max_fee_per_execution, version, lineage,
+        grant_amount, grant_deadline) for an extended rule; None keeps the
+        stored row the shape it always had. Held and drawn are not stored: a
+        grant rule draws every coin it pays, so on restore drawn is paid_total
+        and held is what the grant has left."""
         if not terms.extended:
             return None
         return (terms.periods_from, terms.due_at, self.last_clock, self.due_done,
                 terms.due_every, terms.due_months, terms.on_arrival,
                 self.due_index, self.missed, terms.max_fee_per_execution,
-                terms.version, lineage.hex())
+                terms.version, lineage.hex(), terms.grant_amount,
+                terms.grant_deadline)
 
     def spent_at(self, terms: PayoutTerms, clock: int) -> int:
         return self.spent_in_period if self.period_index == self.period_at(terms, clock) else 0
@@ -597,13 +640,15 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
         due_months=_opt_u64(fields, "due_months"),
         on_arrival=on_arrival is True,
         max_fee_per_execution=_opt_u64(fields, "max_fee_per_execution"),
+        grant_amount=_opt_u64(fields, "grant_amount"),
+        grant_deadline=_opt_u64(fields, "grant_deadline"),
     )
 
 
 SPEC_FIELDS = ("rule_text", "slots", "cap_per_execution", "cap_per_period",
                "period_blocks", "period_seconds", "expires_at", "per_sale", "sealed",
                "periods_from", "due_at", "due_every", "due_months", "on_arrival",
-               "max_fee_per_execution")
+               "max_fee_per_execution", "grant_amount", "grant_deadline")
 
 
 def parse_payout_rule_set(tx: Dict[str, Any]) -> PayoutTerms:
@@ -984,6 +1029,13 @@ def validate_terms_shape(terms: PayoutTerms, height: int, ts: int) -> Optional[s
             return "on_arrival needs a rule that pays per sale"
         if not fixed:
             return "on_arrival needs a fixed slot: the node names no recipient"
+    if (terms.grant_amount is None) != (terms.grant_deadline is None):
+        return "grant_amount and grant_deadline come together or not at all"
+    if terms.is_grant:
+        if not 1 <= terms.grant_amount <= tau_defs.MAX_TRANSFER_VALUE:
+            return f"grant_amount must be in 1..{tau_defs.MAX_TRANSFER_VALUE}"
+        if not now < terms.grant_deadline <= terms.expires_at:
+            return "grant_deadline must be in the future and no later than expires_at"
     return None
 
 
@@ -1056,6 +1108,12 @@ def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
     if total > terms.cap_per_execution:
         raise PayoutRefused(
             f"the rule pays {total}, over the cap per execution {terms.cap_per_execution}")
+    if terms.is_grant and total > state.held:
+        # A grant draw spends the escrow, not the account: the held balance is
+        # the only money the rule may pay. Callers pass held as `balance`, so
+        # the check below would refuse it too -- this one names the escrow.
+        raise PayoutRefused(
+            f"the rule pays {total}, the grant holds {state.held}")
     spent = state.spent_at(terms, terms.clock(height, ts))
     if spent + total > terms.cap_per_period:
         raise PayoutRefused(
@@ -1121,6 +1179,9 @@ class PayoutBook:
         # (due_at, account, rule_id), sorted, per clock: points being retried
         # while their window is open.
         self._retry: Dict[int, List[Tuple[int, str, bytes]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
+        # (grant_deadline, account, rule_id), sorted, per clock: grants whose
+        # remainder the node refunds at the deadline.
+        self._grants: Dict[int, List[Tuple[int, str, bytes]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
         # (account, rule_id) with arrivals waiting for an on-arrival run.
         self._arrivals: Set[Tuple[str, bytes]] = set()
         self.resolved_count = 0
@@ -1137,6 +1198,7 @@ class PayoutBook:
         clone._expiry = {k: list(rows) for k, rows in self._expiry.items()}
         clone._due = {k: list(rows) for k, rows in self._due.items()}
         clone._retry = {k: list(rows) for k, rows in self._retry.items()}
+        clone._grants = {k: list(rows) for k, rows in self._grants.items()}
         clone._arrivals = set(self._arrivals)
         clone.resolved_count = self.resolved_count
         clone.resolved_acc = self.resolved_acc
@@ -1175,12 +1237,22 @@ class PayoutBook:
                 lineage = terms.rule_id
                 last_clock, due_done, due_index, missed = 0, False, 0, 0
             else:
-                (periods_from, due_at, last_clock, due_done, due_every, due_months,
-                 on_arrival, due_index, missed, max_fee, version, lineage_hex) = more
+                if len(more) == 12:
+                    (periods_from, due_at, last_clock, due_done, due_every,
+                     due_months, on_arrival, due_index, missed, max_fee, version,
+                     lineage_hex) = more
+                    grant_amount, grant_deadline = None, None
+                elif len(more) == 14:
+                    (periods_from, due_at, last_clock, due_done, due_every,
+                     due_months, on_arrival, due_index, missed, max_fee, version,
+                     lineage_hex, grant_amount, grant_deadline) = more
+                else:
+                    raise ValueError(f"stored payout rule has a bad more: {rid.hex()}")
                 terms = PayoutTerms(account, sequence, body, tuple(slots), cap_exec,
                                     cap_period, kind, period, expires_at, sales is not None,
                                     sealed, periods_from, due_at, due_every, due_months,
-                                    on_arrival, max_fee, version)
+                                    on_arrival, max_fee, version, grant_amount,
+                                    grant_deadline)
                 lineage = bytes.fromhex(lineage_hex)
             rid = terms.rule_id
             if rid != bytes(stored_id):
@@ -1190,9 +1262,16 @@ class PayoutBook:
             if lineage in book._lineage:
                 raise ValueError(f"two stored payout rules with one lineage: {lineage.hex()}")
             open_sales, missed_sales = _restore_sales(sales, rid)
+            if terms.is_grant:
+                # Every coin a grant rule pays comes out of the escrow.
+                drawn, held = paid_total, terms.grant_amount - paid_total
+                if held < 0:
+                    raise ValueError(f"stored payout rule drew more than it granted: {rid.hex()}")
+            else:
+                drawn, held = 0, 0
             state = PayoutState(anchor, period_index, spent, executions, paid_total,
                                 last_height, open_sales, missed_sales,
-                                last_clock, due_done, due_index, missed)
+                                last_clock, due_done, due_index, missed, held, drawn)
             if not all(_is_int(v) and v >= 0 for v in (anchor, period_index, spent,
                                                         executions, paid_total, last_height,
                                                         last_clock, due_index, missed)):
@@ -1218,6 +1297,9 @@ class PayoutBook:
         if terms.due_at is not None and not state.due_done:
             bisect.insort(self._due[terms.kind],
                           (state.next_due(terms), terms.account_pubkey, terms.rule_id))
+        if terms.is_grant:
+            bisect.insort(self._grants[terms.kind],
+                          (terms.grant_deadline, terms.account_pubkey, terms.rule_id))
         if terms.on_arrival and state.open_sales:
             self._arrivals.add(key)
         self._root = None
@@ -1239,6 +1321,12 @@ class PayoutBook:
         i = bisect.bisect_left(rows, entry)
         if i < len(rows) and rows[i] == entry:
             del rows[i]
+        if terms.is_grant:
+            grows = self._grants[terms.kind]
+            gentry = (terms.grant_deadline, account, rule_id)
+            j = bisect.bisect_left(grows, gentry)
+            if j < len(grows) and grows[j] == gentry:
+                del grows[j]
         due = state.next_due(terms)
         if due is not None:
             row = (due, account, rule_id)
@@ -1349,6 +1437,9 @@ class PayoutBook:
         old = self.terms.get((account, bytes(rule_id)))
         if old is None:
             return False, "the account has no payout rule with that id"
+        if old.is_grant or new_terms.is_grant:
+            return False, ("a grant rule is not updated: revoke it (the remainder "
+                           "is refunded) and install a new one")
         reason = validate_terms_shape(new_terms, height, ts)
         if reason:
             return False, reason
@@ -1364,6 +1455,8 @@ class PayoutBook:
             raise PayoutRefused("the account has no payout rule with that id")
         if terms.clock(height, ts) >= terms.expires_at:
             raise PayoutRefused("the payout rule has expired")
+        if terms.is_grant and terms.clock(height, ts) >= terms.grant_deadline:
+            raise PayoutRefused("the grant deadline has passed")
         for k, who in exe.recipients:
             if k >= len(terms.slots):
                 raise PayoutRefused(f"slot {k} does not exist")
@@ -1386,11 +1479,15 @@ class PayoutBook:
 
     def install(self, terms: PayoutTerms, anchor: int) -> None:
         """Install `terms` as a new rule. Installing never replaces another rule:
-        a second rule for the same account is independent of the first."""
+        a second rule for the same account is independent of the first. A grant
+        rule starts with the whole grant held; the engine debited the grantor."""
         key = (terms.account_pubkey, terms.rule_id)
         if key in self.terms:
             raise ValueError("this payout rule is already installed")
-        self._insert(terms, PayoutState(anchor=int(anchor)), terms.rule_id)
+        state = PayoutState(anchor=int(anchor))
+        if terms.is_grant:
+            state = replace(state, held=terms.grant_amount)
+        self._insert(terms, state, terms.rule_id)
 
     def update(self, account: str, rule_id: bytes, new_terms: PayoutTerms,
                anchor: int) -> Tuple[PayoutTerms, PayoutTerms]:
@@ -1401,6 +1498,8 @@ class PayoutBook:
         old = self.terms.get(key)
         if old is None:
             raise KeyError("the account has no payout rule with that id")
+        if old.is_grant or new_terms.is_grant:
+            raise ValueError("a grant rule is not updated: revoke it and install a new one")
         lineage = self._lineage_of(rule_id)
         if replace(new_terms, version=old.version) == old:
             raise ValueError("the update changes nothing")
@@ -1417,7 +1516,8 @@ class PayoutBook:
 
     def record(self, account: str, rule_id: bytes, total: int, height: int, ts: int,
                sale_id: Optional[bytes] = None) -> PayoutState:
-        """A paid execution; for a per-sale rule it closes the sale it paid."""
+        """A paid execution; for a per-sale rule it closes the sale it paid.
+        For a grant rule the draw comes out of the held balance."""
         key = (account, bytes(rule_id))
         terms, state = self.terms[key], self.state[key]
         clock = terms.clock(height, ts)
@@ -1428,11 +1528,17 @@ class PayoutBook:
             open_sales = tuple(e for e in open_sales if e[0] != sale_id)
             if len(open_sales) != len(state.open_sales) - 1:
                 raise KeyError("the sale paid is not an open sale of this rule")
+        held, drawn = state.held, state.drawn
+        if terms.is_grant:
+            if total > held:
+                raise ValueError("a grant draw may not pass the held balance")
+            held, drawn = held - total, drawn + total
         state = replace(state, period_index=index, spent_in_period=spent + total,
                         executions=state.executions + 1,
                         paid_total=state.paid_total + total, last_height=int(height),
                         open_sales=open_sales,
-                        last_clock=int(clock) if terms.extended else 0)
+                        last_clock=int(clock) if terms.extended else 0,
+                        held=held, drawn=drawn)
         self.state[key] = state
         if terms.on_arrival and not open_sales:
             self._arrivals.discard(key)
@@ -1586,6 +1692,48 @@ class PayoutBook:
                               (terms.due_point(ni), account, rule_id))
         self._root = None
 
+    # -- conditional grants ------------------------------------------------------
+
+    def escrow_total(self) -> int:
+        """The coins the book holds in escrow: every grant rule's held balance.
+        The engine counts it toward the supply, like a parked retractable
+        transfer, so install, draw and refund conserve supply."""
+        return sum(self.state[key].held for key, terms in self.terms.items()
+                   if terms.is_grant)
+
+    def has_grants_due(self, height: int, ts: int) -> bool:
+        h, t = self._grants[KIND_BLOCKS], self._grants[KIND_SECONDS]
+        return bool((h and h[0][0] <= height) or (t and t[0][0] <= ts))
+
+    def grants_due(self, height: int, ts: int) -> List[Tuple[str, bytes]]:
+        """The grant rules whose deadline this block's clock reached, earliest
+        first (rules on the block clock before rules on the time clock)."""
+        out: List[Tuple[str, bytes]] = []
+        for kind, clock in ((KIND_BLOCKS, height), (KIND_SECONDS, ts)):
+            for deadline, account, rule_id in self._grants[kind]:
+                if deadline > clock:
+                    break
+                out.append((account, rule_id))
+        return out
+
+    def refund_due(self, height: int, ts: int) -> List[Tuple[PayoutTerms, PayoutState]]:
+        """Remove every grant rule whose deadline this block reached and return
+        its terms with the state the engine refunds from: the remainder is
+        what the rule still holds. Removal is unconditional -- the deadline is
+        the end of the escrow, whatever due point or arrival is still owed;
+        a due run with nothing held pays nothing. The engine runs this before
+        expiry, so a grant rule never reaches its end still holding escrow."""
+        gone: List[Tuple[PayoutTerms, PayoutState]] = []
+        for kind, clock in ((KIND_BLOCKS, height), (KIND_SECONDS, ts)):
+            rows = self._grants[kind]
+            while rows and rows[0][0] <= clock:
+                _, account, rule_id = rows[0]
+                terms = self.terms[(account, rule_id)]
+                state = self.state[(account, rule_id)]
+                gone.append((terms, state))
+                self._remove(account, rule_id, OUTCOME_REFUNDED)
+        return gone
+
     def sealed(self, account: Any) -> bool:
         """Some rule of the account is sealed: until it ends, the node takes no
         transaction the account signs."""
@@ -1694,6 +1842,10 @@ def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
             "missed_due_points": state.missed}
            if terms.due_at is not None else {}),
         **({"on_arrival": True} if terms.on_arrival else {}),
+        **({"grant_amount": terms.grant_amount,
+            "grant_deadline": terms.grant_deadline,
+            "held": state.held,
+            "drawn": state.drawn} if terms.is_grant else {}),
         **({"per_sale": True,
             "open_sales": [{"sale_id": sid.hex(), "payer_pubkey": payer, "amount": amount,
                             "height": h, "kind": kind}

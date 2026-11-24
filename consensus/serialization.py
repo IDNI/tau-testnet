@@ -865,7 +865,8 @@ def compute_payout_rule_id(
 
 
 def compute_payout_resolved_acc(acc: Any, rule_id: Any, outcome: int) -> bytes:
-    """Fold one removal (revoked, expired, replaced, superseded) into the running commitment."""
+    """Fold one removal (revoked, expired, replaced, superseded, refunded)
+    into the running commitment."""
     out = bytearray()
     out.extend(encode_string(DOMAIN_PAYOUT_RESOLVED_V1.decode()))
     out.extend(encode_hash32(acc))
@@ -904,7 +905,10 @@ def encode_payout_entry(
     `more`, only for an extended rule (optional terms or a rule that reads the
     kept clocks): (periods_from, due_at, last_clock, due_done, due_every,
     due_months, on_arrival, due_index, missed, max_fee_per_execution, version,
-    lineage). A rule without it keeps the entry it always had.
+    lineage), with (grant_amount, grant_deadline) after it for a rule that
+    carries a conditional grant. A stored row without the grant pair is the
+    old shape and encodes as before. A rule without it keeps the entry it
+    always had.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -935,8 +939,16 @@ def encode_payout_entry(
     else:
         out.extend(b"\x00")
     if more is not None:
-        (periods_from, due_at, last_clock, due_done, due_every, due_months,
-         on_arrival, due_index, missed, max_fee, version, lineage) = more
+        if len(more) == 12:
+            (periods_from, due_at, last_clock, due_done, due_every, due_months,
+             on_arrival, due_index, missed, max_fee, version, lineage) = more
+            grant_amount, grant_deadline = None, None
+        elif len(more) == 14:
+            (periods_from, due_at, last_clock, due_done, due_every, due_months,
+             on_arrival, due_index, missed, max_fee, version, lineage,
+             grant_amount, grant_deadline) = more
+        else:
+            raise ValueError("payout entry has a bad more")
         out.extend(b"\x01")
         for value in (periods_from, due_at):
             if value is None:
@@ -962,6 +974,15 @@ def encode_payout_entry(
             out.extend(encode_uint64(int(max_fee)))
         out.extend(encode_uint64(int(version)))
         out.extend(encode_hash32(bytes.fromhex(lineage)))
+        if len(more) == 14:
+            # A grant rule's entry carries its terms; an old-shape entry keeps
+            # the bytes it always had, so its root does not move.
+            for value in (grant_amount, grant_deadline):
+                if value is None:
+                    out.extend(b"\x00")
+                else:
+                    out.extend(b"\x01")
+                    out.extend(encode_uint64(int(value)))
     else:
         out.extend(b"\x00")
     return bytes(out)
