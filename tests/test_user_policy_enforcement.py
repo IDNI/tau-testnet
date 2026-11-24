@@ -58,6 +58,51 @@ def _transfer_tx(transfers):
     })
 
 
+def test_recipient_refusal_precedes_legacy_batch_balance_writes():
+    from consensus.governance import ConsensusLifecycleManager
+    from consensus.recipient_policy import Refusal
+
+    lm = ConsensusLifecycleManager(active_validators=[SENDER])
+    lm.recipient_controls_active = True
+    second = pubkey_hex(0x44)
+    tx = _transfer_tx([[SENDER, RECIPIENT, "10"], [SENDER, second, "20"]])
+    balances = {SENDER: 1000}
+    seqs = {SENDER: 0}
+    blocked = Refusal("RECIPIENT_POLICY_BLOCKED", "Recipient refuses payment.", {"recipient_pubkey": second})
+    with patch("consensus.recipient_policy.check_recipient", side_effect=[None, blocked]):
+        result = TauConsensusEngine().apply(
+            _snap(), [tx], 1_700_000_000, target_lifecycle=lm,
+            target_balances=balances, target_sequences=seqs,
+        )
+    assert result.rejected_transactions == [tx]
+    assert result.receipts[tx["tx_id"]]["details"]["transfer_index"] == 2
+    assert balances == {SENDER: 1000}
+    assert seqs == {SENDER: 0}
+
+
+def test_recipient_worker_error_leaves_fee_era_transfer_retryable():
+    from consensus.governance import ConsensusLifecycleManager
+    from tau_speculation import SpeculationError, WorkerLost
+
+    lm = ConsensusLifecycleManager(active_validators=[SENDER])
+    lm.recipient_controls_active = True
+    tx = _transfer_tx([[SENDER, RECIPIENT, "10"]])
+    balances = {SENDER: 1000}
+    seqs = {SENDER: 0}
+    engine = TauConsensusEngine()
+    args = dict(target_balances=balances, target_sequences=seqs,
+                target_lifecycle=lm, proposer_pubkey=PROPOSER)
+    with patch("tau_manager.tau_ready") as ready, patch(
+        "tau_manager.communicate_with_tau_multi", return_value={1: "10", 5: "1"}
+    ):
+        ready.is_set.return_value = True
+        with patch("consensus.recipient_policy.check_recipient", side_effect=SpeculationError("bad response")):
+            with pytest.raises(WorkerLost):
+                engine.apply(_snap(), [tx], 1_700_000_000, **args)
+        assert balances == {SENDER: 1000} and seqs == {SENDER: 0}
+        assert engine.apply(_snap(), [tx], 1_700_000_000, **args).accepted_transactions == [tx]
+
+
 class TestUserPolicyApplyEnforcement(unittest.TestCase):
     """o5 enforced in the fee-era apply loop (proposer + target_balances)."""
 

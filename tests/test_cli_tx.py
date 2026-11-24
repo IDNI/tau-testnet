@@ -445,3 +445,25 @@ def test_tx_send_retries_a_busy_estimate_with_a_backoff(tmp_path, monkeypatch):
     assert rc == 0, err
     assert waits == list(tx_mod.ESTIMATE_BUSY_BACKOFF[:2])
     assert json.loads(recorded[-1][len("sendtx '") : -1])["fee_limit"] == "12"
+
+
+@pytest.mark.parametrize("command,code,message", [
+    (["tx", "send"], "RECIPIENT_POLICY_BLOCKED", "Transfer rejected by recipient policy (o5=0)."),
+    (["retractable", "send", "--release-at-height", "900"],
+     "RECIPIENT_MAX_HOLD", "Recipient refuses this hold (max_hold_blocks=2)."),
+])
+def test_recipient_refusal_is_reported_before_signing_final_payment(
+        tmp_path, monkeypatch, command, code, message):
+    monkeypatch.setattr(keys_mod, "KEY_DIR_DEFAULT", tmp_path)
+    keys_mod.save_key("alice", tmp_path)
+    refused = json.dumps({"status": "error", "command": "checktx",
+                          "error": {"code": code, "message": message}})
+    recorded = []
+    rc, _, err = _run_cli(
+        command + ["--key", "alice", "--to", "ab" * 48, "--amount", "1"],
+        send_responses=[SEQ, refused], recorded=recorded,
+    )
+    assert rc == 1
+    assert code in err and message in err
+    assert "--fee" not in err
+    assert not any(c.startswith("sendtx") for c in recorded)

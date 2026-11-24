@@ -5,6 +5,8 @@ import { bytesToHex, hexToBytes } from '@noble/hashes/utils';
 
 // --- State ---
 let socket = null;
+let recipientControlsActive = false;
+const RECIPIENT_RULE_PREFIX = "recipient_v1 o5[t] ";
 let currentKeyPair = null;
 let isConnected = false;
 let savedWallets = {}; // name -> {priv: hex, pub: hex}
@@ -340,7 +342,9 @@ function attemptConnection() {
     log(`Connecting to ${url}...`);
 
     try {
-        socket = new WebSocket(url);
+        const connection = new WebSocket(url);
+        socket = connection;
+        recipientControlsActive = false;
 
         socket.onopen = () => {
             log(`WebSocket Open on ${url}. Sending Handshake...`);
@@ -349,6 +353,7 @@ function attemptConnection() {
         };
 
         socket.onmessage = (event) => {
+            if (socket !== connection) return;
             const msg = event.data;
             log(`RECV: ${msg}`, 'recv');
 
@@ -369,6 +374,7 @@ function attemptConnection() {
                 }
                 // Refresh accounts on connect
                 refreshKnownAccounts();
+                sendRpc("getgovernance");
             } else if (!isConnected && msg.startsWith("error")) {
                 log("Handshake Error. Closing.");
                 socket.close();
@@ -381,6 +387,8 @@ function attemptConnection() {
         };
 
         socket.onclose = () => {
+            if (socket !== connection) return;
+            recipientControlsActive = false;
             if (!isConnected) {
                 log(`Connection to ${url} closed/failed.`);
                 connectionIndex++;
@@ -503,11 +511,15 @@ function handleServerResponse(msg) {
             }));
             break;
 
-        case 'getgovernance':
+        case 'getgovernance': {
+            recipientControlsActive = ok && data.recipient_controls_active === true;
+            const draft = ruleEditor ? ruleEditor.getValue() : txRule.value;
+            if (draft.trim().startsWith(RECIPIENT_RULE_PREFIX)) validateRuleSyntax(draft);
             window.dispatchEvent(new CustomEvent('govStatusResponse', {
                 detail: ok ? data : { error: errMsg }
             }));
             break;
+        }
 
         case 'getruleoffer':
             window.dispatchEvent(new CustomEvent('ruleOfferResponse', {
@@ -792,14 +804,18 @@ async function onSendTransaction() {
     // 2. Rule Logic
     if (ruleInputPreCheck) {
         if (!validateRuleSyntax(ruleInputPreCheck)) {
-            log("Invalid Rule Syntax. Correct it before sending.", "error");
+            log(ruleValidationStatus.textContent, "error");
             return;
         }
         // Allow comments in the UI, but strip them before sending to the node.
         // This is IMPORTANT because the current code joins lines with spaces,
         // and a '#' would comment out everything after it on the same line.
-        const noComments = stripTauComments(ruleInputPreCheck);
-        ops["0"] = noComments.split('\n').map(l => l.trim()).filter(Boolean).join(' ');
+        if (ruleInputPreCheck.startsWith(RECIPIENT_RULE_PREFIX)) {
+            ops["0"] = ruleInputPreCheck;
+        } else {
+            const noComments = stripTauComments(ruleInputPreCheck);
+            ops["0"] = noComments.split('\n').map(l => l.trim()).filter(Boolean).join(' ');
+        }
     }
 
     // 3. Custom Ops Logic
@@ -830,6 +846,11 @@ async function onSendTransaction() {
             }
             ops[keyStr] = valStr;
         }
+    }
+
+    if (ruleInputPreCheck.startsWith(RECIPIENT_RULE_PREFIX) && Object.keys(ops).length > 1) {
+        log("Send the recipient policy in a rule-only transaction.", "error");
+        return;
     }
 
     if (Object.keys(ops).length === 0) {
@@ -864,8 +885,15 @@ async function onSendTransaction() {
 
     summaryText += `Sign and send this to the network?`;
 
+    const confirmedConnection = socket;
     if (!await customConfirm(summaryText)) {
         log("Transaction cancelled by user.", "warn");
+        return;
+    }
+
+    if (ruleInputPreCheck.startsWith(RECIPIENT_RULE_PREFIX)
+            && (socket !== confirmedConnection || !isConnected || !recipientControlsActive)) {
+        log("The node or its recipient-controls status changed. Review the rule again.", "error");
         return;
     }
 
@@ -988,6 +1016,25 @@ function validateRuleSyntax(rule) {
     if (!rule || !rule.trim()) {
         ruleValidationStatus.textContent = "";
         return true;
+    }
+    const text = rule.trim();
+    if (text.startsWith(RECIPIENT_RULE_PREFIX)) {
+        try {
+            if (!recipientControlsActive) {
+                throw new Error("The connected node has not reported active recipient controls.");
+            }
+            const policy = JSON.parse(text.slice(RECIPIENT_RULE_PREFIX.length));
+            if (policy === null || Array.isArray(policy) || typeof policy !== "object") {
+                throw new Error("Recipient policy must be a JSON object.");
+            }
+            ruleValidationStatus.textContent = "Recipient policy ready for node validation.";
+            ruleValidationStatus.style.color = "green";
+            return true;
+        } catch (error) {
+            ruleValidationStatus.textContent = error.message;
+            ruleValidationStatus.style.color = "red";
+            return false;
+        }
     }
     const errors = [];
     // Validate the semantic rule text, not comments.

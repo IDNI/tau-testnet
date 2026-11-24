@@ -266,6 +266,10 @@ def submit_tx(
 ESTIMATE_BUSY_BACKOFF = (0.5, 1.0, 2.0)
 
 
+class RecipientRefusal(RuntimeError):
+    """The node's final recipient-policy verdict for this signed draft."""
+
+
 def estimate_fee(
     payload: dict,
     *,
@@ -295,9 +299,11 @@ def estimate_fee(
             if err.get("code") == "ESTIMATE_BUSY" and delay is not None:
                 time.sleep(delay)
                 continue
-            raise RuntimeError(
-                f"{err.get('code', 'ERROR')} {err.get('message', '')}".strip()
-            )
+            code = err.get("code", "ERROR")
+            message = f"{code} {err.get('message', '')}".strip()
+            if code in {"RECIPIENT_MAX_HOLD", "RECIPIENT_POLICY_BLOCKED"}:
+                raise RecipientRefusal(message)
+            raise RuntimeError(message)
         fee = (parsed.get("data") or {}).get("estimated_fee")
         if not isinstance(fee, str) or not fee.isdigit():
             raise RuntimeError(f"no estimated_fee in the checktx response: {response!r}")

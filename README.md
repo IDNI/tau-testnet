@@ -291,6 +291,8 @@ tau-testnet --host testnet.tau.net --port 65432 status
 
 Full CLI reference, validator-setup recipe, and the governance update lifecycle: [docs/developer_cli.md](docs/developer_cli.md) — which also covers the raw TCP/WebSocket command grammar and JSON envelopes under [Raw protocol](docs/developer_cli.md#raw-protocol).
 
+For a shop that accepts payments only from known senders or limits how long funds can be recalled, see the [recipient-controls guide](docs/recipient_controls.md).
+
 ### Web wallet
 
 A browser wallet lives in [`web-wallet/`](web-wallet/) (static client; connects to the node's **WebSocket** port, 65433 by default). It is not auto-served — open it with a static server:
