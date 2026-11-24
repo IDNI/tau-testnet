@@ -310,7 +310,69 @@ APPROVAL_SLOT_BV_WIDTH = 384
 # and a parked request can outlive the mode it was admitted under.
 REQUEST_CUSTOM_INPUT_MIN = APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT
 
-# Rule-text screening contexts. Slots are readable in exactly one of them.
+# --- Recipient controls (issues #47 + #76) ----------------------------------
+# Two host-fed streams let an account's registered o5 clause judge INBOUND
+# transfers, not only its own outgoing ones:
+#
+#   i17  the hold length of the transfer being judged, in the park's OWN unit
+#        (seconds for a time park, blocks for a height park); 0 for a plain
+#        transfer.
+#   i16  the judgment context: which direction, and which unit i17 carries.
+#        0 = judging an outgoing payment (the sender pass, always),
+#        1 = incoming final payment, 2 = incoming time park,
+#        3 = incoming height park.
+#
+# One hold value in its native unit plus an explicit unit tag, instead of two
+# parallel hold streams: a rule that caps only seconds can never mistake a
+# height park for hold 0, because i16 always says which unit i17 is in. A
+# clause that reads i17 without i16 is refused at deploy for exactly that
+# reason (consensus/admission.py).
+#
+# Stream choice: i1-i5 are the transfer fields, i6-i11 the consensus ABI, i12
+# the sender pubkey, i13-i15 reserved, i18-i25 the approval slots, and i26+
+# the documented custom-input space (REQUEST_CUSTOM_INPUT_MIN). i17 has no
+# assignment anywhere else. i16 IS assigned — to the cooldown feed (issue
+# #21) — but that feed is INACTIVE (COOLDOWN_STREAM_ACTIVE is False and the
+# engine never feeds it), its width is frozen at the same bv[64] these
+# streams pin, and the two activations are MUTUALLY EXCLUSIVE on i16 by
+# construction, not by convention:
+#   * activating recipient controls while the cooldown is active is refused
+#     (governance patch check + activation; see
+#     consensus/governance.py::activate_recipient_policy), and
+#   * reserved_operation_keys() raises rather than reserve i16 twice if both
+#     flags are ever set at once, and the engine's cooldown feed sites skip
+#     i16 while recipient controls are active.
+# So no node can ever feed two meanings onto i16, and a future cooldown
+# activation must take another stream first. There is no cleaner free stream:
+# every other low index is assigned, and i26+ is the wallet-template custom
+# space (a tag there was tried first and broke shipped templates).
+#
+# Both streams are bv[64], host-forced into the transfer input map AFTER the
+# custom-input merge (where the approval slots are overlaid), so a value the
+# sender supplies never reaches the recipient's clause. They are fed only
+# while recipient controls are active and become reserved operations keys at
+# the same moment — reserve a stream exactly when the node feeds it, the i13 /
+# approval-slot precedent. Before activation both stay ordinary custom
+# streams, so rules already deployed against them keep working.
+HOLD_STREAM_INDEX = 17
+CONTEXT_STREAM_INDEX = 16
+RECIPIENT_STREAM_BV_WIDTH = 64
+
+CONTEXT_OUTGOING = 0
+CONTEXT_INCOMING_FINAL = 1
+CONTEXT_INCOMING_TIME_PARK = 2
+CONTEXT_INCOMING_HEIGHT_PARK = 3
+
+
+def recipient_policy_conflicts_with_cooldown() -> bool:
+    """True when recipient controls cannot be activated: the cooldown feed
+    (issue #21) is live and would need i16 too.
+
+    The two activations are mutually exclusive on i16. This is the single
+    predicate every activation path consults, so the refusal cannot drift
+    between the proposal check and the activation itself.
+    """
+    return bool(COOLDOWN_STREAM_ACTIVE)
 RULE_TEXT_CONTEXT_USER = "user_rule"
 RULE_TEXT_CONTEXT_O5_CLAUSE = "o5_clause"
 RULE_TEXT_CONTEXT_CONSENSUS = "consensus_revision"
@@ -322,7 +384,8 @@ def approval_slot_indices() -> tuple:
 
 
 def reserved_operation_keys(
-    eligibility_mode: str = "", approval_slots_active: bool = False
+    eligibility_mode: str = "", approval_slots_active: bool = False,
+    recipient_policy_active: bool = False,
 ) -> tuple:
     """Operation keys a user_tx may not target, for the given eligibility mode.
 
@@ -333,7 +396,21 @@ def reserved_operation_keys(
     one-way activation flag, read from the parent snapshot), never from a module
     global: block apply deep-copies the lifecycle manager per candidate, so a
     global would leak across simulation, rollback and reorg.
+
+    `recipient_policy_active` is the same class of flag for the recipient
+    controls (issues #47/#76): i17 (hold) and i16 (context) become reserved
+    exactly when the node starts forcing them into the transfer input map.
     """
+    if recipient_policy_active and COOLDOWN_STREAM_ACTIVE:
+        # The i16 mutual exclusion, enforced where it cannot be skipped:
+        # recipient controls and the cooldown feed (issue #21) both need i16,
+        # and activation refuses the combination — so reaching here with both
+        # set means the activation guards were bypassed, and failing loudly
+        # beats feeding two meanings onto one stream on different nodes.
+        raise ValueError(
+            "recipient controls and the cooldown feed are mutually exclusive "
+            "on i16; they cannot both be active"
+        )
     keys = EXTRA_RESERVED_OPERATION_KEYS
     if eligibility_mode == "tau_validator_set":
         keys = keys + TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS
@@ -345,6 +422,8 @@ def reserved_operation_keys(
         # Reserved exactly when the node starts feeding them, mirroring the i13
         # and i16 precedents.
         keys = keys + approval_slot_indices()
+    if recipient_policy_active:
+        keys = keys + (HOLD_STREAM_INDEX, CONTEXT_STREAM_INDEX)
     return keys
 
 
@@ -352,6 +431,7 @@ def rule_text_forbidden_input_streams(
     context: str = RULE_TEXT_CONTEXT_USER,
     eligibility_mode: str = "",
     approval_slots_active: bool = False,
+    recipient_policy_active: bool = False,
 ) -> tuple:
     """Input stream NAMES that rule text of this kind may not reference.
 
@@ -360,12 +440,19 @@ def rule_text_forbidden_input_streams(
     rule text depends on what the rule is. i12 is the standing example — reading
     the sender pubkey is how a policy rule scopes itself, only writing it as an
     operation is forbidden. Approval slots are the second: write-forbidden
-    everywhere, readable only from a registered o5 clause.
+    everywhere, readable only from a registered o5 clause. The recipient-control
+    streams i17/i16 are the third, on the same terms: an o5 clause MUST be able
+    to read them or the recipient gate has no inputs; any other rule text may
+    not, because typing them from an accumulated rule would pin their width
+    outside the gate's control.
     """
     keys = reserved_operation_keys(
-        eligibility_mode, approval_slots_active=approval_slots_active
+        eligibility_mode, approval_slots_active=approval_slots_active,
+        recipient_policy_active=recipient_policy_active,
     )
     readable = {12}
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
+        if recipient_policy_active:
+            readable |= {HOLD_STREAM_INDEX, CONTEXT_STREAM_INDEX}
     return tuple(f"i{idx}" for idx in keys if idx not in readable)

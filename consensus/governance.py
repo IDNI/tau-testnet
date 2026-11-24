@@ -11,6 +11,7 @@ from consensus.retractable import RetractableBook
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
     ApprovalRequestLifecycleManager,
+    audit_recipient_stream_collisions,
     audit_stream_collisions,
 )
 
@@ -93,6 +94,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "fee_beneficiary",
     "max_rule_txs_per_block",
     "approval_slots_active",
+    "recipient_policy_active",
 })
 
 
@@ -106,6 +108,28 @@ def validate_approval_slots_active(value: Any) -> Optional[str]:
     """
     if value is not True:
         return "must be true; approval slots cannot be deactivated once active"
+    return None
+
+
+def validate_recipient_policy_active(value: Any) -> Optional[str]:
+    """Recipient-controls activation is a ONE-WAY switch to True.
+
+    Turning it back off would un-reserve i17/i16 while registered clauses
+    still depend on them: a sender could then write their own hold/context
+    values and forge the recipient gate's inputs. So only `True` is a legal
+    patch value, and `apply_host_contract_patch` additionally refuses a
+    downgrade. Activation is also refused while the cooldown feed (issue #21)
+    is live — the two are mutually exclusive on i16.
+    """
+    if value is not True:
+        return "must be true; recipient controls cannot be deactivated once active"
+    import tau_defs
+
+    if tau_defs.recipient_policy_conflicts_with_cooldown():
+        return (
+            "cannot be activated while the cooldown feed (issue #21) is "
+            "active; the two are mutually exclusive on i16"
+        )
     return None
 
 
@@ -196,6 +220,7 @@ def build_mechanism_metadata(
     max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK,
     approval_requests_root: str = "",
     approval_slots_active: bool = False,
+    recipient_policy_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
 ) -> dict:
@@ -234,6 +259,9 @@ def build_mechanism_metadata(
     # unaffected.
     if approval_slots_active:
         mech["approval_slots_active"] = True
+    # Recipient controls: same non-default gate, same reasoning.
+    if recipient_policy_active:
+        mech["recipient_policy_active"] = True
     if approval_requests_root:
         mech["approval_requests_root"] = approval_requests_root
     if faucet_amount:
@@ -457,6 +485,11 @@ class ConsensusLifecycleManager:
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
+        # Recipient controls (issues #47/#76): same one-way, same reason.
+        # While off, no transfer step feeds i17/i16 and no recipient clause is
+        # ever evaluated, so a pre-activation node evaluates byte-identical
+        # inputs. Bound into the meta hash only when active.
+        self.recipient_policy_active: bool = False
         # Pinned by genesis for the life of the network: no patch sets it.
         # Bound into the meta hash only when non-zero.
         self.faucet_amount: int = 0
@@ -544,6 +577,7 @@ class ConsensusLifecycleManager:
                 else self.approval_requests.requests_root().hex()
             ),
             approval_slots_active=self.approval_slots_active,
+            recipient_policy_active=self.recipient_policy_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
         )
@@ -657,6 +691,35 @@ class ConsensusLifecycleManager:
                 )
             else:
                 self.activate_approval_slots()
+
+        if "recipient_policy_active" in patch:
+            # Same "only consensus-binding validation" reasoning as
+            # fee_beneficiary above: _check_host_contract_patch runs at mempool
+            # admission only and block apply reaches here without it.
+            err = validate_recipient_policy_active(patch["recipient_policy_active"])
+            if err:
+                raise ValueError(f"recipient_policy_active: {err}")
+
+            # Second phase of a two-phase activation. Raising here would make
+            # EVERY block at and after the activation height invalid, which
+            # freezes the chain permanently -- so a collision leaves the flag
+            # False and the chain running, unactivated.
+            #
+            # No extra hash key is needed to make that agree across nodes: the
+            # audit reads only hash-bound state (consensus rules, the
+            # application-rules accumulation, the clause registry), so every node
+            # computes the same findings and the flag -- which IS hash-bound --
+            # stays False on all of them identically.
+            corpus = effective_spec_texts() if callable(effective_spec_texts) else effective_spec_texts
+            findings = audit_recipient_stream_collisions(corpus or ())
+            if findings:
+                logger.error(
+                    "recipient_policy_active activation REFUSED at this height; the "
+                    "effective spec already collides: %s",
+                    "; ".join(findings),
+                )
+            else:
+                self.activate_recipient_policy()
         self.recompute_approval_threshold()
 
     def activate_approval_slots(self) -> None:
@@ -667,6 +730,28 @@ class ConsensusLifecycleManager:
         depend on them, letting a sender write their own approval slots.
         """
         self.approval_slots_active = True
+
+    def activate_recipient_policy(self) -> None:
+        """Turn recipient controls on. Idempotent, and there is no way back.
+
+        Deactivation is unrepresentable on purpose: it would un-reserve
+        i17/i16 while registered clauses still depend on them, letting a
+        sender write their own hold/context values and forge the gate.
+
+        Raises if the cooldown feed (issue #21) is live: the two activations
+        are mutually exclusive on i16, and the patch path refuses the
+        combination before it ever gets here — this is the backstop for
+        direct callers (genesis pinning included).
+        """
+        import tau_defs
+
+        if tau_defs.recipient_policy_conflicts_with_cooldown():
+            raise ValueError(
+                "recipient controls cannot be activated while the cooldown "
+                "feed (issue #21) is active; the two are mutually exclusive "
+                "on i16"
+            )
+        self.recipient_policy_active = True
 
     def knows_update(self, update_id: bytes) -> bool:
         """Check if an update is currently known in any state."""
