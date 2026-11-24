@@ -17,7 +17,7 @@ from consensus.clause_registry import ClauseRegistry
 from consensus import faucet
 from consensus.fees import FeeRuleError
 from errors import DatabaseError
-from block import Block
+from block import Block, compute_tx_hash
 import hashlib
 from consensus.state import compute_state_hash as compute_rules_hash, compute_consensus_state_hash
 
@@ -1096,7 +1096,8 @@ def _process_new_block_locked(block: Block) -> bool:
             if _consensus_rules_state != _cons_rules_before:
                 reload_consensus_interpreter_from_state(source_prefix="activation")
 
-            # Optional: mempool eviction triggers could be mapped here using `apply_result.mempool_hints`
+            _evict_settled_from_mempool(
+                compute_tx_hash(tx) for tx in (block.transactions or []) if isinstance(tx, dict))
             return True
         else:
             # Reorg or Orphan Path (delegates to legacy ingest and rebuild)
@@ -2759,9 +2760,8 @@ def _extend_through_commit_protocol(new_suffix, new_head_hash: str) -> bool:
     head reached `new_head_hash`.
     """
     import db
-    from block import Block, compute_tx_hash
 
-    applied = []
+    applied = 0
     for block_hash in new_suffix:
         data = db.get_block_by_hash(block_hash)
         try:
@@ -2775,12 +2775,18 @@ def _extend_through_commit_protocol(new_suffix, new_head_hash: str) -> bool:
                 "not commit", new_head_hash[:16], block_hash[:16],
             )
             break
-        applied.append(data)
-    included = [compute_tx_hash(tx) for data in applied
-                for tx in (data.get("transactions") or []) if isinstance(tx, dict)]
-    if included:
-        db.remove_mempool_by_hashes(included)
-    return len(applied) == len(new_suffix)
+        applied += 1
+    return applied == len(new_suffix)
+
+
+def _evict_settled_from_mempool(tx_hashes) -> None:
+    """Remove the mempool rows that the applied chain settles: the transactions
+    it holds, and each row whose sequence number its sender already used."""
+    import db
+    db.remove_mempool_by_hashes(list(tx_hashes))
+    with _sequence_lock:
+        sequences = dict(_sequence_numbers)
+    db.remove_mempool_stale_sequences(sequences)
 
 
 def _restore_prior_head(old_path, old_head_hash) -> None:
@@ -2966,8 +2972,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
         return False
 
     # Phase 5: Mempool Restore
-    if new_txs:
-        db.remove_mempool_by_hashes(list(new_txs))
+    _evict_settled_from_mempool(new_txs)
 
     orphaned = [tx for tx_id, tx in old_txs.items() if tx_id not in new_txs]
     if orphaned:
