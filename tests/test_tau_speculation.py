@@ -636,3 +636,44 @@ def test_a_real_revision_past_its_deadline_is_a_timeout(tmp_path):
         _assert_lost_and_reaped(s)
     finally:
         s.kill()
+
+
+_COMMENTED_REVISION = (
+    "# header comment\n"
+    "# second line\n"
+    "always ( o5[t]:bv[24] = { #x000007 }:bv[24] )"
+)
+
+
+def _real_worker_session(repo_root):
+    import tau_session
+    with open(os.path.join(repo_root, "genesis.tau")) as fh:
+        router = fh.read().strip()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    raw = spec.SpeculationSession(cwd=repo_root, env=env)
+    raw.init(f"always ( {router} ).")
+    return raw, tau_session.WorkerSession(raw)
+
+
+@pytest.mark.skipif(not _native_available(), reason="native tau module not built")
+def test_worker_session_accepts_a_commented_revision_without_trailing_period():
+    """The proposal evaluator is handed raw spec text, comments and all."""
+    import tau_native
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    raw, session = _real_worker_session(repo_root)
+    try:
+        assert session.apply_rule(_COMMENTED_REVISION, target=0,
+                                  accumulate=False) == "ok"
+        assert session.log.entries()[-1].rule_text == _COMMENTED_REVISION
+    finally:
+        raw.kill()
+
+    pre = tau_native.TauInterface.preprocess_spec_text
+    once = pre(_COMMENTED_REVISION)
+    assert pre(once) == once
+    raw, session = _real_worker_session(repo_root)
+    try:
+        assert session.apply_rule(once, target=0, accumulate=False) == "ok"
+    finally:
+        raw.kill()
