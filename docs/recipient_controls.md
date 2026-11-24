@@ -168,6 +168,25 @@ rule is admitted and then never runs. The admission screen refuses to write
 `i17` as an operation key on this node, which is the other half of the same
 guard.
 
+## Activation is a network-wide break, and it is stated, not hidden
+
+This build feeds `i17` on every transfer, so the index is reserved the moment the
+build runs. A chain that upgrades to it changes what an existing clause reading
+`i17` means: before, that clause saw a value the *sender* wrote as a custom input
+(`operations["17"]`); after, it sees the hold the node computed, and the operation
+key is refused outright.
+
+There is no activation height and no per-node switch for this, deliberately — the
+same shape as `i16` (cooldown) and `i18`–`i25` (approval slots). A flag would let a
+fleet disagree about whether `i17` is a custom input or the receive stream, which is
+a consensus split; one build is the safer failure mode. Consequences a wallet or an
+operator should know before upgrading:
+
+- a rule text that reads `i17` and was written against sender-supplied values must be
+  re-checked (it now reads the node's hold, and `i17 > 1` means "refuse every park");
+- a transaction that writes `operations["17"]` is rejected from that build on;
+- the refusal happens at admission, so nothing is mined and nothing is charged.
+
 ## Tests
 
 `tests/test_recipient_controls.py` covers the helper, the encoding, the reserved
