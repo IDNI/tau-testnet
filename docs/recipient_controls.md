@@ -161,6 +161,12 @@ always ( ( (i26[t]:bv[64] != { #x0000 }:bv[64]) && (i26[t]:bv[64] < { #x01F4 }:b
 
 # only money with no spending limit attached
 always ( (i26[t]:bv[64] != { #x0000 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+
+# no refunds sooner than 90 days (needs i27, i.e. after activation)
+always ( ( (i27[t]:bv[64] != { #x0000 }:bv[64]) && (i27[t]:bv[64] < { #x76A701 }:bv[64]) ) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+
+# combined: hold, allowance and refund must all pass (needs all three facts)
+always ( ( (i17[t]:bv[64] > { #x0259 }:bv[64]) || ( (i26[t]:bv[64] != { #x0000 }:bv[64]) && (i26[t]:bv[64] < { #x01F4 }:bv[64]) ) || ( (i27[t]:bv[64] != { #x0000 }:bv[64]) && (i27[t]:bv[64] < { #x76A701 }:bv[64]) ) ) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
 ```
 
 ## If a second hold stream is ever added
