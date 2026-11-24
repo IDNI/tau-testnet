@@ -81,6 +81,67 @@ def screen_receive_stream_width(body: str) -> Optional[str]:
     return None
 
 
+_SHAPE_IDENTS = frozenset({"T", "F", "min", "max"})
+_SHAPE_KINDS = frozenset({"streamref", "bvlit", "op", "group", "colon", "comma"})
+
+
+def screen_receive_clause_shape(body: str) -> Optional[str]:
+    """None when a clause that reads the receive record is built only from
+    inputs and outputs at [t], typed constants, T, F, min, max, the ternary and
+    comparison, Boolean and bit-vector operators; else the reason, naming the
+    first piece that is not one of them.
+
+    The receiver's verdict is asked again for every incoming payment, on
+    whichever engine instance the node has at hand, so it must be a function of
+    this step's inputs alone. A step constraint such as `[t > 3]` or `[t = 0]`,
+    a temporal operator, a variable or a quantifier makes it depend on how many
+    steps that instance has taken, which differs between nodes. An allowlist
+    rather than a list of bad forms: what the scanner does not recognise is
+    refused. A clause that does not read the record is not screened here.
+    """
+    if not reads_receive_stream(body):
+        return None
+    import tau_shrink
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(body or "")
+    try:
+        tokens = tau_shrink._tokenize(scrubbed)
+    except Exception:
+        tokens = None
+    found = None
+    if tokens is None:
+        found = "text the scanner cannot read"
+    for pos, token in enumerate(tokens or ()):
+        kind, text = token.kind, token.text
+        if kind == "op" and text == "<":
+            after = tokens[pos + 1] if pos + 1 < len(tokens) else None
+            if after is not None and after.text == ">" and after.start == token.end:
+                found = "<>"
+                break
+        if kind in _SHAPE_KINDS:
+            continue
+        if kind == "other" and text == "?":
+            continue
+        if kind == "ident" and text in _SHAPE_IDENTS:
+            continue
+        if kind == "other" and text == "[":
+            close = scrubbed.find("]", token.start)
+            found = scrubbed[token.start:close + 1 if close >= 0 else token.end]
+            found = " ".join(found.split())[:40]
+        else:
+            found = text
+        break
+    if found is None:
+        return None
+    return (
+        f"a clause that reads the receive record may hold only inputs and "
+        f"outputs at [t], typed constants, T, F, min, max and comparison, "
+        f"Boolean and bit-vector operators, so that its answer does not depend "
+        f"on earlier steps; found '{found}'"
+    )
+
+
 def audit_receive_stream_collisions(spec_texts) -> List[str]:
     """Reasons the receive record cannot safely be activated. Empty means clear.
 

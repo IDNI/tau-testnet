@@ -52,6 +52,7 @@ from consensus.recipient_policy import (
     audit_receive_stream_collisions,
     reads_receive_stream,
     recipient_policy_active,
+    screen_receive_clause_shape,
     screen_receive_stream_width,
 )
 from consensus.retractable import (
@@ -1009,13 +1010,15 @@ def _screen_clause(body: str, receive_active: bool = False) -> Optional[str]:
     inputs are ordinary custom streams that a block may already carry at any width, and
     refusing that at apply would split an upgraded node from the rest. So that
     one check is gated on `receive_active`, the chain's flag, which admission
-    reads from the tip and apply from the parent snapshot.
+    reads from the tip and apply from the parent snapshot. The shape screen of
+    a clause that reads the record rides on the same flag for the same reason.
     """
     error = _screen_clause_domains(body)
     if error:
         return error
     if receive_active:
-        receive_error = screen_receive_stream_width(body)
+        receive_error = (screen_receive_stream_width(body)
+                         or screen_receive_clause_shape(body))
         if receive_error:
             return "Shared rules: " + receive_error
     return None

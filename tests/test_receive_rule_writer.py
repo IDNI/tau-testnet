@@ -135,6 +135,7 @@ def test_what_it_writes_registers_as_a_receive_rule(numbers):
     body = clause_body_v1(rule)
     assert recipient_policy.reads_receive_stream(body) is True
     assert recipient_policy.screen_receive_stream_width(body) is None
+    assert recipient_policy.screen_receive_clause_shape(body) is None
     assert clause_comparison_count(body) <= 32
 
 

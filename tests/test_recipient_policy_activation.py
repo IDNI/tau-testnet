@@ -320,6 +320,78 @@ def test_the_documented_rules_pass_the_width_screen():
         assert recipient_policy.screen_receive_stream_width(body) is None
 
 
+# --- the shape of a clause that reads the record --------------------------------
+
+def _reading_the_record(condition):
+    return "( (%s%s) ? %s : %s )" % (condition, rules.FINAL, rules.ALLOW, rules.BLOCK)
+
+
+@pytest.mark.parametrize("condition, named", [
+    ("[t > 3] && ", "[t > 3]"),
+    ("[t = 0] || ", "[t = 0]"),
+    ("[ t>=2 ] && ", "[ t>=2 ]"),
+    ("<> ", "<>"),
+    ("[] ", "[]"),
+    ("sometimes ", "sometimes"),
+    ("always ", "always"),
+    ("ex x (x = { 1 }:bv[64]) && ", "ex"),
+    ("all x (x = x) && ", "all"),
+    ("(i17[t]:bv[64] = 1) && ", "1"),
+    ("(i50[t]:bv[64] = #x01) && ", "#x01"),
+    ("f(i50[t]:bv[64]) && ", "f"),
+])
+def test_a_receive_clause_whose_answer_can_depend_on_earlier_steps_is_refused(condition, named):
+    """The receiver is asked again for every incoming payment, on whatever
+    engine instance the node has at hand. A step constraint, a temporal operator,
+    a variable or a piece the scanner does not know could make that answer
+    depend on how many steps the instance has taken."""
+    error = recipient_policy.screen_receive_clause_shape(_reading_the_record(condition))
+    assert error is not None and "found '%s'" % named in error, error
+
+
+def test_a_step_constraint_named_only_in_a_comment_is_not_read():
+    body = "# [t > 3] would split the nodes\n" + _reading_the_record("")
+    assert recipient_policy.screen_receive_clause_shape(body) is None
+
+
+def test_a_clause_that_does_not_read_the_record_is_not_screened_for_its_shape():
+    """Its answer is asked only about its owner's own sends, as on main."""
+    body = "( ([t > 3] && %s) ? %s : %s )" % (
+        "(i1[t]:bv[24] > { 5 }:bv[24])", rules.BLOCK, rules.ALLOW)
+    assert recipient_policy.reads_receive_stream(body) is False
+    assert recipient_policy.screen_receive_clause_shape(body) is None
+
+
+def test_every_documented_and_helper_rule_has_the_shape():
+    bodies = [rules.allow_list(A), rules.allow_list(A, B), rules.final_only(),
+              rules.max_hold(600), rules.max_hold_either(600, 100),
+              rules.hold_and_recall(2_592_000, 3_600), rules.hold_plus_recall(3_600),
+              rules.one_unit(A, B, 60), rules.min_allowance(500, 604_800),
+              rules.average_allowance(500, 604_800), rules.no_limits(),
+              rules.min_refund(3_600), rules.no_refunds(),
+              rules.combined(A, 600, 60, 500, 604_800, 3_600),
+              rules.needs_reference(30),
+              "( (T && %s) ? %s : %s )" % (rules.FINAL, rules.ALLOW, rules.BLOCK)]
+    for body in bodies:
+        assert recipient_policy.reads_receive_stream(body) is True
+        assert recipient_policy.screen_receive_clause_shape(body) is None, body
+
+
+def test_the_shape_screen_rides_on_the_chain_flag_at_admission_and_apply():
+    """Before activation the record's inputs are ordinary custom streams, so a
+    block may already carry such a clause; apply must not change for it."""
+    from consensus.admission import _screen_clause
+    from consensus.engine import _clause_domain_rejection
+
+    body = _reading_the_record("[t > 3] && ")
+    assert _screen_clause(body, receive_active=False) is None
+    assert _clause_domain_rejection(body, receive_active=False) is None
+    refused = _screen_clause(body, receive_active=True)
+    assert refused is not None and "found '[t > 3]'" in refused
+    error, reason = _clause_domain_rejection(body, receive_active=True)
+    assert error == refused and reason == "rule_not_applied"
+
+
 # --- which condition refused, and what the receiver would take ------------------
 
 LONGEST = 7_776_000

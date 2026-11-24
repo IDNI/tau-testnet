@@ -450,6 +450,29 @@ def test_an_approved_transfer_to_a_willing_recipient_executes(ev):
     assert ap._balances(result)[ap.BOB] == 5000
 
 
+# --- the shape of a receive clause at apply -------------------------------------
+
+@pytest.mark.parametrize("step", ["[t > 3]", "[t = 0]"])
+def test_a_receive_clause_with_a_step_constraint_does_not_land_at_apply(ev, step):
+    """Admission refuses it; a block that carries it anyway registers nothing,
+    so a second node that replays the block holds the same clauses."""
+    body = "( (%s && %s) ? %s : %s )" % (step, rules.FINAL, rules.ALLOW, rules.BLOCK)
+    lm = ap._lm()
+    lm.activate_recipient_policy()
+    result, lm, _ = ap._apply([ap.rule_tx("always ( %s )." % body)], lm=lm)
+    assert lm.rule_offers.clause_for(ap.ALICE, 5) is None
+    logs = ap._logs(result)
+    assert "o5 clause ignored" in logs and "found '%s'" % step in logs
+
+
+def test_the_same_clause_without_the_step_constraint_lands(ev):
+    body = "( (%s) ? %s : %s )" % (rules.FINAL, rules.ALLOW, rules.BLOCK)
+    lm = ap._lm()
+    lm.activate_recipient_policy()
+    _result, lm, _ = ap._apply([ap.rule_tx("always ( %s )." % body)], lm=lm)
+    assert lm.rule_offers.clause_for(ap.ALICE, 5) == body
+
+
 # --- replay -------------------------------------------------------------------
 
 def test_a_replay_reaches_the_same_state(ev):

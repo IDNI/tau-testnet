@@ -538,6 +538,15 @@ def test_a_wrongly_typed_receive_stream_is_refused_on_an_active_chain(mention, s
     assert said in result.error
 
 
+@pytest.mark.parametrize("step", ["[t > 3]", "[t = 0]"])
+def test_a_receive_clause_with_a_step_constraint_is_refused_on_an_active_chain(step):
+    body = "( (%s && %s) ? %s : %s )" % (step, rules.FINAL, rules.ALLOW, rules.BLOCK)
+    tx = _rule_tx("always ( %s )." % body)
+    result = validate_o5_clause_routing(tx, _view(True), tx["operations"]["0"])
+    assert result is not None and result.is_valid is False
+    assert "receive record" in result.error and "found '%s'" % step in result.error
+
+
 @pytest.mark.parametrize("key", [str(i) for i in tau_defs.RECEIVE_RECORD_INDICES])
 def test_only_the_node_writes_the_receive_record(key):
     """A sender who could put "17" or "50" in `operations` would answer the

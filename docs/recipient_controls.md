@@ -62,7 +62,11 @@ its meaning.
 Only the node writes the record: from activation on, `"17"` and `"50"` to `"54"`
 are reserved operation keys, and no rule other than a registered `o5` clause may
 read the six streams. Every mention in a clause must be typed `bv[64]`, as in
-`i50[t]:bv[64]`.
+`i50[t]:bv[64]`. A clause that reads the record holds only inputs and outputs
+at `[t]`, typed constants, `T`, `F`, `min`, `max` and comparison, Boolean and
+bit-vector operators: no step constraint such as `[t > 3]`, no temporal
+operator, no variable. The receiver is asked again for every payment, and its
+answer must not depend on how many steps an engine has taken.
 
 **Ceilings.** A spending limit is at most 16,777,215 per period, and a period at
 most 31,622,400 seconds (366 days) or 1,000,000 blocks. A payment whose terms
