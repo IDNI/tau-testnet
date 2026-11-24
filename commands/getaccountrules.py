@@ -29,6 +29,17 @@ locks the block swap holds, so a block landing mid-call cannot mix two tips.
 replayed (see gettxstatus `outcome`); they are absent, not empty, for older
 blocks. Comparing `sha256` with the hash of the text a wallet sent is the
 check that the rule in force is the one the user meant.
+
+`getaccountrules <address> <block>` answers for an earlier block of the
+canonical chain (a number or a hash): the clauses and the guard the account
+had when that block committed, the application rules naming it, the running
+spec of that block and the history up to it. The clauses come from this node's
+record of rule effects and the texts it kept with them; the running spec comes
+from the committed journal up to that block's journal head. What this node
+cannot know (a block it did not record) is named, never guessed: `complete`
+says whether every part of the answer is certain, `recorded_from` where the
+unbroken record that reaches the block begins. The fields that exist only at
+the tip (open requests, offers, the mempool, the registry root) are left out.
 """
 import hashlib
 import json
@@ -142,11 +153,188 @@ def _since(history: list, stream=None, sha=None, kind="clause"):
     return None
 
 
+_NOT_RECORDED = "this node did not record the block that set it"
+_HEX = "0123456789abcdef"
+
+
+class _BadBlock(ValueError):
+    """The block asked for is not one this node can answer for."""
+
+
+def _resolve_block(chain: list, wanted: str) -> int:
+    """The height on the canonical chain that `wanted` (a number or a hash) names."""
+    text = wanted.strip().lower()
+    if text.isdigit() and len(text) < 20:
+        number = int(text)
+        if number >= len(chain):
+            raise _BadBlock(f"block {number} is above the head ({len(chain) - 1})")
+        return number
+    if len(text) == 64 and all(c in _HEX for c in text):
+        if text in chain:
+            return chain.index(text)
+        raise _BadBlock("that block is not on the canonical chain")
+    raise _BadBlock("the block is a block number or a 64-character block hash")
+
+
+def _state_at(effects: list, number: int, first: int, through_tip: bool, live):
+    """What one clause stream held when block `number` committed.
+
+    `effects` are the stream's canonical effects, oldest first; `first` the
+    height at which the unbroken record that reaches `number` begins (`number
+    + 1` when the block itself is not recorded); `live` the body in the
+    registry now. Returns (effect or None, body or None, why not known or None).
+    """
+    if through_tip and effects:
+        # The whole record after this block is there, so its last word has to
+        # be what the registry holds now. If it is not, do not answer from it.
+        newest = effects[-1]
+        if (live is None) != (newest["action"] == "revoked") or (
+                live is not None and _sha256(live) != newest.get("sha256")):
+            return None, None, "this node's record does not match its registry"
+    known = [e for e in effects if first <= e["block_number"] <= number]
+    if known:
+        last = known[-1]
+        if last["action"] == "revoked":
+            return last, None, None
+        body = last.get("body")
+        if body is None and live is not None and _sha256(live) == last.get("sha256"):
+            body = live
+        return last, body, None if body is not None else "this node did not keep the text"
+    if first <= 1:
+        return None, None, None
+    if not through_tip:
+        return None, None, _NOT_RECORDED
+    later = [e for e in effects if e["block_number"] > number]
+    if not later:
+        return None, live, None            # untouched since: what the registry holds now
+    if later[0]["action"] == "registered":
+        return None, None, None            # the first clause came after this block
+    return None, None, _NOT_RECORDED
+
+
+def _since_of(effect) -> dict:
+    since = {"block_number": int(effect["block_number"])}
+    for key in ("tx_hash", "request_id"):
+        if effect.get(key):
+            since[key] = effect[key]
+    return since
+
+
+def _history_row(effect) -> dict:
+    row = {"block_number": int(effect["block_number"]), "kind": effect["kind"],
+           "action": effect["action"]}
+    for key in ("tx_hash", "request_id", "sha256", "detail"):
+        if effect.get(key):
+            row[key] = effect[key]
+    if effect.get("stream") is not None:
+        row["stream"] = int(effect["stream"])
+    return row
+
+
+def at_block(chain_state, database, address: str, wanted: str) -> dict:
+    """The account's rules when an earlier block committed (see the module text)."""
+    import tau_running_spec
+
+    for _ in range(3):
+        head_hash, lm, _app_rules = _tip_view(chain_state)
+        chain = database.canonical_chain()
+        if chain and chain[-1] == head_hash:
+            break
+    else:
+        raise _BadBlock("the chain moved during the read; ask again")
+    number = _resolve_block(chain, wanted)
+    block_hash = chain[number]
+
+    recorded = database.recorded_outcome_blocks(chain[1:])
+    first = number + 1
+    while first > 1 and chain[first - 1] in recorded:
+        first -= 1
+    through_tip = all(h in recorded for h in chain[number + 1:])
+
+    def canonical(rows):
+        return [e for e in rows
+                if e["block_number"] < len(chain) and chain[e["block_number"]] == e["block_hash"]]
+
+    own = canonical(database.get_rule_effect_rows(account=address))
+    live = {stream: body for (who, stream), body in lm.rule_offers.accepted_clauses.items()
+            if who == address}
+    by_stream = {}
+    for effect in own:
+        if effect["kind"] == "clause" and effect.get("stream") is not None:
+            by_stream.setdefault(int(effect["stream"]), []).append(effect)
+
+    guard_index = tau_defs.RULE_CHANGE_GUARD_INDEX
+    clauses, guard, complete = [], None, True
+    for stream in sorted(set(by_stream) | set(live)):
+        effect, body, unknown = _state_at(
+            by_stream.get(stream, []), number, first, through_tip, live.get(stream))
+        if body is None and not unknown:
+            continue
+        item = {"body": body,
+                "sha256": _sha256(body) if body is not None else (effect or {}).get("sha256"),
+                "since": _since_of(effect) if effect is not None else None}
+        if unknown:
+            item["unavailable"] = unknown
+            complete = False
+        if stream == guard_index:
+            guard = item
+        else:
+            clauses.append({"stream": stream, "name": f"o{stream}", **item})
+
+    # The accumulation only grows, so the units of a block are the genesis
+    # units and every unit accumulated up to it. Certain only on a node that
+    # recorded every block up to this one, with the texts.
+    units, units_unknown = None, None
+    if first <= 1:
+        needle = "#x" + address
+        accumulated = [e for e in canonical(database.get_rule_effect_rows(kind="application_rule"))
+                       if e["action"] == "accumulated" and e["block_number"] <= number]
+        if any(e.get("body") is None for e in accumulated):
+            units_unknown = "this node did not keep the text of every unit"
+        else:
+            units, seen = [], set()
+            genesis = getattr(chain_state, "_genesis_application_rules", "") or ""
+            for unit in (u.strip() for u in genesis.split("\n")):
+                if unit and needle in unit.lower() and unit not in seen:
+                    seen.add(unit)
+                    units.append({"unit": unit, "sha256": _sha256(unit), "since": None})
+            for effect in accumulated:
+                unit = effect["body"]
+                if needle in unit.lower() and unit not in seen:
+                    seen.add(unit)
+                    units.append({"unit": unit, "sha256": effect["sha256"],
+                                  "since": _since_of(effect)})
+    else:
+        units_unknown = "this node did not record every block up to this one"
+    if units_unknown:
+        complete = False
+
+    running = tau_running_spec.at_block(block_hash, database)
+    history = [_history_row(e) for e in reversed(own) if e["block_number"] <= number]
+    data = {
+        "address": address,
+        "block_number": number,
+        "block_hash": block_hash,
+        "at_block": True,
+        "head_block_number": len(chain) - 1,
+        "complete": complete,
+        "recorded_from": first if first <= number else None,
+        "clauses": clauses,
+        "rule_change_guard": guard,
+        "application_rules": units,
+        "running_spec": running,
+        "history": history[:_HISTORY_LIMIT],
+    }
+    if units_unknown:
+        data["application_rules_unavailable"] = units_unknown
+    return data
+
+
 def execute(raw_command: str, container):
     parts = raw_command.split()
-    if len(parts) != 2:
+    if len(parts) not in (2, 3):
         return api_response.error_response(
-            _CMD, f"Usage: {_CMD} <address>", "INVALID_PARAMS"
+            _CMD, f"Usage: {_CMD} <address> [block number or hash]", "INVALID_PARAMS"
         )
     from consensus.approvals import ApprovalShapeError, _normalize_pubkey
 
@@ -157,6 +345,17 @@ def execute(raw_command: str, container):
 
     chain_state = container.chain_state
     database = container.db
+    if len(parts) == 3:
+        try:
+            return api_response.success_response(
+                _CMD, at_block(chain_state, database, address, parts[2]))
+        except _BadBlock as exc:
+            return api_response.error_response(_CMD, str(exc), "INVALID_PARAMS")
+        except Exception as exc:
+            logger.exception("Failed to build account rules at %s for %s", parts[2], address)
+            return api_response.error_response(
+                _CMD, f"Failed to read account rules: {exc}", "INTERNAL_ERROR"
+            )
     try:
         (head_hash, lm, app_rules), running = tip_and_running_spec(chain_state)
         head = database.get_block_by_hash(head_hash) if head_hash else None

@@ -12,10 +12,13 @@ is on":
 3. **What does the engine actually run?** A later rule can revise part of an
    earlier one, so the stored rule units say what was sent, not what is in
    force.
+4. **What was in force when an earlier payment was made?** Both sides of a
+   payment may have to show later which conditions held in its block.
 
 `gettxstatus` now carries the transaction's **outcome**, `getaccountrules`
-answers the second question from one tip, and `running_spec` (in
-`getaccountrules` and `getgovernance`) answers the third. Both are read-only, need no restart,
+answers the second question from one tip, `running_spec` (in
+`getaccountrules` and `getgovernance`) answers the third, and
+`getaccountrules <address> <block>` the fourth. All are read-only, need no restart,
 no regenesis and no change to the state hash. Issue: #42.
 
 Short reference: [README](../README.md#pending-aware-wallet-queries). CLI:
@@ -72,12 +75,46 @@ the engine's own revision receipt when the block was applied:
 
 | `revision` field | Meaning |
 |---|---|
-| `taken` | `true` when the engine's specification changed (`ACCEPTED_CHANGED`). `false` when the engine accepted the unit without a change (`ACCEPTED_NOOP`, a unit the specification already implies): the rule is stored, nothing new is in force. A unit the engine refuses is never included, so it has no effect at all. |
+| `taken` | `true` when the engine took the unit as a revision and its revision counter advanced (`ACCEPTED_CHANGED`). `false` when the engine consumed the unit and its counter stayed (`ACCEPTED_NOOP`): the rule is stored, nothing new is in force. A unit the engine refuses is never included, so it has no effect at all. `taken` says the engine revised, not that the text it runs differs: the unit already in force, sent once more, counts as a revision and leaves the text the same (checked on the real engine). Whether the text differs is what `running_spec.sha256` of the block and of the block before it say, see [The rules at an earlier block](#the-rules-at-an-earlier-block). |
 | `engine_outcome` | The engine's outcome as it reported it. |
 | `spec_revision` | The engine's revision counter after the unit. It grows with every revision taken, so a wallet can order its rules. Nodes that applied the same blocks give the same number, and a restarted node, whose engine is rebuilt from the journal, continues it (both checked on two live nodes, scenario 7). |
 
 `revision` is absent when the evaluator gave no receipt (the mock engine of
 `TAU_FORCE_TEST`).
+
+### The rule's outcome from the block's journal (`rule_outcome`)
+
+The outcome above is this node's own record, written when it applied the
+block. A node that was upgraded in place has none for older blocks. For a
+transaction that carried a rule for the engine, `outcome` therefore also
+carries `rule_outcome`, read from the journal the block committed with:
+
+```json
+"outcome": {"status": "applied", "…": "…",
+            "rule_outcome": {"source": "committed_journal",
+                             "engine_outcome": "ACCEPTED_CHANGED",
+                             "accepted": true, "taken": true, "spec_revision": 12}}
+```
+
+Every revision the engine was asked for in a block is a row of the committed
+journal, in block order, with the rule text and the engine's outcome. The k-th
+transaction of the block that carries a given text is the k-th row with that
+text. `spec_revision` is the counter in the block's commit record minus the
+revisions the engine took later in the same block, so it is the counter after
+this rule. The journal is hash-chained and committed with the block, a
+restarted node keeps it and a follower rebuilds the same rows, so the answer
+needs no record of the node's own: it is there for a block whose `status` is
+`not_recorded`, next to that status.
+
+- A transaction without a rule, and a rule that is a clause (`o5`, the guard),
+  have no `rule_outcome`: a clause is kept in the registry, not in the
+  engine's specification.
+- Where the block's transactions and its journal rows do not pair up (the
+  block carries the text 2 times and the journal 1), the answer is
+  `{"source": "committed_journal", "unavailable": "…"}`. It is never guessed.
+- On the real engine the two sources agree for every rule transaction, the
+  counter included (`tests/test_running_spec_native.py`, and scenario 8 on two
+  live nodes, one of them restarted in between).
 
 ### What is recorded where
 
@@ -229,16 +266,140 @@ expired, the body no longer builds) appears as:
 
 Before this, the reason was only in the node's log.
 
+## The rules at an earlier block
+
+```bash
+tau-testnet policy show <address> --block 40         # human summary
+tau-testnet rpc getaccountrules <address> 40          # a block number
+tau-testnet rpc getaccountrules <address> <64-hex>    # or a block hash
+```
+
+The answer describes the account when that block of the canonical chain
+committed:
+
+```json
+{"address": "8e7b…", "block_number": 40, "block_hash": "…",
+ "at_block": true, "head_block_number": 57,
+ "complete": true, "recorded_from": 1,
+ "clauses": [{"stream": 5, "name": "o5", "body": "…", "sha256": "…",
+              "since": {"block_number": 40, "tx_hash": "…"}}],
+ "rule_change_guard": null,
+ "application_rules": [],
+ "running_spec": {"text": "…", "sha256": "…", "block_hash": "…", "spec_revision": 11},
+ "history": [{"block_number": 40, "kind": "clause", "stream": 5,
+              "action": "registered", "tx_hash": "…", "sha256": "…"}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `at_block`, `head_block_number` | The answer is for an earlier block, read while this was the head. |
+| `clauses`, `rule_change_guard` | What the registry held for the account when the block committed, with the text and where it was set. |
+| `application_rules` | The units naming the account that were accumulated up to the block, each with the block and transaction that brought it. |
+| `running_spec` | What the engine ran when the block committed, with the engine's revision counter of that block. |
+| `history` | The latest 20 rule effects up to the block, newest first. |
+| `complete` | `true` when every part of the answer is certain. |
+| `recorded_from` | The block at which this node's unbroken record that reaches the block begins (`1` on a node that synced from genesis), `null` when the block itself is not recorded. |
+
+The fields that exist only at the tip are left out: open requests, offers, the
+mempool and the registry root.
+
+Where it comes from.
+
+- **The running spec** comes from the committed journal alone. Every block's
+  commit record names the journal head it committed with, so the rule history
+  of a block is the journal up to that head. The hash chain of that stretch is
+  verified first, then the engine rebuilds the text from it the way it does for
+  the tip. A journal that does not verify, a missing commit record and a unit
+  the engine does not accept again are each reported in `unavailable`, never
+  answered from. The text of a block is cached by its journal head.
+- **The clauses and the guard** come from this node's record of rule effects
+  and the texts it keeps with them (below). The registry itself holds only the
+  present state.
+- **The application rules** are the genesis units and every unit accumulated up
+  to the block, in order.
+
+What a node cannot know, it says. A node that synced from genesis with this
+change records every block and answers `complete: true` for all of them. A
+node that was upgraded in place did not record its earlier blocks:
+
+- A clause that was set in a block the node did not record is listed with
+  `unavailable` and without a text. If nothing touched the stream since, the
+  text is what the registry holds now, and it is given.
+- `application_rules` is `null` with `application_rules_unavailable` when the
+  record does not reach back to block 1.
+- If the record's newest word on a stream is not what the registry holds, the
+  node answers `unavailable: "this node's record does not match its registry"`
+  and nothing from the record.
+- The running spec does not depend on the record, so it is there for every
+  block that has a commit record.
+
+A block that is not on the canonical chain, a number above the head and a
+fourth word are refused with `INVALID_PARAMS`. Effects recorded for a block
+that a reorg left behind are ignored: canonicality is resolved at read time.
+
+Why the journal and not the stored units. Sent `o26 = {7} && o27 = {9}`, then
+`o26 = {3}`, then the first unit once more: the engine runs `o26 = 7` again,
+because a unit revises what is there in the order it arrives. The stored units
+hold each text once and are the same before and after the third transaction.
+Only the rule history in order, which the journal keeps, gives each block's
+text (`tests/test_running_spec_native.py::test_each_block_of_the_probe_reads_what_the_engine_ran_then`).
+
+What to compare. Two nodes give the same answer for the same block, a node
+gives the same answer before and after a restart, and an earlier block answers
+with what the tip said while it was the tip. `scripts/e2e_rules_in_force.py`
+(scenarios 7 and 8) checks all three on two live nodes for eight remembered
+blocks: clauses set, replaced and revoked, an accepted offer, a guard, a
+release, and the two blocks of the probe.
+
+## No fee for a unit the network drops
+
+The third point of #42: an account sent an `o5` unit behind `i12 = <its key>`,
+the specification already held another account's `o5` unit in total form, the
+engine found nothing new, and the account paid for a rule that never took
+effect.
+
+On this node that cannot happen, and `tests/test_no_fee_for_a_dropped_unit.py`
+pins why:
+
+- An `o5` unit never joins the shared specification. It is the sender's own
+  clause, kept per account. No account's `o5` rule can make another's a no-op:
+  two accounts each keep their own, in one block or in later ones, with the
+  same text or different ones.
+- The reported unit itself is refused at admission with `CLAUSE_SHAPE` and the
+  way to fix it (submit the body without the `i12` guard), before any fee, the
+  same way `UNSCOPED_USER_RULE` refuses an unscoped rule. `checktx` gives the
+  same verdict before signing.
+- A block that carries it anyway rejects it at apply: `rejected`,
+  `rule_not_applied`, `fee_charged: 0`, no rule effect, nothing registered,
+  the specification untouched.
+- The same policy without the guard is `applied` and `registered` as the
+  sender's clause.
+
+What is left of "accepted, nothing new" is an application rule whose text the
+engine already runs. The transaction is valid and pays, and the reads say what
+happened: the outcome names the engine's verdict, and the block's
+`running_spec.sha256` equals that of the block before it. Refusing such a unit
+at admission would be wrong, because the same text sent again is not always a
+no-op (see the example above).
+
 ## Operator notes
 
 | Table | Written | Read by |
 |---|---|---|
 | `tx_outcomes (tx_hash, block_hash, …)` | per block, every node, apply and replay | `gettxstatus` |
 | `rule_effects (account, block_hash, …)`, indexed by account | per block, every node | `getaccountrules` |
+| `rule_bodies (sha256, body)` | with the effects: each rule text once, by its hash | `getaccountrules <address> <block>` |
+| `outcome_blocks (block_hash, block_number)` | one row per block whose outcomes were recorded, also a block without transactions | `getaccountrules <address> <block>`, to know where the record is unbroken |
 
-Both writes are best effort: a failure is logged and never reaches block commit.
-Both tables are created on start (`CREATE TABLE IF NOT EXISTS`); there is no
+All writes are best effort: a failure is logged and never reaches block commit.
+The tables are created on start (`CREATE TABLE IF NOT EXISTS`); there is no
 migration. They grow with the chain; a full replay rewrites them idempotently.
+`rule_bodies` grows with the number of distinct rule texts, not with the number
+of blocks. None of them is part of the state hash.
+
+A read for an earlier block walks the canonical chain from the head and reads
+the account's effects; its running spec starts one engine worker for a journal
+head it has not built yet (the newest 16 are kept), outside the state locks.
 
 `getaccountrules` is in the expensive rate-limit tier: it takes the state locks
 and scans the mempool and the history.
@@ -256,6 +417,10 @@ for it.
   wallet that wants proof needs a receipts root committed by the block, which
   changes the header or the state hash and therefore needs a coordinated
   restart.
+- An earlier block's clauses are this node's record, not a proof. They are
+  certain on a node that recorded every block (`complete: true`) and named as
+  unknown elsewhere. The running spec of a block needs no such record: it is
+  rebuilt from the committed journal.
 - It does not change which transactions are valid or what they cost. Soft no-ops
   (an offer that lost a race, a duplicate request) still sit in the block and
   pay their fee; they are now visible as `skipped` with their `fee_charged`.

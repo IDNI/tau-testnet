@@ -262,7 +262,9 @@ def _note_rule_effect(receipt, account, action, *, stream=None, body=None,
     the application-rules accumulation; `action` is "accumulated".
 
     `sha256` names the text exactly as the node stores it (registry body, or
-    the accumulated unit), so a wallet can compare it with what it sent.
+    the accumulated unit), so a wallet can compare it with what it sent. The
+    text itself goes beside the effects, under the receipt's `rule_bodies`, for
+    the node's own record (`db.record_tx_outcomes` keeps it once per hash).
     """
     import hashlib
 
@@ -271,6 +273,7 @@ def _note_rule_effect(receipt, account, action, *, stream=None, body=None,
         effect["stream"] = int(stream)
     if body is not None:
         effect["sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        receipt.setdefault("rule_bodies", {})[effect["sha256"]] = body
     if revision is not None:
         effect["revision"] = revision
     receipt.setdefault("rule_effects", []).append(effect)
@@ -381,6 +384,8 @@ def _tx_outcomes(block, exec_result) -> List[Dict[str, Any]]:
         effects = receipt.get("rule_effects")
         if effects and status == TX_OUTCOME_APPLIED:
             row["rule_effects"] = [dict(e) for e in effects]
+            if receipt.get("rule_bodies"):
+                row["rule_bodies"] = dict(receipt["rule_bodies"])
         rows.append(row)
     return rows
 
@@ -476,10 +481,13 @@ def _release_rule_changes(lm, height, timestamp, timeout,
         approvals.resolve_rule_change(rid, STATUS_EXECUTED)
         events.append((rid.hex(), "executed"))
         if releases_out is not None:
+            after = _clauses_of(lm.rule_offers, entry.sender_pubkey)
+            effects = _clause_diff_effects(before, after)
             releases_out.append({
                 "request_id": rid.hex(), "account": entry.sender_pubkey, "status": "executed",
-                "rule_effects": _clause_diff_effects(
-                    before, _clauses_of(lm.rule_offers, entry.sender_pubkey)),
+                "rule_effects": effects,
+                "rule_bodies": {e["sha256"]: after[e["stream"]]
+                                for e in effects if e.get("sha256")},
             })
     return events
 

@@ -2181,26 +2181,52 @@ def _format_account_rules(data: dict) -> str:
                else f"request {_short(since.get('request_id'))}")
         return f"set at block {since.get('block_number')} by {how}"
 
+    earlier = bool(data.get("at_block"))
     lines = [f"rules in force for {_short(data.get('address'), 16)} at block "
              f"{data.get('block_number')} ({_short(data.get('block_hash'))})"]
+    if earlier:
+        lines[0] += f", read at head {data.get('head_block_number')}"
+        if not data.get("complete"):
+            start = data.get("recorded_from")
+            lines.append("  NOT COMPLETE: this node's record "
+                         + (f"begins at block {start}" if start is not None
+                            else "does not cover this block"))
+
+    def _clause(label, item):
+        if item.get("unavailable"):
+            known = f"sha256 {item['sha256']}" if item.get("sha256") else "text not known"
+            lines.append(f"  {label}: {known} ({item['unavailable']})")
+            return
+        lines.append(f"  {label}: sha256 {item.get('sha256')}")
+        lines.append(f"    {_since(item)}")
+        lines.append(f"    {item.get('body')}")
+
     clauses = data.get("clauses") or []
     if not clauses:
         lines.append("  o5 policy: none (only the network's own rules apply)")
     for clause in clauses:
-        lines.append(f"  {clause.get('name')} clause: sha256 {clause.get('sha256')}")
-        lines.append(f"    {_since(clause)}")
-        lines.append(f"    {clause.get('body')}")
+        _clause(f"{clause.get('name')} clause", clause)
     guard = data.get("rule_change_guard")
     if guard:
-        lines.append(f"  rule-change guard: sha256 {guard.get('sha256')}")
-        lines.append(f"    {_since(guard)}")
-        lines.append(f"    {guard.get('body')}")
+        _clause("rule-change guard", guard)
     else:
         lines.append("  rule-change guard: none (a stolen key can replace the policy at once)")
-    units = data.get("application_rules") or []
-    lines.append(f"  application rules naming this account: {len(units)}")
-    for unit in units:
-        lines.append(f"    sha256 {unit.get('sha256')}  {_since(unit)}")
+    units = data.get("application_rules")
+    if units is None and data.get("application_rules_unavailable"):
+        lines.append("  application rules naming this account: not known "
+                     f"({data['application_rules_unavailable']})")
+    else:
+        units = units or []
+        lines.append(f"  application rules naming this account: {len(units)}")
+        for unit in units:
+            lines.append(f"    sha256 {unit.get('sha256')}  {_since(unit)}")
+    running = data.get("running_spec") or {}
+    if earlier and running.get("sha256"):
+        lines.append(f"  running spec: sha256 {running['sha256']}")
+    elif earlier and running.get("unavailable"):
+        lines.append(f"  running spec: not available ({running['unavailable']})")
+    if earlier:
+        return "\n".join(lines + _format_rule_history(data.get("history") or []))
     changes = data.get("open_rule_changes") or []
     lines.append(f"  open rule-change requests: {len(changes)}")
     for change in changes:
@@ -2219,9 +2245,11 @@ def _format_account_rules(data: dict) -> str:
     lines.append(f"  rule transactions still queued: {len(queued)}")
     for tx in queued:
         lines.append(f"    {_short(tx.get('tx_hash'))} {tx.get('tx_type')}")
-    history = data.get("history") or []
-    if history:
-        lines.append("recent rule changes (newest first):")
+    return "\n".join(lines + _format_rule_history(data.get("history") or []))
+
+
+def _format_rule_history(history: list) -> list:
+    lines = ["recent rule changes (newest first):"] if history else []
     for effect in history:
         what = (f"o{effect['stream']}" if effect.get("stream") not in (None, 0xFFFFFFFF)
                 else ("guard" if effect.get("stream") == 0xFFFFFFFF else effect.get("kind")))
@@ -2232,7 +2260,7 @@ def _format_account_rules(data: dict) -> str:
             tail += f"  ({effect['detail']})"
         lines.append(f"  block {effect.get('block_number')}  {what} "
                      f"{effect.get('action')}  {source}{tail}")
-    return "\n".join(lines)
+    return lines
 
 
 def cmd_policy_show(args: argparse.Namespace) -> int:
@@ -2241,7 +2269,12 @@ def cmd_policy_show(args: argparse.Namespace) -> int:
     except _PayloadError as exc:
         print_error(str(exc))
         return EXIT_LOCAL
-    raw = _send(args, f"getaccountrules {address}")
+    block = (getattr(args, "block", None) or "").strip().lower()
+    if block and not (block.isdigit() or (len(block) == 64 and all(
+            c in "0123456789abcdef" for c in block))):
+        print_error("--block takes a block number or a 64-character block hash")
+        return EXIT_LOCAL
+    raw = _send(args, f"getaccountrules {address}" + (f" {block}" if block else ""))
     if rpc_mod.is_error_response(raw) or args.json:
         return _simple_query_response(args, raw)
     print(_format_account_rules((parse_json_response(raw) or {}).get("data") or {}))
@@ -2341,6 +2374,10 @@ def _add_policy_subparsers(sub) -> None:
         help="Everything in force for an account's rules, from one tip",
     )
     p_pshow.add_argument("address", nargs="?", help="Address (default: your key's)")
+    p_pshow.add_argument(
+        "--block", metavar="NUMBER_OR_HASH",
+        help="The rules as they were when this block of the canonical chain committed",
+    )
     _key_group(p_pshow, required=False)
     p_pshow.set_defaults(func=cmd_policy_show)
 

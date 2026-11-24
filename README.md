@@ -594,6 +594,12 @@ the clause hash matches the rule it sent: [docs/rules_in_force.md](docs/rules_in
 the engine runs at that head, rebuilt by the engine from the committed rules,
 with its sha256: a later rule can revise part of an earlier one, so the stored
 units are what was sent and `running_spec` is what is in force.
+`getaccountrules <address> <block>` (a number or a hash) gives the same for an
+earlier block of the canonical chain: the clauses, the guard and the running
+spec the account had when that block committed, and says what a node that did
+not record the block cannot know. For a rule the engine was given,
+`gettxstatus` also reads the engine's verdict from the block's committed
+journal (`rule_outcome`).
 
 ### Checking conflict status
 
@@ -760,12 +766,14 @@ For a wallet view that accounts for queued sends, use the additive commands
   `fee_charged`, the receipt `logs`, and for rule transactions `rule_effects`
   with the sha256 of the stored rule. See
   [docs/rules_in_force.md](docs/rules_in_force.md).
-- **`getaccountrules <address>`** — everything in force for one account's rules,
+- **`getaccountrules <address> [block]`** — everything in force for one account's rules,
   read at one tip: its registry clauses and rule-change guard with their
   sha256, application rules naming it, its open rule-change requests, requests
   waiting for its vote, pending offers, queued rule transactions and the latest
-  rule changes, and `running_spec`, what the engine runs. CLI: `tau-testnet
-  policy show <address>`.
+  rule changes, and `running_spec`, what the engine runs. With a block number
+  or block hash: the clauses, guard, units, running spec and history as they
+  were when that block committed. CLI: `tau-testnet policy show <address>
+  [--block N]`.
 
 `sendtx` returns the computed `tx_hash` in its success `data`, so a wallet can
 poll `gettxstatus` immediately after queuing.

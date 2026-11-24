@@ -16,9 +16,15 @@ text depends on the order of the revisions, not on the inputs or the time point
 at which they arrived (measured: the same text and hash with no steps and with
 steps between). The result is cached per rule history, so a read costs one
 worker only after a reset or a revision commits.
+
+`at_block` gives the same answer for an earlier block. Every block's commit
+record names the journal head it committed with, so the rule history of that
+block is the committed journal up to that head. The hash chain of that stretch
+is verified first: a journal that was altered is reported, never answered from.
 """
 from __future__ import annotations
 
+import collections
 import hashlib
 import logging
 import os
@@ -31,6 +37,9 @@ ACCEPTED = ("ACCEPTED_CHANGED", "ACCEPTED_NOOP")
 _lock = threading.Lock()
 _cached_key = None
 _cached_text = None
+# Earlier blocks: text per journal head, a few of them.
+_BLOCK_CACHE_SIZE = 16
+_block_cache: "collections.OrderedDict[str, str]" = collections.OrderedDict()
 
 
 class RunningSpecUnavailable(RuntimeError):
@@ -143,6 +152,56 @@ def running_spec(store, *, baseline=None, spawn=None) -> dict:
         return _available(head, text)
 
 
+def at_block(block_hash: str, store=None, *, baseline=None, spawn=None) -> dict:
+    """The running spec as it stood when `block_hash` committed.
+
+    The same shape as `at_head`, with `spec_revision`: the engine's revision
+    counter in that block's commit record. `unavailable` names why there is no
+    text: no authoritative engine, no commit record for the block on this node,
+    a journal that does not verify, or an engine that could not rebuild it.
+    """
+    import tau_authority
+    import tau_journal
+    import tau_speculation
+
+    if baseline is None and not tau_authority.owner().enabled:
+        return _unavailable(block_hash, "this node runs without the authoritative engine")
+    if store is None:
+        import db as store
+    try:
+        anchor = store.committed_journal_at(block_hash)
+    except Exception as exc:
+        return _unavailable(block_hash, f"the block's journal could not be read: {exc}")
+    if anchor is None:
+        return _unavailable(block_hash, "this node holds no commit record for that block")
+    try:
+        tau_journal.journal_from_rows(anchor["rows"]).verify_chain()
+    except Exception as exc:
+        return _unavailable(block_hash, f"the committed journal does not verify: {exc}")
+    entries = [row for row in anchor["rows"] if row["kind"] in ("reset", "revision")]
+    key = anchor["journal_head"] or ""
+    with _lock:
+        text = _block_cache.get(key)
+        if text is None:
+            try:
+                base = baseline if baseline is not None else tau_authority.program_baseline()
+                if not base:
+                    raise RunningSpecUnavailable("no program baseline")
+                text = compose(base, rule_units(entries), spawn=spawn)
+            except (Exception, tau_speculation.WorkerLost) as exc:
+                logger.warning("running spec at %s could not be rebuilt: %r", block_hash, exc)
+                return _unavailable(block_hash, f"the engine could not rebuild it: {exc!r}")
+            _block_cache[key] = text
+            while len(_block_cache) > _BLOCK_CACHE_SIZE:
+                _block_cache.popitem(last=False)
+        else:
+            _block_cache.move_to_end(key)
+    answer = _available(block_hash, text)
+    if anchor.get("spec_revision") is not None:
+        answer["spec_revision"] = anchor["spec_revision"]
+    return answer
+
+
 def _available(head, text: str) -> dict:
     return {"text": text, "sha256": _sha256(text), "block_hash": head}
 
@@ -155,3 +214,4 @@ def reset_cache() -> None:
     global _cached_key, _cached_text
     with _lock:
         _cached_key = _cached_text = None
+        _block_cache.clear()

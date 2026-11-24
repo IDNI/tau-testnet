@@ -181,6 +181,7 @@ def test_an_approved_rule_change_records_what_the_release_wrote(guard_needs_slot
         "request_id": req.request_id.hex(), "account": ALICE, "status": "executed",
         "rule_effects": [{"kind": "clause", "stream": STREAM, "action": "registered",
                           "sha256": _sha(SET_BODY)}],
+        "rule_bodies": {_sha(SET_BODY): SET_BODY},
     }]
 
 

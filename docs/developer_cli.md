@@ -171,7 +171,7 @@ The full registry (29 names, `app/container.py`):
 | `getruleoffers` | `getruleoffers <address> [in\|out\|all]` (default `all`) |
 | `getruleoffer` | `getruleoffer <offer_id>` — 64 hex chars |
 | `getruleconflict` | `getruleconflict <offer_id>` — advisory, node-local |
-| `getaccountrules` | `getaccountrules <address>` — everything in force for an account's rules, at one tip; see [rules_in_force.md](rules_in_force.md) |
+| `getaccountrules` | `getaccountrules <address> [block number or hash]` — everything in force for an account's rules, at one tip or as it was when an earlier block committed; see [rules_in_force.md](rules_in_force.md) |
 | `getapprovalrequests` | `getapprovalrequests <address> [in\|out\|all]` (default `all`) |
 | `getapprovalrequest` | `getapprovalrequest <request_id>` |
 | `getrequestid` | `getrequestid <json_payload>` |
@@ -517,6 +517,7 @@ and limits are in [approvals.md](approvals.md#guarding-policy-changes).
 ```bash
 tau-testnet policy show <address>       # everything in force, from one tip
 tau-testnet policy show --key alice
+tau-testnet policy show <address> --block 40   # as it was when block 40 committed
 tau-testnet policy guard set --key alice --file guard.tau --approver 18=<xpub>
 tau-testnet policy guard revoke --key alice
 tau-testnet policy guard show <address>
@@ -538,7 +539,10 @@ sha256 of each stored body and the block and transaction (or released request)
 that set it, application rules naming the account, open requests with their
 votes, requests waiting for this account's vote, pending offers, queued rule
 transactions and the latest rule changes, including releases that failed and
-why. With `--json` it prints the raw answer. To see what one transaction did,
+why. With `--block <number or hash>` it prints the clauses, the guard, the
+running spec's hash and the history as they were when that block committed, the
+head it read at, and `NOT COMPLETE` where this node did not record the block.
+With `--json` it prints the raw answer. To see what one transaction did,
 `tau-testnet rpc gettxstatus <tx_hash>` and read `outcome`. Long form:
 [rules_in_force.md](rules_in_force.md).
 

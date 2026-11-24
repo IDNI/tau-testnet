@@ -363,3 +363,54 @@ def test_policy_show_defaults_to_the_key_and_passes_json_through(alice):
     assert rc == 0
     assert recorded == [f"getaccountrules {alice}"]
     assert json.loads(out)["data"]["clauses"][0]["sha256"] == "22" * 32
+
+
+AT_BLOCK = {
+    "address": APPROVER, "block_number": 12, "block_hash": "ee" * 32, "at_block": True,
+    "head_block_number": 41, "complete": True, "recorded_from": 1,
+    "clauses": [{"stream": 5, "name": "o5", "body": "(o5[t]:bv[24] = { #x000000 }:bv[24])",
+                 "sha256": "22" * 32, "since": {"block_number": 9, "tx_hash": "33" * 32}}],
+    "rule_change_guard": None,
+    "application_rules": [],
+    "running_spec": {"text": "always (x)", "sha256": "66" * 32, "block_hash": "ee" * 32,
+                     "spec_revision": 3},
+    "history": [{"block_number": 9, "kind": "clause", "action": "registered", "stream": 5,
+                 "tx_hash": "33" * 32, "sha256": "22" * 32}],
+}
+
+
+def test_policy_show_at_a_block_asks_for_that_block_and_says_where_it_read(alice):
+    recorded = []
+    rc, out, err = _run(["policy", "show", APPROVER, "--block", "12"], [_ok(AT_BLOCK)], recorded)
+    assert rc == 0, err
+    assert recorded == [f"getaccountrules {APPROVER} 12"]
+    assert "at block 12 (eeeeeeeeeeee...), read at head 41" in out
+    assert "o5 clause: sha256 " + "22" * 32 in out
+    assert "set at block 9 by tx 333333333333..." in out
+    assert "running spec: sha256 " + "66" * 32 in out
+    assert "block 9  o5 registered" in out
+    # What exists only at the tip is not printed for an earlier block.
+    assert "open rule-change requests" not in out and "NOT COMPLETE" not in out
+
+
+def test_policy_show_at_a_block_says_what_the_node_does_not_know(alice):
+    partial = dict(AT_BLOCK, complete=False, recorded_from=30, application_rules=None,
+                   application_rules_unavailable="this node did not record every block up to this one",
+                   clauses=[{"stream": 5, "name": "o5", "body": None, "sha256": None,
+                             "since": None,
+                             "unavailable": "this node did not record the block that set it"}],
+                   running_spec={"text": None, "sha256": None, "block_hash": "ee" * 32,
+                                 "unavailable": "this node holds no commit record for that block"})
+    rc, out, _ = _run(["policy", "show", APPROVER, "--block", "ee" * 32], [_ok(partial)])
+    assert rc == 0
+    assert "NOT COMPLETE: this node's record begins at block 30" in out
+    assert "o5 clause: text not known (this node did not record the block that set it)" in out
+    assert "application rules naming this account: not known" in out
+    assert "running spec: not available (this node holds no commit record for that block)" in out
+
+
+def test_policy_show_refuses_a_block_that_is_neither_a_number_nor_a_hash(alice):
+    recorded = []
+    rc, _, err = _run(["policy", "show", APPROVER, "--block", "latest"], [], recorded)
+    assert rc != 0 and recorded == []
+    assert "--block takes a block number or a 64-character block hash" in err

@@ -604,13 +604,16 @@ def _record_tx_outcomes(block, next_snapshot) -> None:
     """
     try:
         meta = getattr(next_snapshot, "metadata", None) or {}
+        if "tx_outcomes" not in meta:
+            return
         outcomes = _outcomes_for_block(block, meta.get("tx_outcomes"))
         releases = meta.get("rule_change_releases")
-        if outcomes or releases:
-            db.record_tx_outcomes(
-                block.block_hash, block.header.block_number,
-                outcomes, list(releases or ()),
-            )
+        # Also for a block without a transaction: the record then says that
+        # nothing happened in it, which a read at an earlier block relies on.
+        db.record_tx_outcomes(
+            block.block_hash, block.header.block_number,
+            outcomes, list(releases or ()),
+        )
     except Exception:
         logger.exception("could not record transaction outcomes")
 

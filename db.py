@@ -518,6 +518,24 @@ def init_db():
                 'CREATE INDEX IF NOT EXISTS idx_rule_effects_account '
                 'ON rule_effects (account, block_number)'
             )
+            # The exact text behind a rule effect, once per text. With it the
+            # rules of an account can be read at an earlier block, not only at
+            # the tip. Node-local, like rule_effects.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_bodies (
+                    sha256 TEXT PRIMARY KEY,
+                    body   TEXT NOT NULL
+                );
+            ''')
+            # One row per block this node recorded outcomes for, also a block
+            # without a transaction: it tells "nothing happened in that block"
+            # from "this node did not record that block".
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS outcome_blocks (
+                    block_hash   TEXT PRIMARY KEY,
+                    block_number INTEGER NOT NULL
+                );
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -2747,16 +2765,17 @@ def record_tx_outcomes(block_hash: str, block_number: int, outcomes,
 
     `outcomes` are the engine's per-transaction rows; `releases` the rule-change
     requests the block's release sweep processed. Written by every node for every
-    block it applies, replay included. Diagnostic only: a failure is logged and
-    never reaches block commit.
+    block it applies, replay included, also for a block without a transaction
+    (`outcome_blocks`). A row or a release may carry `rule_bodies`, the texts
+    its effects wrote by their sha256; each is kept once, in the table of that
+    name. Diagnostic only: a failure is logged and never reaches block commit.
     """
-    if not outcomes and not releases:
-        return
     try:
         if _db_conn is None:
             init_db()
         rows = []
         effect_rows = []
+        bodies = {}
 
         def _effect_row(account, tx_hash, request_id, tx_index, n, effect, detail=None):
             stream = effect.get("stream")
@@ -2776,6 +2795,7 @@ def record_tx_outcomes(block_hash: str, block_number: int, outcomes,
                     row.get("index", 0), n, effect))
             logs = row.get("logs")
             fee = row.get("fee_charged")
+            bodies.update(row.get("rule_bodies") or {})
             rows.append((
                 str(row["tx_hash"]), block_hash, int(block_number), int(row.get("index", 0)),
                 str(row["status"]), row.get("reason"),
@@ -2792,10 +2812,18 @@ def record_tx_outcomes(block_hash: str, block_number: int, outcomes,
                     {"kind": "rule_change_request", "action": "release_failed"},
                     detail=release.get("detail")))
                 continue
+            bodies.update(release.get("rule_bodies") or {})
             for n, effect in enumerate(release.get("rule_effects") or ()):
                 effect_rows.append(_effect_row(account, "", rid, -1, n, effect))
         with _db_lock:
             with _db_conn:
+                _db_conn.execute(
+                    'INSERT OR REPLACE INTO outcome_blocks (block_hash, block_number) '
+                    'VALUES (?, ?)', (block_hash, int(block_number)))
+                if bodies:
+                    _db_conn.executemany(
+                        'INSERT OR IGNORE INTO rule_bodies (sha256, body) VALUES (?, ?)',
+                        sorted((str(k), str(v)) for k, v in bodies.items()))
                 if rows:
                     _db_conn.executemany(
                         'INSERT OR REPLACE INTO tx_outcomes '
@@ -2883,6 +2911,129 @@ def get_canonical_rule_effects(account: str, limit: int = 20) -> List[Dict]:
         if len(out) >= limit:
             break
     return out
+
+
+def canonical_chain() -> List[str]:
+    """The block hashes of the canonical chain, indexed by block number.
+
+    Walks back from the canonical head over the indexed columns of the blocks
+    table. Empty without a head or when the walk does not reach block 0.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        head = cur.execute(
+            "SELECT value FROM chain_state WHERE key = 'canonical_head_hash'").fetchone()
+        if not head or not head[0]:
+            return []
+        links = {h: (int(n), prev) for h, n, prev in cur.execute(
+            'SELECT block_hash, block_number, previous_hash FROM blocks')}
+    chain: List[str] = []
+    current = head[0]
+    while current in links:
+        number, previous = links[current]
+        chain.append(current)
+        if number == 0:
+            chain.reverse()
+            return chain if len(chain) == links[chain[-1]][0] + 1 else []
+        if len(chain) > len(links):
+            break
+        current = previous
+    return []
+
+
+def recorded_outcome_blocks(block_hashes) -> set:
+    """Those of `block_hashes` this node recorded outcomes for."""
+    hashes = list(block_hashes)
+    if not hashes:
+        return set()
+    if _db_conn is None:
+        init_db()
+    found = set()
+    with _db_lock:
+        for start in range(0, len(hashes), 500):
+            part = hashes[start:start + 500]
+            marks = ','.join('?' * len(part))
+            found.update(r[0] for r in _db_conn.execute(
+                f'SELECT block_hash FROM outcome_blocks WHERE block_hash IN ({marks})', part))
+    return found
+
+
+def get_rule_effect_rows(account: Optional[str] = None, kind: Optional[str] = None) -> List[Dict]:
+    """Recorded rule effects, oldest first, on any chain: the caller keeps the
+    rows of the blocks it asks about. Within a block the transactions come
+    first, in their order, then the release sweep. `body` is the text behind
+    `sha256` where this node kept it."""
+    if _db_conn is None:
+        init_db()
+    where, args = [], []
+    if account is not None:
+        where.append('e.account = ?')
+        args.append(account.lower())
+    if kind is not None:
+        where.append('e.kind = ?')
+        args.append(kind)
+    sql = ('SELECT e.account, e.block_hash, e.block_number, e.tx_hash, e.request_id, e.kind, '
+           'e.stream, e.action, e.sha256, e.detail, b.body FROM rule_effects e '
+           'LEFT JOIN rule_bodies b ON b.sha256 = e.sha256 '
+           + ('WHERE ' + ' AND '.join(where) + ' ' if where else '')
+           + "ORDER BY e.block_number, (e.tx_hash = ''), e.tx_index, e.effect_index")
+    with _db_lock:
+        rows = _db_conn.execute(sql, args).fetchall()
+    keys = ("account", "block_hash", "block_number", "tx_hash", "request_id", "kind",
+            "stream", "action", "sha256", "detail", "body")
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def committed_journal_at(block_hash: str) -> Optional[Dict]:
+    """The committed journal as it stood when `block_hash` committed, or None
+    when this node holds no commit record for that block.
+
+    `{"rows": every journal row up to the block's journal head, in order,
+    "journal_head", "spec_revision"}`. The commit record and the rows are read
+    as one, under the lock a block commit holds.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        commit = cur.execute(
+            'SELECT journal_head, spec_revision FROM block_commits_v1 WHERE tip = ? '
+            'ORDER BY committed_at DESC, rowid DESC LIMIT 1', (block_hash,)).fetchone()
+        if commit is None:
+            return None
+        journal_head, spec_revision = commit
+        rows = []
+        if journal_head:
+            seq = cur.execute(
+                'SELECT seq FROM tau_journal_v1 WHERE link = ?', (journal_head,)).fetchone()
+            if seq is None:
+                raise ValueError("the block's journal head is not in the committed journal")
+            rows = _journal_rows(cur, limit=int(seq[0]))
+    return {"rows": rows, "journal_head": journal_head,
+            "spec_revision": int(spec_revision) if spec_revision is not None else None}
+
+
+def journal_revisions_of_block(block_hash: str) -> Dict:
+    """The rule revisions the committed journal holds for one block, in order
+    (`{"seq", "phase", "rule_text", "outcome", "accumulate"}` each), and the
+    engine's revision counter in that block's commit record:
+    `{"revisions": [...], "spec_revision": n or None}`."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            "SELECT seq, phase, rule_text, outcome, accumulate FROM tau_journal_v1 "
+            "WHERE tip = ? AND kind = 'revision' ORDER BY seq", (block_hash,)).fetchall()
+        commit = _db_conn.execute(
+            'SELECT spec_revision FROM block_commits_v1 WHERE tip = ? '
+            'ORDER BY committed_at DESC, rowid DESC LIMIT 1', (block_hash,)).fetchone()
+    return {
+        "revisions": [{"seq": int(r[0]), "phase": r[1], "rule_text": r[2], "outcome": r[3],
+                       "accumulate": bool(r[4])} for r in rows],
+        "spec_revision": int(commit[0]) if commit and commit[0] is not None else None,
+    }
 
 
 def get_canonical_retractable_events(retractable_id: str) -> List[Dict]:

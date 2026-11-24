@@ -35,7 +35,15 @@ SCENARIOS
        Node B replays A's blocks with the engine it has run since block 0,
        restarts, and gives the same outcome for every transaction (the revision
        fields included), the same rules in force for every account and the same
-       running spec.
+       running spec. The reads of earlier blocks (scenario 8) are among them.
+    8. Every block answers again what the tip said while it was the tip:
+       `getaccountrules <address> <block>` gives the clauses, the guard, the
+       account's units, the running spec and the history of that block, by
+       number or by hash, complete on a node that recorded every block. The
+       probe's blocks give `o26 = 7`, then `o26 = 3`. `gettxstatus` reads from
+       the block's committed journal what the engine did with each rule
+       (`rule_outcome`), and it agrees with the recorded revision. `policy
+       show --block` prints the same. All of it after A's restart and on B.
 
 USAGE
     python scripts/e2e_rules_in_force.py provision --dir .local/e2e-rules-in-force
@@ -110,6 +118,15 @@ def revision(rig, h, node=None):
                  if e.get("action") == "accumulated"), {})
 
 
+def remember(rig, st, who, what):
+    """Keep what the tip says about `who` now, to ask for this block again later."""
+    st.setdefault("then", []).append({"who": who, "what": what, "view": rules(rig, who)})
+
+
+def then_read(rig, entry):
+    return f"getaccountrules {rig.pk[entry['who']]} {entry['view'].get('block_number')}"
+
+
 def landed(rig, res, what):
     h = tx_hash(res)
     check(f"{what} is admitted", res.get("status") == "ok" and bool(h), res)
@@ -151,12 +168,15 @@ def scenario_registered(rig, st):
           proc.returncode == 0 and f"sha256 {sha}" in proc.stdout and "set at block" in proc.stdout,
           proc.stdout[-500:] + proc.stderr[-300:])
     st["sha_first"] = sha
+    remember(rig, st, "alice", "alice's first policy")
 
 
 def scenario_replaced_and_revoked(rig, st):
     say("2. Replaced, then revoked")
     h2 = landed(rig, rule_tx(rig, "alice", PERMISSIVE), "the replacement")
+    remember(rig, st, "alice", "the replacement")
     h3 = landed(rig, rule_tx(rig, "alice", NEUTRAL), "the revoke")
+    remember(rig, st, "alice", "the revoke")
     st["txs"] += [h2, h3]
     e2 = (outcome(rig, h2).get("rule_effects") or [{}])[0]
     e3 = (outcome(rig, h3).get("rule_effects") or [{}])[0]
@@ -230,6 +250,7 @@ def scenario_skipped(rig, st):
     check("a skipped transaction carries no rule effect", "rule_effects" not in reject, reject)
     check("bob's policy in force is the accepted text",
           (policy(rig, "bob") or {}).get("sha256") == effects[0].get("sha256"), policy(rig, "bob"))
+    remember(rig, st, "bob", "bob's accepted offer")
 
 
 def scenario_guard_and_release(rig, st):
@@ -251,6 +272,7 @@ def scenario_guard_and_release(rig, st):
     guard = rules(rig, "carol").get("rule_change_guard") or {}
     check("the guard is in force, `since` names the request (no guard yet: it ran at once)",
           guard.get("sha256") and (guard.get("since") or {}).get("request_id") == rid, guard)
+    remember(rig, st, "carol", "carol's guard in force")
     hist = (rules(rig, "carol").get("history") or [{}])[0]
     check("the history records the guard as registered by that request",
           hist.get("stream") == GUARD_STREAM and hist.get("action") == "registered"
@@ -298,6 +320,7 @@ def scenario_guard_and_release(rig, st):
     check("the second is recorded `release_failed` with its reason",
           failed.get("action") == "release_failed" and bool(failed.get("detail")), failed)
     say(f"   release_failed detail: {failed.get('detail')!r}")
+    remember(rig, st, "carol", "the release")
     check("nothing is left open", not view.get("open_rule_changes"), view.get("open_rule_changes"))
 
 
@@ -307,7 +330,10 @@ def scenario_running_spec(rig, st):
     check("before the probe the running spec has a text and no o26",
           bool(before.get("text")) and "o26" not in before["text"], before)
     st["txs"].append(landed(rig, rule_tx(rig, "bob", PROBE_A), "`o26 = 7 && o27 = 9`"))
+    remember(rig, st, "bob", "the probe's first rule")
     st["txs"].append(landed(rig, rule_tx(rig, "bob", PROBE_B), "`o26 = 3`"))
+    remember(rig, st, "bob", "the probe's second rule")
+    st["probe"] = st["txs"][-2:]
     took_a, took_b = revision(rig, st["txs"][-2]), revision(rig, st["txs"][-1])
     check("each confirmed rule transaction says the engine took its revision",
           took_a.get("taken") is True and took_b.get("taken") is True
@@ -341,6 +367,7 @@ def scenario_restart_and_follower(rig, st):
     say("7. Node A restarts; node B replays A's blocks, restarts, and agrees")
     reads = [f"gettxstatus {h}" for h in st["txs"] if h]
     reads += [f"getaccountrules {rig.pk[n]}" for n in ACTORS if n != "miner"]
+    reads += [then_read(rig, entry) for entry in st.get("then") or []]
     before = {cmd: rig_mod.stable(rig.read(cmd)) for cmd in reads}
     if rig.restart_a():
         after = {cmd: rig_mod.stable(rig.read(cmd)) for cmd in reads}
@@ -356,6 +383,7 @@ def scenario_restart_and_follower(rig, st):
           and took.get("spec_revision", -1) > st["last_revision"], took)
     reads.append(f"gettxstatus {h}")
     st["txs"].append(h)
+    st["probe"].append(h)
     running = (rig.read("getgovernance") or {}).get("running_spec") or {}
     check("the engine now runs o26 = 3 and o27 = 4",
           RUNS_3 in (running.get("text") or "") and RUNS_4 in (running.get("text") or "")
@@ -367,6 +395,103 @@ def scenario_restart_and_follower(rig, st):
     check("node B, rebuilt from its own journal, runs the same spec",
           on_b.get("sha256") == st.get("running_sha") and RUNS_4 in (on_b.get("text") or ""),
           on_b.get("sha256"))
+
+
+def _shape(view):
+    """The parts of an answer that an earlier block has to give again."""
+    def since(item):
+        return item.get("since") or None
+    return {
+        "block_hash": view.get("block_hash"),
+        "clauses": [(c.get("stream"), c.get("body"), c.get("sha256")) for c in view.get("clauses") or []],
+        "guard": (view.get("rule_change_guard") or {}).get("sha256"),
+        "units": [u.get("sha256") for u in view.get("application_rules") or []],
+        "running": ((view.get("running_spec") or {}).get("sha256"),
+                    (view.get("running_spec") or {}).get("text")),
+        "history": [(e.get("block_number"), e.get("action"), e.get("tx_hash"),
+                     e.get("request_id"), e.get("sha256")) for e in view.get("history") or []],
+        "since": [since(c) for c in view.get("clauses") or []]
+                 + [since(view.get("rule_change_guard") or {})],
+    }
+
+
+def scenario_earlier_blocks(rig, st):
+    say("8. Every block answers again what the tip said while it was the tip")
+    head = rig.a.height()
+    for entry in st.get("then") or []:
+        tip = entry["view"]
+        number = tip.get("block_number")
+        now = rig.read(then_read(rig, entry)) or {}
+        want, got = _shape(tip), _shape(now)
+        # the tip names where a text was set only within its newest history rows
+        want["since"] = [a if a is not None else b for a, b in zip(want["since"], got["since"])]
+        check(f"block {number} ({entry['what']}): the same clauses, guard, units, running spec "
+              f"and history, complete", want == got and now.get("at_block") is True
+              and now.get("complete") is True and now.get("head_block_number") == head
+              and bool(got["running"][0]),
+              {k: (want[k], got[k]) for k in want if want[k] != got[k]}
+              or {k: now.get(k) for k in ("at_block", "complete", "head_block_number")})
+    first, second = [e for e in st["then"] if e["who"] == "bob" and "probe" in e["what"]]
+    text_1 = (first["view"].get("running_spec") or {}).get("text") or ""
+    text_2 = (second["view"].get("running_spec") or {}).get("text") or ""
+    at_1 = (rig.read(then_read(rig, first)) or {}).get("running_spec") or {}
+    at_2 = (rig.read(then_read(rig, second)) or {}).get("running_spec") or {}
+    check("the probe's first block ran o26 = 7, its second o26 = 3, and the tip runs o27 = 4",
+          "{ 7 }" in (at_1.get("text") or "") and RUNS_3 not in (at_1.get("text") or "")
+          and RUNS_3 in (at_2.get("text") or "") and "{ 7 }" not in (at_2.get("text") or "")
+          and (at_1.get("text"), at_2.get("text")) == (text_1, text_2)
+          and at_2.get("sha256") != st.get("running_sha"),
+          (at_1.get("sha256"), at_2.get("sha256"), st.get("running_sha")))
+    check("the revision counter of the two blocks is one apart",
+          isinstance(at_1.get("spec_revision"), int)
+          and at_2.get("spec_revision") == at_1["spec_revision"] + 1,
+          (at_1.get("spec_revision"), at_2.get("spec_revision")))
+
+    by_hash = rig.read(f"getaccountrules {rig.pk['bob']} {first['view'].get('block_hash')}")
+    by_number = rig.read(then_read(rig, first))
+    check("asked by the block's hash, the same answer as by its number",
+          by_hash is not None and rig_mod.stable(by_hash) == rig_mod.stable(by_number),
+          (by_hash or {}).get("block_number"))
+    tip = rules(rig, "bob")
+    at_tip = rig.read(f"getaccountrules {rig.pk['bob']} {head}") or {}
+    check("the tip asked for by its number gives what the plain read gives",
+          {k: v for k, v in _shape(at_tip).items() if k != "since"}
+          == {k: v for k, v in _shape(tip).items() if k != "since"} and at_tip.get("complete") is True,
+          (at_tip.get("block_hash"), tip.get("block_hash")))
+    above = rig.a.rpc(f"getaccountrules {rig.pk['bob']} {head + 5}")
+    check("a block above the head is refused, not answered from the tip",
+          above.get("status") == "error"
+          and (above.get("error") or {}).get("code") == "INVALID_PARAMS", above)
+
+    counters = []
+    for h in st.get("probe") or []:
+        out = outcome(rig, h)
+        from_journal, recorded = out.get("rule_outcome") or {}, revision(rig, h)
+        counters.append(from_journal.get("spec_revision"))
+        check("`gettxstatus` reads the rule's outcome from the committed journal, and it agrees "
+              "with the recorded revision",
+              from_journal.get("source") == "committed_journal"
+              and from_journal.get("accepted") is True and from_journal.get("taken") is True
+              and from_journal.get("engine_outcome") == recorded.get("engine_outcome")
+              and from_journal.get("spec_revision") == recorded.get("spec_revision"),
+              (from_journal, recorded))
+    check("the three revisions are in order, the third by the engine as rebuilt after the restart",
+          len(counters) == 3 and all(isinstance(n, int) for n in counters)
+          and counters[0] < counters[1] < counters[2], counters)
+    clause_tx = outcome(rig, st["txs"][0])
+    check("a clause is kept in the registry: its transaction names no revision of the engine",
+          clause_tx.get("status") == "applied" and "rule_outcome" not in clause_tx, clause_tx)
+
+    number = first["view"].get("block_number")
+    proc = rig.cli("policy", "show", rig.pk["bob"], "--block", str(number))
+    check("`policy show --block` prints the block, the head it read at and the running spec",
+          proc.returncode == 0 and f"read at head {head}" in proc.stdout
+          and f"running spec: sha256 {at_1.get('sha256')}" in proc.stdout
+          and "NOT COMPLETE" not in proc.stdout, proc.stdout[-600:] + proc.stderr[-300:])
+    on_b = rig.read(then_read(rig, first), rig.b) or {}
+    check("node B, which only replayed A's blocks, gives the same text for that block",
+          ((on_b.get("running_spec") or {}).get("sha256"), on_b.get("complete"))
+          == (at_1.get("sha256"), True), (on_b.get("running_spec") or {}).get("sha256"))
 
 
 def run(root: str) -> int:
@@ -382,6 +507,7 @@ def run(root: str) -> int:
             scenario_guard_and_release(rig, st)
             scenario_running_spec(rig, st)
             scenario_restart_and_follower(rig, st)
+            scenario_earlier_blocks(rig, st)
     except Exception:
         import traceback
         check("the run completed", False, traceback.format_exc()[-1500:])

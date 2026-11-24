@@ -195,3 +195,116 @@ def test_a_new_rule_entry_rebuilds_it_and_a_plain_block_does_not(authority, monk
     third = rs.at_head()
     assert len(spawned) == 2
     assert "{ 7 }" not in third["text"]
+
+
+# --- an earlier block ------------------------------------------------------------
+
+def _journal_outcome(queued, block_hash):
+    import db
+    from commands import gettxstatus
+    return gettxstatus.journal_rule_outcome(db, queued["tx_hash"], block_hash)
+
+
+def _rules_at(pk, block):
+    import db
+    from commands import getaccountrules
+    return getaccountrules.at_block(chain_state, db, pk, str(block))
+
+
+def test_each_block_of_the_probe_reads_what_the_engine_ran_then(authority):
+    """The probe again, read block by block afterwards: every block answers
+    with the text the head gave while that block was the head."""
+    import db
+    sk, pk = _sender("then")
+    _, peer = _sender("then-peer")
+    scoped = ("always ( (i12[t]:bv[384] = { #x" + pk + " }:bv[384]) ? "
+              "(o28[t]:bv[24] = { 5 }:bv[24]) : (o28[t]:bv[24] = { 0 }:bv[24]) ).")
+    heads, sent, stored = [], [], []
+    for seq, ops in enumerate(({"0": A}, {"0": B}, {"1": [[pk, peer, "3"]]}, {"0": scoped},
+                               {"0": B}, {"0": A})):
+        queued = _submit(sk, pk, ops, seq=seq)
+        assert queued.get("ok"), queued
+        _mine()
+        sent.append(queued)
+        heads.append((chain_state._canonical_head_hash, rs.at_head()))
+        stored.append(chain_state._application_rules_state)
+
+    rs.reset_cache()
+    then = [rs.at_block(block_hash) for block_hash, _ in heads]
+    for (block_hash, at_head), at_block in zip(heads, then):
+        assert at_block["block_hash"] == block_hash
+        assert (at_block["text"], at_block["sha256"]) == (at_head["text"], at_head["sha256"])
+    with_7, with_3, plain, with_28, same_again, back_to_7 = then
+    assert "{ 7 }" in with_7["text"] and "{ 3 }" not in with_7["text"]
+    assert "{ 3 }" in with_3["text"] and "{ 7 }" not in with_3["text"]
+    assert plain["sha256"] == with_3["sha256"]          # a transfer revises nothing
+    assert "o28" in with_28["text"] and "o28" not in plain["text"]
+
+    # The unit in force sent once more: the engine counts a revision, and the
+    # text it runs is the same. The two blocks' hashes are what say so.
+    assert same_again["sha256"] == with_28["sha256"]
+    # The first unit sent once more: its `7` is back in force, while the stored
+    # units, which hold each text once, are what they were. Only the rule
+    # history in order, which the journal keeps, gives the right answer.
+    assert "{ 7 }" in back_to_7["text"] and "{ 3 }" not in back_to_7["text"]
+    assert "{ 9 }" in back_to_7["text"] and "o28" in back_to_7["text"]
+    assert stored[5] == stored[4] == stored[3]
+
+    # the revision counter of each block's commit record
+    counters = [at["spec_revision"] for at in then]
+    assert [n - counters[0] for n in counters] == [0, 1, 1, 2, 3, 4]
+
+    # the journal says for each rule transaction what the engine did with it,
+    # and agrees with what the node recorded when it applied the block
+    for i in (0, 1, 3, 4, 5):
+        recorded = db.get_tx_outcome(sent[i]["tx_hash"], heads[i][0])
+        (effect,) = [e for e in recorded["rule_effects"] if e["action"] == "accumulated"]
+        assert _journal_outcome(sent[i], heads[i][0]) == {
+            "source": "committed_journal", "engine_outcome": "ACCEPTED_CHANGED",
+            "accepted": True, "taken": True, "spec_revision": counters[i]}
+        assert effect["revision"] == {"taken": True, "engine_outcome": "ACCEPTED_CHANGED",
+                                      "spec_revision": counters[i]}
+    assert _journal_outcome(sent[2], heads[2][0]) is None      # a transfer carries no rule
+
+    # the account's own unit is listed from the block that accumulated it
+    numbers = [db.get_block_by_hash(h)["header"]["block_number"] for h, _ in heads]
+    before, after = _rules_at(pk, numbers[2]), _rules_at(pk, numbers[3])
+    assert before["complete"] and before["application_rules"] == []
+    assert [u["since"]["block_number"] for u in after["application_rules"]] == [numbers[3]]
+    assert after["application_rules"][0]["since"]["tx_hash"] == sent[3]["tx_hash"]
+    assert after["running_spec"]["sha256"] == with_28["sha256"]
+    assert before["running_spec"]["sha256"] == plain["sha256"]
+    # and the tip, asked for by its number, is the answer of the head
+    tip = _rules_at(pk, numbers[5])
+    assert tip["running_spec"]["sha256"] == rs.at_head()["sha256"] == back_to_7["sha256"]
+
+
+def test_a_clause_is_read_at_the_block_it_held(authority):
+    """An o5 clause registered, replaced and revoked in three blocks: each block
+    answers with the clause it held, and the tip with what is in force now."""
+    import db
+    sk, pk = _sender("clause")
+    limit = "always ( (i1[t]:bv[24] > { #x0000fa }:bv[24]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
+    stricter = limit.replace("#x0000fa", "#x000064")
+    neutral = "always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
+    numbers, sent = [], []
+    for seq, rule in enumerate((limit, stricter, neutral)):
+        queued = _submit(sk, pk, {"0": rule}, seq=seq)
+        assert queued.get("ok"), queued
+        _mine()
+        sent.append(queued)
+        numbers.append(db.get_block_by_hash(
+            chain_state._canonical_head_hash)["header"]["block_number"])
+
+    held = [_rules_at(pk, n) for n in numbers]
+    assert all(answer["complete"] for answer in held)
+    (first,), (second,) = held[0]["clauses"], held[1]["clauses"]
+    assert "#x0000fa" in first["body"] and "#x000064" in second["body"]
+    assert first["sha256"] == _sha(first["body"]) != second["sha256"]
+    assert first["since"] == {"block_number": numbers[0], "tx_hash": sent[0]["tx_hash"]}
+    assert second["since"] == {"block_number": numbers[1], "tx_hash": sent[1]["tx_hash"]}
+    assert held[2]["clauses"] == []                       # revoked in the third
+    assert [row["action"] for row in held[2]["history"]] == ["revoked", "replaced", "registered"]
+    assert [row["action"] for row in held[0]["history"]] == ["registered"]
+    # a clause is kept in the registry, not in the engine's specification
+    assert _journal_outcome(sent[0], db.canonical_chain()[numbers[0]]) is None
