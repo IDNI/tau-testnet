@@ -15,19 +15,23 @@ from .governance import (
     normalize_validator_set,
     is_tau_authoritative_eligibility_mode,
 )
-from . import fees
+from . import faucet, fees
+from . import sender_policy
 from .fees import FeeRuleError
 from .approvals import (
     APPROVAL_TX_TYPES,
+    RULE_CHANGE_TX_TYPES,
     STATUS_EXECUTED,
     STATUS_FAILED,
+    STATUS_CANCELLED,
     STATUS_OPEN,
     TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
     parse_approval_request,
+    parse_rule_change_cancel,
+    parse_rule_change_request_checked,
     parse_transfer_vote,
-    screen_policy_widths,
-    screen_unsatisfiable_sender_conjunction,
 )
 from .retractable import (
     RETRACTABLE_TX_TYPES,
@@ -38,10 +42,9 @@ from .retractable import (
     parse_retractable_transfer,
 )
 from .rule_offers import (
-    NEUTRAL_O5_CLAUSE_BODY,
     RULE_OFFER_TX_TYPES,
+    RuleOfferDecision,
     RuleOfferShapeError,
-    clause_author_cap,
     clause_body_v1,
     is_neutral_clause_body,
     TX_TYPE_RULE_OFFER,
@@ -66,19 +69,27 @@ from .rule_offers import (
 # an engine import, and a divergence charges a different fee at admission than
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
-    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER}
+    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
+     TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
 )
 
-# Branches that mutate the lifecycle manager in place. Once the envelope
-# checks have already rejected the transaction, entering them records a
-# governance update, offer, accept or vote that only proposal mode discards.
-# `withdraw_request` still covers a request rejected later, at fee settlement.
+
+def _receipt_lookup_key(tx: Dict[str, Any], index: int) -> str:
+    """Receipt dict key; only used for receipts and ApplyBlockResult id lists."""
+    return tx.get("tx_id") or str(index)
+
+# Branches that mutate the lifecycle manager in place. They write only to the
+# fork of the tx, which both apply paths drop on a rejection. A tx that is
+# already rejected skips them, so it never reaches the evaluator.
 _LIFECYCLE_TX_TYPES = frozenset(
     {"consensus_rule_update", "consensus_rule_vote"}
     | set(RULE_OFFER_TX_TYPES)
     | set(APPROVAL_TX_TYPES)
+    | set(RULE_CHANGE_TX_TYPES)
 )
+from consensus.tx_checks import apply_tx_error
+from consensus import bls
 from consensus.tx_signing import verify_tx_signature
 import tau_native
 import tau_advisory
@@ -210,73 +221,6 @@ class ConsensusEngine(ABC):
         """
         pass
 
-def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict,
-                          session=None) -> Tuple[bool, str]:
-    """Route a regenerated composite rule through i0, as an op-"0" rule would.
-
-    Returns (ok, detail). `composite` is None only when the acceptor's clause
-    was the last one for that stream, which cannot happen on an accept, so a
-    None here is a programming error rather than a chain condition.
-
-    A rejection is deterministic: every node applying this block composes the
-    same text from the same registry and feeds it to the same engine, so all of
-    them either accept or hard-reject the transaction identically.
-
-    `session` is the evaluator this composite belongs to and is NOT optional in
-    proposal mode -- it is defaulted only so the live apply path and the existing
-    callers keep working unchanged. Reaching `tau_manager` from inside a proposal
-    would step the authoritative interpreter for a block that may never commit,
-    which is the one thing the whole speculative path exists to prevent; the
-    isolation guard traps that call, so the default here is a convenience for the
-    authoritative path and a hard error for a proposal.
-    """
-    if not composite:
-        return False, "composite is empty"
-
-    _session = (
-        session if session is not None
-        else tau_session.InProcessSession(manager=tau_manager)
-    )
-
-    if not _session.ready(timeout=5):
-        # Soft failure shape is not available here: the clause is already
-        # registered in the caller's registry, so refusing the tx is the only way
-        # to keep the emitted spec and the registry consistent.
-        return False, "Tau not ready"
-
-    try:
-        # NOT accumulated: the composite feeds the interpreter but skips the
-        # rules handler, so it never enters the application-rules accumulation.
-        # save_effective_tau_spec only dedups EXACT units, so appending left
-        # every earlier composite in place -- several per stream, net effect
-        # dependent on replay order, and the spec growing with every acceptance.
-        # The clause registry is the consensus-bound source of truth and
-        # chain_state's restore plan rebuilds the composite from it.
-        output = _session.apply_rule(composite, target=0, accumulate=False)
-    except Exception as exc:  # noqa: BLE001 - deliberately broad, see below
-        # A deterministic parse/compile failure surfaces as an engine error in
-        # the exception text. Anything else (transient outage) is equally fatal
-        # for this transaction, because the registry has already moved.
-        return False, str(exc)
-
-    tx_receipt["logs"].append(f"Tau(composite) o0: {output}")
-
-    # W6, same correction the ordinary rule path got: the engine's own verdict
-    # rather than a guess at the formatted output. The string test cannot tell an
-    # accepted no-op from a composite the engine never routed -- an unsatisfiable
-    # one lands in the no-revision branch and prints nothing that looks like an
-    # error -- and it is blind to ANSI-wrapped diagnostics besides.
-    receipt = _session.last_receipt()
-    if receipt is not None:
-        if not receipt.get("accepted", False):
-            return False, f"{receipt.get('outcome')}: {output}"
-        return True, ""
-    if "error" in str(output).lower() and "x1001" not in str(output).lower():
-        return False, str(output)
-    return True, ""
-
-
-
 def _retractable_book(lm) -> Optional[RetractableBook]:
     book = getattr(lm, "retractable_transfers", None)
     return book if isinstance(book, RetractableBook) else None
@@ -287,35 +231,152 @@ def _escrow_total(lm) -> int:
     return book.escrow_total() if book is not None else 0
 
 
-def _release_due_retractables(lm, balances, height, timestamp) -> List[str]:
+def _release_due_retractables(lm, balances, sequences, height, timestamp) -> List[str]:
     """Pay every matured entry to its recipient; returns the released ids."""
     book = _retractable_book(lm)
     if book is None:
         return []
     released = book.release_due(int(height), int(timestamp))
+    grant = faucet.amount(lm)
     for entry in released:
-        balances[entry.recipient_pubkey] = (
-            int(balances.get(entry.recipient_pubkey, 0)) + entry.amount
-        )
+        balances[entry.recipient_pubkey] = faucet.spendable(
+            balances, sequences, entry.recipient_pubkey, grant
+        ) + entry.amount
     return [entry.retractable_id.hex() for entry in released]
 
 
-def _revised_policy_composite(proposal) -> bool:
-    # Only composites and activations are fed with accumulate=False; op-0 rules accumulate.
-    return any(
-        entry.kind == tau_journal.REVISION and not entry.accumulate
-        for entry in proposal.journal.entries()
+TEMPORAL_REFERENCE_REASON = "temporal_reference"
+RULE_CHANGE_NEEDS_APPROVAL_REASON = "rule_change_needs_approval"
+
+
+def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tuple[str, str]]:
+    """(error, receipt reason) when admission would refuse this clause body."""
+    # Lazy: consensus.admission imports chain_state, which imports this module.
+    from consensus.admission import (
+        _screen_clause_domains,
+        _screen_guard_domains,
+        _width_mismatch_details,
+        is_temporal_reference_error,
     )
 
+    error = (_screen_guard_domains if guard else _screen_clause_domains)(body)
+    if error is None:
+        return None
+    if is_temporal_reference_error(error):
+        return error, TEMPORAL_REFERENCE_REASON
+    if _width_mismatch_details(error):
+        return error, "width_mismatch"
+    return error, "rule_not_applied"
 
-TEMPORAL_REFERENCE_REASON = "temporal_reference"
+
+def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str]]:
+    """Write every READY rule-change request, lowest id first, up to the per-block cap.
+
+    Runs after the transaction loop and before expiry, so a deferred request
+    whose window closes this block expires instead of releasing. A failure is
+    recorded on the request, never on the block. Returns (id, status name).
+    """
+    approvals = lm.approval_requests
+    if not approvals.rule_change_requests:
+        return []
+    approvals.mark_escape_due_ready(int(height))
+    events: List[Tuple[str, str]] = []
+    processed = 0
+    for rid in approvals.ready_rule_change_ids():
+        if processed >= tau_defs.MAX_RULE_CHANGE_RELEASES_PER_BLOCK:
+            break
+        entry = approvals.get_rule_change(rid)
+        if entry is None or entry.status != STATUS_OPEN:
+            continue
+        processed += 1
+        problem = _write_rule_change(lm, rid, entry, int(height), timeout)
+        if problem:
+            approvals.resolve_rule_change(rid, STATUS_FAILED)
+            logger.info("Rule-change request %s failed at release: %s", rid.hex(), problem)
+            events.append((rid.hex(), "failed"))
+            continue
+        approvals.resolve_rule_change(rid, STATUS_EXECUTED)
+        events.append((rid.hex(), "executed"))
+    return events
 
 
-def _offered_rule_temporal_error(rule_text: str) -> Optional[str]:
-    # Lazy: consensus.admission imports chain_state, which imports this module.
-    from consensus.admission import screen_temporal_rule
+def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
+    """Apply one request to the block's lifecycle. None on success, else why not.
 
-    return screen_temporal_rule(clause_body_v1(rule_text))
+    Every check runs before the first write, so a failure leaves nothing behind.
+    """
+    offers = lm.rule_offers
+    approvals = lm.approval_requests
+    sender = entry.sender_pubkey
+    kind = entry.kind
+    policy_key = (sender, tau_defs.USER_POLICY_STREAM_INDEX)
+    guard_key = (sender, tau_defs.RULE_CHANGE_GUARD_INDEX)
+
+    def _screen_and_build(body, *, guard=False):
+        rejection = _clause_domain_rejection(body, guard=guard)
+        if rejection:
+            return rejection[0]
+        builds, build_error = sender_policy.clause_builds(
+            body, pool="apply", timeout=timeout
+        )
+        return None if builds else f"does not build: {build_error}"
+
+    decision = None
+    if kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+        problem = _screen_and_build(entry.body)
+    elif kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
+        problem = _screen_and_build(entry.body, guard=True)
+    elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
+        problem = None if offers.clause_for(*policy_key) else "no policy to revoke"
+    elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
+        problem = None if offers.clause_for(*guard_key) else "no guard to revoke"
+    elif kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+        offer_id = bytes.fromhex(entry.offer_id)
+        offer = offers.offered.get(offer_id)
+        text = entry.body
+        if offer is None:
+            problem = "the offer is no longer open"
+        elif offer.recipient_pubkey != sender:
+            problem = "the offer is not addressed to the sender"
+        elif offer.expire_at_height <= height:
+            problem = "the offer has expired"
+        else:
+            decision = RuleOfferDecision(
+                offer_id=offer_id, actor_pubkey=sender, accept=True, rule_text=text
+            )
+            ok, reason = offers.can_admit_decision(decision)
+            problem = None if ok else reason
+            if ok:
+                try:
+                    problem = _screen_and_build(clause_body_v1(text))
+                except RuleOfferShapeError as exc:
+                    problem = str(exc)
+    else:
+        problem = f"unknown kind {kind}"
+    if problem:
+        return problem
+
+    if kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+        offers.accepted_clauses[policy_key] = entry.body
+    elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
+        offers.accepted_clauses.pop(policy_key, None)
+    elif kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
+        offers.accepted_clauses[guard_key] = entry.body
+    elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
+        offers.accepted_clauses.pop(guard_key, None)
+    else:
+        try:
+            offers.submit_decision(decision)
+        except RuleOfferShapeError as exc:
+            return str(exc)
+
+    if kind in (tau_defs.RULE_CHANGE_KIND_SET_GUARD, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD):
+        approvals.resolve_open_rule_changes_for_sender(
+            sender, STATUS_FAILED, except_id=rid
+        )
+    else:
+        approvals.resolve_all_for_sender(sender, STATUS_FAILED)
+    return None
 
 
 def _refuse_in_process_authority(entry: str) -> None:
@@ -515,30 +576,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             return None
         return value
 
-    @staticmethod
-    def _view_approval_slots_active(active_view) -> bool:
-        meta = getattr(active_view, "mechanism_specific_metadata", None) or {}
-        return meta.get("approval_slots_active") is True
-
     @classmethod
-    def _counts_against_rule_budget(cls, tx: dict, slots_active: bool) -> bool:
-        """Whether this transaction costs an interpreter rebuild.
+    def _counts_against_rule_budget(cls, tx: dict) -> bool:
+        """Whether this transaction costs a clause build.
 
-        The rule-sharing types always do. A user_tx carrying an o5 policy rule
-        does too ONCE routing is active, because it re-derives the composite --
-        and not counting it would leave the flood vector wide open on the one
-        path this feature adds.
-
-        Legacy `operations["0"]` rules stay excluded, for the reason the comment
-        at the call site gives: existing chains already contain blocks carrying
-        many of them, and counting those retroactively would break replay of
-        history. Post-activation routed rules are new, so counting them breaks
-        nothing.
+        The rule-sharing types always do, and so does a user_tx carrying an o5
+        policy rule, because every such rule registers a clause.
         """
         tx_type = tx.get("tx_type", "user_tx")
-        if tx_type in RULE_OFFER_TX_TYPES:
+        if tx_type in RULE_OFFER_TX_TYPES or tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
             return True
-        if not slots_active or tx_type != "user_tx":
+        if tx_type != "user_tx":
             return False
         operations = tx.get("operations")
         if not isinstance(operations, dict):
@@ -599,24 +647,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             logger.warning("Consensus: Block #%s has no consensus proof", block.header.block_number)
             return False
 
-        # Per-block rule-transaction budget. Applying a rule regenerates and
-        # recompiles a composite, whose cost climbs steeply with specification
-        # complexity; without a ceiling a proposer could author a block that
-        # every validator times out on (COMM_TIMEOUT, then a watchdog kill).
+        # Per-block rule-transaction budget. Applying a rule builds an
+        # engine unit, whose cost climbs steeply with its complexity; without a
+        # ceiling a proposer could author a block that every validator times out
+        # on (COMM_TIMEOUT, then a watchdog kill).
         # This is consensus, not policy: over-budget blocks are invalid.
         #
-        # Counts ONLY the rule-sharing types. Legacy operations["0"] user_tx
-        # rules are deliberately excluded, because existing chains may already
-        # contain blocks carrying many of them and counting those would break
-        # replay of history. That flood vector is pre-existing and separate.
+        # Counts the rule-sharing types and every user_tx carrying an o5 rule:
+        # each one builds a clause.
         if block is not None and active_view is not None:
             budget = self._view_rule_tx_budget(active_view)
             if budget is not None:
-                slots_active = self._view_approval_slots_active(active_view)
                 rule_txs = sum(
                     1 for tx in (getattr(block, "transactions", None) or [])
                     if isinstance(tx, dict)
-                    and self._counts_against_rule_budget(tx, slots_active)
+                    and self._counts_against_rule_budget(tx)
                 )
                 if rule_txs > budget:
                     logger.warning(
@@ -642,6 +687,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         getattr(getattr(block, "header", None), "block_number", "?"),
                     )
                     return False
+                # Stake is consensus data: like get_committed_balance, it ignores a pending faucet grant.
                 proposer_stake = int(balances.get((block.header.proposer_pubkey or "").lower(), 0))
             tau_inputs = self._build_consensus_input_streams(
                 proposer_pubkey=block.header.proposer_pubkey,
@@ -716,7 +762,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return True
             if "require_bls_sig" in output:
                 try:
-                    from py_ecc.bls import G2Basic
                     import hashlib
                     block_sig = block.consensus_proof
                     if isinstance(block_sig, dict):
@@ -727,7 +772,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     msg_hash = hashlib.sha256(block.header.canonical_bytes()).digest()
                     pubkey_bytes = bytes.fromhex(block.header.proposer_pubkey)
                     sig_bytes = bytes.fromhex(block_sig)
-                    if not G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes):
+                    if not bls.verify(pubkey_bytes, msg_hash, sig_bytes):
                         logger.warning("Consensus: Block #%s cryptographic proof failed", block.header.block_number)
                         return False
                 except Exception as e:
@@ -812,7 +857,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             lm = copy.deepcopy(parent_lm)
         else:
             # Fallback if somehow not provided (tests, legacy)
+            import chain_state
             from consensus.governance import ConsensusLifecycleManager
+            if chain_state._genesis_faucet_amount:
+                raise BlockchainBug("no parent lifecycle on a network with a genesis faucet")
             lm = ConsensusLifecycleManager(active_validators=[bytes.fromhex(v) for v in self._validators])
         if proposal is not None:
             # The block's lifecycle IS the proposal's from here: transactions
@@ -839,6 +887,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # metadata['balances'] is the pre-block state; t_bals above is the
             # mutable copy apply() debits, and must NOT be used for i2.
             parent_balances=metadata.get('balances'),
+            parent_sequences=metadata.get('sequence_numbers'),
             parent_last_transfer_ts=metadata.get('last_transfer_ts'),
             session=session,
             target_last_transfer_ts=t_lts,
@@ -847,29 +896,46 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
         # Conservation invariant: the native fee model debits the sender and
         # credits the proposer through the same staged_writes pass, so total
-        # supply is preserved across a block (no mint, no burn). A mismatch is
-        # a consensus bug, not a recoverable error.
+        # supply moves only by the faucet grants of the block (no other mint, no
+        # burn). A mismatch is a consensus bug, not a recoverable error.
         # The sweep runs after the transaction loop, so a retract (strictly
         # before release) and a release can never both fire in one block.
         released_retractables = _release_due_retractables(
-            lm, t_bals, block.header.block_number, block.header.timestamp
+            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
+        )
+        _release_rule_changes(
+            lm, block.header.block_number, block.header.timestamp,
+            getattr(
+                session if session is not None else getattr(proposal, "session", None),
+                "request_budget", None,
+            ),
         )
 
+        minted = faucet.granted(
+            metadata.get('balances'), metadata.get('sequence_numbers'),
+            t_bals, t_seqs, faucet.amount(lm),
+        )
         post_total = sum(int(v) for v in t_bals.values()) + _escrow_total(lm)
-        if post_total != parent_total and not getattr(config, "TESTNET_AUTO_FAUCET", False):
+        if post_total != parent_total + minted:
             raise BlockchainBug(
                 f"Supply not conserved applying block #{block.header.block_number}: "
-                f"parent_total={parent_total} post_total={post_total}"
+                f"parent_total={parent_total} minted={minted} post_total={post_total}"
             )
 
         # Convert internal apply result into structural outcomes
         outcomes = []
         accepted_ids = []
         skipped_ids = []
-        
-        for tx in block.transactions:
-            tx_id = tx.get('tx_id')
-            if tx in exec_result.accepted_transactions:
+        invalid_ids = []
+
+        accepted_obj = {id(t) for t in exec_result.accepted_transactions}
+        rejected_obj = {id(t) for t in exec_result.rejected_transactions}
+
+        # Receipt keys match apply(); id() membership keeps a content-equal
+        # rejected duplicate distinct from the accepted object.
+        for i, tx in enumerate(block.transactions):
+            tx_id = _receipt_lookup_key(tx, i)
+            if id(tx) in accepted_obj:
                 # We consider all accepted ones as "applied" or "skipped/no-op"
                 # Internal execution logs tell us if it was essentially a no-op 
                 status = "applied"
@@ -882,15 +948,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     accepted_ids.append(tx_id)
                     
                 outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, receipt_logs=logs))
-            elif tx in exec_result.rejected_transactions:
+            elif id(tx) in rejected_obj:
                 status = "invalid"
                 receipt = exec_result.receipts.get(tx_id, {})
                 outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, reason=receipt.get("reason"), receipt_logs=receipt.get("logs", [])))
+                invalid_ids.append(tx_id)
 
         retractable_events = []
         for i, tx in enumerate(block.transactions):
-            event = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get("retractable_event")
-            if event and tx in exec_result.accepted_transactions:
+            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "retractable_event"
+            )
+            if event and id(tx) in accepted_obj:
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
 
@@ -906,23 +975,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # rules are consensus-visible changes, and a rule already typing a slot
         # (or a legacy raw o5 writer) would poison process-global stream typing.
         # Everything in this corpus is hash-bound state, so every node computes
-        # the same verdict.
-        effective_spec_texts = [
-            ("consensus_rules", active_view.consensus_rules or ""),
-            ("application_rules", next_app_rules or ""),
-        ]
-        try:
-            effective_spec_texts.extend(
-                ("builtin_rule_%d" % n, text)
-                for n, text in enumerate(chain_state.load_builtin_rules_from_disk() or [])
+        # the same verdict. Passed as a callable: it walks the whole registry,
+        # so it is built only when an audit runs.
+        def effective_spec_texts():
+            texts = [
+                ("consensus_rules", active_view.consensus_rules or ""),
+                ("application_rules", next_app_rules or ""),
+            ]
+            try:
+                texts.extend(
+                    ("builtin_rule_%d" % n, text)
+                    for n, text in enumerate(chain_state.load_builtin_rules_from_disk() or [])
+                )
+            except Exception:  # noqa: BLE001 - the audit is best-effort on disk reads
+                logger.warning("Could not read builtin rules for the activation audit")
+            texts.extend(
+                ("clause_%s_o%d" % (acceptor[:10], stream), body)
+                for (acceptor, stream), body in
+                sorted(getattr(lm.rule_offers, "accepted_clauses", {}).items())
             )
-        except Exception:  # noqa: BLE001 - the audit is best-effort on disk reads
-            logger.warning("Could not read builtin rules for the activation audit")
-        effective_spec_texts.extend(
-            ("clause_%s_o%d" % (acceptor[:10], stream), body)
-            for (acceptor, stream), body in
-            sorted(getattr(lm.rule_offers, "accepted_clauses", {}).items())
-        )
+            return texts
+
         newly_active = lm.process_height_transitions(
             block.header.block_number, effective_spec_texts=effective_spec_texts
         )
@@ -989,19 +1062,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             next_cons_rules = "\n".join(last_update.rule_revisions)
             next_active_consensus_id = last_update.update_id_hex[:16]
 
-        if proposal is not None and (newly_active or _revised_policy_composite(proposal)):
-            # Activations and composites fed through i0 layer instead of replacing;
+        if proposal is not None and newly_active:
+            # Activations are fed through i0 and layer instead of replacing;
             # collapsing to the hashed state matches a restart and bounds apply cost.
-            units = chain_state.restore_plan_for(
-                next_cons_rules, next_app_rules, lifecycle=lm,
-            )
+            units = chain_state.restore_plan_for(next_cons_rules, next_app_rules)
             try:
                 proposal.reset(units)
             except Exception as exc:
                 # Deterministic: every node composes the same plan from the same hashed state.
-                cause = "governance activation" if newly_active else "policy revision"
                 raise FeeRuleError(
-                    f"Block #{block.header.block_number} ({cause}) "
+                    f"Block #{block.header.block_number} (governance activation) "
                     f"could not collapse the evaluator: {exc}"
                 )
 
@@ -1056,7 +1126,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             outcomes=outcomes,
             accepted_tx_ids=accepted_ids,
             skipped_tx_ids=skipped_ids,
-            invalid_tx_ids=[tx.get('tx_id') for tx in exec_result.rejected_transactions],
+            invalid_tx_ids=invalid_ids,
             governance_changes={
                 "activated_updates": [u.update_id_hex for u in newly_active],
                 "released_retractables": released_retractables,
@@ -1150,6 +1220,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         proposer_pubkey: Optional[str] = None,
         block_height: Optional[int] = None,
         parent_balances: Optional[Dict[str, int]] = None,
+        parent_sequences: Optional[Dict[str, int]] = None,
         parent_last_transfer_ts: Optional[Dict[str, int]] = None,
         target_last_transfer_ts: Optional[Dict[str, int]] = None,
         session=None,
@@ -1176,6 +1247,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             proposer_pubkey=proposer_pubkey,
             block_height=block_height,
             parent_balances=parent_balances,
+            parent_sequences=parent_sequences,
             parent_last_transfer_ts=parent_last_transfer_ts,
             target_last_transfer_ts=target_last_transfer_ts,
             session=session,
@@ -1210,6 +1282,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         proposer_pubkey: Optional[str] = None,
         block_height: Optional[int] = None,
         parent_balances: Optional[Dict[str, int]] = None,
+        parent_sequences: Optional[Dict[str, int]] = None,
         parent_last_transfer_ts: Optional[Dict[str, int]] = None,
         target_last_transfer_ts: Optional[Dict[str, int]] = None,
         session=None,
@@ -1259,10 +1332,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             else chain_state._lifecycle_manager
         )
         if proposal is not None:
-            # The proposal owns it from here. Identity is kept deliberately: the
-            # block builder holds this same object and hashes it after apply
-            # returns, so the proposal adopts a transaction's clone INTO it
-            # rather than swapping in a different manager.
             proposal.lifecycle = _block_lifecycle
         lifecycle_mgr = _block_lifecycle
         # The evaluator this apply drives. The default binds to THIS module's
@@ -1294,11 +1363,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 return int(target_sequences[address])
             return chain_state.get_sequence_number(address)
 
+        faucet_grant = faucet.amount(lifecycle_mgr)
+
         def _balance_of(address) -> int:
-            if proposal is not None:
-                return int(target_balances.get(address, 0))
-            if target_balances is not None and address in target_balances:
-                return target_balances[address]
+            # The overlay already holds the parent state: reading chain_state
+            # here would judge a block against the node's live head instead.
+            if target_balances is not None:
+                return faucet.spendable(
+                    target_balances, target_sequences, address, faucet_grant
+                )
             return chain_state.get_balance(address)
 
         def _commit_snapshot(snap):
@@ -1361,6 +1434,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # both see the same pre-block balance, so a min-balance floor does not
         # compound within a block. The block-build re-check remains the backstop.
         parent_bals = dict(parent_balances or {})
+        parent_seqs = dict(parent_sequences or {})
         if parent_balances is None and target_balances is not None:
             # Legacy direct-apply callers (tests) that never pass a parent map.
             # Feed 0 rather than guessing from the mutable overlay, which would
@@ -1370,20 +1444,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         def _parent_bal(addr: Optional[str]) -> str:
             """i2 for `addr`, clamped to the width the rules declare for it.
 
-            Applies the same TESTNET_AUTO_FAUCET substitution the debit path uses
-            further down. Without it Tau would see 0 for a faucet-funded account
-            while the transfer succeeded against a synthetic 100000, so a
-            min-balance rule would reject a send that then went through. This does
-            make i2 depend on a per-node flag — but that flag already has to match
-            network-wide (it also exempts the supply-conservation invariant), and
-            being inconsistent *within* one node is the worse, silent failure.
+            The parent's spendable balance, with the pending grant of an
+            account that has no record yet: the value the debit path spends, so
+            a min-balance rule judges the balance the transfer spends.
             """
+            if not addr or parent_balances is None:
+                return "0"
             try:
-                value = int(parent_bals.get(addr, 0)) if addr else 0
+                value = faucet.spendable(parent_bals, parent_seqs, addr, faucet_grant)
             except (TypeError, ValueError):
                 value = 0
-            if value == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                value = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
             return str(max(0, min(value, tau_defs.MAX_TRANSFER_VALUE)))
 
         # i16: seconds since this sender's previous transfer, read from the
@@ -1444,6 +1514,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # would wrap to a huge bv value and silently satisfy the cooldown).
             return str(max(0, min(elapsed, tau_defs.COOLDOWN_NEVER_SENT)))
 
+        def _lifecycle_for_write():
+            """This transaction's fork of the block lifecycle, made on the first write.
+
+            Every lifecycle write goes through here, on both apply paths, so a
+            plain transfer pays no copy.
+            """
+            nonlocal lifecycle_mgr
+            if lifecycle_mgr is _block_lifecycle and _block_lifecycle is not None:
+                lifecycle_mgr = (
+                    _branch.lifecycle if _branch is not None
+                    else _block_lifecycle.fork()
+                )
+            return lifecycle_mgr
+
         for i, tx in enumerate(transactions):
             # One branch per transaction. Its journal child, allocator child and
             # state delta resolve together; a rejection that already stepped the
@@ -1455,25 +1539,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     str(tx.get("tx_id") or tx.get("tx_hash") or f"tx{i}")
                 )
                 _session = proposal.session
-                # Lifecycle state is branched like everything else. The routed
-                # o5 path resolves the sender's open approval requests and
-                # replaces their registered clause BEFORE the composite is even
-                # evaluated, and the offer path does the same on accept -- both
-                # mutate in place, with no inverse worth trusting. So the
-                # transaction mutates a clone, derives its composite from THAT
-                # clone, and the proposal adopts it only on acceptance.
-                lifecycle_mgr = _branch.lifecycle
-            tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
+            tx_id = _receipt_lookup_key(tx, i)
             # operations is signed only for user_tx.
             operations = tx.get('operations', {}) if tx.get('tx_type', 'user_tx') == 'user_tx' else {}
             sender = tx.get('sender_pubkey')
-            
-            # By default, we consider the transaction valid for inclusion unless strictly malformed
-            # (e.g. signature issues are handled in verify_block, here we might assume validity).
-            # However, historically we used tx_success to mean "execution successful".
-            # We now split this:
-            # - accepted_in_block: True (unless we decide it's total garbage)
-            # - execution_success: True/False
             
             accepted_in_block = True
             hard_reject = False
@@ -1513,7 +1582,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # Sequence number handling: only increment if the tx is included/accepted.
             sequence_number = tx.get('sequence_number')
             should_increment_seq = False
-            if sequence_number is not None and sender:
+            if sequence_number is not None and isinstance(sender, str) and sender:
                 if target_sequences is not None:
                     current_seq = target_sequences.get(sender, 0)
                 else:
@@ -1535,6 +1604,35 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         f"Invalid sequence number: expected {current_seq}, got {sequence_number}"
                     )
 
+            # Every branch and every account-scoped policy below trusts sender_pubkey.
+            # Replay rejects too: the state hash binds the tx as rejected.
+            precheck_rejected = False
+            if not hard_reject:
+                sig_ok, sig_reason = verify_tx_signature(tx)
+                if not sig_ok:
+                    logger.error("Tx %s signature rejected at apply: %s", tx_id, sig_reason)
+                    accepted_in_block = False
+                    hard_reject = True
+                    execution_success = False
+                    precheck_rejected = True
+                    operations = {}
+                    tx_receipt["reason"] = "invalid_signature"
+                    tx_receipt["logs"].append(f"Transaction signature invalid: {sig_reason}")
+
+            # The admission checks of transfers and recipient keys, again: a
+            # proposer can put a transaction into a block that never passed admission.
+            if not hard_reject:
+                tx_error = apply_tx_error(tx)
+                if tx_error is not None:
+                    logger.error("Tx %s rejected at apply: %s", tx_id, tx_error[1])
+                    accepted_in_block = False
+                    hard_reject = True
+                    execution_success = False
+                    precheck_rejected = True
+                    operations = {}
+                    tx_receipt["reason"], detail = tx_error
+                    tx_receipt["logs"].append(f"Error: {detail}")
+
             # Process operations
             # Parse operations first to establish deterministic order:
             # 1. Rule update (key "0")
@@ -1549,7 +1647,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # user-initiated and expensive, and exempting them would make rule
             # spam free. They carry no transfers, so the transfer-less
             # fee-query step below covers them.
-            charge_fee = fees_enabled and tx_type in FEE_BEARING_TX_TYPES
+            charge_fee = (
+                fees_enabled and tx_type in FEE_BEARING_TX_TYPES
+                and not precheck_rejected
+            )
             fee_limit_int: Optional[int] = None
             fee_components: List[int] = []
             staged_writes: Dict[str, int] = {}
@@ -1557,14 +1658,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # the generic transfer-less fee-query step (which feeds the canonical
             # mocked i1=i2=i3=i4=0) must not run for it as well and charge twice.
             fee_already_measured = False
-            # Set when this tx parked an approval request. Parking is committed
-            # in the apply branch below, but the fee is settled afterwards and
-            # can still hard-reject the tx -- and hard_reject suppresses staged
-            # balances and nonces without rolling lifecycle mutations back. A
-            # request whose tx paid nothing must not stay parked, so it is
-            # withdrawn after settlement. Deterministic: every node measures the
-            # same fee against the same signed fee_limit and balance.
+            # Set when this tx parked an approval request. The fee settles after
+            # the park and can still reject the tx, so the request is withdrawn below.
             parked_request_id: Optional[bytes] = None
+            parked_rule_change_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
 
@@ -1577,8 +1674,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             def _apply_o5_clause_routing(rule_text):
                 """Register or revoke the sender's o5 clause. True when handled.
 
-                False means "not an o5 policy rule, or routing is inactive", and
-                the caller takes the ordinary accumulation path unchanged.
+                False means "not an o5 policy rule", and the caller takes the
+                ordinary accumulation path.
 
                 Mirrors admission.validate_o5_clause_routing. A clause that does
                 not land is hard-rejected: a soft no-op would let a rule-only
@@ -1594,16 +1691,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     execution_success = False
                     tx_receipt["reason"] = reason
 
-                if not approval_slots_on:
-                    return False
                 if tau_defs.USER_POLICY_STREAM_INDEX not in clause_output_streams(rule_text):
                     return False
 
-                sig_ok, sig_reason = verify_tx_signature(tx)
-                if not sig_ok:
+                # Lazy: consensus.admission imports chain_state, which imports this module.
+                from consensus.admission import routed_rule_conflict
+                conflict = routed_rule_conflict(rule_text, operations)
+                if conflict:
                     _did_not_land(
-                        f"o5 clause signature invalid: {sig_reason}",
-                        reason="invalid_signature",
+                        f"o5 clause ignored ({conflict.error})", reason=conflict.reason
                     )
                     return True
 
@@ -1612,7 +1708,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return True
 
                 offers = lifecycle_mgr.rule_offers
-                approvals_mgr = lifecycle_mgr.approval_requests
                 sender_n = sender.lower()
                 stream = tau_defs.USER_POLICY_STREAM_INDEX
 
@@ -1625,23 +1720,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return True
 
                 # Same screen admission runs, so the two paths reject the same
-                # clause bodies. Imported lazily: consensus.admission pulls in
-                # the facade and chain_state, and chain_state imports this
-                # module, so a module-level import would be a cycle.
-                from consensus.admission import (
-                    _screen_clause_domains,
-                    _width_mismatch_details,
-                    is_temporal_reference_error,
-                )
-
-                domain_error = _screen_clause_domains(body)
-                if domain_error:
-                    if is_temporal_reference_error(domain_error):
-                        reason = TEMPORAL_REFERENCE_REASON
-                    elif _width_mismatch_details(domain_error):
-                        reason = "width_mismatch"
-                    else:
-                        reason = "rule_not_applied"
+                # clause bodies.
+                rejection = _clause_domain_rejection(body)
+                if rejection:
+                    domain_error, reason = rejection
                     _did_not_land(f"o5 clause ignored ({domain_error})", reason=reason)
                     return True
 
@@ -1653,18 +1735,40 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     _did_not_land(
                         "o5 clause revocation ignored (nothing registered)")
                     return True
-                if not revoking and not registered:
-                    cap = clause_author_cap(stream, True)
-                    if len(offers.clauses_for_stream(stream)) >= cap:
-                        _did_not_land(
-                            f"o5 clause ignored (registry full: {cap} authors)")
+                if not revoking:
+                    builds, build_error = sender_policy.clause_builds(
+                        body, pool="apply",
+                        timeout=getattr(_session, "request_budget", None),
+                    )
+                    if not builds:
+                        _did_not_land(f"o5 clause ignored (does not build: {build_error})")
                         return True
+
+                guard_blocked, guard_detail = sender_policy.rule_change_blocked(
+                    lambda who, idx: offers.accepted_clauses.get((who, idx)),
+                    sender_n,
+                    tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY if revoking
+                    else tau_defs.RULE_CHANGE_KIND_SET_POLICY,
+                    int(block_timestamp or 0),
+                    pool="apply",
+                    timeout=getattr(_session, "request_budget", None),
+                )
+                if guard_blocked:
+                    _did_not_land(
+                        f"o5 clause ignored (rule-change guard blocks: {guard_detail})",
+                        reason=RULE_CHANGE_NEEDS_APPROVAL_REASON,
+                    )
+                    return True
 
                 # A request snapshots its approvers but re-evaluates the CURRENT
                 # clause, so changing the clause under an open request would
                 # silently change what its recorded votes mean, or strand it
                 # until expiry. Resolve them first, in canonical id order.
-                doomed = approvals_mgr.resolve_all_for_sender(sender_n, STATUS_FAILED)
+                lifecycle = _lifecycle_for_write()
+                offers = lifecycle.rule_offers
+                doomed = lifecycle.approval_requests.resolve_all_for_sender(
+                    sender_n, STATUS_FAILED
+                )
                 if doomed:
                     tx_receipt["logs"].append(
                         "Policy change failed %d open approval request(s)" % len(doomed))
@@ -1674,31 +1778,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 else:
                     offers.accepted_clauses[key] = body
 
-                composite = offers.composite_for_stream(stream)
-                if composite is None:
-                    # The registry is empty now. Feeding nothing would leave the
-                    # PREVIOUS composite in force on this already-running
-                    # interpreter while a restarted node -- whose restore plan
-                    # emits no composite for an empty registry -- would allow the
-                    # transfer. Same block, two verdicts. So feed the neutral
-                    # composite explicitly: it supersedes the old one, and "o5
-                    # emits allow" and "o5 is never mentioned" are the same
-                    # verdict.
-                    composite = "always ( %s )." % NEUTRAL_O5_CLAUSE_BODY
-
-                ok_apply, detail = _apply_composite_rule(
-                    composite, tx_receipt, session=_session
+                tx_receipt["logs"].append(
+                    "o5 clause %s for %s"
+                    % ("revoked" if revoking else "registered", sender_n[:10])
                 )
-                if not ok_apply:
-                    accepted_in_block = False
-                    hard_reject = True
-                    execution_success = False
-                    tx_receipt["logs"].append(f"Error: o5 composite rejected: {detail}")
-                else:
-                    tx_receipt["logs"].append(
-                        "o5 clause %s for %s"
-                        % ("revoked" if revoking else "registered", sender_n[:10])
-                    )
                 return True
 
             def _transfer_input_map(from_addr, to_addr, amount,
@@ -1780,6 +1863,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     and tau_manager.parse_tau_output(o5_raw)
                     == tau_defs.USER_POLICY_BLOCK_VALUE
                 )
+                if allows:
+                    own_blocks, _own_o5 = sender_policy.clause_blocks(
+                        lifecycle_mgr.rule_offers.clause_for(
+                            from_addr, tau_defs.USER_POLICY_STREAM_INDEX),
+                        inputs, pool="apply",
+                        timeout=getattr(_session, "request_budget", None),
+                    )
+                    allows = not own_blocks
                 fee = fees.parse_consensus_fee(
                     outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
                     context=f"tx {tx_id} parked",
@@ -1892,9 +1983,28 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                             return False
 
+                        own_blocks, own_o5 = sender_policy.clause_blocks(
+                            lifecycle_mgr.rule_offers.clause_for(
+                                from_addr, tau_defs.USER_POLICY_STREAM_INDEX),
+                            tau_input_stream_values, pool="apply",
+                            timeout=getattr(_session, "request_budget", None),
+                        )
+                        if own_blocks:
+                            logger.info(
+                                "Transfer rejected by the sender's own policy clause for %s->%s (o5=%s)",
+                                str(from_addr)[:10], str(to_addr)[:10], own_o5,
+                            )
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = "user_policy_block"
+                            tx_receipt["logs"].append(
+                                f"Transfer rejected by the sender's own policy clause (o5={own_o5})"
+                            )
+                            return False
+
                     current_from = _read_bal(from_addr)
-                    if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                        current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
                     if current_from < amount:
                         logger.error(
                             "Insufficient funds for %s to send %s. Has: %s.",
@@ -1949,11 +2059,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             transfers_op_data = None
             custom_tau_inputs: dict[int, list[str]] = {}
             reserved_error = None
+            reserved_reason = None
 
             from consensus.governance import parse_consensus_rule_update, parse_consensus_rule_vote
 
+            if tx_type in _LIFECYCLE_TX_TYPES and accepted_in_block and not hard_reject:
+                _lifecycle_for_write()
             if tx_type in _LIFECYCLE_TX_TYPES and not (accepted_in_block and not hard_reject):
-                # Already rejected: lifecycle mutations are only rolled back in proposal mode.
+                # Already rejected: the lifecycle branches below must not run.
                 tx_receipt["logs"].append(
                     "Lifecycle action skipped: transaction already rejected"
                 )
@@ -1976,9 +2089,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         if block_height is not None else None
                     )
                     # Lazy: consensus.admission imports chain_state, which imports this module.
-                    from consensus.admission import _temporal_backreference
+                    from consensus.admission import (
+                        _temporal_backreference,
+                        revision_policy_width_error,
+                    )
 
                     temporal_ref = _temporal_backreference(update.rule_revisions)
+                    width_error = revision_policy_width_error(update.rule_revisions)
                     if min_activation is not None and update.activate_at_height < min_activation:
                         tx_receipt["logs"].append(
                             "Update ignored (activation delay breached): "
@@ -1989,6 +2106,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         tx_receipt["logs"].append(
                             "Update ignored (consensus rule revision reads a "
                             f"previous step): {temporal_ref}"
+                        )
+                    elif width_error:
+                        tx_receipt["logs"].append(
+                            f"Update ignored (consensus rule revision: {width_error})"
                         )
                     elif lifecycle_mgr.can_admit_update(update, is_mempool=False):
                         if lifecycle_mgr.submit_update(update):
@@ -2005,12 +2126,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     accepted_in_block = False # Structural invalidity rejects entirely in most chains
 
             elif tx_type in RULE_OFFER_TX_TYPES:
-                # Bounds and cap breaches are SOFT no-ops with a receipt log,
+                # Bound breaches are SOFT no-ops with a receipt log,
                 # matching the activation-delay handling above: the block stays
                 # valid and the offer simply is not recorded, so replay is
-                # deterministic regardless of tip state. Only a Tau failure on
-                # the composed rule hard-rejects, because that means the text
-                # could not have entered the specification at all.
+                # deterministic regardless of tip state. Only a clause that
+                # does not build hard-rejects.
                 offers = lifecycle_mgr.rule_offers
 
                 if tx_type == TX_TYPE_RULE_OFFER:
@@ -2031,17 +2151,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             offer,
                             next_height=block_height if block_height is not None else 0,
                         )
-                        temporal_error = (
-                            _offered_rule_temporal_error(offer.rule_text) if ok else None
+                        rejection = (
+                            _clause_domain_rejection(clause_body_v1(offer.rule_text))
+                            if ok else None
                         )
                         if not ok:
                             tx_receipt["logs"].append(f"Offer ignored ({reason})")
-                        elif temporal_error:
+                        elif rejection:
+                            domain_error, domain_reason = rejection
                             accepted_in_block = False
                             hard_reject = True
                             execution_success = False
-                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
-                            tx_receipt["logs"].append(f"Error: {temporal_error}")
+                            tx_receipt["reason"] = domain_reason
+                            tx_receipt["logs"].append(f"Error: {domain_error}")
                         elif offers.submit_offer(offer):
                             tx_receipt["logs"].append("Offer submitted: " + offer.offer_id_hex)
                         else:
@@ -2050,24 +2172,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                 else:
                     accept = tx_type == TX_TYPE_RULE_OFFER_ACCEPT
-                    sig_ok, sig_reason = (
-                        verify_tx_signature(tx) if accept and approval_slots_on
-                        else (True, "")
-                    )
                     decision = (
-                        None if not sig_ok
-                        else parse_rule_offer_accept(tx) if accept
+                        parse_rule_offer_accept(tx) if accept
                         else parse_rule_offer_reject(tx)
                     )
-                    if not sig_ok:
-                        tx_receipt["logs"].append(
-                            f"Rule offer accept signature invalid: {sig_reason}"
-                        )
-                        accepted_in_block = False
-                        hard_reject = True
-                        execution_success = False
-                        tx_receipt["reason"] = "invalid_signature"
-                    elif decision is None:
+                    if decision is None:
                         tx_receipt["logs"].append("Invalid rule offer decision format")
                         accepted_in_block = False
                     elif not isinstance(sender, str) or sender.lower() != decision.actor_pubkey:
@@ -2075,47 +2184,61 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         accepted_in_block = False
                     else:
                         ok, reason = offers.can_admit_decision(decision)
-                        temporal_error = (
-                            _offered_rule_temporal_error(decision.rule_text)
-                            if ok and accept else None
+                        accepted_body = (
+                            clause_body_v1(decision.rule_text) if ok and accept else None
                         )
+                        rejection = (
+                            _clause_domain_rejection(accepted_body)
+                            if accepted_body is not None else None
+                        )
+                        if accepted_body is not None and not rejection:
+                            builds, build_error = sender_policy.clause_builds(
+                                accepted_body, pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
+                            )
+                            if not builds:
+                                rejection = (build_error, "rule_not_applied")
+                        guard_blocked, guard_detail = False, ""
+                        if accepted_body is not None and not rejection:
+                            guard_blocked, guard_detail = sender_policy.rule_change_blocked(
+                                lambda who, idx: offers.accepted_clauses.get((who, idx)),
+                                decision.actor_pubkey,
+                                tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
+                                int(block_timestamp or 0),
+                                pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
+                            )
                         if not ok:
                             tx_receipt["logs"].append(
                                 f"Offer decision ignored ({reason})"
                             )
-                        elif temporal_error:
+                        elif rejection:
+                            domain_error, domain_reason = rejection
                             accepted_in_block = False
                             hard_reject = True
                             execution_success = False
-                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
-                            tx_receipt["logs"].append(f"Error: {temporal_error}")
-                        else:
-                            target_stream = offers.submit_decision(
-                                decision, approval_slots_active=approval_slots_on
+                            tx_receipt["reason"] = domain_reason
+                            tx_receipt["logs"].append(f"Error: {domain_error}")
+                        elif guard_blocked:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = RULE_CHANGE_NEEDS_APPROVAL_REASON
+                            tx_receipt["logs"].append(
+                                f"Offer accept ignored (rule-change guard blocks: {guard_detail})"
                             )
+                        else:
+                            target_stream = offers.submit_decision(decision)
                             if target_stream is None:
-                                # An accept that registers nothing hit the cap.
                                 tx_receipt["logs"].append(
-                                    ("Offer accept ignored (clause registry full): "
-                                     if accept else "Offer resolved: ")
-                                    + decision.offer_id_hex
+                                    "Offer resolved: " + decision.offer_id_hex
                                 )
                             else:
-                                # Re-emit the whole composite for the stream.
-                                # Individually guarded units cannot be appended:
-                                # an unconstrained stream materializes with an
-                                # arbitrary witness, and two total-form rules on
-                                # one stream either fail to conjoin or supersede
-                                # each other. See tests/test_rule_scoping_native.
-                                if (accept and target_stream
-                                        == tau_defs.USER_POLICY_STREAM_INDEX):
-                                    # Accepting an offered o5 clause replaces
-                                    # the acceptor's registered policy, exactly
-                                    # as an op-"0" declare does. Same hazard,
-                                    # same remedy: a request snapshots its
-                                    # approvers but re-evaluates the CURRENT
-                                    # clause, so recorded votes would come to
-                                    # mean something they were never given for.
+                                if target_stream == tau_defs.USER_POLICY_STREAM_INDEX:
+                                    # A request snapshots its approvers but
+                                    # re-evaluates the CURRENT clause, so a
+                                    # changed clause would change what its
+                                    # recorded votes mean.
                                     book = lifecycle_mgr.approval_requests
                                     doomed = book.resolve_all_for_sender(
                                         decision.actor_pubkey, STATUS_FAILED
@@ -2125,35 +2248,128 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             "Policy change failed %d open approval "
                                             "request(s)" % len(doomed)
                                         )
-                                composite = offers.composite_for_stream(target_stream)
-                                ok_apply, detail = _apply_composite_rule(
-                                    composite, tx_receipt, session=_session
+                                tx_receipt["logs"].append(
+                                    f"Offer accepted, o{target_stream} clause registered: "
+                                    + decision.offer_id_hex
                                 )
-                                if not ok_apply:
-                                    accepted_in_block = False
-                                    hard_reject = True
-                                    execution_success = False
-                                    tx_receipt["logs"].append(
-                                        f"Error: composite rule rejected: {detail}"
-                                    )
-                                else:
-                                    # current_tau_bytes deliberately unchanged:
-                                    # the composite is not part of the
-                                    # application-rules accumulation. What binds
-                                    # it into the state hash is the clause
-                                    # registry root in consensus_meta.
-                                    tx_receipt["logs"].append(
-                                        f"Offer accepted, o{target_stream} composite applied: "
-                                        + decision.offer_id_hex
-                                    )
+
+            elif tx_type in RULE_CHANGE_TX_TYPES:
+                # Failures are SOFT no-ops with a receipt log, like approval
+                # requests: the tx is not included and pays nothing.
+                operations = {}
+                approvals = lifecycle_mgr.approval_requests
+                offers = lifecycle_mgr.rule_offers
+                height_now = int(block_height or 0)
+
+                if tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
+                    request, parse_error = parse_rule_change_request_checked(tx)
+                    problem = None
+                    if request is None:
+                        problem = (parse_error, "rule_change_request_invalid")
+                    elif not isinstance(sender, str) or sender.lower() != request.sender_pubkey:
+                        problem = ("sender is not the signer", "rule_change_request_invalid")
+                    elif request.approvers and not approval_slots_on:
+                        problem = (
+                            "approval slots are not active",
+                            "rule_change_request_invalid",
+                        )
+                    else:
+                        ok, reason = approvals.can_admit_rule_change(request, height_now)
+                        if not ok:
+                            problem = (reason, "rule_change_request_invalid")
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+                            rejection = _clause_domain_rejection(request.body)
+                            if rejection:
+                                problem = rejection
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
+                            rejection = _clause_domain_rejection(request.body, guard=True)
+                            if rejection:
+                                problem = rejection
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+                            rejection = _clause_domain_rejection(
+                                clause_body_v1(request.rule_text))
+                            if rejection:
+                                problem = rejection
+                    if request is not None and problem is None:
+                        precondition = None
+                        if request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
+                            if not offers.clause_for(
+                                    request.sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX):
+                                precondition = "there is no registered o5 policy to revoke"
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
+                            if not offers.clause_for(
+                                    request.sender_pubkey, tau_defs.RULE_CHANGE_GUARD_INDEX):
+                                precondition = "there is no registered rule-change guard to revoke"
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+                            offer_entry = offers.offered.get(bytes.fromhex(request.offer_id))
+                            if offer_entry is None:
+                                precondition = "the offer is not open"
+                            elif offer_entry.recipient_pubkey != request.sender_pubkey:
+                                precondition = "only the offer recipient may park its acceptance"
+                            elif offer_entry.expire_at_height <= height_now:
+                                precondition = "the offer expires at or before the next block"
+                            else:
+                                accepted, why = offers.can_admit_decision(RuleOfferDecision(
+                                    offer_id=bytes.fromhex(request.offer_id),
+                                    actor_pubkey=request.sender_pubkey,
+                                    accept=True, rule_text=request.rule_text))
+                                if not accepted:
+                                    precondition = why
+                        if precondition:
+                            problem = (precondition, "rule_change_request_invalid")
+                    if problem is not None:
+                        tx_receipt["logs"].append(f"Rule-change request ignored ({problem[0]})")
+                        tx_receipt["reason"] = problem[1]
+                        accepted_in_block = False
+                    elif approvals.submit_rule_change(request, height_now):
+                        parked_rule_change_id = request.request_id
+                        tx_receipt["logs"].append(
+                            "Rule-change request parked: " + request.request_id_hex
+                        )
+                        blocked, _detail = sender_policy.rule_change_blocked(
+                            lambda who, idx: offers.accepted_clauses.get((who, idx)),
+                            request.sender_pubkey, request.kind,
+                            int(block_timestamp or 0),
+                            pool="apply",
+                            timeout=getattr(_session, "request_budget", None),
+                        )
+                        if not blocked:
+                            approvals.mark_rule_change_ready(request.request_id)
+                            tx_receipt["logs"].append(
+                                "Rule-change request ready: " + request.request_id_hex
+                            )
+                    else:
+                        tx_receipt["logs"].append(
+                            "Duplicate rule-change request ignored: " + request.request_id_hex
+                        )
+                        tx_receipt["reason"] = "rule_change_request_invalid"
+                        accepted_in_block = False
+
+                else:  # TX_TYPE_RULE_CHANGE_CANCEL
+                    cancel = parse_rule_change_cancel(tx)
+                    if cancel is None:
+                        reason = "invalid rule-change cancel format"
+                    elif not isinstance(sender, str) or sender.lower() != cancel.sender_pubkey:
+                        reason = "sender is not the signer"
+                    else:
+                        ok, reason = approvals.can_cancel_rule_change(cancel, height_now)
+                        if ok:
+                            approvals.resolve_rule_change(cancel.request_id, STATUS_CANCELLED)
+                            tx_receipt["logs"].append(
+                                "Rule-change request cancelled: " + cancel.request_id_hex
+                            )
+                    if cancel is None or reason:
+                        tx_receipt["logs"].append(f"Rule-change cancel ignored ({reason})")
+                        tx_receipt["reason"] = "rule_change_cancel_invalid"
+                        accepted_in_block = False
 
             elif tx_type in APPROVAL_TX_TYPES:
                 # Bounds and state disagreements are SOFT no-ops with a receipt
                 # log, matching the rule-offer branch: the block stays valid and
                 # the action simply is not recorded, so replay is deterministic
-                # regardless of tip state. Only a forged signature or a Tau
-                # failure hard-rejects.
+                # regardless of tip state. Only a Tau failure hard-rejects.
                 approvals = lifecycle_mgr.approval_requests
+                offers_book = lifecycle_mgr.rule_offers
 
                 if not approval_slots_on:
                     tx_receipt["logs"].append(
@@ -2161,24 +2377,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                     accepted_in_block = False
                 else:
-                    # Apart from the policy-setting paths, signatures are checked
-                    # only at admission; a forged vote would release parked funds
-                    # with no approver involved.
-                    sig_ok, sig_reason = verify_tx_signature(tx)
-                    if not sig_ok:
-                        logger.error(
-                            "Approval tx %s signature rejected at apply: %s",
-                            tx_id, sig_reason,
-                        )
-                        tx_receipt["logs"].append(
-                            f"Approval transaction signature invalid: {sig_reason}"
-                        )
-                        accepted_in_block = False
-                        hard_reject = True
-                        execution_success = False
-                        tx_receipt["reason"] = "invalid_signature"
-
-                    elif tx_type == TX_TYPE_APPROVAL_REQUEST:
+                    if tx_type == TX_TYPE_APPROVAL_REQUEST:
                         request = parse_approval_request(tx)
                         if request is None:
                             tx_receipt["logs"].append("Invalid approval request format")
@@ -2248,13 +2447,39 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             if not ok:
                                 tx_receipt["logs"].append(f"Transfer vote ignored ({reason})")
                                 accepted_in_block = False
+                            elif vote.request_id in approvals.rule_change_requests:
+                                rc_entry = approvals.get_rule_change(vote.request_id)
+                                # Evaluated on the prospective slots and committed
+                                # after, so a failed evaluation records no vote.
+                                filled = approvals.prospective_rule_change_slots(
+                                    vote.request_id, vote
+                                )
+                                blocked = True
+                                if vote.approve and not rc_entry.ready:
+                                    blocked, _detail = sender_policy.rule_change_blocked(
+                                        lambda who, idx: offers_book.accepted_clauses.get(
+                                            (who, idx)),
+                                        rc_entry.sender_pubkey, rc_entry.kind,
+                                        int(block_timestamp or 0),
+                                        pool="apply",
+                                        timeout=getattr(_session, "request_budget", None),
+                                        voted=filled,
+                                    )
+                                approvals.commit_rule_change_vote(vote)
+                                tx_receipt["logs"].append(
+                                    "Rule-change vote recorded: %s %s"
+                                    % (vote.request_id_hex,
+                                       "approve" if vote.approve else "decline")
+                                )
+                                if not blocked and approvals.mark_rule_change_ready(
+                                        vote.request_id):
+                                    tx_receipt["logs"].append(
+                                        "Rule-change request ready: " + vote.request_id_hex
+                                    )
                             else:
                                 entry = approvals.get_request(vote.request_id)
-                                # PROSPECTIVE first, commit after. hard_reject
-                                # suppresses staged balances and nonces but does
-                                # NOT roll back lifecycle mutations, so a Tau
-                                # failure here must not leave a recorded vote
-                                # behind.
+                                # PROSPECTIVE first, commit after: a failed
+                                # measurement leaves no recorded vote.
                                 # The manager returns raw pubkeys (the right
                                 # domain value); _approval_slot_values formats
                                 # them for the wire as `{ #x.. }:bv[384]`, which
@@ -2343,20 +2568,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # fields are signed, so anything else is unsigned data.
                 operations = {}
                 if accepted_in_block and not hard_reject:
-                    sig_ok, sig_reason = verify_tx_signature(tx)
-                    if not sig_ok:
-                        logger.error(
-                            "Retractable tx %s signature rejected at apply: %s",
-                            tx_id, sig_reason,
-                        )
-                        tx_receipt["logs"].append(
-                            f"Retractable transaction signature invalid: {sig_reason}"
-                        )
-                        accepted_in_block = False
-                        hard_reject = True
-                        execution_success = False
-                        tx_receipt["reason"] = "invalid_signature"
-                    elif tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+                    if tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
                         try:
                             park = parse_retractable_transfer(tx)
                         except RetractableShapeError as exc:
@@ -2455,8 +2667,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # consensus-shared constant) so apply agrees with the
                     # sendtx/admission gate. Consensus change.
                     if idx in tau_defs.RESERVED_STREAMS or idx in tau_defs.reserved_operation_keys(
-                            getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")()):
+                            getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")(),
+                            approval_slots_active=approval_slots_on):
                          reserved_error = f"Operation key '{k}' matches reserved stream {idx}."
+                         reserved_reason = "reserved_operation_key"
                          break
                     
                     # Normalize value
@@ -2503,6 +2717,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 accepted_in_block = False
                 hard_reject = True
                 execution_success = False
+                if reserved_reason:
+                    tx_receipt["reason"] = reserved_reason
                 tx_receipt["logs"].append(f"Error: {reserved_error}")
             else:
                 # --- Step 1: Rule Execution ---
@@ -2520,49 +2736,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                      if isinstance(rule_op_data, str) and rule_op_data.strip() \
                              and _verdict_still_open \
                              and _apply_o5_clause_routing(rule_op_data.strip()):
-                        # Registered as this sender's policy clause; the
-                        # composite was fed instead of accumulating the text.
+                        # Registered in the clause registry, not accumulated.
                         pass
                      elif isinstance(rule_op_data, str) and rule_op_data.strip():
                         rule_text = rule_op_data.strip()
-                        width_error = screen_policy_widths(rule_text)
-                        conj_error = (
-                            None if approval_slots_on
-                            else screen_unsatisfiable_sender_conjunction(rule_text)
-                        )
-                        if (width_error or conj_error) and not replay_mode:
-                            accepted_in_block = False
-                            hard_reject = True
-                            execution_success = False
-                            tx_receipt["reason"] = (
-                                "width_mismatch" if width_error
-                                else "unsatisfiable_sender_conjunction"
-                            )
-                            tx_receipt["logs"].append(
-                                f"Error: {width_error or conj_error}"
-                            )
                         # Lazy: consensus.admission imports chain_state, which imports this module.
-                        from consensus.admission import (
-                            screen_reserved_rule_outputs,
-                            screen_temporal_rule,
+                        from consensus.admission import screen_user_rule_text
+                        rejection = screen_user_rule_text(
+                            rule_text,
+                            getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")(),
+                            approval_slots_on,
                         )
-                        output_error = (
-                            None if replay_mode
-                            else screen_reserved_rule_outputs(rule_text)
-                        )
-                        if output_error and not hard_reject:
+                        if rejection and not hard_reject:
                             accepted_in_block = False
                             hard_reject = True
                             execution_success = False
-                            tx_receipt["reason"] = "reserved_output_stream"
-                            tx_receipt["logs"].append(f"Error: {output_error}")
-                        temporal_error = screen_temporal_rule(rule_text)
-                        if temporal_error and not hard_reject:
-                            accepted_in_block = False
-                            hard_reject = True
-                            execution_success = False
-                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
-                            tx_receipt["logs"].append(f"Error: {temporal_error}")
+                            tx_receipt["reason"] = rejection.reason
+                            tx_receipt["logs"].append(f"Error: {rejection.error}")
                         if execution_success and accepted_in_block and not hard_reject:
                           try:
                             # The rule goes through the evaluator SESSION rather
@@ -2787,13 +2977,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     
                                     if target_balances is not None:
                                         # Use isolated balance tracking
-                                        if from_addr in target_balances:
-                                            current_from = target_balances[from_addr]
-                                        else:
-                                            current_from = _balance_of(from_addr)
-
-                                        if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                                            current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+                                        current_from = _balance_of(from_addr)
 
                                         if current_from < amount:
                                             logger.error("Insufficient funds for %s to send %s. Has: %s.", from_addr[:10], amount, current_from)
@@ -2921,15 +3105,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             f"Fee {total_fee} exceeds fee_limit {fee_limit_int}"
                         )
                 else:
-                    # Same faucet shim as the transfer debit and admission's
-                    # get_balance. Without it admission accepted a rule-only tx
-                    # from a fresh account (faucet-funded there) that apply
-                    # then refused as insufficient_funds_for_fee: a transfer
-                    # materializes the faucet balance before the fee, a rule
-                    # alone never did.
+                    # _read_bal gives a new sender its pending grant, as
+                    # admission's get_balance does, so a rule-only tx from a new
+                    # account pays its fee from the grant.
                     sender_bal = _read_bal(sender) if sender else 0
-                    if sender and sender_bal == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                        sender_bal = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
                     if sender is None or sender_bal < total_fee:
                         if replay_mode:
                             logger.error(
@@ -2967,21 +3146,25 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         )
 
             if parked_request_id is not None and not accepted_in_block:
-                # The tx did not survive settlement (fee_limit_exceeded or
-                # insufficient_funds_for_fee, both of which also set
-                # hard_reject). Un-park it: otherwise the request stays in
-                # consensus state having paid nothing, and a later vote releases
-                # the transfer for free. Replay is unaffected -- it logs and
-                # skips the fee without clearing accepted_in_block, so a request
-                # parked on the mined chain stays parked.
-                if lifecycle_mgr.approval_requests.withdraw_request(parked_request_id):
+                # A request whose tx paid no fee must not stay parked. Replay
+                # keeps accepted_in_block, so a request parked on the mined chain
+                # stays parked.
+                if _lifecycle_for_write().approval_requests.withdraw_request(parked_request_id):
                     tx_receipt["logs"].append(
                         "Approval request un-parked (its fee was not paid)"
                     )
 
+            if parked_rule_change_id is not None and not accepted_in_block:
+                if _lifecycle_for_write().approval_requests.withdraw_rule_change(
+                        parked_rule_change_id):
+                    tx_receipt["logs"].append(
+                        "Rule-change request un-parked (its fee was not paid)"
+                    )
+
             stamp_retractable_park = False
             if accepted_in_block and not hard_reject:
-                book = lifecycle_mgr.retractable_transfers
+                if pending_retractable_park is not None or pending_retract_id is not None:
+                    book = _lifecycle_for_write().retractable_transfers
                 if pending_retractable_park is not None:
                     tx_receipt["retractable_event"] = (
                         pending_retractable_park.retractable_id.hex(), "parked"
@@ -3052,6 +3235,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if should_increment_seq and sender:
                     try:
                         if target_sequences is not None:
+                            # A record made by the nonce alone still gets the grant.
+                            if (faucet_grant and target_balances is not None
+                                    and not faucet.has_account(
+                                        target_balances, target_sequences, sender)):
+                                target_balances[sender] = faucet_grant
                             target_sequences[sender] = target_sequences.get(sender, 0) + 1
                         else:
                             if proposal is not None:
@@ -3076,6 +3264,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     if _rule_touched_canonical:
                         _set_rules_state(_rule_prior_rules_state or "")
                         current_tau_bytes = _rule_prior_tau_bytes
+            elif (lifecycle_mgr is not _block_lifecycle
+                    and accepted_in_block and not hard_reject):
+                _block_lifecycle.adopt(lifecycle_mgr)
 
             if accepted_in_block and not hard_reject:
                 accepted_txs.append(tx)

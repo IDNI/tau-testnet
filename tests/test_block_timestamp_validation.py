@@ -14,6 +14,7 @@ import config
 import chain_state
 import db
 from block import Block
+from bls_keys import SK_ALICE, pubkey_hex, sign_header
 
 
 class BlockTimestampTestBase(unittest.TestCase):
@@ -77,10 +78,11 @@ class TestBlockTimestampMonotonic(BlockTimestampTestBase):
             block_number=2,
             previous_hash=block1.block_hash,
             transactions=[],
-            proposer_pubkey=config.MINER_PUBKEY,
+            proposer_pubkey=pubkey_hex(SK_ALICE),
             timestamp=999
         )
         block2.header.state_hash = ""
+        block2.consensus_proof = sign_header(block2.header, SK_ALICE)
         # Process block #2: should be rejected
         res2 = chain_state.process_new_block(block2)
         self.assertFalse(res2)

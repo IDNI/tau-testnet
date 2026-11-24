@@ -14,9 +14,10 @@ import tau_manager
 from tau_manager import parse_tau_output
 import utils
 from errors import TauCommunicationError
-from consensus import fees
+from consensus import fees, sender_policy
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
+from consensus.tx_checks import check_transfer, validate_bls_pubkey
 from consensus.tx_signing import signing_message_bytes, verify_tx_signature
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
@@ -28,7 +29,9 @@ from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
+    RULE_CHANGE_TX_TYPES,
     TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
 
@@ -39,6 +42,7 @@ KNOWN_TX_TYPES = frozenset(
     {"user_tx", "consensus_rule_update", "consensus_rule_vote"}
     | set(RULE_OFFER_TX_TYPES)
     | set(APPROVAL_TX_TYPES)
+    | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
@@ -47,15 +51,30 @@ KNOWN_TX_TYPES = frozenset(
 # and a fee strategy, and the vote is bounded by the request's declared approver
 # set instead.
 FEE_BEARING_TX_TYPES = frozenset(
-    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER}
+    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
+     TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
 )
 from db import add_mempool_tx
 from network import bus as network_bus
 import api_response
+from rate_limit import KeyedBuckets
 
 
 logger = logging.getLogger(__name__)
+
+# The connection limiter does not stop one key that opens a new connection for
+# each estimate. The bucket holds seconds of slot time, so one key holds the
+# estimate slot for at most about a quarter of the time on any chain length.
+_ESTIMATE_SLOT_SECONDS_PER_SEC = 0.25
+_ESTIMATE_SLOT_SECONDS_BURST = 0.5
+_ESTIMATE_MAX_KEYS = 4096
+_estimate_buckets = KeyedBuckets(_ESTIMATE_SLOT_SECONDS_BURST,
+                                 _ESTIMATE_SLOT_SECONDS_PER_SEC, _ESTIMATE_MAX_KEYS)
+
+
+def reset_estimate_limits() -> None:
+    _estimate_buckets.clear()
 
 
 def _qt_ok(tx_hash: str, message: str = "Transaction queued.", **extra) -> dict:
@@ -74,6 +93,10 @@ def _qt_err(code: str, message: str, **details) -> dict:
 # the 64 the host used to check against — a value in between was accepted here
 # and then truncated mod 2^24 inside Tau. See tau_defs.TRANSFER_VALUE_BV_WIDTH.
 _MAX_TAU_BV_VALUE = tau_defs.MAX_TRANSFER_VALUE
+
+
+def _estimate_busy(message: str = "Another fee estimate is running on this node; please retry.") -> dict:
+    return _qt_err("ESTIMATE_BUSY", message)
 
 
 def _admission_i2(address: str) -> str:
@@ -111,53 +134,6 @@ def _compute_transaction_message_id(payload: dict) -> tuple[str, str]:
     tx_hash = block_module.compute_tx_hash(payload)
     return tx_hash, canonical
 
-_PY_ECC_AVAILABLE = False
-_PY_ECC_BLS = None
-try:
-    import py_ecc.bls as _bls_mod
-    from py_ecc.bls import G2Basic
-    _PY_ECC_BLS = _bls_mod
-    _PY_ECC_AVAILABLE = True
-    logger.info("py_ecc.bls module loaded. BLS public key validation enabled.")
-except ModuleNotFoundError:
-    logger.warning(
-        "py_ecc.bls module not found. BLS public key validation will be skipped; only format checks run."
-    )
-except Exception as e:
-    logger.warning("Error importing py_ecc.bls (%s). Skipping BLS public key validation.", e)
-
-
-def _validate_bls12_381_pubkey(key_hex: str, key_name: str) -> tuple[bool, str | None]:
-    """
-    Validates a 48-byte BLS12-381 public key.
-    Checks for 96-character hex format and, if py_ecc is available, cryptographic validity.
-    Args:
-        key_hex: The public key as a hexadecimal string.
-        key_name: Descriptive name for the key (e.g., "sender_pubkey") for error messages.
-    Returns:
-        A tuple (is_valid, error_message). error_message is None if is_valid is True.
-    """
-    if not (isinstance(key_hex, str) and len(key_hex) == 96):
-        return False, f"Invalid {key_name}: Must be a 96-character hex string representing 48 bytes, got length {len(key_hex)}."
-
-    try:
-        key_bytes = bytes.fromhex(key_hex)
-        if len(key_bytes) != 48:
-             return False, f"Invalid {key_name}: Hex string decodes to {len(key_bytes)} bytes, expected 48."
-    except ValueError:
-        return False, f"Invalid {key_name}: Not a valid hexadecimal string."
-
-    if not all(c in '0123456789abcdefABCDEF' for c in key_hex):
-        return False, f"Invalid {key_name}: Contains non-hexadecimal characters."
-
-    if _PY_ECC_AVAILABLE:
-        try:
-            G2Basic.KeyValidate(key_bytes)
-        except Exception as e:
-            return False, f"Invalid {key_name} (cryptographic validation failed): {e}. Key: {key_hex[:10]}..."
-
-    return True, None
-
 
 def _parse_bitvector_string(bv_str: str) -> int:
     """Helper to parse a bitvector string from Tau's output (#b, #x, or decimal)."""
@@ -170,29 +146,12 @@ def _parse_bitvector_string(bv_str: str) -> int:
         return int(bv_str)
 
 
-def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
-    """
-    Prepares a dictionary of integer inputs for a single transfer for Tau validation.
-    Amounts and balances can be large (up to 32 bytes).
-    """
-    if not (isinstance(transfer_entry, (list, tuple)) and len(transfer_entry) == 3):
-        raise ValueError(f"Invalid transfer entry format: {transfer_entry}")
-    from_addr_key, to_addr_key, amount_decimal_str = map(str, transfer_entry)
-
-    # Basic inline format check to catch obvious errors even if cryptographic
-    # validation is patched in tests
-    hex_chars = set('0123456789abcdefABCDEF')
-    if not (isinstance(from_addr_key, str) and len(from_addr_key) == 96 and all(c in hex_chars for c in from_addr_key)):
-        raise ValueError("Invalid 'from' address: Must be a 96-character hex BLS12-381 public key")
-    if not (isinstance(to_addr_key, str) and len(to_addr_key) == 96 and all(c in hex_chars for c in to_addr_key)):
-        raise ValueError("Invalid 'to' address: Must be a 96-character hex BLS12-381 public key")
-
-    is_valid_from, err_from = _validate_bls12_381_pubkey(from_addr_key, "'from' address")
-    if not is_valid_from:
-        raise ValueError(err_from)
-    is_valid_to, err_to = _validate_bls12_381_pubkey(to_addr_key, "'to' address")
-    if not is_valid_to:
-        raise ValueError(err_to)
+def _prepare_transfer_inputs(transfer_entry, sender_pubkey, sender_balance: int) -> dict:
+    """Tau inputs for one transfer. Raises ValueError for a transfer that block apply refuses."""
+    transfer_error = check_transfer(transfer_entry, sender_pubkey)
+    if transfer_error:
+        raise ValueError(transfer_error)
+    from_addr_key, to_addr_key, amount_value = transfer_entry
 
     # i3/i4 now carry the FULL 384-bit pubkey (lowercase hex). The bv-shrink layer
     # interns equality-only address streams to a small bv automatically -- no
@@ -200,13 +159,7 @@ def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
     from_addr_hex = from_addr_key.lower()
     to_addr_hex = to_addr_key.lower()
 
-    try:
-        # Amount is now a 32-byte (256-bit) integer, represented as a string.
-        amount = int(amount_decimal_str)
-        if not (0 <= amount < (1 << 256)):
-            raise ValueError("Amount must be a positive 256-bit integer.")
-    except ValueError:
-        raise ValueError(f"Invalid amount: '{amount_decimal_str}' is not a valid large integer.")
+    amount = int(amount_value)
     _validate_tau_bv_range(amount, "Amount")
 
     if not isinstance(sender_balance, int) or sender_balance < 0:
@@ -261,6 +214,28 @@ def _approval_slot_feed(tip_view) -> tuple:
     return tau_defs.approval_slot_indices()
 
 
+def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
+                            admission_ts: int) -> dict:
+    """Tau inputs of the step that prices an approval_request.
+
+    Apply prices a parked transfer with its real transfer inputs, so admission
+    feeds the same keys in the same order as the per-transfer step.
+    """
+    values = {
+        1: str(request["amount"]),
+        2: _admission_i2(sender_pubkey),
+        3: "{ #x" + sender_pubkey + " }:bv[384]",
+        4: "{ #x" + request["recipient_pubkey"] + " }:bv[384]",
+        12: "{ #x" + sender_pubkey + " }:bv[384]",
+    }
+    for k, v in (request.get("custom_inputs") or {}).items():
+        values[int(k)] = str(v)
+    for slot in _approval_slot_feed(tip_view):
+        values[slot] = "0"
+    values[5] = str(admission_ts)
+    return values
+
+
 def _get_signing_message_bytes(payload: dict) -> bytes:
     """Canonical signing preimage. Kept as a module-level name because wallets,
     the CLI and a dozen tests import it from here; the implementation is
@@ -289,26 +264,19 @@ def _process_transfers_operation(transfers, sender_pubkey):
     logger.info("Processing %s transfers...", len(transfers))
     for i, transfer_entry in enumerate(transfers):
         logger.debug("Processing transfer #%s: %s", i + 1, transfer_entry)
-        if not (isinstance(transfer_entry, (list, tuple)) and len(transfer_entry) == 3):
-            return False, None, f"Transfer #{i+1} has invalid format: {transfer_entry}"
-            
-        from_addr_key, to_addr_key, amount_decimal_str = map(str, transfer_entry)
-
-        if from_addr_key != sender_pubkey:
-            return False, None, f"Transfer #{i+1} 'from' address does not match sender_pubkey."
-
-        if from_addr_key not in remaining_balances:
-            remaining_balances[from_addr_key] = chain_state.get_balance(from_addr_key)
-        available_balance = remaining_balances[from_addr_key]
-        logger.debug("Available balance for %s: %s", from_addr_key, available_balance)
+        if sender_pubkey not in remaining_balances:
+            remaining_balances[sender_pubkey] = chain_state.get_balance(sender_pubkey)
+        available_balance = remaining_balances[sender_pubkey]
+        logger.debug("Available balance for %s: %s", sender_pubkey, available_balance)
         try:
-            transfer_input_dict = _prepare_transfer_inputs(transfer_entry, available_balance)
+            transfer_input_dict = _prepare_transfer_inputs(
+                transfer_entry, sender_pubkey, available_balance)
             logger.debug("Transfer input dictionary: %s", transfer_input_dict)
             # Store the full integer amount for post-validation balance updates
             amount_int = transfer_input_dict['amount']
-            validated_transfers.append((from_addr_key, to_addr_key, amount_int))
+            validated_transfers.append((sender_pubkey, transfer_entry[1], amount_int))
             tau_inputs.append(transfer_input_dict)
-            remaining_balances[from_addr_key] = max(available_balance - amount_int, 0)
+            remaining_balances[sender_pubkey] = max(available_balance - amount_int, 0)
         except ValueError as e:
             return False, None, f"Error processing transfer #{i+1}: {e}"
         except Exception as e:
@@ -455,18 +423,19 @@ def _admission_timestamp() -> int:
 
     Apply re-checks against the AUTHORITATIVE block timestamp, so this is a soft
     pre-check only: a tx may pass admission yet be rejected at inclusion near a
-    time threshold (and vice versa). The chain tip's timestamp (deterministic
-    across this node's view, no wall-clock skew); wall clock if unavailable.
+    time threshold (and vice versa).
     """
-    try:
-        head = db.get_canonical_head_block()
-        if isinstance(head, dict):
-            header = head.get("header")
-            if isinstance(header, dict) and header.get("timestamp") is not None:
-                return int(header.get("timestamp"))
-    except Exception:
-        pass
-    return int(time.time())
+    from consensus.facade import TipAdmissionView
+
+    return TipAdmissionView().next_block_timestamp
+
+
+class _TauFacts:
+    """What one request really ran, as opposed to what its mode allowed."""
+
+    def __init__(self):
+        self.tau_steps = 0
+        self.fee_estimated = False
 
 
 class _AdmissionTau:
@@ -484,31 +453,46 @@ class _AdmissionTau:
     pays for a replay.
     """
 
-    def __init__(self, *, candidate_rules=()):
+    def __init__(self, *, candidate_rules=(), estimate=False, facts=None):
         import tau_admission
         self.isolated = tau_admission.enabled()
         self.budget = tau_admission.default_budget()
         self._candidates = tuple(c for c in candidate_rules if c)
+        self._estimate = estimate
         self._context = None
+        self.facts = facts if facts is not None else _TauFacts()
 
     def _ctx(self):
         if self._context is None:
             import tau_admission
             self._context = tau_admission.open_context(
                 candidate_rules=self._candidates, budget=self.budget,
-                label="admission",
+                label="estimate" if self._estimate else "admission",
+                estimate=self._estimate,
             )
         return self._context
 
     def revise(self, rule_text: str) -> dict:
-        return self._ctx().revise(rule_text)
+        receipt = self._ctx().revise(rule_text)
+        self.facts.tau_steps += 1
+        return receipt
 
     def step_multi(self, inputs: dict, *, source: str) -> dict:
         if not self.isolated:
-            return tau_manager.communicate_with_tau_multi(
+            outputs = tau_manager.communicate_with_tau_multi(
                 input_stream_values=inputs, source=source, apply_rules_update=False,
             )
-        return self._ctx().step(inputs)
+            self.facts.tau_steps += 1
+            return outputs
+        import tau_admission
+        try:
+            outputs = self._ctx().step(inputs)
+        except tau_admission.StepRefused:
+            # The engine evaluated the step and refused it: Tau did run.
+            self.facts.tau_steps += 1
+            raise
+        self.facts.tau_steps += 1
+        return outputs
 
     def close(self) -> None:
         context, self._context = self._context, None
@@ -516,25 +500,39 @@ class _AdmissionTau:
             context.dispose()
 
 
-def _routed_o5_composite(tip_view, sender_pubkey: str, action: str, body: str):
-    """The o5 composite apply feeds for a routed policy rule -- not the rule.
+def _policy_call(call):
+    """Run a policy-evaluator call, mapping its operational failures to the
+    admission exceptions the request handler turns into ADMISSION_* codes."""
+    from tau_speculation import SpeculationError, WorkerLost, WorkerTimeout
 
-    A routed rule never enters the specification as written: apply registers
-    (or revokes) the sender's clause and feeds the regenerated composite, the
-    neutral one when the registry ends up empty. Validating the raw text instead
-    would admit or refuse something apply never runs.
-    """
-    from consensus.rule_offers import NEUTRAL_O5_CLAUSE_BODY, compose_stream_rule
+    try:
+        return call()
+    except WorkerTimeout as exc:
+        raise tau_admission.AdmissionTimeout(str(exc)) from exc
+    except (WorkerLost, SpeculationError) as exc:
+        raise tau_admission.AdmissionUnavailable(str(exc)) from exc
 
-    stream = tau_defs.USER_POLICY_STREAM_INDEX
-    clauses = dict(tip_view.clauses_for_stream(stream))
-    key = str(sender_pubkey or "").lower()
-    if action == "revoke":
-        clauses.pop(key, None)
-    else:
-        clauses[key] = body
-    composite = compose_stream_rule(stream, clauses) if clauses else None
-    return composite or "always ( %s )." % NEUTRAL_O5_CLAUSE_BODY
+
+def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
+    """(blocked, detail) for the sender's own o5 clause on one transfer's inputs."""
+    body = tip_view.clause_for(sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
+    return _policy_call(lambda: sender_policy.clause_blocks(
+        body, values, pool="admission", timeout=budget
+    ))
+
+
+def _clause_build_refusal(body, budget):
+    """The rejection envelope when `body` does not build as a clause, or None."""
+    ok, error = _policy_call(lambda: sender_policy.clause_builds(
+        body, pool="admission", timeout=budget
+    ))
+    if ok:
+        return None
+    from tau_native import strip_ansi
+    return _qt_err(
+        "TX_REJECTED",
+        f"Transaction rejected by Tau (rule validation). {strip_ansi(str(error)).strip()}",
+    )
 
 
 def _revision_refusal(receipt: dict):
@@ -580,8 +578,8 @@ def _check_tx_envelope(payload: dict) -> dict | None:
     if 'sender_pubkey' not in payload:
         return _qt_err("INVALID_PARAMS", "Missing 'sender_pubkey' in transaction.")
     sender_pubkey = payload['sender_pubkey']
-    is_valid_sender, err_sender = _validate_bls12_381_pubkey(sender_pubkey, "sender_pubkey")
-    if not is_valid_sender:
+    err_sender = validate_bls_pubkey(sender_pubkey, "sender_pubkey")
+    if err_sender:
         return _qt_err("TX_INVALID", f"Transaction invalid. {err_sender}")
 
     if 'sequence_number' not in payload:
@@ -647,13 +645,8 @@ def _check_tx_envelope(payload: dict) -> dict | None:
         return _qt_err("INVALID_PARAMS", "Missing or invalid 'signature' in transaction.")
     signature = payload['signature']
 
-    if not (_PY_ECC_AVAILABLE and _PY_ECC_BLS):
-        return _qt_err("BLS_UNAVAILABLE", "BLS signatures are required but py_ecc is missing.")
-
-    # One verifier, shared with block apply (consensus/tx_signing.py). G2Basic is
-    # read from this module's globals at call time so the many tests that
-    # patch("commands.sendtx.G2Basic") keep working.
-    sig_ok, sig_reason = verify_tx_signature(payload, g2=globals().get("G2Basic"))
+    # One verifier, shared with block apply (consensus/tx_signing.py).
+    sig_ok, sig_reason = verify_tx_signature(payload)
     if not sig_ok:
         return _qt_err("INVALID_SIGNATURE", f"Invalid signature: {sig_reason}")
     return None
@@ -780,25 +773,29 @@ def readmit_orphaned_transactions(txs: list) -> dict:
 
 
 def queue_transaction(json_blob: str, propagate: bool = True, *,
-                      dry_run: bool = False, skip_tau_eval: bool = False) -> dict:
+                      dry_run: bool = False, skip_tau_eval: bool = False,
+                      estimate: bool = False) -> dict:
     """Validate a transaction and (unless dry_run) queue it in the mempool.
 
-    `dry_run` returns the verdict just before the two mutations
-    (db.add_mempool_tx, broadcast_transaction), so checktx (#26) answers "would
-    this be admitted?" with byte-identical codes and details to what sendtx would
-    have produced. It is a flag on this function rather than an extracted pure
-    copy deliberately: there are 34 distinct error returns and three outer
-    exception handlers here, so verdict parity is worth guaranteeing by
-    construction instead of by test.
-
-    `skip_tau_eval` additionally skips Tau steps 2/3/3b. Those are NOT
-    side-effect-free — they intern addresses into SQLite, advance the live
-    interpreter's logical time by up to 100 steps per call (up to 64 transfers
-    per tx), can rebuild the interpreter from stdout, and on intern-width
-    overflow re-exec the process. An unauthenticated, fee-free RPC must not
-    reach them. The rule-compile step is unaffected: it already runs in a
-    SIGKILL-able subprocess and is genuinely pure.
+    The flags give the forms of checktx (docs/developer_cli.md). Flags on this one
+    function keep a dry-run verdict equal to the sendtx verdict by construction.
+    `skip_tau_eval` exists because in-process Tau steps intern addresses and advance time.
     """
+    facts = _TauFacts()
+    verdict = _queue_transaction(
+        json_blob, propagate, dry_run=dry_run, skip_tau_eval=skip_tau_eval,
+        estimate=estimate, facts=facts,
+    )
+    if dry_run:
+        verdict["tau_evaluated"] = facts.tau_steps > 0
+        verdict["fee_checked"] = facts.fee_estimated
+    return verdict
+
+
+def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
+                       skip_tau_eval: bool, estimate: bool, facts: _TauFacts) -> dict:
+    if estimate and (not dry_run or skip_tau_eval):
+        raise ValueError("estimate is a dry run that evaluates Tau")
     blob = json_blob.strip()
     if len(blob) >= 2 and ((blob[0] == '"' and blob[-1] == '"') or (blob[0] == "'" and blob[-1] == "'")):
         blob = blob[1:-1]
@@ -846,7 +843,17 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     from consensus.facade import TipAdmissionView
     tip_view = TipAdmissionView()
     
-    admission_eval = validate_mempool_admission(payload, tip_view)
+    try:
+        admission_eval = validate_mempool_admission(payload, tip_view)
+    except tau_admission.AdmissionTimeout as e:
+        logger.warning("Admission evaluation timed out: %s", e)
+        return _qt_err("ADMISSION_TIMEOUT", "Transaction evaluation timed out and was rejected.")
+    except tau_admission.AdmissionUnavailable as e:
+        logger.warning("Admission evaluation unavailable: %s", e)
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            "Transaction validation is temporarily unavailable; please resubmit.",
+        )
     if not admission_eval.is_valid:
         # Forward the admission layer's own code/details when it set them;
         # everything else still collapses to TX_REJECTED as before (issue #23).
@@ -966,94 +973,59 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     try:
         if not tau_admission.enabled():
             pass
-        elif tx_type == TX_TYPE_RULE_OFFER_ACCEPT:
-            admission_candidate = (admission_eval.data or {}).get("composite_rule")
         elif tx_type == "user_tx" and has_rules:
             _rule_value = operations.get("0")
-            if isinstance(_rule_value, str) and _rule_value.strip():
-                _action = (admission_eval.data or {}).get("o5_clause_action")
-                admission_candidate = (
-                    _routed_o5_composite(
-                        tip_view, sender_pubkey, _action,
-                        (admission_eval.data or {}).get("o5_clause_body") or "",
-                    )
-                    if _action else _rule_value.strip()
-                )
+            if (isinstance(_rule_value, str) and _rule_value.strip()
+                    and not (admission_eval.data or {}).get("o5_clause_action")):
+                admission_candidate = _rule_value.strip()
     except Exception as e:
         logger.exception("Could not derive the admission candidate: %s", e)
         return _qt_err("INTERNAL_ERROR", "An unexpected server error occurred.")
+    if estimate and not tau_admission.enabled():
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            "This node has no isolated admission context, so it cannot estimate a fee.",
+        )
+    if estimate and tx_type in FEE_BEARING_TX_TYPES:
+        # Refused before the one estimate slot is taken, so unfunded keys cannot hold it.
+        # The floor assumes a fee of at least 1. On a network with no fee rule, give --fee 0.
+        floor = sum(amt for _, _, amt in all_validated_transfers) + 1
+        sender_balance = chain_state.get_balance(sender_pubkey)
+        if sender_balance < floor:
+            return _qt_err(
+                "INSUFFICIENT_FUNDS",
+                f"Sender balance {sender_balance} cannot cover transfers and a fee.",
+                balance=sender_balance,
+                required=floor,
+            )
+    estimate_started = None
+    if estimate:
+        if not _estimate_buckets.admit(sender_pubkey):
+            return _estimate_busy("This sender used its share of fee estimates; please retry.")
+        estimate_started = _estimate_buckets.clock()
     admission_tau = _AdmissionTau(
-        candidate_rules=(admission_candidate,) if admission_candidate else ()
+        candidate_rules=(admission_candidate,) if admission_candidate else (),
+        estimate=estimate, facts=facts,
     )
+
+    # Advisory block timestamp for i5 at admission (see _admission_timestamp).
+    # Read once: every step of one request is judged at the same moment.
+    admission_ts = _admission_timestamp()
 
     try:
         if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RULE_OFFER_ACCEPT):
-            # Compile the COMPOSED rule, not the offered clause on its own.
-            # What actually enters the specification is the composite for the
-            # target stream with this acceptor's clause folded in, so that is
-            # the only text whose compilability tells us anything. Admission
-            # already built it (see consensus/admission._compose_with_clause).
-            composite_rule = (admission_eval.data or {}).get("composite_rule")
-            if (composite_rule and not tau_force_test and admission_tau.isolated
-                    and tx_type == TX_TYPE_RULE_OFFER_ACCEPT):
-                # Accepting folds the clause into the stream's composite, and
-                # apply feeds that composite to an evaluator carrying the
-                # committed type history. Validate it there -- a fresh process
-                # has none, and passes text the block then refuses.
-                refusal = _revision_refusal(admission_tau.revise(composite_rule))
+            refusal = _clause_build_refusal(
+                (admission_eval.data or {}).get("clause_body"), admission_tau.budget
+            )
+            if refusal is not None:
+                return refusal
+
+        elif tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
+            clause_body = (admission_eval.data or {}).get("clause_body")
+            if clause_body:
+                refusal = _clause_build_refusal(clause_body, admission_tau.budget)
                 if refusal is not None:
                     return refusal
-                logger.info(
-                    "Rule offer composite validated for o%s (admission context).",
-                    (admission_eval.data or {}).get("target_stream"),
-                )
-            elif composite_rule and not tau_force_test:
-                if tau_manager.tau_ready.is_set() and not getattr(
-                    tau_manager, "tau_test_mode", False
-                ):
-                    import tau_native
-                    try:
-                        # Same killable-subprocess gate as the op-"0" path
-                        # below, and for the same reason: the in-process
-                        # compile can hang inside native Tau with no status
-                        # stamp for the watchdog (issue #24). apply_block
-                        # re-compiles deterministically, so a rare skip here
-                        # cannot let an invalid rule take effect.
-                        compile_err = tau_native.compile_revisions_isolated_subprocess(
-                            chain_state.get_rules_state(),
-                            [composite_rule],
-                            timeout=config.COMM_TIMEOUT,
-                        )
-                    except tau_native.RuleCompileTimeout as compile_exc:
-                        logger.warning(
-                            "Rule offer compile timed out at admission: %s", compile_exc
-                        )
-                        return _qt_err(
-                            "ADMISSION_TIMEOUT",
-                            (
-                                f"Rule validation timed out after "
-                                f"{config.COMM_TIMEOUT}s and was rejected."
-                            ),
-                            timeout_seconds=config.COMM_TIMEOUT,
-                        )
-                    except tau_native.NativeTauUnavailable as compile_exc:
-                        logger.warning(
-                            "Isolated rule offer compile unavailable; rejecting: %s",
-                            compile_exc,
-                        )
-                        return _qt_err(
-                            "ADMISSION_UNAVAILABLE",
-                            "Rule validation is temporarily unavailable; please resubmit.",
-                        )
-                    if compile_err:
-                        return _qt_err(
-                            "TX_REJECTED",
-                            f"Transaction rejected by Tau (rule validation). {compile_err}",
-                        )
-                    logger.info(
-                        "Rule offer composite validated for o%s (isolated compile).",
-                        (admission_eval.data or {}).get("target_stream"),
-                    )
 
         elif tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER):
             # --- Tau Validation (Deterministic Two-Step) ---
@@ -1070,12 +1042,20 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                         ),
                     )
                 rule_text = rule_value.strip()
-                if rule_text:
+                routed_action = (admission_eval.data or {}).get("o5_clause_action")
+                if rule_text and routed_action:
+                    if routed_action == "declare":
+                        refusal = _clause_build_refusal(
+                            (admission_eval.data or {}).get("o5_clause_body"),
+                            admission_tau.budget,
+                        )
+                        if refusal is not None:
+                            return refusal
+                elif rule_text:
                     if tau_force_test:
                         logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
-                    elif admission_tau.isolated:
-                        # The revision apply will make -- the rule itself, or the
-                        # composite a routed o5 rule becomes -- offered to an
+                    elif admission_tau.isolated and not skip_tau_eval:
+                        # The rule apply will feed, offered to an
                         # evaluator rebuilt from the committed journal, so it
                         # meets every type commitment the chain has made,
                         # superseded rules' included. This replaces both the
@@ -1083,7 +1063,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                         # the preflight against the in-process mirror, whose
                         # representation is not the one the authority runs.
                         refusal = _revision_refusal(
-                            admission_tau.revise(admission_candidate or rule_text)
+                            admission_tau.revise(rule_text)
                         )
                         if refusal is not None:
                             return refusal
@@ -1173,14 +1153,12 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                             # so it passes text the live process cannot type. Now
                             # validate what apply will actually feed: the PREPARED
                             # runtime rule against the runtime baseline.
-                            preflight_err = _preflight_prepared_rule(rule_text)
-                            if preflight_err is not None:
-                                return preflight_err
-
-            # Advisory block timestamp for i5 at admission (see
-            # _admission_timestamp). Read once: every step of one request is
-            # judged at the same moment.
-            admission_ts = _admission_timestamp()
+                            # The preflight prepares the rule in this process,
+                            # so a request that asks for no Tau run skips it.
+                            if not skip_tau_eval:
+                                preflight_err = _preflight_prepared_rule(rule_text)
+                                if preflight_err is not None:
+                                    return preflight_err
 
             # Step 2: Custom Input Validation (transfer-less user_tx only).
             # For txs WITH transfers the custom streams are merged into the
@@ -1317,6 +1295,21 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                                     transfer_index=i + 1,
                                 )
 
+                        own_blocks, own_o5 = _sender_clause_blocks(
+                            tip_view, sender_pubkey,
+                            tau_input_stream_values, admission_tau.budget,
+                        )
+                        if own_blocks:
+                            return _qt_err(
+                                "TX_REJECTED",
+                                (
+                                    f"Transaction rejected: the sender's own policy clause "
+                                    f"blocked transfer #{i+1} ({transfer_details}). "
+                                    f"Policy output: {own_o5}"
+                                ),
+                                transfer_index=i + 1,
+                            )
+
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.
                         try:
@@ -1335,20 +1328,24 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                                 f"Consensus fee rule failure: {fee_exc}",
                             )
                     logger.info("All Tau transfer validations successful.")
+                    facts.fee_estimated = tx_type in FEE_BEARING_TX_TYPES
 
-            # Step 3b: Fee estimate for any fee-bearing tx with no transfers —
-            # one fee-query step with the canonical mocked transfer inputs
-            # (mirrors the engine's apply-time convention). Covers the
-            # rule-sharing types, which are user-initiated and expensive and so
-            # pay like a user_tx, unlike the fee-exempt governance types.
-            if (
-                tx_type in FEE_BEARING_TX_TYPES
-                and not all_validated_transfers
-                and not tau_force_test
-                and not skip_tau_eval
-                and (admission_tau.isolated or tau_manager.tau_ready.is_set())
-            ):
-                try:
+        # Step 3b: Fee estimate for any fee-bearing tx with no transfers, for
+        # every type, as apply charges it. An approval_request is priced on its
+        # parked transfer. The rest get the canonical mocked fee-query step.
+        if (
+            tx_type in FEE_BEARING_TX_TYPES
+            and not all_validated_transfers
+            and not tau_force_test
+            and not skip_tau_eval
+            and (admission_tau.isolated or tau_manager.tau_ready.is_set())
+        ):
+            try:
+                if tx_type == TX_TYPE_APPROVAL_REQUEST:
+                    fee_query_inputs = _parked_transfer_inputs(
+                        sender_pubkey, admission_eval.data, tip_view, admission_ts,
+                    )
+                else:
                     # i2 is the sender's head balance here too, matching the
                     # engine's transfer-less fee-query step (issue #20).
                     fee_query_inputs = {1: "0", 2: _admission_i2(sender_pubkey),
@@ -1359,31 +1356,48 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                     # fee-query overlay order in consensus/engine.py.
                     for k, v in custom_tau_inputs.items():
                         fee_query_inputs[k] = v
-                    fee_outputs = admission_tau.step_multi(
-                        fee_query_inputs, source=sender_pubkey,
-                    )
-                    estimated_fee_total += fees.parse_consensus_fee(
-                        fee_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
-                        context="queue fee-query",
-                    ) + fees.parse_custom_fee(
-                        fee_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
-                        context="queue fee-query",
-                    )
-                except FeeRuleError as fee_exc:
-                    return _qt_err(
-                        "FEE_RULE_ERROR",
-                        f"Consensus fee rule failure: {fee_exc}",
-                    )
-                except Exception:
-                    if admission_tau.isolated:
-                        # A context that could not answer is not an estimate of
-                        # zero: admitting on it would quote a fee the block then
-                        # charges differently. Reported by the handlers below.
-                        raise
-                    logger.warning(
-                        "Fee-query estimation failed; estimate stays %s (engine is authoritative).",
-                        estimated_fee_total, exc_info=True,
-                    )
+                fee_outputs = admission_tau.step_multi(
+                    fee_query_inputs, source=sender_pubkey,
+                )
+                estimated_fee_total += fees.parse_consensus_fee(
+                    fee_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
+                    context="queue fee-query",
+                ) + fees.parse_custom_fee(
+                    fee_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
+                    context="queue fee-query",
+                )
+                if tx_type == TX_TYPE_APPROVAL_REQUEST:
+                    from commands.getapprovalpreview import _o5_allows
+
+                    # Apply drops a request whose transfer the policy already
+                    # allows: the o5 rules and the sender's own clause, which
+                    # the registry holds apart from the step.
+                    if _o5_allows(fee_outputs) and not _sender_clause_blocks(
+                        tip_view, sender_pubkey, fee_query_inputs,
+                        admission_tau.budget,
+                    )[0]:
+                        return _qt_err(
+                            "APPROVAL_NOT_NEEDED",
+                            "The sender's policy allows this transfer with no votes. "
+                            "Send it as an ordinary transfer.",
+                            request_id=admission_eval.data["request_id"],
+                        )
+                facts.fee_estimated = True
+            except FeeRuleError as fee_exc:
+                return _qt_err(
+                    "FEE_RULE_ERROR",
+                    f"Consensus fee rule failure: {fee_exc}",
+                )
+            except Exception:
+                if admission_tau.isolated:
+                    # A context that could not answer is not an estimate of
+                    # zero: admitting on it would quote a fee the block then
+                    # charges differently. Reported by the handlers below.
+                    raise
+                logger.warning(
+                    "Fee-query estimation failed; estimate stays %s (engine is authoritative).",
+                    estimated_fee_total, exc_info=True,
+                )
 
         # Evaluation is over; the context goes before anything is queued.
         admission_tau.close()
@@ -1391,8 +1405,6 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
         # --- Post-Tau Processing ---
         # Note: We do NOT increment sequence number or update balances here anymore.
         # This is now an ingestion-only phase. State mutation happens during mining.
-        # if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
-        #     chain_state.increment_sequence_number(sender_pubkey)
 
         if all_validated_transfers:
             logger.info(
@@ -1412,7 +1424,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
         # diverge only for fee rules that violate the documented
         # determinism constraint (i2/i3/i4 are mocked at apply time).
         if tx_type in FEE_BEARING_TX_TYPES:
-            if estimated_fee_total > fee_limit_int:
+            if estimated_fee_total > fee_limit_int and not estimate:
                 return _qt_err(
                     "FEE_LIMIT_TOO_LOW",
                     f"required estimated fee {estimated_fee_total}, fee_limit {fee_limit_int}",
@@ -1445,10 +1457,10 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                 "message": "Transaction would be admitted.",
                 "admissible": True,
                 "tx_type": tx_type,
-                "tau_evaluated": not skip_tau_eval,
             }
-            if not skip_tau_eval and tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER):
+            if facts.fee_estimated:
                 verdict["estimated_fee"] = str(estimated_fee_total)
+                verdict["fee_limit"] = str(fee_limit_int)
             update_id = admission_eval.data.get("update_id")
             if update_id:
                 verdict["update_id"] = update_id
@@ -1500,6 +1512,11 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
         # The engine refused this request's own inputs, against committed state:
         # the same refusal wherever they run.
         return _qt_err("TX_REJECTED", f"Transaction rejected by Tau. {e}")
+    except tau_admission.EstimateBusy as e:
+        logger.info("Fee estimate refused: %s", e)
+        # The sender did not get the slot, so its retry costs it nothing.
+        estimate_started = None
+        return _estimate_busy()
     except tau_admission.AdmissionTimeout as e:
         logger.warning("Admission evaluation timed out: %s", e)
         return _qt_err(
@@ -1521,6 +1538,9 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
         return _qt_err("INTERNAL_ERROR", "An unexpected server error occurred.")
     finally:
         admission_tau.close()
+        if estimate_started is not None:
+            _estimate_buckets.charge(sender_pubkey,
+                                     _estimate_buckets.clock() - estimate_started)
 
 
 def execute(raw_command: str, container):
@@ -1534,14 +1554,6 @@ def execute(raw_command: str, container):
             "sendtx",
             "Invalid sendtx format. Use sendtx '{\"0\":...}'.",
             "INVALID_PARAMS",
-        )
-
-    if not _PY_ECC_AVAILABLE:
-        logger.error("BLS library not available. Transaction rejected.")
-        return api_response.error_response(
-            "sendtx",
-            "BLS signatures are required but py_ecc is missing.",
-            "BLS_UNAVAILABLE",
         )
 
     json_blob = raw_command[len(prefix):].strip()

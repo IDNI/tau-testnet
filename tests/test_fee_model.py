@@ -8,6 +8,8 @@ communicate_with_tau_multi mocks.
 """
 import json
 import os
+import shutil
+import tempfile
 import sqlite3
 import unittest
 from unittest.mock import MagicMock, patch
@@ -18,13 +20,15 @@ import config
 import chain_state
 import db
 import tau_defs
+from bls_keys import SK_ALICE, SK_CAROL, pubkey_hex, sign_payload, sign_tx
 from consensus import fees
 from consensus.engine import TauConsensusEngine
 from consensus.fees import FeeRuleError
+from consensus.governance import ConsensusLifecycleManager, ConsensusRuleUpdate
 from consensus.state import TauStateSnapshot
 
-SENDER = "a" * 96
-RECIPIENT = "c" * 96
+SENDER = pubkey_hex(SK_ALICE)
+RECIPIENT = pubkey_hex(SK_CAROL)
 PROPOSER = "b" * 96
 
 
@@ -102,11 +106,6 @@ class EngineFeeBase(unittest.TestCase):
         self.mock_comm = self.comm_patcher.start()
         self.addCleanup(self.comm_patcher.stop)
 
-        # Fee settlement reads plain balances; the faucet shim would mask
-        # insufficiency cases.
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
-        self.addCleanup(lambda: setattr(config, "TESTNET_AUTO_FAUCET", self.original_faucet))
 
         mock_store = MagicMock()
         mock_store.commit.side_effect = lambda snap: snap
@@ -115,7 +114,7 @@ class EngineFeeBase(unittest.TestCase):
 
     def transfer_tx(self, amount=100, fee_limit="50", seq=0, sender=SENDER,
                     recipient=RECIPIENT, tx_id="tx1", transfers=None):
-        return {
+        return sign_tx({
             "tx_id": tx_id,
             "tx_type": "user_tx",
             "sender_pubkey": sender,
@@ -123,7 +122,7 @@ class EngineFeeBase(unittest.TestCase):
             "fee_limit": fee_limit,
             "operations": {"1": transfers if transfers is not None
                            else [[sender, recipient, amount]]},
-        }
+        })
 
     def apply(self, txs, balances, seqs=None, proposer=PROPOSER, height=1,
               replay_mode=False):
@@ -243,18 +242,22 @@ class TestEngineFeeCharging(EngineFeeBase):
 
     def test_governance_tx_exempt(self):
         self.mock_multi.return_value = {1: "1", 9: "10"}
-        lifecycle = MagicMock()
-        lifecycle.can_admit_vote.return_value = True
-        lifecycle.submit_vote.return_value = True
+        lifecycle = ConsensusLifecycleManager(active_validators=[SENDER])
+        update = ConsensusRuleUpdate(
+            rule_revisions=["always ( o6[t]:bv[16] = { 0 }:bv[16] )."],
+            activate_at_height=100,
+            proposer_pubkey=SENDER,
+        )
+        self.assertTrue(lifecycle.submit_update(update))
         balances = {}  # zero-balance validator
-        tx = {
+        tx = sign_tx({
             "tx_id": "gov1",
             "tx_type": "consensus_rule_vote",
             "sender_pubkey": SENDER,
             "fee_limit": "0",
-            "update_id": "ab" * 32,
+            "update_id": update.update_id_hex,
             "approve": True,
-        }
+        })
         result = self.engine.apply(
             self.snapshot, [tx], 1700000000,
             target_balances=balances,
@@ -264,6 +267,10 @@ class TestEngineFeeCharging(EngineFeeBase):
             block_height=1,
         )
         self.assertEqual(len(result.accepted_transactions), 1)
+        self.assertIn(
+            "Vote accepted for update " + update.update_id_hex,
+            result.receipts["gov1"]["logs"],
+        )
         self.assertEqual(balances, {})  # no fee writes
 
     def test_sender_equals_proposer_nets_zero(self):
@@ -279,14 +286,14 @@ class TestEngineFeeCharging(EngineFeeBase):
     def test_transfer_less_tx_charged_via_fee_query(self):
         self.mock_multi.return_value = {9: "7"}
         balances = {SENDER: 1000}
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx_norule",
             "tx_type": "user_tx",
             "sender_pubkey": SENDER,
             "sequence_number": 0,
             "fee_limit": "10",
             "operations": {"100": "42"},
-        }
+        })
         result = self.apply([tx], balances)
         self.assertEqual(len(result.accepted_transactions), 1)
         self.assertEqual(balances[SENDER], 993)
@@ -304,22 +311,21 @@ class TestEngineFeeCharging(EngineFeeBase):
         rule-only tx from it is queued. Proposal-mode apply (the production
         path) reads plain target_balances, and refused the same tx as
         insufficient_funds_for_fee: "need 10, have 0"."""
-        config.TESTNET_AUTO_FAUCET = True
-        amount = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+        amount = 100000
         session = MagicMock(is_speculative=True)
         session.ready.return_value = True
         session.evaluate.return_value = {9: "10"}
         proposal = MagicMock(session=session, label="test")
-        proposal.lifecycle = MagicMock(approval_slots_active=False)
+        proposal.lifecycle = MagicMock(approval_slots_active=False, faucet_amount=amount)
         balances = {}
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx_fresh",
             "tx_type": "user_tx",
             "sender_pubkey": SENDER,
             "sequence_number": 0,
             "fee_limit": "10",
             "operations": {"100": "42"},
-        }
+        })
         result = self.engine.apply(
             self.snapshot, [tx], 1700000000,
             target_balances=balances, target_sequences={},
@@ -412,12 +418,6 @@ class TestAdmissionFees(unittest.TestCase):
         self.iso_patcher.start()
         self.addCleanup(self.iso_patcher.stop)
 
-        # Crypto is mandatory now: mock signature verification instead of disabling it.
-        self.crypto_patcher = patch("commands.sendtx.G2Basic")
-        mock_bls = self.crypto_patcher.start()
-        mock_bls.Verify.return_value = True
-        self.addCleanup(self.crypto_patcher.stop)
-
         # Sequence enforcement is on; pin the sender's expected sequence to match
         # the payload (sequence_number=1) and fund the sender (no auto-faucet).
         self.seq_patcher = patch(
@@ -434,7 +434,7 @@ class TestAdmissionFees(unittest.TestCase):
         _cs._balances[SENDER] = 1_000_000
 
         self.pub_patcher = patch(
-            "commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)
+            "commands.sendtx.validate_bls_pubkey", return_value=None
         )
         self.pub_patcher.start()
         self.addCleanup(self.pub_patcher.stop)
@@ -457,13 +457,12 @@ class TestAdmissionFees(unittest.TestCase):
             "expire_at_height": 5000,
             "operations": operations if operations is not None else {"100": "42"},
             "fee_limit": fee_limit,
-            "signature": "00" * 48,
         }
         if tx_type != "user_tx":
             p["tx_type"] = tx_type
             p.pop("operations")
         p.update(extra)
-        return p
+        return sign_payload(p, SK_ALICE)
 
     def test_missing_fee_limit_rejected(self):
         p = self.payload()
@@ -524,16 +523,21 @@ class TestAdmissionFees(unittest.TestCase):
             self.assertFalse(result["ok"], msg=f"stream {stream} not screened")
             self.assertIn(stream, result["message"])
 
-    # o5/o8 rule text must carry a sender scope (#24 ask 3). These tests target
-    # the other screens, so they wrap their body in the guard; the unscoped form
-    # is covered by TestUserRuleSenderScope in test_launch_hardening.py.
+    # o8 rule text must carry a sender scope. These tests target the other
+    # screens, so they wrap their body in the guard; the unscoped form is covered
+    # by TestUserRuleSenderScope in test_launch_hardening.py.
     _SCOPE = "i12[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]"
 
     def _scoped(self, body: str) -> str:
         return f"always (({self._SCOPE}) -> ({body}))."
 
     def test_benign_rule_text_passes_screen(self):
-        rule = self._scoped("o5[t]:bv[24] = { #x000001 }:bv[24]")
+        from consensus import sender_policy
+        from consensus.policy_mock import MockPolicyEvaluator
+
+        sender_policy.set_evaluator("admission", MockPolicyEvaluator(pool="admission"))
+        self.addCleanup(sender_policy.set_evaluator, "admission", None)
+        rule = "always (o5[t]:bv[24] = i1[t]:bv[24])."
         result, _ = self.queue(self.payload(operations={"0": rule}))
         self.assertTrue(result["ok"], msg=f"benign rule rejected: {result}")
 
@@ -575,7 +579,8 @@ class TestAdmissionFees(unittest.TestCase):
 
 class TestMempoolFeePriority(unittest.TestCase):
     def setUp(self):
-        self.test_db_path = "test_fee_mempool.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db_path = os.path.join(self._tmpdir, "test_fee_mempool.sqlite")
         self.original_db_path = config.STRING_DB_PATH
         config.set_database_path(self.test_db_path)
         if db._db_conn is not None:
@@ -587,8 +592,7 @@ class TestMempoolFeePriority(unittest.TestCase):
         if db._db_conn is not None:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db_path):
-            os.remove(self.test_db_path)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.set_database_path(self.original_db_path)
 
     def test_priority_by_estimated_fee(self):
@@ -701,9 +705,6 @@ class TestApplyBlockFeeE2E(unittest.TestCase):
         self.comm_patcher.start()
         self.addCleanup(self.comm_patcher.stop)
 
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
-        self.addCleanup(lambda: setattr(config, "TESTNET_AUTO_FAUCET", self.original_faucet))
 
     def _parent_snapshot(self, balances):
         from consensus.governance import ConsensusLifecycleManager
@@ -743,14 +744,14 @@ class TestApplyBlockFeeE2E(unittest.TestCase):
 
     def test_state_hash_stable_across_normal_and_replay(self):
         engine = TauConsensusEngine()
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx1",
             "tx_type": "user_tx",
             "sender_pubkey": SENDER,
             "sequence_number": 0,
             "fee_limit": "50",
             "operations": {"1": [[SENDER, RECIPIENT, 100]]},
-        }
+        })
         parent = self._parent_snapshot({SENDER: 1000})
         active_view = engine.derive_active_consensus(parent, 1)
         blk = self._block([tx])
@@ -775,14 +776,14 @@ class TestApplyBlockFeeE2E(unittest.TestCase):
         engine = TauConsensusEngine()
 
         def make_tx(seq, tx_id):
-            return {
+            return sign_tx({
                 "tx_id": tx_id,
                 "tx_type": "user_tx",
                 "sender_pubkey": SENDER,
                 "sequence_number": seq,
                 "fee_limit": "50",
                 "operations": {"1": [[SENDER, RECIPIENT, 100]]},
-            }
+            })
 
         parent = self._parent_snapshot({SENDER: 1000})
         active_view = engine.derive_active_consensus(parent, 1)
@@ -802,14 +803,14 @@ class TestApplyBlockFeeE2E(unittest.TestCase):
 
     def test_o9_garbage_propagates_out_of_apply_block(self):
         engine = TauConsensusEngine()
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx1",
             "tx_type": "user_tx",
             "sender_pubkey": SENDER,
             "sequence_number": 0,
             "fee_limit": "50",
             "operations": {"1": [[SENDER, RECIPIENT, 100]]},
-        }
+        })
         self.mock_multi.return_value = {1: "1", 9: "garbage"}
         parent = self._parent_snapshot({SENDER: 1000})
         active_view = engine.derive_active_consensus(parent, 1)
@@ -1107,9 +1108,9 @@ class TestCooldownStream(EngineFeeBase):
         target = {}
         self.engine.apply(
             self.snapshot,
-            [{"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
-              "sequence_number": 0, "fee_limit": "0",
-              "operations": {"0": "always (o13[t]:bv[16] = { #x0001 }:bv[16])."}}],
+            [sign_tx({"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
+                      "sequence_number": 0, "fee_limit": "0",
+                      "operations": {"0": "always (o13[t]:bv[16] = { #x0001 }:bv[16])."}})],
             1700000000,
             target_balances={SENDER: 1000}, target_sequences={},
             proposer_pubkey=PROPOSER, block_height=1,

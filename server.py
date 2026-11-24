@@ -1,5 +1,6 @@
 import logging
 import os
+import signal
 import socket
 import ssl
 import sys
@@ -9,6 +10,7 @@ import trio
 import argparse
 import trio_websocket
 import subprocess
+import urllib.parse
 
 
 from app.container import ServiceContainer
@@ -21,6 +23,7 @@ import api_response
 from commands import createblock, sendtx  # Import command handlers
 from errors import ConfigurationError, TauEngineCrash, TauTestnetError
 import tau_logging
+from rate_limit import TokenBucket as _TokenBucket
 
 
 logger = logging.getLogger("tau.server")
@@ -28,6 +31,9 @@ logger = logging.getLogger("tau.server")
 # --- NetworkService globals ---
 NETWORK_THREAD = None
 NETWORK_STOP_FLAG = threading.Event()
+# Set when the network thread dies after a successful start; main() turns it into a failing exit.
+_NETWORK_FATAL: "BaseException | None" = None
+_NETWORK_FATAL_EXIT_CODE = 70
 # --- Command Dispatch Table ---
 
 
@@ -88,34 +94,6 @@ _WS_MAX_RESPONSE_BYTES = 900_000
 # Bare `getblocks` over WS used to dump the whole chain. TCP/CLI keep that
 # behaviour; WS pollers get a recent window and truncated=true when there is more.
 _WS_DEFAULT_GETBLOCKS_LIMIT = 50
-
-
-class _TokenBucket:
-    """Token bucket over an injected clock.
-
-    The clock is a parameter because the two transports measure time
-    differently: the WebSocket loop runs under trio and must use
-    `trio.current_time()`, while the TCP handler is a plain thread using
-    `time.monotonic()`. Not thread-safe — one instance per connection.
-    """
-
-    __slots__ = ("capacity", "refill_per_second", "_tokens", "_last")
-
-    def __init__(self, capacity: float, refill_per_second: float, now: float):
-        self.capacity = capacity
-        self.refill_per_second = refill_per_second
-        self._tokens = capacity
-        self._last = now
-
-    def take(self, now: float) -> bool:
-        """Consume one token. False when the caller is over budget."""
-        elapsed = max(0.0, now - self._last)
-        self._last = now
-        self._tokens = min(self.capacity, self._tokens + elapsed * self.refill_per_second)
-        if self._tokens < 1.0:
-            return False
-        self._tokens -= 1.0
-        return True
 
 
 class _RpcLimiter:
@@ -291,6 +269,39 @@ class _NetworkStartup:
     def wait(self, timeout: float) -> bool:
         return self._done.wait(timeout)
 
+    @property
+    def succeeded(self) -> bool:
+        return self._done.is_set() and self.error is None
+
+
+def _deliver_sigint() -> None:
+    # A real signal interrupts the blocking accept() in the main thread; flag-polling cannot.
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+def _hard_exit(code: int) -> None:
+    os._exit(code)
+
+
+def _arm_hard_exit_timer(grace: float) -> None:
+    timer = threading.Timer(grace, lambda: _hard_exit(_NETWORK_FATAL_EXIT_CODE))
+    timer.daemon = True
+    timer.start()
+
+
+def _on_network_thread_crash(exc: BaseException) -> None:
+    """Turn a dead network thread into a process exit instead of a node that mines but never gossips."""
+    global _NETWORK_FATAL
+    _NETWORK_FATAL = exc
+    logger.critical("NetworkService thread crashed; shutting the node down: %r", exc)
+    # Covers the miner stop plus both thread joins in the _run_server cleanup.
+    _arm_hard_exit_timer(2 * config.SHUTDOWN_TIMEOUT + 5.0)
+    try:
+        _deliver_sigint()
+    except OSError:
+        logger.critical("Could not signal the main thread; exiting immediately.", exc_info=True)
+        _hard_exit(_NETWORK_FATAL_EXIT_CODE)
+
 
 def _start_network_background(container: ServiceContainer) -> _NetworkStartup:
     """
@@ -334,7 +345,13 @@ def _start_network_background(container: ServiceContainer) -> _NetworkStartup:
                     await trio.sleep(0.25)
             finally:
                 await service.stop()
-        trio.run(main)
+        try:
+            trio.run(main)
+        except BaseException as exc:
+            if startup.succeeded and not NETWORK_STOP_FLAG.is_set():
+                _on_network_thread_crash(exc)
+            # Propagates so threading.excepthook prints the traceback to stderr even if the logger is silenced.
+            raise
 
     t = threading.Thread(target=_runner, name="NetworkServiceThread", daemon=True)
     t.start()
@@ -383,6 +400,45 @@ def _await_network_listening(startup: _NetworkStartup, timeout: float = _NETWORK
 
 
 # --- WebSocket Server ---
+_WS_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_WS_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _ws_origin_key(value: str):
+    """(scheme, host, port) of an origin, or None when it does not parse."""
+    try:
+        parts = urllib.parse.urlsplit(value.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if not scheme or not parts.hostname:
+        return None
+    return scheme, parts.hostname, port or _WS_DEFAULT_PORTS.get(scheme)
+
+
+def _ws_origin_allowed(origin, allowed_entries) -> bool:
+    """An entry with a scheme must match the whole origin. A bare entry must match the host."""
+    if origin is None:
+        return True
+    if origin == "null":
+        return "null" in allowed_entries or "*" in allowed_entries
+    key = _ws_origin_key(origin)
+    if key is None:
+        return False
+    if key[1] in _WS_LOOPBACK_HOSTS:
+        return True
+    for entry in allowed_entries:
+        if entry == "*":
+            return True
+        if "://" in entry:
+            if _ws_origin_key(entry) == key:
+                return True
+        elif entry.lower() == key[1]:
+            return True
+    return False
+
+
 def _ws_peer_label(request, ws=None) -> str:
     remote = getattr(ws, "remote", None) if ws is not None else None
     if remote is None:
@@ -409,39 +465,26 @@ async def websocket_handler(request):
 
     client_label = _ws_peer_label(request)
     try:
-        ws = await request.accept()
-        client_label = _ws_peer_label(request, ws)
-
-        # Origin Check (Basic)
-        headers = dict(request.headers)
-        origin = headers.get("Origin") or headers.get("origin")
+        # trio-websocket gives the headers as (bytes, bytes) pairs with lower-case names.
+        origin = next(
+            (value.decode("latin-1") for name, value in request.headers if name.lower() == b"origin"),
+            None,
+        )
 
         # Parse allowed origins from environment (comma-separated, e.g. "https://domain1.com,https://domain2.com,*")
         allowed_env = os.environ.get("TAU_WS_ALLOWED_ORIGINS", "")
         allowed_domains = [d.strip() for d in allowed_env.split(",") if d.strip()]
 
-        # Allow missing origin (localhost tools) or localhost/file
-        allowed = False
-        if not origin or origin == "null":
-            allowed = True
-        elif "localhost" in origin or "127.0.0.1" in origin:
-            allowed = True
-        elif "*" in allowed_domains:
-            allowed = True
-        else:
-            for domain in allowed_domains:
-                if domain in origin:
-                    allowed = True
-                    break
-
-        if not allowed:
+        if not _ws_origin_allowed(origin, allowed_domains):
             logger.warning(
                 "Rejected WS connection from disallowed origin: %s. Use TAU_WS_ALLOWED_ORIGINS to allow it.",
                 origin,
             )
-            await ws.send_message("error disallowed_origin")
-            await ws.aclose()
+            await request.reject(403, body=b"error disallowed_origin")
             return
+
+        ws = await request.accept()
+        client_label = _ws_peer_label(request, ws)
 
         logger.info("WS Connection accepted: %s (Origin: %s)", client_label, origin)
 
@@ -893,8 +936,7 @@ def _run_server(container: ServiceContainer):
         tau_module.set_rules_handler(chain_state_module.save_effective_tau_spec)
 
     logger.info("Starting Tau Process Manager Thread...")
-    manager_thread = threading.Thread(target=tau_module.start_and_manage_tau_process, daemon=True)
-    manager_thread.start()
+    manager_thread = tau_module.start_manager_thread()
 
     logger.info("Waiting for Tau to signal readiness...")
     # This waits for 'tau_ready', which is set AFTER the callback completes
@@ -1070,6 +1112,10 @@ def main():
     try:
         _run_server(container)
     except KeyboardInterrupt:
+        if _NETWORK_FATAL is not None:
+            logger.critical("Exiting after NetworkService thread failure: %r", _NETWORK_FATAL)
+            tau_module.request_shutdown()
+            sys.exit(1)
         logger.info("KeyboardInterrupt received, shutting down server...")
         tau_module.request_shutdown()
     except ConfigurationError as exc:

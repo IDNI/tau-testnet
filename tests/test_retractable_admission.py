@@ -14,10 +14,10 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 import chain_state
-import config
 import db
 import tau_defs
 import consensus.retractable as retractable
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload
 from consensus.admission import (
     TipAdmissionView,
     validate_mempool_admission,
@@ -33,9 +33,9 @@ from consensus.retractable import (
     parse_retractable_transfer,
 )
 
-A = "1a" * 48
-B = "2b" * 48
-C = "3c" * 48
+A = pubkey_hex(0x1A)
+B = pubkey_hex(0x2B)
+C = pubkey_hex(0x3C)
 NEXT_HEIGHT = 50
 TIP_TS = 1_700_000_000
 FAR = 9_999_999_999
@@ -46,6 +46,7 @@ def tip_view():
     view = MagicMock(spec=TipAdmissionView)
     view.next_block_height = NEXT_HEIGHT
     view.tip_timestamp = TIP_TS
+    view.next_block_timestamp = TIP_TS
     view.get_retractable.return_value = None
     view.open_retractable_count_for_sender.return_value = 0
     view.open_retractable_count.return_value = 0
@@ -266,13 +267,13 @@ def test_a_malformed_retractable_id_is_refused(tip_view, rid):
 
 # --- queue_transaction flows -------------------------------------------------
 
-SENDER = "a" * 96
-RECIPIENT = "c" * 96
+SENDER = pubkey_hex(SK_ALICE)
+RECIPIENT = pubkey_hex(SK_BOB)
 
 
 @pytest.fixture
 def node(temp_database, monkeypatch):
-    """A real database, a mocked signature check, and a scriptable Tau."""
+    """A real database, real signatures, and a scriptable Tau."""
     from commands import sendtx
 
     script = {"fee": 0, "custom": 0, "block_o5": False, "calls": []}
@@ -291,31 +292,31 @@ def node(temp_database, monkeypatch):
         patch("tau_manager.tau_ready"),
         patch("tau_manager.communicate_with_tau", return_value="x1001"),
         patch("tau_manager.communicate_with_tau_multi", side_effect=multi),
-        patch("commands.sendtx.G2Basic"),
         patch("commands.sendtx.chain_state.get_sequence_number", return_value=1),
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)),
+        patch("commands.sendtx.validate_bls_pubkey", return_value=None),
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}),
     ]
     mocks = [p.start() for p in patches]
     mocks[0].is_set.return_value = True
-    mocks[3].Verify.return_value = True
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
     monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
     height = patch.object(TipAdmissionView, "next_block_height",
                           new_callable=PropertyMock, return_value=NEXT_HEIGHT)
     ts = patch.object(TipAdmissionView, "tip_timestamp",
                       new_callable=PropertyMock, return_value=TIP_TS)
+    next_ts = patch.object(TipAdmissionView, "next_block_timestamp",
+                           new_callable=PropertyMock, return_value=TIP_TS)
     height.start()
     ts.start()
+    next_ts.start()
     yield sendtx, script
-    for p in reversed(patches + [height, ts]):
+    for p in reversed(patches + [height, ts, next_ts]):
         p.stop()
 
 
 def _park_payload(**over):
     over.setdefault("fee_limit", "100")
-    return park(sender_pubkey=SENDER, recipient_pubkey=RECIPIENT,
-                signature="00" * 48, **over)
+    return sign_payload(
+        park(sender_pubkey=SENDER, recipient_pubkey=RECIPIENT, **over), SK_ALICE)
 
 
 def _queue(sendtx, payload, **kw):
@@ -412,7 +413,7 @@ def _seed_open_entry(tx):
 
 
 def _retract_payload(rid, **over):
-    return retract(rid, sender=SENDER, signature="00" * 48, **over)
+    return sign_payload(retract(rid, sender=SENDER, **over), SK_ALICE)
 
 
 def test_a_retract_is_queued_without_a_tau_step(node):
@@ -540,6 +541,7 @@ def _admission_verdict(tx, sender_height, ts, *, existing=None, sender_open=0, t
     view = MagicMock(spec=TipAdmissionView)
     view.next_block_height = sender_height
     view.tip_timestamp = ts
+    view.next_block_timestamp = ts
     view.get_retractable.return_value = existing
     view.open_retractable_count_for_sender.return_value = sender_open
     view.open_retractable_count.return_value = total_open
@@ -623,6 +625,7 @@ def test_admission_and_apply_agree_on_retract_timing():
         view = MagicMock(spec=TipAdmissionView)
         view.next_block_height = height
         view.tip_timestamp = TS
+        view.next_block_timestamp = TS
         view.get_retractable.return_value = row
         admitted = validate_retract_transfer_payload(tx, view).is_valid
         assert admitted == retracted, f"height {height}: admission={admitted} apply={retracted}"

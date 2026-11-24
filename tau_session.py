@@ -170,9 +170,9 @@ class InProcessSession(EvaluatorSession):
                    accumulate: bool = True):
         """`accumulate=False` feeds the interpreter without the rules handler.
 
-        That is how a regenerated o5 composite is applied: it changes the
+        That is how a governance activation is applied: it changes the
         evaluator but is not part of the application-rules accumulation, because
-        the clause registry is what the restore plan rebuilds it from. It still
+        the hashed consensus rules are what the restore plan rebuilds it from. It still
         goes in the journal -- an unrecorded revision that changed the evaluator
         is precisely what makes a replay diverge.
         """
@@ -432,10 +432,14 @@ class WorkerSession(EvaluatorSession):
         # representations: a granted sender's full-width literal never matches its
         # interned input value, and the simulation rejects transfers the
         # authoritative path accepts.
+        import tau_native
         import tau_shrink
-        exclude = self._excluded_streams(rule_text)
+        # The engine rejects comments and a missing trailing period; the
+        # recorded text stays the caller's, as in the in-process session.
+        engine_text = tau_native.TauInterface.preprocess_spec_text(rule_text)
+        exclude = self._excluded_streams(engine_text)
         with self._allocating():
-            prepared = tau_shrink.prepare_rule(rule_text, exclude_streams=exclude)
+            prepared = tau_shrink.prepare_rule(engine_text, exclude_streams=exclude)
             if self.plan is not None and not (
                     set(prepared.shrunk_streams) <= set(self.plan.interned)):
                 import tau_reconstruction
@@ -448,6 +452,7 @@ class WorkerSession(EvaluatorSession):
             runtime_text = prepared.runtime_text
             receipt = self._spec.revise(runtime_text, "apply",
                                         timeout=self.request_budget)
+        self._explain_untyped_shrunk(rule_text, receipt)
         self.last_outcome = receipt
         identity = tau_journal.candidate_identity(
             rule_text, mapping_epoch=self.allocation.epoch,
@@ -475,6 +480,20 @@ class WorkerSession(EvaluatorSession):
                                 result=receipt.get("outputs"),
                                 identity=identity, accumulate=accumulate)
         return "ok" if accepted else f"error: {outcome}"
+
+    def _explain_untyped_shrunk(self, rule_text, receipt):
+        """Put the author's fix first in a refusal caused by a bare reference to
+        a stream this plan interns. Only the message changes, never the verdict."""
+        if self.plan is None or getattr(receipt, "accepted", False):
+            return
+        report = receipt.get("report")
+        if not isinstance(report, dict):
+            return
+        import tau_shrink
+        hint = tau_shrink.untyped_shrunk_hint(rule_text, self.plan.interned,
+                                              report.get("codes"))
+        if hint is not None:
+            report["errors"] = [hint] + list(report.get("errors") or [])
 
     def _excluded_streams(self, rule_text):
         """Streams this rule must leave at full width under this session's plan.

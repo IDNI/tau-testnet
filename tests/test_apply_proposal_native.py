@@ -18,6 +18,7 @@ import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session as ts
 import tau_shrink as tshrink
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
 
@@ -34,9 +35,10 @@ def _native_available():
 pytestmark = pytest.mark.skipif(not _native_available(), reason="native tau module not built")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SENDER_A = "a1" * 48
-SENDER_B = "b2" * 48
-SENDER_C = "c3" * 48
+SENDER_A = pubkey_hex(SK_ALICE)
+SENDER_B = pubkey_hex(SK_BOB)
+SENDER_C = pubkey_hex(SK_CAROL)
+_SK = {SENDER_A: SK_ALICE, SENDER_B: SK_BOB, SENDER_C: SK_CAROL}
 PROPOSER = "d4" * 48
 
 
@@ -52,8 +54,9 @@ def _router():
 
 
 def _allow(sender):
+    """A sender-scoped fee rule: o5 rules are per-account clauses, not accumulated."""
     return (f"always ( i12[t]:bv[384] = {{ #x{sender} }}:bv[384] -> "
-            f"o5[t]:bv[24] = {{ #x000001 }}:bv[24] ).")
+            f"o8[t]:bv[24] = {{ #x000001 }}:bv[24] ).")
 
 
 def _tx(tx_id, sender, rule=None, fee_limit="1000", transfer=None):
@@ -63,7 +66,7 @@ def _tx(tx_id, sender, rule=None, fee_limit="1000", transfer=None):
         tx["operations"]["0"] = rule
     if transfer:
         tx["operations"]["1"] = [transfer]
-    return tx
+    return sign_tx(tx, _SK[sender])
 
 
 def _proposal():
@@ -103,7 +106,7 @@ def _run(transactions, balances):
                 transactions, 1700000000,
                 target_balances=dict(balances),
                 target_sequences={},
-                target_lifecycle=MagicMock(approval_slots_active=False),
+                target_lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
                 proposer_pubkey=PROPOSER,
                 block_height=1,
                 proposal=ctx,
@@ -192,7 +195,7 @@ def test_proposal_mode_refuses_to_run_without_owned_state(temp_database):
                 [_tx("A", SENDER_A)], 1700000000,
                 target_balances=None,          # not owned
                 target_sequences={},
-                target_lifecycle=MagicMock(approval_slots_active=False),
+                target_lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
                 proposer_pubkey=PROPOSER, block_height=1,
                 proposal=ctx, session=ctx.session,
             )
@@ -211,7 +214,7 @@ def test_proposal_mode_does_not_commit_the_snapshot(temp_database):
             TauStateSnapshot(b"hash", b"rules", {}),
             [_tx("A", SENDER_A)], 1700000000,
             target_balances={SENDER_A: 1000}, target_sequences={},
-            target_lifecycle=MagicMock(approval_slots_active=False),
+            target_lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
             proposer_pubkey=PROPOSER, block_height=1,
             proposal=ctx, session=ctx.session,
         )

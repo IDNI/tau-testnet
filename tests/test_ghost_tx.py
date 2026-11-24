@@ -1,5 +1,7 @@
 import unittest
 import os
+import shutil
+import tempfile
 import json
 import time
 import sys
@@ -9,6 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 import db
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_tx
 
 # Mock blake3 if missing (for test environment)
 # try:
@@ -27,19 +30,17 @@ import blake3
 class TestGhostTx(unittest.TestCase):
     def setUp(self):
         # Use a temporary DB
-        self.test_db = "test_ghost_tx.db"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_ghost_tx.db")
         config.STRING_DB_PATH = self.test_db
         db._db_conn = None # Force re-init
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
         db.init_db()
 
     def tearDown(self):
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def test_mempool_reservation_isolation(self):
         print("\n[TEST] Verifying Mempool Reservation Isolation (Ghost TX Fix)...")
@@ -94,15 +95,13 @@ from commands import createblock
 
 class TestGhostTxIntegration(unittest.TestCase):
     def setUp(self):
-        self.test_db = "test_ghost_integration.db"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_ghost_integration.db")
         config.DB_PATH = self.test_db
         config.STRING_DB_PATH = self.test_db # Ensure db.py uses this
-        config.TESTNET_AUTO_FAUCET = True # Allow funding
         
         # Reset DB connection
         db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
         db.init_db()
         
         # Set dummy miner key for block creation
@@ -126,13 +125,11 @@ class TestGhostTxIntegration(unittest.TestCase):
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.MINER_PRIVKEY = self.original_privkey
 
     @patch('commands.createblock.tau_manager')
-    @patch('commands.createblock._validate_signature')
-    def test_rule_change_and_rejection(self, mock_sig, mock_tau):
+    def test_rule_change_and_rejection(self, mock_tau):
         # Mock Tau Manager
         mock_tau.tau_ready.is_set.return_value = True
         # Side effect to simulate Tau returning a spec update or createblock capturing it
@@ -164,20 +161,18 @@ class TestGhostTxIntegration(unittest.TestCase):
              patch('consensus.engine.tau_manager.communicate_with_tau', side_effect=tau_side_effect), \
              patch('consensus.engine.tau_manager.communicate_with_tau_multi', return_value={}), \
              patch('chain_state.tau_manager.tau_ready.wait', return_value=True):
-             # Mock Sig Validation (Always valid for this test)
-             mock_sig.return_value = True
              
              print("\n[TEST] Verifying Rule Changes & Rejection Logic (Integration)...")
             
              # 1. Test Rule Application
              # Insert TX with Rule
-             payload_rule = json.dumps({
-                 "sender_pubkey": "UserRule",
+             payload_rule = json.dumps(sign_tx({
+                 "sender_pubkey": pubkey_hex(SK_ALICE),
                  "sequence_number": 0,
                  "expiration_time": int(time.time() + 3600),
                  "expire_at_height": 5000,
                  "operations": {"0": "rule X"}
-             })
+             }, SK_ALICE))
              db.add_mempool_tx(payload_rule, "hash_rule", 1000)
              
              # Run Mining
@@ -195,13 +190,14 @@ class TestGhostTxIntegration(unittest.TestCase):
         
         # 2. Test Rejection (Bad Sequence)
         # Insert TX with bad sequence (100 vs expected 0 for new user)
-        payload_bad = json.dumps({
-            "sender_pubkey": "UserBad",
+        bad_sender = pubkey_hex(SK_BOB)
+        payload_bad = json.dumps(sign_tx({
+            "sender_pubkey": bad_sender,
             "sequence_number": 100,
             "expiration_time": int(time.time() + 3600),
             "expire_at_height": 5000,
-            "operations": {"1": [["UserBad", "UserX", "10"]]}
-        })
+            "operations": {"1": [[bad_sender, "UserX", "10"]]}
+        }, SK_BOB))
         db.add_mempool_tx(payload_bad, "hash_bad", 2000)
 
         # Run Mining. This must stay inside the patch context: a tx rejected at

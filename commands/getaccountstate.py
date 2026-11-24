@@ -49,7 +49,8 @@ def execute(raw_command: str, container):
     address = parts[1]
 
     try:
-        chain_balance = int(container.chain_state.get_balance(address))
+        chain_balance, faucet_pending = container.chain_state.get_balance_view(address)
+        chain_balance = int(chain_balance)
         pending = container.db.get_mempool_txs_for_address(address)
     except Exception as exc:
         logger.exception("Failed to build account state for %s", address)
@@ -109,6 +110,7 @@ def execute(raw_command: str, container):
     return api_response.success_response("getaccountstate", {
         "address": address,
         "chain_balance": str(chain_balance),
+        "faucet_pending": bool(faucet_pending),
         "pending_outgoing": str(pending_outgoing),
         "pending_incoming": str(pending_incoming),
         "pending_fees": str(pending_fees),

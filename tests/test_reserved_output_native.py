@@ -16,8 +16,8 @@ live apply path has to refuse it too:
    the accumulated application rules, and the transfer is still charged the
    consensus fee.
 
-3. REPLAY. Stored blocks are canonical, so the same block under
-   `replay_mode=True` keeps the old behaviour: the rule is applied.
+3. REPLAY. The same block under `replay_mode=True` is refused the same way,
+   so a node rebuilding from stored blocks agrees with live apply.
 
 Each case runs in a child process: the engine types streams process-wide, and
 the native library segfaults on interpreter teardown, so the child prints a
@@ -37,10 +37,18 @@ SENTINEL = "RESERVED_OUTPUT_RESULT "
 
 HOSTILE_O9 = "always ( o9[t]:bv[24] = { #x000000 }:bv[24] )."
 HOSTILE_O1 = "always ( o1[t]:bv[24] = { #x000000 }:bv[24] )."
-HOSTILE_O1_GUARDED = (
-    "always ( ( i12[t]:bv[384] = { #x" + "cc" * 48 + " }:bv[384] ) -> "
-    "( o1[t]:bv[24] = { #x000000 }:bv[24] ) )."
-)
+SENDER_PUBKEY = "aa" * 48
+
+
+def _o1_guarded_on(pubkey):
+    return (
+        "always ( ( i12[t]:bv[384] = { #x" + pubkey + " }:bv[384] ) -> "
+        "( o1[t]:bv[24] = { #x000000 }:bv[24] ) )."
+    )
+
+
+HOSTILE_O1_GUARDED = _o1_guarded_on(SENDER_PUBKEY)
+HOSTILE_O1_GUARDED_ELSEWHERE = _o1_guarded_on("cc" * 48)
 
 AMOUNT = 100
 FEE = 10
@@ -57,7 +65,8 @@ def _native_python():
 
 def _child_env():
     env = dict(os.environ)
-    env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [REPO_ROOT, os.path.join(REPO_ROOT, "tests"), env.get("PYTHONPATH", "")])
     env["REPO_ROOT"] = REPO_ROOT
     return env
 
@@ -83,11 +92,9 @@ _PREAMBLE = r'''
 import json, os, sys, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-# Raw engine for the characterization; the apply child runs as a node does.
-os.environ["TAU_SHRINK_ENABLED"] = os.environ.get("CHILD_SHRINK", "false")
 
 SENTINEL = %(sentinel)r
-A = "aa" * 48
+A = %(sender)r
 B = "bb" * 48
 PROPOSER = "dd" * 48
 
@@ -135,7 +142,7 @@ def boot_interface(through_manager=False):
     for rule in chain_state.load_builtin_rules_from_disk():
         revise(rule)
     return iface, revise
-''' % {"sentinel": SENTINEL}
+''' % {"sentinel": SENTINEL, "sender": SENDER_PUBKEY}
 
 
 _CHARACTERIZE_BODY = r'''
@@ -164,7 +171,7 @@ emit({"before": {"o1": stream(before, 1), "o9": stream(before, 9)},
 
 _APPLY_BODY = r'''
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import config
 config.set_database_path(os.path.join(tempfile.mkdtemp(), "reserved.sqlite"))
@@ -174,10 +181,13 @@ import tau_manager
 import tau_shrink
 import chain_state
 from block import Block
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_tx
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
 from consensus.state import TauStateSnapshot
 
+A = pubkey_hex(SK_ALICE)
+B = pubkey_hex(SK_BOB)
 tau_shrink.set_shrink_width_from_db()
 iface, revise = boot_interface(through_manager=True)
 # As a node wires it: an accepted rule lands in the hashed accumulation.
@@ -187,12 +197,12 @@ HOSTILE = os.environ["HOSTILE_RULE"]
 REPLAY = os.environ["REPLAY_MODE"] == "1"
 AMOUNT = int(os.environ["AMOUNT"])
 
-tx_rule = {"tx_id": "rule-tx", "tx_type": "user_tx", "sender_pubkey": A,
-           "sequence_number": 0, "fee_limit": "1000",
-           "operations": {"0": HOSTILE}}
-tx_transfer = {"tx_id": "transfer-tx", "tx_type": "user_tx", "sender_pubkey": B,
-               "sequence_number": 0, "fee_limit": "1000",
-               "operations": {"1": [[B, A, str(AMOUNT)]]}}
+tx_rule = sign_tx({"tx_id": "rule-tx", "tx_type": "user_tx", "sender_pubkey": A,
+                   "sequence_number": 0, "fee_limit": "1000",
+                   "operations": {"0": HOSTILE}}, SK_ALICE)
+tx_transfer = sign_tx({"tx_id": "transfer-tx", "tx_type": "user_tx", "sender_pubkey": B,
+                       "sequence_number": 0, "fee_limit": "1000",
+                       "operations": {"1": [[B, A, str(AMOUNT)]]}}, SK_BOB)
 
 lifecycle = ConsensusLifecycleManager(active_validators=[PROPOSER])
 parent_app_rules = GENESIS["application_rules"]
@@ -211,8 +221,7 @@ view = ActiveConsensusView(target_height=1,
 
 engine = TauConsensusEngine(state_store=MagicMock())
 engine._state_store.commit.side_effect = lambda snap: snap
-with patch("consensus.engine.verify_tx_signature", return_value=(True, "")):
-    result = engine.apply_block(view, block, parent, replay_mode=REPLAY)
+result = engine.apply_block(view, block, parent, replay_mode=REPLAY)
 
 outcomes = {o.tx_id: o for o in result.outcomes}
 balances = result.next_snapshot.metadata["balances"]
@@ -253,29 +262,32 @@ def _run_child(tmp_path, name, body, env_extra):
 
 @requires_native
 @pytest.mark.parametrize(
-    "stream,rule,expect_before",
+    "stream,rule,expect_before,expect_after",
     [
-        ("o9", HOSTILE_O9, FEE),
-        ("o1", HOSTILE_O1, AMOUNT),
-        ("o1", HOSTILE_O1_GUARDED, AMOUNT),
+        ("o9", HOSTILE_O9, FEE, 0),
+        ("o1", HOSTILE_O1, AMOUNT, 0),
+        ("o1", HOSTILE_O1_GUARDED, AMOUNT, 0),
+        ("o1", HOSTILE_O1_GUARDED_ELSEWHERE, AMOUNT, AMOUNT),
     ],
-    ids=["o9-unguarded", "o1-unguarded", "o1-sender-guarded"],
+    ids=["o9-unguarded", "o1-unguarded", "o1-sender-guarded", "o1-other-pubkey-guarded"],
 )
-def test_hostile_unit_displaces_the_builtin_value(tmp_path, stream, rule, expect_before):
+def test_hostile_unit_displaces_the_builtin_value(
+    tmp_path, stream, rule, expect_before, expect_after
+):
     """Pins the engine behaviour the reserved-output screen guards against: a
-    later unit on a consensus-owned stream wins for every sender, even when the
-    unit is guarded on someone else's pubkey."""
+    later unit on a consensus-owned stream displaces the built-in value for
+    every sender it applies to; a unit guarded on another pubkey leaves it."""
     out = _run_child(tmp_path, "characterize", _CHARACTERIZE_BODY,
                      {"HOSTILE_RULE": rule})
     assert int(out["before"][stream]) == expect_before
-    assert int(out["after"][stream]) == 0
+    assert int(out["after"][stream]) == expect_after
 
 
 def _apply(tmp_path, rule, replay):
     return _run_child(
         tmp_path, "apply", _APPLY_BODY,
         {"HOSTILE_RULE": rule, "REPLAY_MODE": "1" if replay else "0",
-         "CHILD_SHRINK": "true", "AMOUNT": str(AMOUNT)},
+         "AMOUNT": str(AMOUNT)},
     )
 
 
@@ -301,13 +313,11 @@ def test_live_apply_rejects_the_hostile_rule_and_keeps_the_builtin_values(tmp_pa
 
 
 @requires_native
-def test_replay_applies_the_rule_a_stored_block_already_carried(tmp_path):
-    """Replay never re-litigates a stored block: the screen is live-only, so the
-    rule is applied and, being the later unit, zeroes the fee."""
+def test_replay_rejects_the_rule_like_live_apply(tmp_path):
     out = _apply(tmp_path, HOSTILE_O9, replay=True)
 
-    assert out["rule_reason"] != "reserved_output_stream", out
-    assert "rule-tx" in out["accepted"], out
-    assert out["rules_changed"], out
-    assert out["rule_in_saved_state"], out
-    assert out["proposer_balance"] == 0, out
+    assert out["invalid"] == ["rule-tx"], out
+    assert out["rule_reason"] == "reserved_output_stream", out
+    assert not out["rules_changed"], out
+    assert not out["rule_in_saved_state"], out
+    assert out["proposer_balance"] == FEE, out

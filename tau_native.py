@@ -92,11 +92,18 @@ def load_tau_module():
     tau_lang_dir = os.path.join(workspace_dir, "tau-lang")
     
     # Candidate build paths relative to tau-lang root
+    # Lowercase entries are the CMake preset layout (./dev preset
+    # release-binding-python -> build/release); the rest are the legacy
+    # ./dev build layout. Both are in use, so both are searched.
     candidate_paths = [
         "build/release/bindings/python/nanobind",
         "build/bindings/python/nanobind",
+        "build/release/bindings/python/nanobind",
         "build/Release/bindings/python/nanobind",
         "build-Release/bindings/python/nanobind",
+        "build/devel/bindings/python/nanobind",
+        "build/relwithdebinfo/bindings/python/nanobind",
+        "build/debug/bindings/python/nanobind",
         "build/Debug/bindings/python/nanobind",
         "build-Debug/bindings/python/nanobind",
     ]
@@ -319,7 +326,7 @@ def _classify_report(report, msg: str, node_generated: bool):
             )
             return TauSpecIntegrationError(msg)
         logger.warning("Tau refused the supplied rule/value: %s", msg)
-        return TauSpecRejected(msg)
+        return TauSpecRejected(msg, codes=(int(c) for c in report.codes))
     filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
     if filepath:
         logger.error(f"Dumped Tau crash log to {filepath}")

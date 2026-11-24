@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import threading
@@ -227,12 +228,6 @@ def _preprocess_rule_for_tau(rule_text: str | None) -> str | None:
     return text
 
 
-def _shrink_exclude() -> frozenset:
-    if not getattr(config, "TAU_SHRINK_ENABLED", False):
-        return frozenset()
-    return frozenset(getattr(config, "TAU_SHRINK_STREAM_EXCLUDE", frozenset()))
-
-
 def _assert_representation_compatible(prepared) -> None:
     """Refuse any representation this process cannot type.
 
@@ -242,14 +237,23 @@ def _assert_representation_compatible(prepared) -> None:
     revision and never re-types it. Checking only the stream that caused the
     fallback would let the others through.
     """
+    runtime_shrunk = frozenset(_runtime_shrunk_streams)
     wide = frozenset(getattr(prepared, "wide_streams_unshrunk", ()) or ())
-    conflict = wide & frozenset(_runtime_shrunk_streams)
+    # The engine types a bare reference with no width source from the shrunk
+    # width, while the inputs of its equality partners stay full width.
+    untyped = tau_shrink.untyped_input_streams(
+        getattr(prepared, "canonical_text", "") or ""
+    ) & runtime_shrunk
+    conflict = (wide & runtime_shrunk) | untyped
     conflict |= _evaluator_state.conflicts(
         prepared, width=tau_shrink.current_shrink_width()
     )
     if conflict:
+        # The author can fix an untyped reference, so give that fix first.
+        hint = f"{tau_shrink.untyped_shrunk_stream_error(untyped)} " if untyped else ""
         raise tau_shrink.ShrinkTypeConflict(
-            "rule references "
+            hint
+            + "rule references "
             + ", ".join(f"i{i}" for i in sorted(conflict))
             + " at a width this process has already committed differently; no "
             "representation of it can be typed here. A fresh process rebuilds "
@@ -259,7 +263,7 @@ def _assert_representation_compatible(prepared) -> None:
 
 def _prepare_rule_for_tau(rule_text: str | None) -> "tau_shrink.PreparedTauSpec | None":
     """Canonical/runtime split for a rule. canonical_text is persisted; the
-    interpreter is fed runtime_text. Disabled => canonical == runtime.
+    interpreter is fed runtime_text.
 
     W3: this layer -- not tau_shrink, which stays stateless about the live
     interpreter -- owns the compatibility decision. Falling back to full width is
@@ -271,9 +275,7 @@ def _prepare_rule_for_tau(rule_text: str | None) -> "tau_shrink.PreparedTauSpec 
     canonical = _preprocess_rule_for_tau(rule_text)
     if canonical is None:
         return None
-    if not getattr(config, "TAU_SHRINK_ENABLED", False):
-        return tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())
-    prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
+    prepared = tau_shrink.prepare_rule(canonical)
     _assert_representation_compatible(prepared)
     return prepared
 
@@ -469,11 +471,30 @@ def _handle_width_overflow(exc: "tau_shrink.ShrinkWidthOverflow"):
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+@contextlib.contextmanager
+def reexec_on_width_overflow():
+    """Send a ShrinkWidthOverflow to the re-exec, never to a fallback or a plain stream."""
+    try:
+        yield
+    except tau_shrink.ShrinkWidthOverflow as exc:
+        _handle_width_overflow(exc)
+
+
+def _set_unless_stopped(event: threading.Event) -> None:
+    # request_shutdown() sets the flag before it clears the event, so one of the two clears it.
+    event.set()
+    if server_should_stop.is_set():
+        event.clear()
+
+
 def start_and_manage_tau_process():
     global tau_ready, tau_process_ready, server_should_stop, tau_process_lock, tau_test_mode, restart_in_progress
     global tau_direct_interface, last_known_tau_spec
 
-    server_should_stop.clear()
+    if server_should_stop.is_set():
+        logger.info("Server shutdown requested before the Tau manager started.")
+        return
+
     tau_ready.clear()
     tau_process_ready.clear()
     restart_in_progress.clear()
@@ -483,8 +504,8 @@ def start_and_manage_tau_process():
     if is_force_test_enabled():
         logger.warning("TAU_FORCE_TEST enabled. Running in TEST MODE without Tau Engine.")
         tau_test_mode = True
-        tau_process_ready.set()
-        tau_ready.set()
+        _set_unless_stopped(tau_process_ready)
+        _set_unless_stopped(tau_ready)
         while not server_should_stop.is_set():
             time.sleep(0.05)
         logger.info("Server shutdown requested, Tau manager exiting.")
@@ -493,12 +514,16 @@ def start_and_manage_tau_process():
     logger.info("Direct Bindings Mode Enabled. Initializing Tau Native Interface...")
     try:
         tau_direct_interface = tau_native.TauInterface(config.TAU_PROGRAM_FILE)
+        # request_shutdown() sets the flag before it drops the interface, so one of the two drops it.
+        if server_should_stop.is_set():
+            tau_direct_interface = None
+            logger.info("Server shutdown requested, Tau manager exiting (during init).")
+            return
         logger.info("Tau Native Interface initialized successfully.")
         # Pick the smallest shrink width for this process from the current intern
         # table. Sticky per-stream typing means it is fixed until the next re-exec.
-        if getattr(config, "TAU_SHRINK_ENABLED", False):
-            tau_shrink.set_shrink_width_from_db()
-        tau_process_ready.set()
+        tau_shrink.set_shrink_width_from_db()
+        _set_unless_stopped(tau_process_ready)
 
         if _state_restore_callback:
             try:
@@ -515,7 +540,7 @@ def start_and_manage_tau_process():
                     time.sleep(0.05)
                 return
 
-        tau_ready.set()
+        _set_unless_stopped(tau_ready)
         
         while not server_should_stop.is_set():
             time.sleep(1)
@@ -531,6 +556,19 @@ def start_and_manage_tau_process():
             time.sleep(0.05)
         logger.info("Server shutdown requested, Tau manager exiting (native init failed).")
         return
+
+
+def start_manager_thread() -> threading.Thread:
+    """Start the manager thread. Clear the stop flag here, before the start,
+    so that a request_shutdown() right after this call is not lost."""
+    server_should_stop.clear()
+    thread = threading.Thread(
+        target=start_and_manage_tau_process,
+        name="tau-manager (start_and_manage_tau_process)",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def communicate_with_tau(
@@ -904,28 +942,16 @@ def restore_full_tau_spec(spec_text: str, *, runtime_shrunk_streams: "frozenset 
     # half-replaced interpreter. Reentrant: callers may already hold the lock.
     with tau_comm_lock:
         # Feed the interpreter the shrunk runtime form (matching the i0 path) so
-        # runtime stream values stay consistent post-recovery. When shrink is off
-        # (default) runtime == canonical and this is identical to the pre-shrink path.
+        # runtime stream values stay consistent post-recovery.
         canonical = tau_direct_interface.preprocess_spec_text(spec_text or "")
-        if getattr(config, "TAU_SHRINK_ENABLED", False):
-            # Do NOT re-pick the shrink width here. It is chosen ONCE per process
-            # (start_and_manage_tau_process, before this callback runs). Restores
-            # happen mid-process -- createblock does one per block -- while the
-            # intern table can still grow under them (each newly-seen address
-            # takes an id; before tau_shrink_ids it grew every block, because the
-            # consensus yids for parent hash / proposer / claims shared the
-            # tau_strings sequence). Re-picking widened bv[8] -> bv[16] in a live
-            # process, after which every prepared rule carried `i12[t]:bv[16]`
-            # into an interpreter that had already typed i12 as bv[8]:
-            # "Incompatible type information in i12:untyped, expected :bv[8],
-            # found :bv[16]". Widening is only safe via re-exec.
-            prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
-            # The restore path builds its own preparation, so it needs the same
-            # gate: the engine's type commitments are process-global and survive
-            # the interpreter rebuild this function performs.
-            _assert_representation_compatible(prepared)
-        else:
-            prepared = tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())
+        # Do NOT re-pick the shrink width here: restores run mid-process while the
+        # intern table grows, and the engine never re-types a stream it typed.
+        # Widening is only safe via re-exec.
+        prepared = tau_shrink.prepare_rule(canonical)
+        # The restore path builds its own preparation, so it needs the same
+        # gate: the engine's type commitments are process-global and survive
+        # the interpreter rebuild this function performs.
+        _assert_representation_compatible(prepared)
         _print_tau_send("restore_full_tau_spec update_spec", prepared.runtime_text)
         tau_direct_interface.update_spec(prepared.runtime_text)
         _commit_runtime_spec(prepared)
@@ -937,7 +963,7 @@ def restore_full_tau_spec(spec_text: str, *, runtime_shrunk_streams: "frozenset 
             last_known_tau_spec = tau_direct_interface.get_current_spec() or canonical
         except Exception:
             last_known_tau_spec = canonical
-        # Full composed interpreter spec (== canonical when shrink is off).
+        # Full composed interpreter spec (== canonical when nothing is shrunk).
         last_known_tau_spec = tau_direct_interface.get_current_spec() or prepared.canonical_text
 
 
@@ -993,10 +1019,17 @@ def kill_tau_process():
         recovered_interface = tau_native.TauInterface(config.TAU_PROGRAM_FILE)
         with tau_process_lock:
             tau_direct_interface = recovered_interface
-        tau_process_ready.set()
+        # request_shutdown() sets the flag before it drops the interface, so one of the two drops it.
+        if server_should_stop.is_set():
+            with tau_process_lock:
+                tau_direct_interface = None
+            restart_in_progress.clear()
+            logger.info("Shutdown requested, Tau interface rebuild dropped.")
+            return
+        _set_unless_stopped(tau_process_ready)
         if _state_restore_callback:
             _state_restore_callback()
-        tau_ready.set()
+        _set_unless_stopped(tau_ready)
         restart_in_progress.clear()
     except Exception as e:
         logger.error("Failed to recover direct Tau interface: %s", e)
@@ -1045,5 +1078,6 @@ __all__ = [
     "set_state_restore_callback",
     "is_force_test_enabled",
     "start_and_manage_tau_process",
+    "start_manager_thread",
     "reset_tau_state",
 ]

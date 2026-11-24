@@ -1,65 +1,23 @@
-"""Rule sharing: offer lifecycle, per-user clause registry, composite emitter.
+"""Rule sharing: offer lifecycle and the per-account o5 clause registry.
 
-WHY THIS EXISTS
----------------
-A user can send a Tau rule to another user, who reviews it and either accepts
-it into their own specification or rejects it. There is no per-user
-specification in the engine: `chain_state.save_effective_tau_spec` appends to
-ONE global newline-joined rule string, and the documented convention is that a
-user "scopes" a rule by guarding it on their own sender identity (`i12`).
+An account registers at most one clause per target stream, either by accepting
+an offered rule or by declaring one itself. The registry is committed to the
+state hash; each clause is evaluated on its own, for its owner only.
 
-That convention does not hold. Measured on the real engine (pinned by
-tests/test_rule_scoping_native.py):
-
-  1. An output stream that no clause constrains for a given input still
-     MATERIALIZES, with an arbitrary witness -- observed as 0, which for `o5`
-     is exactly USER_POLICY_BLOCK_VALUE. So `always ( (i12 = A) -> (o5 = 1) ).`
-     yields o5=1 for A and o5=0 (BLOCK) for every other sender. Implication
-     guards do not isolate users; they are a network-wide transfer block.
-
-  2. Two total-form rules on the same stream do not compose: conjoined, the
-     spec is unsatisfiable and the interpreter fails to build; fed sequentially
-     through `i0`, the later one silently SUPERSEDES the earlier. So "append
-     one guarded unit per user" cannot work for a shared stream either.
-
-  3. A SINGLE nested total-form unit does work, and applying it through `i0`
-     is equivalent to building it conjoined -- which is what makes a replaying
-     node match a live one.
-
-Hence the model here: the accepted-clause registry IS the per-user
-specification, and the node deterministically emits ONE composite rule unit
-per shared output stream from it:
-
-    always ( (i12[t]:bv[384] = { #x<acceptor_1> }:bv[384]) ? ( <body_1> )
-           : ( (i12[t]:bv[384] = { #x<acceptor_2> }:bv[384]) ? ( <body_2> )
-           : ( <neutral for this stream> ) ) ).
-
-Acceptors are ordered by raw public-key bytes; the innermost else-branch is
-the stream's frozen neutral value. Because one composite REPLACES the previous
-one rather than accumulating, the live spec keeps exactly one unit per stream.
-
-CONSENSUS-FROZEN SURFACE
-------------------------
-`canonicalize_clause_v1`, `clause_body_v1` and `compose_stream_rule` determine
-the exact text appended to the application-rules state, which is hashed into
-the block state hash. Changing any of them changes every accepted rule's
-canonical text and breaks replay of all historical blocks. They are pure,
-versioned, and deliberately do NOT call into tau_native: `preprocess_spec_text`
-exists to normalize interpreter *output* quirks and its width-inference
-heuristic is tied to tau-lang pretty-printer behaviour, so coupling the state
-hash to it would let a tau-lang upgrade silently invalidate history.
+`canonicalize_clause_v1` and `clause_body_v1` are consensus-frozen: they fix the
+canonical clause text that the registry root commits to. They are pure and do
+not call into tau_native, so a tau-lang upgrade cannot change historical roots.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import tau_defs
-from consensus.approvals import MAX_TIER_AUTHORS
+from consensus.clause_registry import ClausePlan, ClauseRegistry
 from consensus.serialization import (
     compute_offer_id,
-    compute_clause_registry_root,
     compute_rule_offer_book_root,
 )
 
@@ -84,35 +42,14 @@ MAX_OFFER_RULE_BYTES = 8192
 MAX_PENDING_OFFERS_PER_RECIPIENT = 32
 MAX_PENDING_OFFERS_PER_OFFERER = 16
 MAX_OFFER_WINDOW_BLOCKS = 100_000
-# Bounds composite nesting depth, and with it the interpreter rebuild cost:
-# rebuild time grows steeply with spec complexity, and a runaway composite
-# would eventually exceed COMM_TIMEOUT and get the node killed by the watchdog.
-MAX_ACCEPTORS_PER_STREAM = 64
-
-# Output streams an offered clause may target, with the value the composite
-# emits for everyone NOT covered by a clause. The neutral value must mean
-# "no opinion" for that stream, because (per finding 1 above) the stream
-# materializes for every sender once any clause mentions it.
-#
-# o5 is the user-policy stream: 1 = allow, 0 = block, absent = allow. Neutral
-# is therefore 1 -- emitting 0 would block every unrelated user's transfers.
+# Bound the build cost of one clause.
+MAX_CLAUSE_COMPARISONS = 32
+MAX_CLAUSE_DEPTH = 32
+# Output streams an offered clause may target. o5 is the user-policy stream:
+# 1 = allow, 0 = block, absent = allow.
 ALLOWED_TARGET_STREAMS: Dict[int, Dict[str, Any]] = {
-    tau_defs.USER_POLICY_STREAM_INDEX: {
-        "width": 24,
-        "neutral": tau_defs.USER_POLICY_ALLOW_VALUE,
-    },
+    tau_defs.USER_POLICY_STREAM_INDEX: {"width": 24},
 }
-
-
-def clause_author_cap(stream_index: int, approval_slots_active: bool) -> int:
-    """Authors one stream's clause registry may hold, whichever door they enter by.
-
-    The o5 tier cap binds only while approval slots are active; without them
-    the frozen ceiling is the only bound.
-    """
-    if approval_slots_active and stream_index == tau_defs.USER_POLICY_STREAM_INDEX:
-        return MAX_TIER_AUTHORS
-    return MAX_ACCEPTORS_PER_STREAM
 
 
 # Streams a clause may never write: consensus-owned verdicts and fees, plus the
@@ -120,13 +57,12 @@ def clause_author_cap(stream_index: int, approval_slots_active: bool) -> int:
 # same set.
 FORBIDDEN_CLAUSE_OUTPUT_STREAMS = (0, 1, 2, 3, 4, 6, 7, 8, 9)
 
-# Guard construction. i12 is the node-injected sender public key, bv[384].
+# i12 is the node-injected sender public key.
 SENDER_STREAM = "i12"
-SENDER_WIDTH = 384
 
 
 class RuleOfferShapeError(ValueError):
-    """An offered rule does not have a shape the node can safely compose."""
+    """An offered rule does not have a shape the node can safely register."""
 
 
 # --- Frozen text canonicalization ------------------------------------------
@@ -201,6 +137,43 @@ def _parens_balanced(text: str) -> bool:
     return depth == 0
 
 
+_COMPARISON_RE = re.compile(r"!=|<=|>=|(?<![-<])>|<(?!-)|=")
+
+
+def clause_comparison_count(body: str) -> int:
+    """Comparison operators in the comment-stripped body, each counted once."""
+    return len(_COMPARISON_RE.findall(strip_clause_comments(body)))
+
+
+def clause_paren_depth(body: str) -> int:
+    """Deepest parenthesis nesting in the comment-stripped body."""
+    depth = deepest = 0
+    for ch in strip_clause_comments(body):
+        if ch == "(":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif ch == ")":
+            depth = max(depth - 1, 0)
+    return deepest
+
+
+def screen_clause_structure(body: str) -> Optional[str]:
+    """None when the body is within the comparison and nesting limits."""
+    comparisons = clause_comparison_count(body)
+    if comparisons > MAX_CLAUSE_COMPARISONS:
+        return (
+            f"clause has {comparisons} comparisons; the limit is "
+            f"{MAX_CLAUSE_COMPARISONS}"
+        )
+    depth = clause_paren_depth(body)
+    if depth > MAX_CLAUSE_DEPTH:
+        return (
+            f"clause nests parentheses {depth} deep; the limit is "
+            f"{MAX_CLAUSE_DEPTH}"
+        )
+    return None
+
+
 def clause_output_streams(body: str) -> List[int]:
     """Output stream indices the body writes, comment-stripped, deduplicated."""
     scrubbed = strip_clause_comments(body)
@@ -213,12 +186,12 @@ def clause_output_streams(body: str) -> List[int]:
 
 
 def clause_body_v1(rule_text: str) -> str:
-    """CONSENSUS-FROZEN. Extract the guardable body of a single `always` unit.
+    """CONSENSUS-FROZEN. Extract the body of a single `always` unit.
 
-    Rejects anything the composite cannot safely wrap. The balanced-paren check
+    Rejects anything that is not exactly one unit. The balanced-paren check
     is load-bearing, not cosmetic: `_ALWAYS_UNIT_RE` uses a greedy `.*`, so
     "always (a). always (b)." matches with body "a). always (b" -- accepting it
-    would smuggle a second, unguarded unit into the composite.
+    would smuggle a second unit into one clause.
     """
     unit = canonicalize_clause_v1(rule_text)
     match = _ALWAYS_UNIT_RE.match(unit)
@@ -239,8 +212,8 @@ def clause_body_v1(rule_text: str) -> str:
         )
     if re.search(rf"\b{SENDER_STREAM}\b", strip_clause_comments(body)):
         raise RuleOfferShapeError(
-            f"rule must not reference {SENDER_STREAM}; the node supplies the "
-            "sender guard when composing"
+            f"rule must not reference {SENDER_STREAM}; a clause is evaluated "
+            "only for its owner, so it must not carry a sender guard"
         )
     return body
 
@@ -268,18 +241,9 @@ def validate_clause_target(body: str) -> int:
     return target
 
 
-# CONSENSUS-FROZEN. Submitting a clause whose body is exactly this REMOVES the
-# author's registered clause instead of registering one.
-#
-# Sound because "always allow" and "no clause" are semantically identical, and it
-# gives the registry the release valve it otherwise lacks: with no revocation the
-# first N accounts would occupy every author slot forever, and the cap is small
-# because each author multiplies interpreter rebuild cost.
-#
-# Exact match on one frozen spelling, deliberately: a near-miss simply registers
-# a permissive clause, which is harmless and equivalent, so there is no incentive
-# to make the matching clever. Cleverness here would be text analysis on a
-# consensus path.
+# CONSENSUS-FROZEN. A clause whose body is exactly this removes the author's
+# registered clause: "always allow" and "no clause" give the same verdict.
+# Exact match on one spelling keeps text analysis off the consensus path.
 NEUTRAL_O5_CLAUSE_BODY = "(o5[t]:bv[24] = { #x000001 }:bv[24])"
 
 
@@ -297,22 +261,6 @@ def normalize_offer_rule_text(rule_text: str) -> Tuple[str, int]:
     return body, validate_clause_target(body)
 
 
-# --- Composite emitter ------------------------------------------------------
-
-def _guard_expr(acceptor_pubkey: str) -> str:
-    return (
-        f"({SENDER_STREAM}[t]:bv[{SENDER_WIDTH}] = "
-        f"{{ #x{acceptor_pubkey} }}:bv[{SENDER_WIDTH}])"
-    )
-
-
-def _neutral_expr(stream_index: int) -> str:
-    spec = ALLOWED_TARGET_STREAMS[stream_index]
-    width = spec["width"]
-    hex_digits = format(int(spec["neutral"]), "x").rjust(width // 4, "0")
-    return f"(o{stream_index}[t]:bv[{width}] = {{ #x{hex_digits} }}:bv[{width}])"
-
-
 def normalize_acceptor_pubkey(pubkey: Any) -> str:
     """Lowercase 96-hex form. The guard literal is compared byte-for-byte
     across nodes, so casing has to be pinned."""
@@ -325,33 +273,6 @@ def normalize_acceptor_pubkey(pubkey: Any) -> str:
     if len(text) != 96 or any(c not in "0123456789abcdef" for c in text):
         raise RuleOfferShapeError("public key must be 96 lowercase hex digits")
     return text
-
-
-def compose_stream_rule(stream_index: int, clauses: Dict[str, str]) -> Optional[str]:
-    """CONSENSUS-FROZEN. Build the composite rule unit for one output stream.
-
-    `clauses` maps acceptor pubkey (96 lc hex) -> canonical clause body.
-    Returns None when there are no clauses, so the stream is never mentioned
-    and therefore never materializes for anybody.
-    """
-    if stream_index not in ALLOWED_TARGET_STREAMS:
-        raise RuleOfferShapeError(f"o{stream_index} is not an accepted target stream")
-    if not clauses:
-        return None
-    if len(clauses) > MAX_ACCEPTORS_PER_STREAM:
-        raise RuleOfferShapeError(
-            f"o{stream_index} has {len(clauses)} clauses, over the "
-            f"{MAX_ACCEPTORS_PER_STREAM} limit"
-        )
-
-    # Sort by raw key bytes so every node emits identical text.
-    ordered = sorted(
-        (normalize_acceptor_pubkey(pk), body) for pk, body in clauses.items()
-    )
-    expr = _neutral_expr(stream_index)
-    for pubkey, body in reversed(ordered):
-        expr = f"({_guard_expr(pubkey)} ? ( {body} ) : {expr})"
-    return f"always ( {expr} )."
 
 
 # --- Transaction payloads ---------------------------------------------------
@@ -497,16 +418,26 @@ class RuleOfferLifecycleManager:
         self,
         offered: Optional[Dict[bytes, OfferEntry]] = None,
         resolved: Optional[Iterable[bytes]] = None,
-        accepted_clauses: Optional[Dict[Tuple[str, int], str]] = None,
+        accepted_clauses: Optional[Mapping[Tuple[str, int], str]] = None,
     ) -> None:
         self.offered: Dict[bytes, OfferEntry] = dict(offered or {})
         self.resolved: Set[bytes] = set(resolved or ())
         # (acceptor pubkey, target stream) -> canonical clause body.
-        self.accepted_clauses: Dict[Tuple[str, int], str] = dict(accepted_clauses or {})
+        self._accepted_clauses = ClauseRegistry(accepted_clauses)
         # Node-local only: never hashed, re-derivable by replay. Kept for the
         # RPC surface so a wallet can show what an offer actually said.
         self.terminal_status: Dict[bytes, str] = {}
         self.offer_payloads: Dict[bytes, str] = {}
+
+    @property
+    def accepted_clauses(self) -> ClauseRegistry:
+        return self._accepted_clauses
+
+    @accepted_clauses.setter
+    def accepted_clauses(self, clauses: Mapping[Tuple[str, int], str]) -> None:
+        self._accepted_clauses = (
+            clauses if isinstance(clauses, ClauseRegistry) else ClauseRegistry(clauses)
+        )
 
     # -- hashing ------------------------------------------------------------
 
@@ -536,7 +467,7 @@ class RuleOfferLifecycleManager:
         )
 
     def clauses_root(self) -> bytes:
-        return compute_clause_registry_root(self.accepted_clauses)
+        return self._accepted_clauses.root()
 
     # -- queries ------------------------------------------------------------
 
@@ -558,16 +489,6 @@ class RuleOfferLifecycleManager:
         return self.accepted_clauses.get(
             (normalize_acceptor_pubkey(acceptor_pubkey), stream_index)
         )
-
-    def clauses_for_stream(self, stream_index: int) -> Dict[str, str]:
-        return {
-            acceptor: body
-            for (acceptor, stream), body in self.accepted_clauses.items()
-            if stream == stream_index
-        }
-
-    def composite_for_stream(self, stream_index: int) -> Optional[str]:
-        return compose_stream_rule(stream_index, self.clauses_for_stream(stream_index))
 
     # -- transitions --------------------------------------------------------
 
@@ -640,14 +561,11 @@ class RuleOfferLifecycleManager:
             return False, str(exc)
         return True, ""
 
-    def submit_decision(
-        self, decision: RuleOfferDecision, *, approval_slots_active: bool = False
-    ) -> Optional[int]:
+    def submit_decision(self, decision: RuleOfferDecision) -> Optional[int]:
         """Resolve an offer.
 
-        Returns the target stream index when an accept registered a clause
-        (so the caller knows which composite to re-emit), or None when the
-        offer was rejected or the stream's registry was full.
+        Returns the target stream index when an accept registered a clause,
+        or None when the offer was rejected or unknown.
         """
         entry = self.offered.pop(decision.offer_id, None)
         if entry is None:
@@ -659,17 +577,11 @@ class RuleOfferLifecycleManager:
             return None
 
         body, target = normalize_offer_rule_text(decision.rule_text or "")
-        key = (decision.actor_pubkey, target)
-        if key not in self.accepted_clauses:
-            existing = len(self.clauses_for_stream(target))
-            if existing >= clause_author_cap(target, approval_slots_active):
-                # Soft no-op: the offer is consumed but no clause registers, so
-                # block validity stays deterministic across replays.
-                self.terminal_status[decision.offer_id] = STATUS_REJECTED
-                return None
+        if target == tau_defs.RULE_CHANGE_GUARD_INDEX:
+            raise RuleOfferShapeError("offers cannot register a rule-change guard")
         # An acceptor holds at most one clause per stream; accepting a new one
-        # replaces it. There is no separate retraction primitive.
-        self.accepted_clauses[key] = body
+        # replaces it.
+        self.accepted_clauses[(decision.actor_pubkey, target)] = body
         self.terminal_status[decision.offer_id] = STATUS_ACCEPTED
         return target
 
@@ -711,8 +623,6 @@ class RuleOfferLifecycleManager:
             })
         return rows
 
-    def snapshot_clauses(self) -> List[Dict[str, Any]]:
-        return [
-            {"acceptor_pubkey": acceptor, "target_stream": stream, "clause_body": body}
-            for (acceptor, stream), body in sorted(self.accepted_clauses.items())
-        ]
+    def clause_plan(self) -> ClausePlan:
+        """The registry writes for one state save; confirm it after the commit."""
+        return self._accepted_clauses.storage_plan()

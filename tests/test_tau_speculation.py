@@ -590,10 +590,9 @@ def test_an_unconsumed_candidate_is_incomplete_not_accepted(tmp_path):
 
 @pytest.mark.skipif(not _native_available(), reason="native tau module not built")
 def test_a_real_revision_past_its_deadline_is_a_timeout(tmp_path):
-    """An o5 composite of this many authors compiles for several seconds, far
-    past the one-second deadline."""
-    from consensus.rule_offers import compose_stream_rule
-
+    """A sender-guarded chain over this many authors compiles for several
+    seconds, far past the one-second deadline (80 authors took 3.4 s and 20
+    only 0.75 s on a desktop in 2026-11)."""
     def bv24(n):
         return "{ #x" + format(n, "06x") + " }:bv[24]"
 
@@ -612,10 +611,14 @@ def test_a_real_revision_past_its_deadline_is_a_timeout(tmp_path):
                 " || (i1[t]:bv[24] > " + bv24(1000) + " && !(i18[t]:bv[384] = " + bv384(a) + ")) )"
                 " ? " + o5(0) + " : " + o5(1) + " )")
 
-    composite = compose_stream_rule(5, {
+    clauses = {
         key("ab", i): clause(key("ca", i), key("cb", i), key("cc", i))
-        for i in range(20)
-    })
+        for i in range(80)
+    }
+    chain = o5(1)
+    for author in sorted(clauses, reverse=True):
+        chain = f"((i12[t]:bv[384] = {bv384(author)}) ? ( {clauses[author]} ) : {chain})"
+    slow_rule = f"always ( {chain} )."
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(repo_root, "genesis.tau")) as fh:
         router = fh.read().strip()
@@ -626,10 +629,51 @@ def test_a_real_revision_past_its_deadline_is_a_timeout(tmp_path):
         s.init(f"always ( {router} ).")
         started = time.monotonic()
         with pytest.raises(spec.WorkerTimeout):
-            s.revise(composite, "slow", timeout=1.0)
+            s.revise(slow_rule, "slow", timeout=1.0)
         elapsed = time.monotonic() - started
         assert 0.9 <= elapsed < 6.0, elapsed
         assert s._proc.returncode is not None, "the slow worker was not reaped"
         _assert_lost_and_reaped(s)
     finally:
         s.kill()
+
+
+_COMMENTED_REVISION = (
+    "# header comment\n"
+    "# second line\n"
+    "always ( o5[t]:bv[24] = { #x000007 }:bv[24] )"
+)
+
+
+def _real_worker_session(repo_root):
+    import tau_session
+    with open(os.path.join(repo_root, "genesis.tau")) as fh:
+        router = fh.read().strip()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    raw = spec.SpeculationSession(cwd=repo_root, env=env)
+    raw.init(f"always ( {router} ).")
+    return raw, tau_session.WorkerSession(raw)
+
+
+@pytest.mark.skipif(not _native_available(), reason="native tau module not built")
+def test_worker_session_accepts_a_commented_revision_without_trailing_period():
+    """The proposal evaluator is handed raw spec text, comments and all."""
+    import tau_native
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    raw, session = _real_worker_session(repo_root)
+    try:
+        assert session.apply_rule(_COMMENTED_REVISION, target=0,
+                                  accumulate=False) == "ok"
+        assert session.log.entries()[-1].rule_text == _COMMENTED_REVISION
+    finally:
+        raw.kill()
+
+    pre = tau_native.TauInterface.preprocess_spec_text
+    once = pre(_COMMENTED_REVISION)
+    assert pre(once) == once
+    raw, session = _real_worker_session(repo_root)
+    try:
+        assert session.apply_rule(once, target=0, accumulate=False) == "ok"
+    finally:
+        raw.kill()

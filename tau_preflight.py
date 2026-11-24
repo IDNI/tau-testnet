@@ -23,6 +23,7 @@ admission and apply are identical.
 from __future__ import annotations
 
 import logging
+import re
 
 import tau_speculation
 
@@ -116,10 +117,18 @@ def preflight_rule(baseline_spec: str, runtime_rule_text: str, *, context=None,
                            detail="inconclusive; apply revalidates")
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def _first_error(receipt) -> str:
-    for key in ("diagnostics", "deferred_diagnostics"):
-        text = receipt.get(key) or ""
-        for line in text.splitlines():
-            if "Error" in line:
-                return line.strip()
-    return ""
+    """The line of the diagnostics that says why the engine refused: one that
+    names an error, else the first one. The engine's reports carry no
+    `Error` tag of their own, only color."""
+    lines = [
+        _ANSI_RE.sub("", line).strip()
+        for key in ("diagnostics", "deferred_diagnostics")
+        for line in (receipt.get(key) or "").splitlines()
+    ]
+    lines = [line for line in lines if line]
+    return next((line for line in lines if "Error" in line),
+                lines[0] if lines else "")

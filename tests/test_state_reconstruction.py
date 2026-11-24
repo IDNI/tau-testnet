@@ -5,7 +5,6 @@ import json
 import tempfile
 import sys
 
-import threading
 import tau_manager
 import tau_defs
 import random
@@ -15,8 +14,10 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from chain_state import rebuild_state_from_blockchain, get_balance, get_sequence_number, GENESIS_ADDRESS, GENESIS_BALANCE
+from chain_state import rebuild_state_from_blockchain, get_balance, get_sequence_number, GENESIS_BALANCE
 from block import Block
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
+from conftest import stop_tau_manager_thread
 from db import init_db, add_block, clear_mempool
 import config
 import chain_state
@@ -30,19 +31,20 @@ class TestStateReconstruction(unittest.TestCase):
         self._prev_tau_force_test = os.environ.get("TAU_FORCE_TEST", "1")
         if force_native:
             os.environ["TAU_FORCE_TEST"] = "0"
-        tau_manager.server_should_stop.clear()
         tau_manager.tau_ready.clear()
-        self.tau_thread = threading.Thread(target=tau_manager.start_and_manage_tau_process, daemon=True)
-        self.tau_thread.start()
+        self.tau_thread = tau_manager.start_manager_thread()
         ready = tau_manager.tau_ready.wait(timeout=60)
         if not ready:
+            self.stop_tau()
             self.fail("Tau process failed to become ready within 60 seconds.")
 
     def stop_tau(self):
         """Request Tau shutdown and wait for the background thread to exit."""
-        tau_manager.request_shutdown()
         if hasattr(self, 'tau_thread'):
-            self.tau_thread.join(timeout=10)
+            if not stop_tau_manager_thread(self.tau_thread):
+                raise AssertionError("the Tau manager thread did not stop")
+        else:
+            tau_manager.request_shutdown()
         # start_and_manage_tau_process leaves tau_test_mode=True after a
         # TAU_FORCE_TEST run; reset it so later tests (e.g. sendtx's isolated
         # compile path) don't see stale test-mode state.
@@ -70,20 +72,19 @@ class TestStateReconstruction(unittest.TestCase):
         init_db()
         clear_mempool()
         chain_state.load_genesis("data/genesis.json")
-        # These tests build synthetic histories on the legacy GENESIS_ADDRESS
-        # baseline; pin the rebuild seed accordingly (rebuild now seeds from
-        # the loaded genesis artifact by default).
-        chain_state._genesis_accounts_state = {GENESIS_ADDRESS: GENESIS_BALANCE}
-        chain_state._balances[GENESIS_ADDRESS] = GENESIS_BALANCE
 
-        # Sample addresses for testing
-        self.addr1 = GENESIS_ADDRESS
-        self.addr2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
-        self.addr3 = "aabbccddee1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
+        # Sample accounts for testing; every sender signs its transactions for real.
+        self.addr1 = pubkey_hex(SK_ALICE)
+        self.addr2 = pubkey_hex(SK_BOB)
+        self.addr3 = pubkey_hex(SK_CAROL)
+        self._sk = {self.addr1: SK_ALICE, self.addr2: SK_BOB, self.addr3: SK_CAROL}
+
+        # These tests build synthetic histories on a single funded baseline
+        # account; pin the rebuild seed accordingly (rebuild seeds from the
+        # loaded genesis artifact by default).
+        chain_state._genesis_accounts_state = {self.addr1: GENESIS_BALANCE}
+        chain_state._balances[self.addr1] = GENESIS_BALANCE
         
-        # Disable auto-faucet for these tests to ensure strict balance checks
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
         
         from unittest.mock import patch
         self.verify_patch = patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
@@ -91,12 +92,12 @@ class TestStateReconstruction(unittest.TestCase):
     
     def tearDown(self):
         """Clean up the temporary database."""
-        # Restore auto-faucet setting
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         self.verify_patch.stop()
 
-        # Ensure Tau process is stopped between tests
-        if tau_manager.tau_ready.is_set():
+        # A live manager thread reads the database that this tearDown closes.
+        if hasattr(self, 'tau_thread'):
+            self.stop_tau()
+        elif tau_manager.tau_ready.is_set():
             try:
                 tau_manager.request_shutdown()
             except Exception:
@@ -133,15 +134,20 @@ class TestStateReconstruction(unittest.TestCase):
         if transfers:
             operations["1"] = transfers
         
-        return {
+        return sign_payload({
             "sender_pubkey": sender_pubkey,
             "sequence_number": sequence_number,
             "expiration_time": 9999999999,  # Far in the future
             "operations": operations,
             "fee_limit": "0",
-            "signature": "dummy_signature_for_testing"
-        }
+        }, self._sk[sender_pubkey])
     
+    def test_a_failed_start_leaves_no_manager_thread(self):
+        with patch.object(tau_manager.tau_ready, "wait", return_value=False):
+            with self.assertRaises(self.failureException):
+                self.start_tau()
+        self.assertFalse(self.tau_thread.is_alive())
+
     def test_reconstruction_empty_blockchain(self):
         """Test state reconstruction when no blocks exist."""
         print("\n=== Testing state reconstruction with empty blockchain ===")
@@ -150,8 +156,8 @@ class TestStateReconstruction(unittest.TestCase):
         rebuild_state_from_blockchain()
         
         # Verify genesis state
-        self.assertEqual(get_balance(GENESIS_ADDRESS), GENESIS_BALANCE)
-        self.assertEqual(get_sequence_number(GENESIS_ADDRESS), 0)
+        self.assertEqual(get_balance(self.addr1), GENESIS_BALANCE)
+        self.assertEqual(get_sequence_number(self.addr1), 0)
         
         # Verify no other balances
         self.assertEqual(get_balance(self.addr2), 0)
@@ -215,7 +221,7 @@ class TestStateReconstruction(unittest.TestCase):
             # Simple helper to build a unique rule for index i
             def rule_for(i: int) -> str:
                 pat = random_pattern()
-                return f"always ((i1[t]:bv[24] = {pat})? o1[t]:bv[24] = {{ 0 }}:bv[24] : o1[t]:bv[24] = i1[t]:bv[24])."
+                return f"always ((i1[t]:bv[24] = {pat})? o12[t]:bv[24] = {{ 0 }}:bv[24] : o12[t]:bv[24] = i1[t]:bv[24])."
 
             # -------- Block 0  (sender = addr1) --------
             tx1 = self.create_test_transaction(
@@ -363,8 +369,9 @@ class TestStateReconstruction(unittest.TestCase):
         self.assertEqual(get_balance(self.addr2), 5)
         self.assertEqual(get_balance(self.addr3), 0)  # Invalid transfers should be ignored
         
-        # All sequence numbers should be incremented (even for failed transactions)
-        self.assertEqual(get_sequence_number(self.addr1), 3)  # All 3 transactions attempted
+        # The failed transfer uses its sequence number. Apply refuses the
+        # transaction with the malformed amount, so that one uses none.
+        self.assertEqual(get_sequence_number(self.addr1), 2)
     
     def test_reconstruction_preserves_state_consistency(self):
         """Test that reconstruction produces the same state as live processing."""
@@ -423,7 +430,8 @@ class TestStateReconstruction(unittest.TestCase):
         # --- Start Tau ---
         self.start_tau()
         try:
-            rule_text = "o1[t] = i1[t]."
+            # start_tau loads no builtin rules, so an untyped i1 here would be typed :tau before rule 02.
+            rule_text = "o12[t]:bv[24] = i1[t]:bv[24]."
 
             # Create a transaction containing both the rule and a transfer
             tx1 = self.create_test_transaction(
@@ -510,6 +518,7 @@ class TestStateReconstruction(unittest.TestCase):
             # Add unknown operations manually
             tx1["operations"]["99"] = "123" # Must be valid Tau syntax or entire tx is rejected
             tx1["operations"]["custom"] = {"some": "data"}
+            sign_payload(tx1, SK_ALICE)
             
             block_1 = Block.create(
                 block_number=1,

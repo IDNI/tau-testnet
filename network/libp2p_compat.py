@@ -18,15 +18,21 @@ API surface lands incrementally per the unification plan
         attach_resource_manager, collect_listen_addrs, wait_for_listening,
         split_listen_outcome, describe_bind_failure)
 - A4 — discovery (ensure_peer_id, seed_peerstore)
-- A5 — stream primitives (bounded_stream_read, close_stream_safely)
+- A5 — stream primitives (bounded_stream_read, read_until_eof, read_json_object,
+        close_stream_safely,
+        reset_stream_safely, reset_stream_on_error)
 - A6 — DHT validator wrap (install_validating_dht)
 - A7 — trio↔async bridge (run_trio_from_thread)
 - A9 — QUIC shim (apply_quic_cleanup_shim)
+- AutoConnector backoff shim (apply_auto_connector_backoff_shim)
 """
 from __future__ import annotations
 
+import contextlib
+import functools
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import re
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Tuple
 
 import multiaddr
 import nacl.utils
@@ -36,10 +42,12 @@ from nacl.signing import SigningKey, VerifyKey
 
 from libp2p.abc import IHost, INotifee
 from libp2p.crypto.keys import KeyPair, KeyType, PrivateKey, PublicKey
+from libp2p.network.stream.exceptions import StreamReset
 from libp2p.peer.id import ID
 from libp2p.peer.peerstore import PERMANENT_ADDR_TTL
 from libp2p.rcmgr.connection_limits import ConnectionLimits
 from libp2p.rcmgr.manager import ResourceLimits, ResourceManager
+from libp2p.stream_muxer.exceptions import MuxedStreamReset
 
 logger = logging.getLogger(__name__)
 
@@ -469,6 +477,147 @@ async def bounded_stream_read(
     return data
 
 
+class StreamTooLarge(ValueError):
+    """A peer's response exceeded the caller's byte cap."""
+
+
+def _raise_if_reset(stream, total: int) -> None:
+    """Raise a reset error when the end of `stream` came from an RST, not a FIN."""
+    muxed = getattr(stream, "muxed_stream", stream)
+    # yamux drops a reset stream once its buffer is empty and reports EOF.
+    reset = getattr(muxed, "reset_received", False) is True
+    event_reset = getattr(muxed, "event_reset", None)  # mplex
+    if isinstance(event_reset, trio.Event) and event_reset.is_set():
+        reset = True
+    if reset:
+        error = StreamReset if muxed is not stream else MuxedStreamReset
+        raise error(f"stream reset by peer after {total} bytes")
+
+
+class StreamReadTimeout(Exception):
+    """A peer did not close its side of the stream within the read timeout."""
+
+
+async def _read_bounded(
+    stream,
+    max_bytes: int,
+    read_timeout: Optional[float],
+    find_end: Optional[Callable[[bytearray], Optional[int]]] = None,
+) -> bytes:
+    """Read until EOF, or until `find_end` gives the end offset of the message."""
+    buf = bytearray()
+    timeout_scope = (
+        trio.fail_after(read_timeout)
+        if read_timeout is not None
+        else contextlib.nullcontext()
+    )
+    try:
+        with timeout_scope:
+            while True:
+                try:
+                    chunk = await stream.read(max_bytes + 1 - len(buf))
+                except EOFError:
+                    _raise_if_reset(stream, len(buf))
+                    break
+                if not chunk:
+                    _raise_if_reset(stream, len(buf))
+                    break
+                buf += chunk
+                end = find_end(buf) if find_end is not None else None
+                if end is not None and end <= max_bytes:
+                    return bytes(buf[:end])
+                if len(buf) > max_bytes:
+                    raise StreamTooLarge(f"stream message exceeds {max_bytes} bytes")
+    except trio.TooSlowError:
+        raise StreamReadTimeout(
+            f"stream read timed out after {read_timeout}s ({len(buf)} bytes so far)"
+        ) from None
+    return bytes(buf)
+
+
+async def read_until_eof(
+    stream, max_bytes: int, *, read_timeout: Optional[float] = None
+) -> bytes:
+    """Read `stream` until the peer closes it, returning every byte received.
+
+    A single `stream.read(n)` yields only what is buffered (one muxer frame),
+    so a multi-frame response needs this loop. Raises `StreamTooLarge` instead
+    of returning a truncated payload. Raises `StreamReadTimeout` when
+    `read_timeout` seconds pass before EOF. A stream reset raises
+    `StreamReset` or `MuxedStreamReset`, also when libp2p reports it as EOF.
+    Other errors propagate.
+    """
+    return await _read_bounded(stream, max_bytes, read_timeout)
+
+
+class _JsonObjectEnd:
+    """Finds the end of the first JSON object in a growing buffer, in one pass."""
+
+    _SPECIAL = re.compile(rb'[{}"\\]')
+    _WHITESPACE = b" \t\r\n"
+
+    def __init__(self) -> None:
+        self._pos = 0
+        self._started = False
+        self._depth = 0
+        self._in_string = False
+        self._escape = False
+
+    def __call__(self, buf: bytearray) -> Optional[int]:
+        pos, n = self._pos, len(buf)
+        if not self._started:
+            while pos < n and buf[pos] in self._WHITESPACE:
+                pos += 1
+            if pos == n:
+                self._pos = pos
+                return None
+            if buf[pos] != ord("{"):
+                raise ValueError("stream message is not a JSON object")
+            self._started = True
+        if self._escape and pos < n:
+            self._escape = False
+            pos += 1
+        while True:
+            match = self._SPECIAL.search(buf, pos)
+            if match is None:
+                self._pos = n
+                return None
+            i = match.start()
+            c = buf[i]
+            pos = i + 1
+            if self._in_string:
+                if c == ord("\\"):
+                    if pos == n:
+                        self._escape = True
+                        self._pos = n
+                        return None
+                    pos += 1
+                elif c == ord('"'):
+                    self._in_string = False
+            elif c == ord('"'):
+                self._in_string = True
+            elif c == ord("{"):
+                self._depth += 1
+            elif c == ord("}"):
+                self._depth -= 1
+                if self._depth == 0:
+                    return pos
+
+
+async def read_json_object(
+    stream, max_bytes: int, *, read_timeout: Optional[float] = None
+) -> bytes:
+    """Read one JSON object from `stream`, returning its bytes.
+
+    The read ends when the braces of the object close, or at EOF. A sender
+    that writes one object and then waits for the reply needs no half-close.
+    Bytes after the object are dropped. A message that does not start with
+    `{` raises `ValueError`. The cap, the timeout and the reset rules are
+    those of `read_until_eof`.
+    """
+    return await _read_bounded(stream, max_bytes, read_timeout, _JsonObjectEnd())
+
+
 async def close_stream_safely(stream) -> None:
     """`await stream.close()` wrapped so close errors do not mask handler errors.
 
@@ -478,6 +627,26 @@ async def close_stream_safely(stream) -> None:
         await stream.close()
     except Exception:
         logger.debug("stream.close() raised", exc_info=True)
+
+
+async def reset_stream_safely(stream) -> None:
+    """`await stream.reset()` wrapped so reset errors do not mask handler errors."""
+    try:
+        await stream.reset()
+    except Exception:
+        logger.debug("stream.reset() raised", exc_info=True)
+
+
+@contextlib.asynccontextmanager
+async def reset_stream_on_error(stream) -> AsyncIterator[Any]:
+    """Reset `stream` when the enclosed block raises or is cancelled, then re-raise."""
+    try:
+        yield stream
+    except BaseException:
+        # A cancelled scope would abort the reset before the RST goes out.
+        with trio.CancelScope(shield=True), trio.move_on_after(1):
+            await reset_stream_safely(stream)
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -670,6 +839,55 @@ def apply_quic_cleanup_shim() -> bool:
     return True
 
 
+# --------------------------------------------------------------------------
+# AutoConnector backoff shim — bounds the per-peer failure counter that
+# upstream `AutoConnector._get_cooldown` feeds into `2 ** (n - 1)`.
+#
+# Like the QUIC shim, this is an explicit call from `network/service.py`.
+# --------------------------------------------------------------------------
+
+# Counts of 8 and above already saturate the 300 s maximum cooldown, so
+# clamping to this ceiling never changes a returned cooldown.
+_AUTO_CONNECTOR_FAILURE_CEILING = 16
+
+
+def apply_auto_connector_backoff_shim() -> bool:
+    """Clamp `AutoConnector._failure_counts[peer]` before `_get_cooldown` runs.
+
+    Source bug: the per-peer failure counter grows on every failed dial and is
+    never bounded, so past 1024 failures `2 ** (n - 1)` no longer converts to
+    float and `_get_cooldown` raises `OverflowError`. The periodic task catches
+    it, but the disconnect-triggered `maybe_connect` path does not, and the
+    exception ends the trio run that hosts the network service.
+    TODO: drop this shim when upstream bounds the backoff exponent.
+
+    Returns:
+        True if the shim is in place (including an earlier application).
+        False if the libp2p AutoConnector is unavailable (no-op).
+    """
+    try:
+        from libp2p.network.auto_connector import AutoConnector
+    except Exception:
+        logger.debug("libp2p AutoConnector unavailable; backoff shim is a no-op", exc_info=True)
+        return False
+
+    orig_get_cooldown = AutoConnector._get_cooldown
+    if getattr(orig_get_cooldown, "_tau_backoff_shim", False):
+        return True
+
+    @functools.wraps(orig_get_cooldown)
+    def _bounded_get_cooldown(self, peer_id):
+        counts = self._failure_counts
+        if counts.get(peer_id, 0) > _AUTO_CONNECTOR_FAILURE_CEILING:
+            counts[peer_id] = _AUTO_CONNECTOR_FAILURE_CEILING
+        return orig_get_cooldown(self, peer_id)
+
+    _bounded_get_cooldown._tau_backoff_shim = True
+    AutoConnector._get_cooldown = _bounded_get_cooldown
+    logger.info("Applied libp2p AutoConnector backoff shim")
+    return True
+
+
 __all__ = [
     # Identity (A2)
     "IDENTITY_SEED_SIZE",
@@ -692,11 +910,18 @@ __all__ = [
     "seed_peerstore",
     # Stream primitives (A5)
     "bounded_stream_read",
+    "read_until_eof",
+    "read_json_object",
+    "StreamTooLarge",
+    "StreamReadTimeout",
     "close_stream_safely",
+    "reset_stream_safely",
+    "reset_stream_on_error",
     # DHT validator wrap (A6)
     "install_validating_dht",
     # Trio↔async bridge (A7)
     "run_trio_from_thread",
     # QUIC shim (A9)
     "apply_quic_cleanup_shim",
+    "apply_auto_connector_backoff_shim",
 ]

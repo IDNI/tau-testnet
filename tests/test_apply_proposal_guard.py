@@ -16,12 +16,13 @@ import tau_proposal
 import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session as ts
+from bls_keys import SK_ALICE, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
 
-SENDER = "aa" * 48
+SENDER = pubkey_hex(SK_ALICE)
 PROPOSER = "bb" * 48
-RULE = "always ( o5[t]:bv[24] = { #x000002 }:bv[24] )."
+RULE = "always ( o13[t]:bv[24] = { #x000002 }:bv[24] )."
 
 
 def _proposal(session):
@@ -32,14 +33,14 @@ def _proposal(session):
         journal=tj.Journal(authoritative=False),
         allocator=alloc.Allocator(snapshot, width=plan.width, label="proposal"),
         plan=plan,
-        lifecycle=MagicMock(approval_slots_active=False),
+        lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
     )
 
 
 def _tx():
-    return {"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
-            "sequence_number": 0, "fee_limit": "100",
-            "operations": {"0": RULE}}
+    return sign_tx({"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
+                    "sequence_number": 0, "fee_limit": "100",
+                    "operations": {"0": RULE}})
 
 
 def _apply(session, proposal):
@@ -134,7 +135,7 @@ def test_non_proposal_apply_installs_no_guard(temp_database):
             [_tx()], 1700000000,
             target_balances={SENDER: 1000},
             target_sequences={},
-            target_lifecycle=MagicMock(approval_slots_active=False),
+            target_lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
             proposer_pubkey=PROPOSER,
             block_height=1,
         )

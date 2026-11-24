@@ -9,7 +9,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 import trio
 from libp2p.peer.id import ID
 
-from .protocols import TAU_PROTOCOL_GOSSIP
+from .libp2p_compat import (
+    StreamReadTimeout,
+    StreamTooLarge,
+    close_stream_safely,
+    read_until_eof,
+    reset_stream_safely,
+)
+from .protocols import REQUEST_READ_TIMEOUT, TAU_PROTOCOL_GOSSIP
 from .host import HostManager
 from .dht_manager import DHTManager
 
@@ -152,6 +159,7 @@ class GossipManager:
                 pass
 
     async def _send_gossip(self, peer_id: Any, payload: bytes) -> None:
+        stream = None
         try:
             if isinstance(peer_id, str):
                 peer_id = ID.from_base58(peer_id)
@@ -160,6 +168,8 @@ class GossipManager:
                 return
             stream = await host.new_stream(peer_id, [TAU_PROTOCOL_GOSSIP])
             await stream.write(payload)
+            # The half-close ends the request also for a server that reads until EOF.
+            await stream.close_write()
             # Best-effort read of the responder ack. This greatly reduces races where a caller
             # assumes subscriptions/messages have been processed once the send completes.
             with trio.move_on_after(0.5):
@@ -167,9 +177,23 @@ class GossipManager:
                     await stream.read(65535)
                 except Exception:
                     pass
-            await stream.close()
         except Exception:
             # logger.debug("Failed to send gossip to %s", peer_id)
+            pass
+        finally:
+            if stream is not None:
+                await close_stream_safely(stream)
+                # yamux keeps the entry of a closed stream until the peer closes its side too.
+                if self._nursery:
+                    self._nursery.start_soon(self._reset_unless_peer_closes, stream)
+
+    async def _reset_unless_peer_closes(self, stream: Any) -> None:
+        # The wait equals the server read timeout, so a slow server gets the full request before a reset.
+        try:
+            await read_until_eof(stream, 65535, read_timeout=REQUEST_READ_TIMEOUT)
+        except (StreamReadTimeout, StreamTooLarge):
+            await reset_stream_safely(stream)
+        except Exception:
             pass
 
     async def receive(self, envelope: Dict[str, Any]) -> None:

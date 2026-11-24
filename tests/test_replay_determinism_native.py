@@ -51,6 +51,8 @@ import sys
 
 import pytest
 
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex
+
 
 def _native_available():
     try:
@@ -82,7 +84,7 @@ def _rendered_revision() -> str:
 GENESIS_DEMO = _flatten((_DEMO / "genesis_consensus_demo.tau").read_text(encoding="utf-8"))
 REVISION = _rendered_revision()
 
-V1, V2, V3 = "a" * 96, "b" * 96, "c" * 96
+V1, V2, V3 = pubkey_hex(SK_ALICE), pubkey_hex(SK_BOB), pubkey_hex(SK_CAROL)
 OUTSIDER = "d" * 96  # balance 200000 -> eligible in stake mode (unused by header
                      # verification here since it's mocked, kept for parity with
                      # the stake-switch spikes/e2e test).
@@ -117,6 +119,7 @@ import chain_state
 from consensus.engine import TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager, ConsensusRuleUpdate, ConsensusRuleVote
 from block import Block
+from bls_keys import SK_ALICE, SK_BOB, sign_tx
 
 V1, V2, V3 = %(V1)r, %(V2)r, %(V3)r
 OUTSIDER = %(OUTSIDER)r
@@ -203,22 +206,22 @@ update = ConsensusRuleUpdate(
 update_id_hex = update.update_id_hex
 note(f"update_id={update_id_hex} activate_at_height={H}")
 
-tx_update = {
+tx_update = sign_tx({
     "tx_id": "gov_update_1",
     "tx_type": "consensus_rule_update",
     "sender_pubkey": V1,
     "rule_revisions": [REVISION],
     "activate_at_height": H,
     "host_contract_patch": {"eligibility_mode": "stake"},
-}
-tx_vote_v1 = {
+}, SK_ALICE)
+tx_vote_v1 = sign_tx({
     "tx_id": "gov_vote_v1", "tx_type": "consensus_rule_vote",
-    "sender_pubkey": V1, "update_id": update_id_hex, "approve": True,
-}
-tx_vote_v2 = {
+    "sender_pubkey": V1, "sequence_number": 1, "update_id": update_id_hex, "approve": True,
+}, SK_ALICE)
+tx_vote_v2 = sign_tx({
     "tx_id": "gov_vote_v2", "tx_type": "consensus_rule_vote",
     "sender_pubkey": V2, "update_id": update_id_hex, "approve": True,
-}
+}, SK_BOB)
 
 # --- Mine blocks 1..H+2 via the MINE path (process_new_block, replay_mode=False) ---
 #
@@ -351,7 +354,8 @@ def _run_child(tmp_path):
     # an inherited PYTHONPATH pointing at the tau-lang nanobind build (see
     # this repo's other native tests / CLAUDE.md for the exact path); if the
     # caller already exported PYTHONPATH we keep it and just prepend repo root.
-    env["PYTHONPATH"] = str(_REPO) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(_REPO), str(_REPO / "tests"), env.get("PYTHONPATH", "")])
     proc = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True, text=True, env=env, timeout=300,
@@ -466,6 +470,8 @@ def test_replay_determinism_across_activation(tmp_path):
 
     # H (activation block itself): expected to match on both paths (per
     # ROOT_CAUSE.md, "Followers rebuild cleanly through" the activation block).
+    assert trace[(H, False)]["newly_active"] != "[]", (
+        f"the governance update never activated, so the comparison proves nothing\n{table}")
     replay_row = trace.get((H, True))
     assert replay_row is not None, f"no REPLAY HASH_TRACE line for block {H} (replay aborted too early)\n{table}"
     assert trace[(H, False)] == replay_row, (

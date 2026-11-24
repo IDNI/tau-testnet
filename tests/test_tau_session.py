@@ -107,18 +107,19 @@ def test_the_default_session_is_replaceable():
 
 # --- the engine drives the session it is given --------------------------------
 
-def _apply_with(session, rule="always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."):
+def _apply_with(session, rule="always ( o13[t]:bv[24] = { #x000001 }:bv[24] )."):
     from unittest.mock import patch
+    from bls_keys import SK_ALICE, pubkey_hex, sign_tx
     from consensus.engine import TauConsensusEngine
     from consensus.state import TauStateSnapshot
 
     engine = TauConsensusEngine(state_store=MagicMock())
     engine._state_store.commit.side_effect = lambda snap: snap
-    sender = "aa" * 48
-    tx = {
+    sender = pubkey_hex(SK_ALICE)
+    tx = sign_tx({
         "tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": sender,
         "sequence_number": 0, "fee_limit": "1000", "operations": {"0": rule},
-    }
+    })
     # The session's own dispatches go through its injected manager; the engine's
     # OTHER evaluator calls (fees, transfers) still go to tau_manager directly --
     # they are not on the session yet, which is exactly what this stage is.
@@ -151,7 +152,7 @@ def test_apply_records_the_rule_in_the_step_log():
     engine applied has to be in it."""
     m = _Manager(receipt={"outcome": "ACCEPTED_CHANGED", "accepted": True})
     session = ts.InProcessSession(manager=m)
-    rule = "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
+    rule = "always ( o13[t]:bv[24] = { #x000001 }:bv[24] )."
     _apply_with(session, rule=rule)
     rules = [e for e in session.log.entries() if e.kind == ts.RULE]
     assert rules, "the applied rule is missing from the step log"

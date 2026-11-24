@@ -10,6 +10,7 @@ import importlib
 sys.path.append(os.getcwd())
 
 import tau_manager
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload
 
 import commands.sendtx
 
@@ -51,8 +52,8 @@ class TestInvalidRuleRegression(unittest.TestCase):
             importlib.reload(commands.sendtx)
 
             with patch.dict('os.environ', {'TAU_FORCE_TEST': '0'}):
-                payload = {
-                    "sender_pubkey": "a" * 96,
+                payload = sign_payload({
+                    "sender_pubkey": pubkey_hex(SK_ALICE),
                     "sequence_number": 0,
                     "expiration_time": 9999999999,
                     "expire_at_height": 5000,
@@ -60,18 +61,16 @@ class TestInvalidRuleRegression(unittest.TestCase):
                         "0": "invalid rule here"
                     },
                     "fee_limit": "0",
-                    "signature": "a" * 192
-                }
+                }, SK_ALICE)
 
                 sys.modules['chain_state'].get_sequence_number.return_value = 0
                 sys.modules['db'].get_pending_sequence.return_value = None
                 sys.modules['chain_state'].get_rules_state.return_value = None
-                sys.modules['py_ecc.bls'].G2Basic.Verify.return_value = True
 
                 import tau_native
                 # The isolated compile reports the rule as invalid (non-None
                 # error string) -> queue_transaction returns TX_REJECTED.
-                with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)), \
+                with patch('commands.sendtx.validate_bls_pubkey', return_value=None), \
                      patch.object(
                          tau_native,
                          'compile_revisions_isolated_subprocess',

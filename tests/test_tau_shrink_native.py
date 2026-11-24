@@ -35,7 +35,6 @@ _CHILD = r'''
 import os, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"   # opt in (OFF by default)
 import config
 config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()
@@ -102,7 +101,6 @@ _CHILD_SRC_EQ = r'''
 import os, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"
 import config
 config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()
@@ -144,7 +142,6 @@ print("SRC_EQ_RESULT", "/".join(str(s) for s in streams), same, diff)
 _CHILD_ACCUM = r'''
 import os, tempfile, json
 os.environ["TAU_ENV"] = "test"; os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"
 import config; config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()
 import tau_native, tau_manager
@@ -206,7 +203,6 @@ def test_shrunk_set_accumulates_over_builtins_then_transfer(tmp_path):
 _CHILD_RESTORE = r'''
 import os, tempfile
 os.environ["TAU_ENV"] = "test"; os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"
 import config; config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()
 import tau_native, tau_manager
@@ -292,8 +288,8 @@ def test_src_eq_dest_rule_full_pubkeys_real_engine(tmp_path):
 
 # --- W1: the incident, end to end on the real engine --------------------------
 #
-# Pin i12 at the shrink width with a composite (the rule-sharing shape, which
-# always shrank correctly), then apply the UNPARENTHESIZED implication rule the
+# Pin i12 at the shrink width with a sender-guarded rule (which always shrank
+# correctly), then apply the UNPARENTHESIZED implication rule the
 # monitoring swarm submitted. Before the supported-subset rewrite this produced
 # `i12[t]:bv[8] = { #x<pk> }:bv[384]` and the engine refused it with
 # "Incompatible type information in i12, expected :bv[384], found :bv[8]" --
@@ -306,7 +302,6 @@ _CHILD_INCIDENT = r'''
 import os, sys, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"
 import config
 config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()
@@ -375,7 +370,7 @@ def test_unparenthesized_implication_applies_against_a_pinned_stream(tmp_path):
     line = next((l for l in proc.stdout.splitlines() if l.startswith("INCIDENT_RESULT")), None)
     assert line is not None, f"child produced no result.\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     _, pinned, applied, blocked, allowed, mixed = line.split()
-    assert pinned == "True", f"composite should pin i12: {line}"
+    assert pinned == "True", f"the guarded rule should pin i12: {line}"
     assert mixed == "False", f"prepared text must not mix widths: {line}"
     # The regression itself: pre-fix the engine rejected this outright.
     assert applied == "True", f"implication rule must apply against a pinned i12: {line}"

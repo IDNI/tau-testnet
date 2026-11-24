@@ -10,6 +10,8 @@ import sys
 import tempfile
 import unittest
 
+import pytest
+
 # Ensure project root is importable
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
@@ -31,10 +33,10 @@ from consensus.governance import ConsensusLifecycleManager, normalize_validator_
 GENESIS_PATH = os.path.join(project_root, "networks", "tau-testnet-v2", "genesis.json")
 
 # ─── Golden Vectors (computed deterministically from data/genesis.json) ───
-EXPECTED_BLOCK_HASH = "35faee3b5652e30c9b5a9adb89bdf3c2312ff0cef833adf57ebd9566ceeaf1a7"
-EXPECTED_STATE_HASH = "aebbc5045c868c8a8aac7a2ab8765c2541a31edc25509efeaa0376810bcee105"
+EXPECTED_BLOCK_HASH = "ebd27b9daabfbe16d7b6058e71b1e6d738c21a4aac2cd9b8ae17ab9c7331c096"
+EXPECTED_STATE_HASH = "3580b4fd39ad852ec23def9fda827af7315757ac2671acf24ecf1d0738c0acd2"
 EXPECTED_ACCOUNTS_HASH = "fa0b485d4a4cfd4a845226cd965cb996b9d0994764b64daca30459b99dd2b323"
-EXPECTED_META_HASH = "6e2c9124c55841f0bd61af7396fd627ecd296eb802ea10bd228b5def80fe9a77"
+EXPECTED_META_HASH = "9ea0065022e631e19a746095d1ab61c97561418607abf4370bde2733dbbce6fe"
 
 
 def _load_genesis():
@@ -149,6 +151,7 @@ class TestGoldenVectors(unittest.TestCase):
         )
         mgr.active_validators = normalize_validator_set(meta["active_validators"])
         mgr.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
+        mgr.faucet_amount = meta.get("mechanism_specific_metadata", {}).get("faucet_amount", 0)
         if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
             mgr.activate_approval_slots()
         mgr.recompute_approval_threshold()
@@ -166,6 +169,7 @@ class TestGoldenVectors(unittest.TestCase):
         self.assertEqual(state_hash, EXPECTED_STATE_HASH)
 
 
+@pytest.mark.usefixtures("isolated_chain_state")
 class TestGenesisReplay(unittest.TestCase):
     """Verify that loading genesis.json into an empty DB produces the correct state."""
 
@@ -284,6 +288,7 @@ class TestGenesisReplay(unittest.TestCase):
         self.assertEqual(head["block_hash"], EXPECTED_BLOCK_HASH)
 
 
+@pytest.mark.usefixtures("isolated_chain_state")
 class TestGenesisMismatchFatal(unittest.TestCase):
     """Verify that DB/genesis.json mismatches are fatal startup errors."""
 

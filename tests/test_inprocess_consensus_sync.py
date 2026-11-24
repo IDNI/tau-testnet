@@ -17,7 +17,7 @@ import tau_manager
 PLAN = [
     {"label": "consensus_rules", "text": "C", "persist": False},
     {"label": "application_rule_1", "text": "A", "persist": False},
-    {"label": "rule_composite_o5", "text": "X", "persist": False},
+    {"label": "application_rule_2", "text": "X", "persist": False},
 ]
 
 
@@ -108,10 +108,9 @@ def _boot_callback(monkeypatch, *, persisted_spec, plan):
                                 db=db_module, chain_state=cs)
     captured = {}
     tm.set_state_restore_callback.side_effect = lambda cb: captured.setdefault("cb", cb)
+    tm.start_manager_thread.side_effect = RuntimeError("stop here")
     with patch.object(tau_authority.AuthoritativeTauOwner, "initialize"), \
-         patch("tau_admission.enable_standby"), \
-         patch("threading.Thread") as thread:
-        thread.return_value.start.side_effect = RuntimeError("stop here")
+         patch("tau_admission.enable_standby"):
         with pytest.raises(RuntimeError, match="stop here"):
             server._run_server(container)
     return captured["cb"], cs, tm

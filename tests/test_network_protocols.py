@@ -1,4 +1,3 @@
-import importlib
 import json
 import os
 import threading
@@ -15,53 +14,7 @@ from commands import sendtx
 import config
 
 
-pytestmark = pytest.mark.trio
-
-
-@pytest.fixture(autouse=True)
-def isolate_db(tmp_path):
-    """Isolate the SQLite DB per test to avoid cross-test interference."""
-    orig_env = os.environ.get("TAU_DB_PATH")
-    db_file = tmp_path / "p2p_test.db"
-    os.environ["TAU_DB_PATH"] = str(db_file)
-    import config as config_module
-    import db as db_module
-    
-    # Close any existing connection before reloading to avoid leaks
-    if getattr(db_module, "_db_conn", None):
-        try:
-            db_module._db_conn.close()
-        except Exception:
-            pass
-
-    importlib.reload(config_module)
-    importlib.reload(db_module)
-    
-    import chain_state as chain_state_module
-    importlib.reload(chain_state_module)
-    import block as block_module
-    
-    db_module.init_db()
-    chain_state_module.load_genesis("data/genesis.json")
-    
-    genesis_hash = db_module.get_genesis_hash()
-    db_module.save_canonical_state_atomically(genesis_hash, 0, {}, {}, "", "", "", [], [], [], [])
-    chain_state_module._canonical_head_hash = genesis_hash
-    yield
-    
-    # Close our test connection before restoring
-    if getattr(db_module, "_db_conn", None):
-        try:
-            db_module._db_conn.close()
-        except Exception:
-            pass
-
-    if orig_env is None:
-        os.environ.pop("TAU_DB_PATH", None)
-    else:
-        os.environ["TAU_DB_PATH"] = orig_env
-    importlib.reload(config_module)
-    importlib.reload(db_module)
+pytestmark = [pytest.mark.trio, pytest.mark.usefixtures("isolate_db")]
 
 
 # Listen-addr helper lives in tests/conftest.py — single source.
@@ -506,6 +459,123 @@ async def test_transaction_gossip_triggers_queue(two_nodes, monkeypatch):
     payload, propagate_flag = recorded[0]
     assert payload == tx_payload
     assert propagate_flag is False
+
+
+async def test_large_header_response_read_until_eof(two_nodes, monkeypatch):
+    from network.libp2p_compat import read_until_eof
+    from network.protocols import TAU_PROTOCOL_SYNC
+    import db
+
+    svc1, svc2, _ = two_nodes
+
+    addrs2 = await _wait_for_addrs(svc2.host)
+    peer_info = PeerInfo(svc2.host.get_id(), addrs2)
+    svc1.host.get_peerstore().add_addrs(peer_info.peer_id, peer_info.addrs, 60)
+    await svc1.host.connect(peer_info)
+
+    def synthetic_blocks(start):
+        return [
+            {
+                "block_hash": f"{i:064x}",
+                "header": {
+                    "block_number": i,
+                    "previous_hash": f"{i - 1:064x}",
+                    "timestamp": 1_700_000_000 + i,
+                    "merkle_root": "f" * 64,
+                    "state_hash": "e" * 64,
+                    "state_locator": "d" * 64,
+                },
+            }
+            for i in range(start, 2000)
+        ]
+
+    monkeypatch.setattr(db, "get_canonical_blocks_at_or_after_height", synthetic_blocks)
+
+    req = {"type": "get_headers", "locator": ["unknown"], "stop": None, "limit": 2000}
+    stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_SYNC])
+    await stream.write(json.dumps(req).encode())
+    raw = await read_until_eof(stream, 2 * 1024 * 1024)
+    await stream.close()
+
+    assert len(raw) > 64 * 1024
+    resp = json.loads(raw.decode())
+    assert len(resp["headers"]) == 2000
+
+
+@pytest.fixture
+async def service_and_plain_host():
+    from libp2p import new_host
+    from network.config import NetworkConfig
+    from network.service import NetworkService
+
+    listen = [multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")]
+    server = new_host(listen_addrs=listen)
+    cfg = NetworkConfig(
+        network_id="testnet",
+        listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
+    )
+    svc = NetworkService(cfg, tx_submitter=lambda payload: "queued")
+    async with server.run(listen):
+        await _wait_for_addrs(server)
+        await svc.start()
+        await _wait_for_addrs(svc.host)
+        try:
+            yield svc, server
+        finally:
+            await svc.stop()
+
+
+async def test_block_sync_path_reads_reply_over_64k(service_and_plain_host, monkeypatch):
+    from conftest import connect_peers
+    from network.libp2p_compat import bounded_stream_read
+    from network.protocols import TAU_PROTOCOL_BLOCKS, TAU_PROTOCOL_SYNC
+    from network.service import NetworkService
+
+    svc, server = service_and_plain_host
+    block_count = 100
+    hashes = [f"{i + 1:064x}" for i in range(block_count)]
+    blocks_reply_sizes: List[int] = []
+
+    async def sync_handler(stream):
+        await bounded_stream_read(stream, 65535)
+        headers = [{"block_hash": bh, "block_number": i + 1} for i, bh in enumerate(hashes)]
+        await stream.write(json.dumps({"headers": headers, "tip_number": block_count}).encode())
+        await stream.close()
+
+    async def blocks_handler(stream):
+        req = json.loads((await bounded_stream_read(stream, 65535)).decode())
+        blocks = [
+            {
+                "block_hash": bh,
+                "header": {"block_number": int(bh, 16), "block_hash": bh},
+                "transactions": ["t" * 2048],
+            }
+            for bh in req["hashes"]
+        ]
+        reply = json.dumps({"blocks": blocks}).encode()
+        blocks_reply_sizes.append(len(reply))
+        await stream.write(reply)
+        await stream.close()
+
+    server.set_stream_handler(TAU_PROTOCOL_SYNC, sync_handler)
+    server.set_stream_handler(TAU_PROTOCOL_BLOCKS, blocks_handler)
+
+    ingested_batches: List[int] = []
+
+    def record_ingest(sorted_blocks, peer_id):
+        ingested_batches.append(len(sorted_blocks))
+        return len(sorted_blocks)
+
+    monkeypatch.setattr(NetworkService, "_ingest_blocks", staticmethod(record_ingest))
+
+    await connect_peers(svc.host, server)
+    ingested = await svc._sync_and_ingest_from_peer(
+        str(server.get_id()), [svc._genesis_hash], limit=block_count
+    )
+    assert len(blocks_reply_sizes) == 1
+    assert blocks_reply_sizes[0] > 2 * 65536
+    assert ingested_batches == [block_count]
+    assert ingested == block_count
 
 
 async def test_block_gossip_triggers_sync(two_nodes, monkeypatch):
@@ -982,6 +1052,92 @@ async def test_gossip_dht_multi_hop_routing(monkeypatch):
         }
         assert str(svc_c.host.get_id()) in svc_a._opportunistic_peers
     finally:
+        await svc_c.stop()
+        await svc_b.stop()
+        await svc_a.stop()
+
+
+async def test_redial_before_late_disconnect_event_gets_handshake():
+    from network.config import NetworkConfig
+    from network.service import NetworkService
+
+    cfg = NetworkConfig(
+        network_id="late-disconnect-testnet",
+        listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
+    )
+
+    svc_a = NetworkService(cfg)
+    svc_b = NetworkService(cfg)
+    svc_c = NetworkService(cfg)
+
+    # libp2p can deliver the disconnect event of an old connection after the
+    # connect event of a redial. B holds that event until the redial is handled.
+    release_disconnect = trio.Event()
+    b_connects: Dict[str, int] = {}
+    b_handshakes: Dict[str, int] = {}
+    orig_connected = svc_b._on_peer_connected
+    orig_disconnected = svc_b._on_peer_disconnected
+    orig_handshake = svc_b._perform_handshake
+
+    async def connected_b(conn):
+        key = str(conn.muxed_conn.peer_id)
+        await orig_connected(conn)
+        b_connects[key] = b_connects.get(key, 0) + 1
+        if key == str(svc_a.host.get_id()) and b_connects[key] >= 2:
+            release_disconnect.set()
+
+    async def disconnected_b(conn):
+        if str(conn.muxed_conn.peer_id) == str(svc_a.host.get_id()):
+            await release_disconnect.wait()
+        await orig_disconnected(conn)
+
+    async def handshake_b(peer_id):
+        key = str(peer_id)
+        b_handshakes[key] = b_handshakes.get(key, 0) + 1
+        await orig_handshake(peer_id)
+
+    svc_b._on_peer_connected = connected_b
+    svc_b._on_peer_disconnected = disconnected_b
+    svc_b._perform_handshake = handshake_b
+
+    await svc_a.start()
+    await svc_b.start()
+    await svc_c.start()
+
+    try:
+        addrs_b = await _wait_for_addrs(svc_b.host)
+        addrs_c = await _wait_for_addrs(svc_c.host)
+        a_key = str(svc_a.host.get_id())
+
+        peer_info_b = PeerInfo(svc_b.host.get_id(), addrs_b)
+        svc_a.host.get_peerstore().add_addrs(peer_info_b.peer_id, peer_info_b.addrs, 60)
+        await svc_a.host.connect(peer_info_b)
+
+        peer_info_c = PeerInfo(svc_c.host.get_id(), addrs_c)
+        svc_b.host.get_peerstore().add_addrs(peer_info_c.peer_id, peer_info_c.addrs, 60)
+        await svc_b.host.connect(peer_info_c)
+
+        with trio.fail_after(5):
+            while b_handshakes.get(a_key, 0) < 1:
+                await trio.sleep(0.05)
+
+        await svc_a.host.get_network().close_peer(svc_b.host.get_id())
+        assert not list(svc_a.host.get_connected_peers())
+
+        await svc_a.publish_gossip("late.disconnect.route", {"value": 1})
+
+        with trio.fail_after(5):
+            await release_disconnect.wait()
+        with trio.fail_after(5):
+            while b_handshakes.get(a_key, 0) < 2:
+                await trio.sleep(0.05)
+        with trio.fail_after(5):
+            while str(svc_c.host.get_id()) not in svc_a._opportunistic_peers:
+                await trio.sleep(0.05)
+
+        assert svc_b._peer_has_open_connection(a_key)
+    finally:
+        release_disconnect.set()
         await svc_c.stop()
         await svc_b.stop()
         await svc_a.stop()

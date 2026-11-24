@@ -12,6 +12,8 @@ unavailable — run with e.g.:
 """
 import json
 import os
+import shutil
+import tempfile
 import sys
 import time
 import unittest
@@ -34,16 +36,15 @@ import config
 import chain_state
 import db
 import tau_manager
+from errors import TauEngineCrash
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 from commands import sendtx, createblock
 
 GENESIS_TAU = os.path.join(project_root, "genesis.tau")
 TRANSFER_RULE_PATH = os.path.join(project_root, "rules", "04_handle_valid_transfer.tau")
 
-FEE_RULE_10 = "always (o9[t]:bv[24] = { #x00000a }:bv[24])."
-FEE_RULE_20 = "always (o9[t]:bv[24] = { #x000014 }:bv[24])."
-CUSTOM_FEE_RULE_5 = "always (o8[t]:bv[24] = { #x000005 }:bv[24])."
 
-RECIPIENT = "c" * 96
+RECIPIENT = pubkey_hex(SK_CAROL)
 
 
 class _NativeFeeE2EBase(unittest.TestCase):
@@ -59,11 +60,17 @@ class _NativeFeeE2EBase(unittest.TestCase):
                 "data_local/test_miner.key absent; local miner identity required "
                 "for real PoA mining (see config.DATA_LOCAL_DIR)"
             )
-        self.test_db = "test_fee_native_db.sqlite"
+        try:
+            iface = tau_native.TauInterface(GENESIS_TAU)
+        except TauEngineCrash:
+            self.skipTest(
+                "native interpreter unavailable in this process (polluted by an "
+                "earlier in-process interpreter); run this file on its own"
+            )
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_fee_native_db.sqlite")
         self.original_db = config.STRING_DB_PATH
         config.set_database_path(self.test_db)
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
         if db._db_conn:
             db._db_conn.close()
         db._db_conn = None
@@ -74,10 +81,8 @@ class _NativeFeeE2EBase(unittest.TestCase):
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
 
-        self.sender = chain_state.GENESIS_ADDRESS
+        self.sender = pubkey_hex(SK_ALICE)
         chain_state._balances[self.sender] = 100000
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
         # The local miner proposes every block here, so it must be the (sole)
         # active validator: in-set for the W1 proposer gate, and the single
         # voter that reaches a 1-of-1 governance quorum in the fee-change tests.
@@ -86,21 +91,23 @@ class _NativeFeeE2EBase(unittest.TestCase):
 
         # Live interpreter from the real genesis program; rules arrive the
         # same way they do in production: as i0 pointwise updates.
-        tau_manager.tau_direct_interface = tau_native.TauInterface(GENESIS_TAU)
+        tau_manager.tau_direct_interface = iface
         tau_manager.tau_ready.set()
         self._seed_rule(open(TRANSFER_RULE_PATH).read(), "transfer-rule")
+        # The block-production worker replays the hashed genesis consensus
+        # rules, so the admission interface must carry the same ones.
+        self._seed_rule(
+            chain_state._preprocess_tau_spec_text(
+                json.load(open("data/genesis.json"))["consensus_rules"]
+            ),
+            "genesis-consensus",
+        )
 
         # The point of this suite: NO TAU_FORCE_TEST — all Tau evaluation
         # is real (conftest defaults it to "1" for the legacy suite).
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
 
-        # Signature plumbing is out of scope here (covered elsewhere);
-        # everything Tau/fee related runs for real. BLS is mandatory now, so
-        # mock the verifier instead of disabling it.
-        patch("commands.sendtx.G2Basic.Verify", return_value=True).start()
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
         patch("commands.createblock._BLS_AVAILABLE", True).start()
-        patch("commands.createblock._validate_signature", return_value=True).start()
         patch("block.bls_signing_available", return_value=True).start()
         patch("consensus.engine.TauConsensusEngine.verify_block_header", return_value=True).start()
         patch("consensus.engine.TauConsensusEngine.query_eligibility", return_value=True).start()
@@ -109,12 +116,10 @@ class _NativeFeeE2EBase(unittest.TestCase):
         patch.stopall()
         tau_manager.tau_ready.clear()
         tau_manager.tau_direct_interface = None
-        config.TESTNET_AUTO_FAUCET = self.original_faucet
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.set_database_path(self.original_db)
 
     def _seed_rule(self, rule_text, label):
@@ -126,8 +131,31 @@ class _NativeFeeE2EBase(unittest.TestCase):
         )
         self.assertNotIn("error", str(out).lower(), f"seeding {label} failed: {out}")
 
+    def _custom_fee_rule(self, fee):
+        # Sender-scoped, as admission requires for o8 rules.
+        return (
+            f"always (i12[t]:bv[384] = {{ #x{self.sender} }}:bv[384] -> "
+            f"o8[t]:bv[24] = {{ #x{fee:06x} }}:bv[24])."
+        )
+
+    def _mine_rule_tx(self, rule):
+        tx = json.dumps(sign_payload({
+            "sender_pubkey": self.sender,
+            "sequence_number": chain_state.get_sequence_number(self.sender),
+            "expiration_time": int(time.time()) + 3600,
+            "expire_at_height": 5000,
+            "operations": {"0": rule},
+            "fee_limit": "50",
+        }, SK_ALICE))
+        res = sendtx.queue_transaction(tx, propagate=False)
+        self.assertTrue(res["ok"], f"rule tx rejected: {res}")
+        block_res = createblock.create_block_from_mempool()
+        self.assertEqual(len(block_res.get("transactions", [])), 1, block_res)
+        # Admission reads the in-process interface, which block apply does not feed.
+        self._seed_rule(rule, "mined-user-rule")
+
     def _tx(self, amount, fee_limit, seq=None):
-        return json.dumps({
+        return json.dumps(sign_payload({
             "sender_pubkey": self.sender,
             "sequence_number": seq if seq is not None
             else chain_state.get_sequence_number(self.sender),
@@ -135,29 +163,15 @@ class _NativeFeeE2EBase(unittest.TestCase):
             "expire_at_height": 5000,
             "operations": {"1": [[self.sender, RECIPIENT, str(amount)]]},
             "fee_limit": str(fee_limit),
-            "signature": "00" * 48,
-        })
+        }, SK_ALICE))
 
 @pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
 class TestFeeModelNativeE2E(_NativeFeeE2EBase):
     """Full pipeline with a live Tau interpreter."""
 
-    def test_fee_inactive_without_o9_rule(self):
-        """No fee rule seeded -> real Tau emits no o9 -> legacy behavior."""
-        start = chain_state.get_balance(self.sender)
-        res = sendtx.queue_transaction(self._tx(100, 0), propagate=False)
-        self.assertTrue(res["ok"], f"queue failed: {res}")
-
-        block_res = createblock.create_block_from_mempool()
-        self.assertEqual(len(block_res.get("transactions", [])), 1, block_res)
-        self.assertEqual(chain_state.get_balance(self.sender), start - 100)
-        self.assertEqual(chain_state.get_balance(RECIPIENT), 100)
-        self.assertEqual(chain_state.get_balance(config.MINER_PUBKEY), 0)
-
     def test_consensus_fee_charged_end_to_end(self):
-        """o9=10 rule live: sender pays amount+10, proposer credited 10,
+        """Genesis o9=10 fee, no user o9 rule: sender pays amount+10, proposer credited 10,
         state hash invariant (process_new_block re-execution) holds."""
-        self._seed_rule(FEE_RULE_10, "fee-10")
         start = chain_state.get_balance(self.sender)
 
         res = sendtx.queue_transaction(self._tx(100, 50), propagate=False)
@@ -177,7 +191,6 @@ class TestFeeModelNativeE2E(_NativeFeeE2EBase):
         self.assertEqual(len(db.get_mempool_txs()), 0)
 
     def test_fee_limit_below_real_fee_rejected_at_admission(self):
-        self._seed_rule(FEE_RULE_10, "fee-10")
         res = sendtx.queue_transaction(self._tx(100, 5), propagate=False)
         self.assertFalse(res["ok"])
         self.assertEqual(res["code"], "FEE_LIMIT_TOO_LOW")
@@ -185,9 +198,9 @@ class TestFeeModelNativeE2E(_NativeFeeE2EBase):
 
     def test_custom_o8_fee_added_on_top(self):
         """User custom fee rule (o8=5) + consensus fee (o9=10) -> 15."""
-        self._seed_rule(FEE_RULE_10, "fee-10")
-        self._seed_rule(CUSTOM_FEE_RULE_5, "custom-fee-5")
+        self._mine_rule_tx(self._custom_fee_rule(5))
         start = chain_state.get_balance(self.sender)
+        miner_start = chain_state.get_balance(config.MINER_PUBKEY)
 
         res = sendtx.queue_transaction(self._tx(100, 50), propagate=False)
         self.assertTrue(res["ok"], f"queue failed: {res}")
@@ -196,44 +209,20 @@ class TestFeeModelNativeE2E(_NativeFeeE2EBase):
         block_res = createblock.create_block_from_mempool()
         self.assertEqual(len(block_res.get("transactions", [])), 1, block_res)
         self.assertEqual(chain_state.get_balance(self.sender), start - 100 - 15)
-        self.assertEqual(chain_state.get_balance(config.MINER_PUBKEY), 15)
-
-    def test_governance_style_fee_change_between_blocks(self):
-        """Fee rule replaced live (o9: 10 -> 20); next block charges 20."""
-        self._seed_rule(FEE_RULE_10, "fee-10")
-        start = chain_state.get_balance(self.sender)
-
-        res = sendtx.queue_transaction(self._tx(100, 50), propagate=False)
-        self.assertTrue(res["ok"], f"queue failed: {res}")
-        block_res = createblock.create_block_from_mempool()
-        self.assertEqual(len(block_res.get("transactions", [])), 1, block_res)
-        self.assertEqual(chain_state.get_balance(config.MINER_PUBKEY), 10)
-
-        # Vote in the new fee (same i0 revision path governance activation uses).
-        self._seed_rule(FEE_RULE_20, "fee-20")
-        res = sendtx.queue_transaction(self._tx(100, 50), propagate=False)
-        self.assertTrue(res["ok"], f"queue failed: {res}")
-        self.assertEqual(db.get_mempool_entries()[0]["estimated_fee"], 20)
-        block_res = createblock.create_block_from_mempool()
-        self.assertEqual(len(block_res.get("transactions", [])), 1, block_res)
-
-        self.assertEqual(chain_state.get_balance(config.MINER_PUBKEY), 30)  # 10 + 20
-        self.assertEqual(chain_state.get_balance(self.sender), start - 200 - 30)
+        self.assertEqual(chain_state.get_balance(config.MINER_PUBKEY), miner_start + 15)
 
     def test_insufficient_for_amount_plus_fee_real_tau(self):
         """Balance covers the amount but not amount+fee -> rejected, state intact."""
-        self._seed_rule(FEE_RULE_10, "fee-10")
-        poor = "d" * 96
+        poor = pubkey_hex(SK_BOB)
         chain_state._balances[poor] = 100
-        tx = json.dumps({
+        tx = json.dumps(sign_payload({
             "sender_pubkey": poor,
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 3600,
             "expire_at_height": 5000,
             "operations": {"1": [[poor, RECIPIENT, "100"]]},
             "fee_limit": "50",
-            "signature": "00" * 48,
-        })
+        }, SK_BOB))
         res = sendtx.queue_transaction(tx, propagate=False)
         self.assertFalse(res["ok"])
         self.assertEqual(res["code"], "INSUFFICIENT_FUNDS")
@@ -262,14 +251,8 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
             validator = validator.hex()
         chain_state._balances.setdefault(validator, 0)
 
-        # Seed the live interpreter with the actual genesis consensus rules
-        # (single i0 update, like the startup restore plan) — fee 10 is in.
-        # Read from the genesis artifact: the in-memory consensus_rules_state
-        # gets rewritten with snapshot provenance after the first block.
         genesis_consensus = json.load(open("data/genesis.json"))["consensus_rules"]
-        genesis_spec = chain_state._preprocess_tau_spec_text(genesis_consensus)
-        self.assertIn("o9", genesis_spec)
-        self._seed_rule(genesis_spec, "genesis-consensus")
+        self.assertIn("o9", chain_state._preprocess_tau_spec_text(genesis_consensus))
 
         start = chain_state.get_balance(self.sender)
 
@@ -284,7 +267,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
         new_spec = genesis_consensus.replace("#x00000a", "#x000014")
         self.assertNotEqual(new_spec, genesis_consensus)
         activate_at = 4
-        update_tx = json.dumps({
+        update_tx = json.dumps(sign_payload({
             "tx_type": "consensus_rule_update",
             "sender_pubkey": validator,
             "sequence_number": chain_state.get_sequence_number(validator),
@@ -294,8 +277,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
             "activate_at_height": activate_at,
             "host_contract_patch": {},
             "fee_limit": "0",
-            "signature": "00" * 48,
-        })
+        }, int(config.MINER_PRIVKEY, 16)))
         res = sendtx.queue_transaction(update_tx, propagate=False)
         self.assertTrue(res["ok"], f"proposal rejected: {res}")
         self._mine(expect_txs=1)
@@ -306,7 +288,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
         )
 
         # Block 3: validator vote reaches threshold (1 of 1) -> scheduled.
-        vote_tx = json.dumps({
+        vote_tx = json.dumps(sign_payload({
             "tx_type": "consensus_rule_vote",
             "sender_pubkey": validator,
             "sequence_number": chain_state.get_sequence_number(validator),
@@ -315,8 +297,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
             "update_id": update_id_hex,
             "approve": True,
             "fee_limit": "0",
-            "signature": "00" * 48,
-        })
+        }, int(config.MINER_PRIVKEY, 16)))
         res = sendtx.queue_transaction(vote_tx, propagate=False)
         self.assertTrue(res["ok"], f"vote rejected: {res}")
         self._mine(expect_txs=1)

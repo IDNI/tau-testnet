@@ -21,9 +21,10 @@ import tau_authority
 import tau_manager
 from chain_state import GENESIS_ADDRESS, GENESIS_BALANCE
 from block import Block, BlockHeader, compute_merkle_root, compute_tx_hash, sha256_hex
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_header, sign_payload, sign_tx
 from consensus.engine import TauConsensusEngine
 
-SENDER = "a" * 96
+SENDER = pubkey_hex(SK_ALICE)
 RECIPIENT = "b" * 96
 PROPOSER = "c" * 96
 BASE_TS = 1_700_000_000
@@ -33,15 +34,14 @@ NODE_GENESIS_PATH = os.path.join(project_root, "data", "genesis.json")
 
 
 def _tx(seq, amount=1):
-    return {
+    return sign_payload({
         "sender_pubkey": SENDER,
         "sequence_number": seq,
         "expiration_time": 9999999999,
         "expire_at_height": 5000,
         "operations": {"1": [[SENDER, RECIPIENT, str(amount)]]},
         "fee_limit": "0",
-        "signature": "dummy_signature_for_testing",
-    }
+    }, SK_ALICE)
 
 
 def _txs(count):
@@ -365,8 +365,6 @@ class ChainTestCase(unittest.TestCase):
         chain_state._genesis_accounts_state = {GENESIS_ADDRESS: GENESIS_BALANCE}
         chain_state._balances[GENESIS_ADDRESS] = GENESIS_BALANCE
 
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
 
         self.verify_patch = patch(
             'consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
@@ -376,7 +374,6 @@ class ChainTestCase(unittest.TestCase):
         self.genesis_hash = db.get_genesis_hash()
 
     def tearDown(self):
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         self.wait_patch.stop()
         self.verify_patch.stop()
         config.set_database_path(self.original_db_path)
@@ -390,10 +387,13 @@ class ChainTestCase(unittest.TestCase):
         return db.get_canonical_head()['block_hash']
 
     def make(self, number, txs, previous_hash=None, proposer=SENDER):
-        return Block.create(
+        blk = Block.create(
             block_number=number, previous_hash=previous_hash or self.genesis_hash,
             transactions=txs, proposer_pubkey=proposer, timestamp=BASE_TS + number,
         )
+        if proposer == SENDER:
+            blk.consensus_proof = sign_header(blk.header, SK_ALICE)
+        return blk
 
     def tampered_copy(self, block):
         """The same block as a relayer would alter it: an extra transaction, header
@@ -586,7 +586,6 @@ class TestMinedBlocksReverify(ChainTestCase):
             patch('commands.createblock.tau_manager', self.mock_tau),
             patch('consensus.engine.tau_manager', self.mock_tau),
             patch('chain_state.tau_manager', self.mock_tau),
-            patch('commands.createblock._validate_signature', return_value=True),
         ]
         for p in self.patches:
             p.start()
@@ -602,9 +601,9 @@ class TestMinedBlocksReverify(ChainTestCase):
         from commands import createblock
 
         sent = [
-            {"sender_pubkey": sender * 96, "recipient": "b", "amount": 10,
-             "operations": {"1": []}, "sequence_number": 0, "fee_limit": "0", "signature": "sig"}
-            for sender in "acd"
+            sign_tx({"sender_pubkey": pubkey_hex(sk), "recipient": "b", "amount": 10,
+                     "operations": {"1": []}, "sequence_number": 0, "fee_limit": "0"}, sk)
+            for sk in (SK_ALICE, SK_BOB, SK_CAROL)
         ]
         for n, tx in enumerate(sent):
             db.add_mempool_tx(json.dumps(tx), compute_tx_hash(tx), 1000 + n)

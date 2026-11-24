@@ -2,8 +2,8 @@
 
     A  accepted rule transaction
     B  changes policy, lifecycle, allocator and evaluator -- then is rejected
-    C  accepted, and SENSITIVE to B: its composite is composed from the clause
-       registry, so a surviving B clause changes the very text C installs
+    C  accepted, and SENSITIVE to B: a surviving B clause in the registry, or a
+       dirty evaluator left by B's fee step, would change C's outcome
     D  accepted lifecycle operation (a rule offer)
 
 The control block is A, C, D with B never submitted. Every observable is
@@ -12,13 +12,13 @@ clause registry, the offer book, the approval book, application-rule state, the
 journal head, the allocator delta, and the evaluator's own counters.
 
 B is a genuine contaminant rather than a no-op. It registers a clause (lifecycle
-+ registry), interns its own pubkey (allocator), installs a recomposed composite
-(evaluator), and only then fails on an unaffordable transfer.
++ registry), interns its own pubkey (allocator), builds its clause in the policy
+evaluator, steps the main evaluator for its fee, and only then fails settlement.
 """
 import os
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import db
 import tau_allocator as alloc
@@ -28,6 +28,7 @@ import tau_journal as tj
 import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session as ts
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, SK_MALLORY, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
 from consensus.rule_offers import RuleOffer
@@ -47,18 +48,12 @@ pytestmark = pytest.mark.skipif(not _native_available(),
                                 reason="native tau module not built")
 
 
-@pytest.fixture(autouse=True)
-def _signatures_not_under_test():
-    # These tests exercise evaluator and lifecycle mechanics, not signatures.
-    with patch("consensus.engine.verify_tx_signature", return_value=(True, "")):
-        yield
-
-
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-A_KEY = "a1" * 48
-B_KEY = "b2" * 48
-C_KEY = "c3" * 48
-D_KEY = "e5" * 48
+A_KEY = pubkey_hex(SK_ALICE)
+B_KEY = pubkey_hex(SK_BOB)
+C_KEY = pubkey_hex(SK_CAROL)
+D_KEY = pubkey_hex(SK_MALLORY)
+_SK = {A_KEY: SK_ALICE, B_KEY: SK_BOB, C_KEY: SK_CAROL, D_KEY: SK_MALLORY}
 PROPOSER = "d4" * 48
 STREAM = tau_defs.USER_POLICY_STREAM_INDEX
 
@@ -77,7 +72,7 @@ def _env():
 
 def _router():
     with open(os.path.join(REPO, "genesis.tau")) as fh:
-        return f"always ( {fh.read().strip()} )."
+        return f"always ( {fh.read().strip()} && (o9[t]:bv[24] = {{ #x000007 }}:bv[24]) )."
 
 
 def _lifecycle():
@@ -117,24 +112,25 @@ def _rule_tx(tx_id, sender, rule, transfer=None, fee_limit="10000"):
           "operations": {"0": rule}}
     if transfer:
         tx["operations"]["1"] = [transfer]
-    return tx
+    return sign_tx(tx, _SK[sender])
 
 
 def _offer_tx(tx_id, offer):
-    return {"tx_id": tx_id, "tx_type": "rule_offer",
-            "sender_pubkey": offer.offerer_pubkey, "sequence_number": 0,
-            "recipient_pubkey": offer.recipient_pubkey,
-            "rule_text": offer.rule_text,
-            "expire_at_height": offer.expire_at_height,
-            "fee_limit": "10000"}
+    return sign_tx({"tx_id": tx_id, "tx_type": "rule_offer",
+                    "sender_pubkey": offer.offerer_pubkey, "sequence_number": 0,
+                    "recipient_pubkey": offer.recipient_pubkey,
+                    "rule_text": offer.rule_text,
+                    "expire_at_height": offer.expire_at_height,
+                    "fee_limit": "10000"}, _SK[offer.offerer_pubkey])
 
 
 OFFER = RuleOffer(offerer_pubkey=D_KEY, recipient_pubkey=A_KEY,
                   rule_text=OFFER_RULE, expire_at_height=500)
 
 TX_A = _rule_tx("A", A_KEY, _clause("000002"))
-TX_B = _rule_tx("B", B_KEY, _clause("000003"),
-                transfer=[B_KEY, C_KEY, "999999"])
+# An unmeetable fee (the router sets o9 = 7) is the rejection left once a routed
+# clause lands, since a rule sharing a tx with transfers is refused up front.
+TX_B = _rule_tx("B", B_KEY, _clause("000003"), fee_limit="1")
 TX_C = _rule_tx("C", C_KEY, _clause("000004"))
 TX_D = _offer_tx("D", OFFER)
 
@@ -260,9 +256,6 @@ def test_b_really_did_contaminate_before_it_was_rejected(temp_database):
         logs = " ".join(result.receipts["B"]["logs"])
         assert "o5 clause registered" in logs, (
             f"B never registered its clause, so it contaminated nothing: {logs}"
-        )
-        assert "Tau(composite)" in logs, (
-            f"B never installed a composite, so the evaluator was untouched: {logs}"
         )
         # The evaluator was rebuilt: C's branch found the proposal dirty on its
         # way in and reconstructed before running. `dirty` is therefore already

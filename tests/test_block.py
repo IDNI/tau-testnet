@@ -1,4 +1,6 @@
 import os
+import shutil
+import tempfile
 import sys
 import unittest
 import hashlib
@@ -20,6 +22,7 @@ from block import (
 from commands import createblock
 from db import init_db, add_mempool_tx, get_canonical_head_block, clear_mempool
 import config
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_tx
 
 TEST_MINER_PRIVKEY = "11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"
 
@@ -83,7 +86,8 @@ class TestBlockCreation(unittest.TestCase):
     
     def setUp(self):
         """Set up a temporary database for testing block creation."""
-        self.test_db_path = "test_blockchain_db.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db_path = os.path.join(self._tmpdir, "test_blockchain_db.sqlite")
         self.original_db_path = config.STRING_DB_PATH
         config.set_database_path(self.test_db_path)
         init_db()
@@ -95,24 +99,22 @@ class TestBlockCreation(unittest.TestCase):
         chain_state._balances.clear()
         chain_state._sequence_numbers.clear()
         
-        self.tx1_json = json.dumps({
-            "sender_pubkey": "a"*96, 
+        self.tx1_json = json.dumps(sign_tx({
+            "sender_pubkey": pubkey_hex(SK_ALICE),
             "recipient": "b", 
             "amount": 10, 
             "operations": {"1": []},
             "sequence_number": 0,
             "fee_limit": "0",
-            "signature": "sig"
-        })
-        self.tx2_json = json.dumps({
-            "sender_pubkey": "c"*96, 
+        }, SK_ALICE))
+        self.tx2_json = json.dumps(sign_tx({
+            "sender_pubkey": pubkey_hex(SK_BOB),
             "recipient": "d", 
             "amount": 20, 
             "operations": {"1": []},
             "sequence_number": 0,
             "fee_limit": "0",
-            "signature": "sig"
-        })
+        }, SK_BOB))
 
         # Mock Tau Manager for createblock
         self.tau_patcher = unittest.mock.patch('commands.createblock.tau_manager')
@@ -128,9 +130,6 @@ class TestBlockCreation(unittest.TestCase):
         self.chain_tau_patcher = unittest.mock.patch('chain_state.tau_manager', self.mock_tau)
         self.chain_tau_patcher.start()
         
-        # Mock Signature Validation
-        self.sig_patcher = unittest.mock.patch('commands.createblock._validate_signature', return_value=True)
-        self.sig_patcher.start()
         self.verify_patcher = unittest.mock.patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
         self.verify_patcher.start()
         
@@ -142,15 +141,13 @@ class TestBlockCreation(unittest.TestCase):
         self.tau_patcher.stop()
         self.engine_tau_patcher.stop()
         self.chain_tau_patcher.stop()
-        self.sig_patcher.stop()
         self.verify_patcher.stop()
         clear_mempool()
         # Close the connection if it's open, to release file lock on Windows
         if hasattr(createblock.db, '_db_conn') and createblock.db._db_conn is not None:
             createblock.db._db_conn.close()
             createblock.db._db_conn = None
-        if os.path.exists(self.test_db_path):
-            os.remove(self.test_db_path)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         # Restore original db path if needed elsewhere
         config.set_database_path(self.original_db_path)
         config.MINER_PRIVKEY = self.original_miner_privkey

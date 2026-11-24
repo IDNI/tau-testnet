@@ -7,34 +7,27 @@ guarded only by the reserved-stream error, so a transaction already rejected by
 the sequence check still had its policy replaced and its pending approvals
 cancelled -- a "rejected" transaction with visible side effects.
 """
-import hashlib
 from unittest.mock import MagicMock, patch
 
 import pytest
-from py_ecc.bls import G2Basic
 
 import tau_defs
+from bls_keys import pubkey_hex, sign_payload
 from consensus.engine import TauConsensusEngine
+from consensus.governance import ConsensusLifecycleManager
 from consensus.state import TauStateSnapshot
-from consensus.tx_signing import signing_message_bytes
 
 SK_SENDER = 33333
-SENDER = G2Basic.SkToPk(SK_SENDER).hex()
+SENDER = pubkey_hex(SK_SENDER)
 PROPOSER = "bb" * 48
 STREAM = tau_defs.USER_POLICY_STREAM_INDEX
-# A registered clause carries NO i12 guard -- the composer supplies the scope.
+# A registered clause carries NO i12 guard -- the node supplies the scope.
 CLAUSE = f"always ( o{STREAM}[t]:bv[24] = {{ #x000000 }}:bv[24] )."
 
 
 class _Offers:
     def __init__(self):
         self.accepted_clauses = {(SENDER.lower(), STREAM): "PREVIOUS POLICY"}
-
-    def clauses_for_stream(self, stream):
-        return {k: v for k, v in self.accepted_clauses.items() if k[1] == stream}
-
-    def composite_for_stream(self, stream):
-        return f"always ( o{stream}[t]:bv[24] = {{ #x000001 }}:bv[24] )."
 
 
 class _Approvals:
@@ -46,9 +39,16 @@ class _Approvals:
         return []
 
 
+class _LifecycleMock(MagicMock):
+    # Each transaction forks the lifecycle, so the double must fork for real.
+    fork = ConsensusLifecycleManager.fork
+    adopt = ConsensusLifecycleManager.adopt
+
+
 def _lifecycle():
-    mgr = MagicMock()
+    mgr = _LifecycleMock()
     mgr.approval_slots_active = True
+    mgr.faucet_amount = 0
     mgr.rule_offers = _Offers()
     mgr.approval_requests = _Approvals()
     return mgr
@@ -58,7 +58,7 @@ def _apply(*, sequence_number, seq_state=None):
     engine = TauConsensusEngine(state_store=MagicMock())
     engine._state_store.commit.side_effect = lambda snap: snap
     lifecycle = _lifecycle()
-    tx = {
+    tx = sign_payload({
         "tx_id": "r1",
         "tx_type": "user_tx",
         "sender_pubkey": SENDER,
@@ -66,10 +66,7 @@ def _apply(*, sequence_number, seq_state=None):
         "expiration_time": 9999999999,
         "fee_limit": "100",
         "operations": {"0": CLAUSE},
-    }
-    tx["signature"] = G2Basic.Sign(
-        SK_SENDER, hashlib.sha256(signing_message_bytes(tx)).digest()
-    ).hex()
+    }, SK_SENDER)
     with patch("tau_manager.tau_ready") as ready, \
          patch("tau_manager.communicate_with_tau", return_value="ok"), \
          patch("tau_manager.communicate_with_tau_multi", return_value={9: "7"}), \
@@ -105,7 +102,7 @@ def test_a_live_transaction_still_registers_its_clause():
 
 # --- the rule must not survive a later rejection ------------------------------
 
-RULE = "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
+RULE = "always ( o13[t]:bv[24] = { #x000001 }:bv[24] )."
 
 
 def _apply_rule_with_fee(*, fee_limit, saves, states):
@@ -117,14 +114,15 @@ def _apply_rule_with_fee(*, fee_limit, saves, states):
     """
     engine = TauConsensusEngine(state_store=MagicMock())
     engine._state_store.commit.side_effect = lambda snap: snap
-    tx = {
+    tx = sign_payload({
         "tx_id": "r1",
         "tx_type": "user_tx",
         "sender_pubkey": SENDER,
         "sequence_number": 0,
+        "expiration_time": 9999999999,
         "fee_limit": fee_limit,
         "operations": {"0": RULE},
-    }
+    }, SK_SENDER)
 
     def _get_state():
         return states.pop(0) if len(states) > 1 else states[0]

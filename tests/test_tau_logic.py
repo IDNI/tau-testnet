@@ -31,16 +31,14 @@ import unittest
 import os
 import sys
 import time
-import threading
 import glob
+import shutil
+import tempfile
 
 # Add the project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-
-# Ensure TAU_DB_PATH is set for db.py
-TEST_DB_PATH = "test_tau_logic_db.sqlite"
 
 import tau_manager
 import tau_defs
@@ -55,7 +53,14 @@ class TestTauLogic(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Starts the Tau manager, loads rules, and prepares for testing."""
-        os.environ["TAU_DB_PATH"] = TEST_DB_PATH
+        cls._tmpdir = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls._tmpdir, True)
+        cls._db_path = os.path.join(cls._tmpdir, "test_tau_logic_db.sqlite")
+        cls._orig_db_env = os.environ.get("TAU_DB_PATH")
+        cls._orig_force_test = os.environ.get("TAU_FORCE_TEST")
+        # Class cleanups run when setUpClass raises, where tearDownClass does not.
+        cls.addClassCleanup(cls._restore_environ)
+        os.environ["TAU_DB_PATH"] = cls._db_path
         os.environ["TAU_FORCE_TEST"] = "0" # FORCE REAL ENGINE
         print("\n--- Starting Tau Manager for TestTauLogic ---")
         chain_state._balances.clear()
@@ -64,9 +69,9 @@ class TestTauLogic(unittest.TestCase):
         chain_state._consensus_rules_state = ""
         chain_state._canonical_head_hash = ""
         
-        if os.path.exists(TEST_DB_PATH):
+        if os.path.exists(cls._db_path):
             try:
-                os.remove(TEST_DB_PATH)
+                os.remove(cls._db_path)
             except OSError:
                 pass
         if getattr(db, "_db_conn", None):
@@ -77,12 +82,10 @@ class TestTauLogic(unittest.TestCase):
         if not os.path.exists(config.TAU_PROGRAM_FILE):
              raise FileNotFoundError(f"Tau program file '{config.TAU_PROGRAM_FILE}' not found.")
 
-        tau_manager.server_should_stop.clear()
         tau_manager.tau_ready.clear()
 
         print("[INFO][TestTauLogic] Starting tau_manager.start_and_manage_tau_process in a thread.")
-        cls.manager_thread = threading.Thread(target=tau_manager.start_and_manage_tau_process, daemon=True)
-        cls.manager_thread.start()
+        cls.manager_thread = tau_manager.start_manager_thread()
 
         print("[INFO][TestTauLogic] Waiting for Tau to become ready (timeout: 30s)...")
         ready = tau_manager.tau_ready.wait(timeout=30)
@@ -137,6 +140,15 @@ class TestTauLogic(unittest.TestCase):
         print("[INFO] Rules loaded.")
 
     @classmethod
+    def _restore_environ(cls):
+        for name, original in (("TAU_FORCE_TEST", cls._orig_force_test),
+                               ("TAU_DB_PATH", cls._orig_db_env)):
+            if original is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = original
+
+    @classmethod
     def tearDownClass(cls):
         print("\n--- Stopping Tau Manager for TestTauLogic ---")
         if tau_manager.tau_direct_interface:
@@ -151,12 +163,6 @@ class TestTauLogic(unittest.TestCase):
         
         tau_manager.tau_ready.clear()
         tau_manager.server_should_stop.clear()
-        os.environ["TAU_FORCE_TEST"] = "1"
-        if os.path.exists(TEST_DB_PATH):
-            try:
-                os.remove(TEST_DB_PATH)
-            except OSError:
-                pass
 
     def _construct_stream_inputs(self, amount: int, balance: int, from_id_idx: int, to_id_idx: int) -> dict:
         """Construct input dictionary for i1, i2, i3, i4 (Amount, Bal, From, To)."""

@@ -19,14 +19,14 @@ The layers are ordered cheapest-first, and each states what it actually proves:
                  (accepting replaces it) and who else holds one
   L3 widths      the same stream declared at two bitvector widths, compared
                  statically so the live interpreter's typing is never touched
-  L4 compile     the COMPOSED rule parses and steps in a throwaway subprocess
+  L4 compile     the clause builds as `always ( body ).` in the policy worker
   L5 unsat       NOT AVAILABLE: sat/unsat/valid/unrealizable exist in tau-lang's
                  C++ API but are not exposed by the Python bindings, so logical
                  contradiction cannot be detected at all
 
-Because each acceptor gets its own guarded branch of one composite, this design
-removes cross-user conflict by construction -- which is what makes L2 a
-decidable question rather than a guess.
+Each clause is evaluated on its own for its owner, so clauses of different
+accounts never conflict -- which is what makes L2 a decidable question rather
+than a guess.
 """
 import logging
 import re
@@ -36,10 +36,11 @@ import api_response
 import chain_state
 import config
 import db
+from consensus import sender_policy
+from tau_speculation import WorkerLost
 from consensus.rule_offers import (
     ALLOWED_TARGET_STREAMS,
     RuleOfferShapeError,
-    compose_stream_rule,
     normalize_offer_rule_text,
     strip_clause_comments,
 )
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 _CMD = "getruleconflict"
 
 # One compile at a time. This is an unauthenticated read RPC that spawns a
-# subprocess, so without a gate it is an amplifier.
+# worker build, so without a gate it is an amplifier.
 _COMPILE_GATE = threading.Semaphore(1)
 
 # Cache keyed on everything the report actually depends on -- the offer, its
@@ -57,7 +58,7 @@ _COMPILE_GATE = threading.Semaphore(1)
 # of an unchanged chain is free while any relevant change invalidates it.
 # Keying on the application rules alone is not enough: a rejection changes an
 # offer's status without touching them, and a clause can be registered on a
-# stream whose composite text the caller has not yet fetched.
+# stream the caller has not yet looked at.
 _CACHE: dict = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_MAX = 64
@@ -245,29 +246,9 @@ def execute(raw_command: str, container):
         else:
             layers.append(_layer("bv_widths", "ok"))
 
-    # --- L4 compile the COMPOSED rule ------------------------------------
-    composite = None
+    # --- L4 does the clause build ----------------------------------------
     if body is not None and target_stream is not None:
-        clauses = {
-            (c.get("acceptor_pubkey") or "").lower(): c["clause_body"]
-            for c in registry
-            if int(c.get("target_stream", -1)) == target_stream
-        }
-        clauses[acceptor] = body
-        try:
-            composite = compose_stream_rule(target_stream, clauses)
-        except RuleOfferShapeError as exc:
-            layers.append(_layer("compile", "conflict", f"cannot compose: {exc}"))
-            escalate(VERDICT_CONFLICT)
-
-    if composite:
-        import tau_manager
-        import tau_native
-
-        if not tau_manager.tau_ready.is_set():
-            layers.append(_layer("compile", "unknown", "Tau is not ready on this node."))
-            escalate(VERDICT_WARN)
-        elif not _COMPILE_GATE.acquire(blocking=False):
+        if not _COMPILE_GATE.acquire(blocking=False):
             layers.append(_layer(
                 "compile", "unknown",
                 "Another conflict check is compiling; retry shortly.",
@@ -275,29 +256,18 @@ def execute(raw_command: str, container):
             escalate(VERDICT_WARN)
         else:
             try:
+                from tau_native import strip_ansi
+
                 timeout = min(getattr(config, "COMM_TIMEOUT", 60) or 60, 30)
-                error = tau_native.compile_revisions_isolated_subprocess(
-                    app_rules, [composite], timeout=timeout
+                builds, error = sender_policy.clause_builds(
+                    body, pool="admission", timeout=timeout
                 )
-                if error:
-                    layers.append(_layer(
-                        "compile", "conflict", tau_native.strip_ansi(error)
-                    ))
-                    escalate(VERDICT_CONFLICT)
-                else:
+                if builds:
                     layers.append(_layer("compile", "ok"))
-            except tau_native.RuleCompileTimeout:
-                layers.append(_layer(
-                    "compile", "unknown",
-                    f"Compile exceeded {timeout}s and was killed.",
-                ))
-                escalate(VERDICT_WARN)
-            except tau_native.NativeTauUnavailable:
-                layers.append(_layer(
-                    "compile", "unknown", "Isolated compile is unavailable."
-                ))
-                escalate(VERDICT_WARN)
-            except Exception as exc:  # noqa: BLE001
+                else:
+                    layers.append(_layer("compile", "conflict", strip_ansi(error)))
+                    escalate(VERDICT_CONFLICT)
+            except (Exception, WorkerLost) as exc:  # noqa: BLE001
                 logger.warning("Conflict-check compile failed", exc_info=True)
                 layers.append(_layer("compile", "unknown", str(exc)))
                 escalate(VERDICT_WARN)
@@ -321,7 +291,6 @@ def execute(raw_command: str, container):
         "verdict": verdict,
         "advisory": True,
         "layers": layers,
-        "composed_rule": composite,
         "supported_target_streams": sorted(ALLOWED_TARGET_STREAMS),
     }
     _cache_put(cache_key, data)

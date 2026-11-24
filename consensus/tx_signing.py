@@ -2,40 +2,35 @@
 
 WHY THIS EXISTS
 ---------------
-Transaction signatures used to be verified in exactly one place: mempool
-admission (`commands/sendtx.py`). Block application never re-checked them --
-`chain_state._process_new_block_locked` verifies the header proof, the engine's
-`verify_block_header` and the timestamp, and `TauConsensusEngine.apply` reads
-`sender_pubkey` as fact. `commands/createblock._validate_signature` exists but is
-referenced only by tests.
+`sender_pubkey` is only a claim until its signature is checked, and every
+account-scoped rule (balance, sequence, policy clause, approvals) trusts it.
+Signatures are verified at mempool admission (`commands/sendtx.py`) and again for
+every transaction at block apply, at one site at the top of the apply loop in
+`TauConsensusEngine.apply`. Without the apply check a proposer could include a
+transfer from any account, or a rule offer or a vote in anyone's name.
 
-For ordinary transfers that is tolerable: forging one forges a transfer the
-sender could have made anyway, and the balance and sequence checks still bind.
-It is NOT tolerable for a feature whose whole promise is independent
-co-signatures -- a malicious proposer could otherwise mint a co-signature
-bearing an approver's `sender_pubkey` and release parked funds with no approver
-involved.
-
-So the preimage and the verify live here, once, and both the admission path and
-the apply path call them. Keeping them in one module is the point: two
-implementations of a signing preimage is a consensus split waiting to happen.
+The preimage and the verify live here, once, and both paths call them. Two
+implementations of a signing preimage would be a consensus split waiting to
+happen.
 
 INJECTION POINT
 ---------------
-`verify_tx_signature` takes an optional `g2` so a caller can supply its own
-py_ecc handle. `commands/sendtx.py` passes its module-level `G2Basic`, which is
-what keeps the ten-odd test files that `patch("commands.sendtx.G2Basic")`
-working unchanged. Callers with nothing to inject get the module's own import.
+Tests that need to control the verdict patch `consensus.bls.verify`, which also
+decides block header proofs. The backend's verdicts must equal py_ecc
+G2Basic.Verify's on every input, or nodes running different backends split on
+which transactions apply.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
+from consensus import bls
 from consensus.approvals import (
     TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_RULE_CHANGE_CANCEL,
+    TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
 from consensus.retractable import (
@@ -47,21 +42,6 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_ACCEPT,
     TX_TYPE_RULE_OFFER_REJECT,
 )
-
-logger = logging.getLogger(__name__)
-
-_PY_ECC_AVAILABLE = False
-_G2BASIC = None
-try:
-    from py_ecc.bls import G2Basic as _G2BASIC_IMPORTED
-
-    _G2BASIC = _G2BASIC_IMPORTED
-    _PY_ECC_AVAILABLE = True
-except ModuleNotFoundError:
-    logger.warning("py_ecc.bls not found; consensus-side signature verification unavailable.")
-except Exception as exc:  # pragma: no cover - defensive, mirrors sendtx
-    logger.warning("Error importing py_ecc.bls (%s); consensus-side verification unavailable.", exc)
-
 
 def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     """CONSENSUS-FROZEN. Canonical bytes over the signed fields of a transaction.
@@ -118,6 +98,15 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["expire_at_height"] = payload.get("expire_at_height")
         signing_dict["approvers"] = payload.get("approvers", {})
         signing_dict["custom_inputs"] = payload.get("custom_inputs", {})
+    elif tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
+        # Everything the request id commits to, so the approvers' votes bind
+        # the exact change and a proposer cannot swap the body or the slots.
+        signing_dict["kind"] = payload.get("kind")
+        signing_dict["rule_text"] = payload.get("rule_text", "")
+        signing_dict["offer_id"] = payload.get("offer_id", "")
+        signing_dict["approvers"] = payload.get("approvers", {})
+    elif tx_type == TX_TYPE_RULE_CHANGE_CANCEL:
+        signing_dict["request_id"] = payload.get("request_id")
     elif tx_type == TX_TYPE_TRANSFER_VOTE:
         signing_dict["request_id"] = payload.get("request_id")
         signing_dict["approve"] = payload.get("approve", True)
@@ -138,9 +127,7 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 
 
-def verify_tx_signature(
-    payload: Dict[str, Any], *, g2: Optional[Any] = None
-) -> Tuple[bool, str]:
+def verify_tx_signature(payload: Dict[str, Any]) -> Tuple[bool, str]:
     """Verify a transaction's BLS signature. Returns (ok, reason).
 
     `reason` is non-empty only when ok is False, so a caller can put it straight
@@ -148,10 +135,6 @@ def verify_tx_signature(
     verification failure, not an exception, because this runs inside block apply
     where an exception would take down the whole block.
     """
-    verifier = g2 if g2 is not None else _G2BASIC
-    if verifier is None:
-        return False, "BLS verification unavailable (py_ecc missing)"
-
     sender_pubkey = payload.get("sender_pubkey")
     signature = payload.get("signature")
     if not isinstance(sender_pubkey, str) or not isinstance(signature, str):
@@ -169,7 +152,7 @@ def verify_tx_signature(
         return False, "signature or sender_pubkey is not valid hex"
 
     try:
-        if not verifier.Verify(pubkey_bytes, msg_hash, sig_bytes):
+        if not bls.verify(pubkey_bytes, msg_hash, sig_bytes):
             return False, "signature does not verify against sender_pubkey"
     except Exception as exc:
         return False, f"cryptographic error during verification: {exc}"

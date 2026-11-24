@@ -18,7 +18,6 @@ patched the way test_state_reconstruction.py does it): what is under test is the
 ancestry walk and the head it picks, not Tau.
 """
 import contextlib
-import hashlib
 import io
 import logging
 import os
@@ -36,38 +35,40 @@ import db
 import chain_state
 import tau_manager
 import tau_authority
-from py_ecc.bls import G2Basic
-from chain_state import GENESIS_ADDRESS, GENESIS_BALANCE
+from chain_state import GENESIS_BALANCE
 from block import Block, compute_tx_hash
-from consensus.tx_signing import signing_message_bytes
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, SK_MALLORY, pubkey_hex, sign_payload, signed_block
 
 ADDR2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
-ADDR3 = "aabbccddee1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
+ADDR3 = pubkey_hex(SK_CAROL)
 
 LEGACY_MAX_DEPTH = 2000
 DEEP = LEGACY_MAX_DEPTH + 100
 SYNC_BATCH = 700
 BASE_TS = 1_700_000_000
 
+# The account these histories fund and spend from.
+FUNDED_ACCOUNT = pubkey_hex(SK_ALICE)
 
-def _tx(sender, seq, transfers):
-    return {
+
+def _tx(sender, seq, transfers, sk=None):
+    """A signed transfer from `sender`; the funded account signs unless `sk` is given."""
+    if sk is None:
+        assert sender == FUNDED_ACCOUNT, "name the key of any other sender"
+        sk = SK_ALICE
+    return sign_payload({
         "sender_pubkey": sender,
         "sequence_number": seq,
         "expiration_time": 9999999999,
         "expire_at_height": 5000,
         "operations": {"1": transfers},
         "fee_limit": "0",
-        "signature": "dummy_signature_for_testing",
-    }
+    }, sk)
 
 
 def _signed_tx(sk, seq, transfers):
-    """A transaction whose signature verifies, from the account of key `sk`."""
-    tx = _tx(G2Basic.SkToPk(sk).hex(), seq, transfers)
-    digest = hashlib.sha256(signing_message_bytes(tx)).digest()
-    tx["signature"] = G2Basic.Sign(sk, digest).hex()
-    return tx
+    """A transfer from the account of key `sk`."""
+    return _tx(pubkey_hex(sk), seq, transfers, sk=sk)
 
 
 @contextlib.contextmanager
@@ -91,11 +92,9 @@ class DeepChainTestCase(unittest.TestCase):
         db.init_db()
         db.clear_mempool()
         chain_state.load_genesis("data/genesis.json")
-        chain_state._genesis_accounts_state = {GENESIS_ADDRESS: GENESIS_BALANCE}
-        chain_state._balances[GENESIS_ADDRESS] = GENESIS_BALANCE
+        chain_state._genesis_accounts_state = {FUNDED_ACCOUNT: GENESIS_BALANCE}
+        chain_state._balances[FUNDED_ACCOUNT] = GENESIS_BALANCE
 
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
 
         self.verify_patch = patch(
             'consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
@@ -108,7 +107,6 @@ class DeepChainTestCase(unittest.TestCase):
         self.genesis_hash = db.get_genesis_hash()
 
     def tearDown(self):
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         self.wait_patch.stop()
         self.verify_patch.stop()
         config.set_database_path(self.original_db_path)
@@ -119,15 +117,15 @@ class DeepChainTestCase(unittest.TestCase):
             os.remove(self.temp_db_path)
 
     @staticmethod
-    def extend(parent_hash, parent_number, count, proposer="a" * 96, txs=None):
+    def extend(parent_hash, parent_number, count, proposer=SK_ALICE, txs=None):
         """`count` blocks on top of `parent_hash`, oldest first. `txs` maps a
         block number to its transactions; every other block is empty."""
         txs = txs or {}
         blocks = []
         prev = parent_hash
         for n in range(parent_number + 1, parent_number + count + 1):
-            blk = Block.create(block_number=n, previous_hash=prev, transactions=txs.get(n, []),
-                               proposer_pubkey=proposer, timestamp=BASE_TS + n)
+            blk = signed_block(proposer, block_number=n, previous_hash=prev,
+                               transactions=txs.get(n, []), timestamp=BASE_TS + n)
             blocks.append(blk)
             prev = blk.block_hash
         return blocks
@@ -191,16 +189,16 @@ class TestDeepReorg(DeepChainTestCase):
     def test_real_fork_deep_in_the_chain_still_rebuilds_from_genesis(self):
         fork_at = DEEP - 10
         sk = 4242
-        keyed = G2Basic.SkToPk(sk).hex()
-        funding = _tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, keyed, "100"]])
+        keyed = pubkey_hex(sk)
+        funding = _tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, keyed, "100"]])
         lost_tx = _signed_tx(sk, 0, [[keyed, ADDR2, "5"]])
-        won_tx = _tx(GENESIS_ADDRESS, 1, [[GENESIS_ADDRESS, ADDR3, "7"]])
+        won_tx = _tx(FUNDED_ACCOUNT, 1, [[FUNDED_ACCOUNT, ADDR3, "7"]])
         main = self.extend(self.genesis_hash, 0, DEEP, txs={1: [funding], DEEP - 5: [lost_tx]})
         self.adopt(main)
         self.assertEqual(chain_state.get_balance(ADDR2), 5)
 
         fork_block = main[fork_at - 1]
-        branch = self.extend(fork_block.block_hash, fork_at, 15, proposer="b" * 96,
+        branch = self.extend(fork_block.block_hash, fork_at, 15, proposer=SK_BOB,
                              txs={fork_at + 1: [won_tx]})
         self.ingest(branch)
         rebuild = chain_state._rebuild_state_from_blockchain_internal
@@ -225,7 +223,7 @@ class TestFindForkPoint(DeepChainTestCase):
         #   genesis - 1 .. 10 - 11 .. 20          (main)
         #                    \- 11' .. 14'        (side)
         self.main = self.extend(self.genesis_hash, 0, 20)
-        self.side = self.extend(self.main[9].block_hash, 10, 4, proposer="b" * 96)
+        self.side = self.extend(self.main[9].block_hash, 10, 4, proposer=SK_BOB)
         for blk in self.main + self.side:
             db.add_block(blk)
 
@@ -289,7 +287,7 @@ class TestFindForkPoint(DeepChainTestCase):
         other_root = Block.create(block_number=0, previous_hash="0" * 64, transactions=[],
                                   proposer_pubkey="d" * 96, timestamp=BASE_TS)
         db.add_block(other_root)
-        other = self.extend(other_root.block_hash, 0, 3, proposer="d" * 96)
+        other = self.extend(other_root.block_hash, 0, 3, proposer=SK_MALLORY)
         for blk in other:
             db.add_block(blk)
         with self.assertRaises(db.ChainAncestryError) as ctx:
@@ -334,8 +332,8 @@ class TestUnresolvableAncestry(DeepChainTestCase):
         # The lying child arrives first and is stored as an orphan; its parent,
         # a valid #21, arrives next. The pair must not become a "#30" head.
         parent = self.extend(self.main[-1].block_hash, 20, 1)[0]
-        liar = Block.create(block_number=30, previous_hash=parent.block_hash,
-                            transactions=[], proposer_pubkey="c" * 96, timestamp=BASE_TS + 30)
+        liar = signed_block(SK_CAROL, block_number=30, previous_hash=parent.block_hash,
+                            transactions=[], timestamp=BASE_TS + 30)
         self.ingest([liar], expect='orphan')
         self.ingest([parent])
         with self.assertLogs('chain_state', level='WARNING') as logs:
@@ -352,11 +350,11 @@ class TestUnresolvableAncestry(DeepChainTestCase):
         # Once the head has a child it is no longer a childless "candidate".
         # If everything above it is rejected, staying put must still beat the
         # tip of an old fork further down.
-        stale = self.extend(self.main[4].block_hash, 5, 2, proposer="b" * 96)
+        stale = self.extend(self.main[4].block_hash, 5, 2, proposer=SK_BOB)
         self.ingest(stale)
         parent = self.extend(self.main[-1].block_hash, 20, 1)[0]
-        liar = Block.create(block_number=30, previous_hash=parent.block_hash,
-                            transactions=[], proposer_pubkey="c" * 96, timestamp=BASE_TS + 30)
+        liar = signed_block(SK_CAROL, block_number=30, previous_hash=parent.block_hash,
+                            transactions=[], timestamp=BASE_TS + 30)
         self.ingest([liar], expect='orphan')
         self.ingest([parent])
         with self.assertLogs('chain_state', level='WARNING'), quiet():
@@ -364,7 +362,7 @@ class TestUnresolvableAncestry(DeepChainTestCase):
         self.assertEqual(self.head(), self.main[-1].block_hash)
 
     def test_lost_block_below_the_fork_point_is_refused_loudly(self):
-        branch = self.extend(self.main[14].block_hash, 15, 7, proposer="b" * 96)
+        branch = self.extend(self.main[14].block_hash, 15, 7, proposer=SK_BOB)
         self.ingest(branch)
         self.drop_block(self.main[4])
         with self.assertLogs('chain_state', level='ERROR') as logs:
@@ -376,7 +374,7 @@ class TestUnresolvableAncestry(DeepChainTestCase):
     def test_lost_block_under_the_current_head_does_not_strand_the_node(self):
         # The head's own chain is damaged above the fork point; the branch is
         # sound all the way to genesis. Reported, then the node moves onto it.
-        branch = self.extend(self.main[9].block_hash, 10, 12, proposer="b" * 96)
+        branch = self.extend(self.main[9].block_hash, 10, 12, proposer=SK_BOB)
         self.ingest(branch)
         self.drop_block(self.main[14])
         with self.assertLogs('chain_state', level='ERROR') as logs, quiet():
@@ -385,7 +383,7 @@ class TestUnresolvableAncestry(DeepChainTestCase):
         self.assertEqual(self.head(), branch[-1].block_hash)
 
     def test_stale_fork_tips_below_the_head_are_not_walked(self):
-        stale = self.extend(self.main[2].block_hash, 3, 2, proposer="b" * 96)
+        stale = self.extend(self.main[2].block_hash, 3, 2, proposer=SK_BOB)
         self.ingest(stale)
         nxt = self.extend(self.main[-1].block_hash, 20, 1)
         self.ingest(nxt)
@@ -448,7 +446,7 @@ class TestExtensionFastPathUnderAuthority(DeepChainTestCase):
         self.rebuild.assert_not_called()
 
     def test_a_head_with_broken_ancestry_is_rebuilt_not_extended(self):
-        branch = self.extend(self.main[9].block_hash, 10, 12, proposer="b" * 96)
+        branch = self.extend(self.main[9].block_hash, 10, 12, proposer=SK_BOB)
         self.ingest(branch)
         self.drop_block(self.main[14])
         with self.assertLogs('chain_state', level='ERROR'), quiet():

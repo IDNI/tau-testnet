@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import config
 import tau_allocator as alloc
 import tau_defs
 import tau_journal as tj
@@ -28,11 +27,6 @@ from test_retractable_apply import (
 RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
 DUE = RetractableEntry(ALICE, BOB, 300, 0, KIND_HEIGHT, HEIGHT)
 LATER = RetractableEntry(ALICE, CAROL, 200, 1, KIND_HEIGHT, HEIGHT + 50)
-
-
-@pytest.fixture(autouse=True)
-def _no_faucet(monkeypatch):
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
 
 
 class _Session:

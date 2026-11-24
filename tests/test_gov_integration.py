@@ -4,6 +4,8 @@ import pytest
 import os
 import sys
 import importlib
+import shutil
+import tempfile
 from unittest.mock import Mock, patch
 from py_ecc.bls import G2Basic as bls
 import hashlib
@@ -17,13 +19,14 @@ import config
 from commands import sendtx
 import chain_state, db
 
+_tmpdir = None
+
 def setup_module(module):
-    test_db = "test_gov_db.sqlite"
-    config.set_database_path(test_db)
+    global _tmpdir
+    _tmpdir = tempfile.mkdtemp()
+    config.set_database_path(os.path.join(_tmpdir, "test_gov_db.sqlite"))
     if db._db_conn:
         db._db_conn.close(); db._db_conn = None
-    if os.path.exists(test_db):
-        os.remove(test_db)
 
     chain_state._balances.clear(); chain_state._sequence_numbers.clear()
     db.init_db()
@@ -37,13 +40,11 @@ def setup_module(module):
     except Exception:
         pass
     db.clear_mempool()
-    sendtx._PY_ECC_AVAILABLE = True
 
 def teardown_module(module):
     if db._db_conn:
         db._db_conn.close(); db._db_conn = None
-    if os.path.exists("test_gov_db.sqlite"):
-        os.remove("test_gov_db.sqlite")
+    shutil.rmtree(_tmpdir, ignore_errors=True)
 
 def _require_miner_privkey():
     # The signing tests below need a miner private key, sourced by the "test"
@@ -873,20 +874,22 @@ def test_forged_vote_in_block_is_noop():
     block and must not advance the tally."""
     from consensus.governance import ConsensusRuleUpdate
 
+    from bls_keys import SK_BOB, pubkey_hex, sign_tx
+
     validator_hex = "a" * 96
-    outsider_hex = "b" * 96
+    outsider_hex = pubkey_hex(SK_BOB)
     engine, lm, parent_snapshot, active_view, _ = _w1_fixture([validator_hex], validator_hex)
 
     update = ConsensusRuleUpdate(["always ( o6[t]:bv[16] = { 0 }:bv[16] )."], 100)
     assert lm.submit_update(update)
 
     from block import Block
-    vote_tx = {
+    vote_tx = sign_tx({
         "tx_type": "consensus_rule_vote",
         "sender_pubkey": outsider_hex,
         "update_id": update.update_id.hex(),
         "approve": True,
-    }
+    }, SK_BOB)
     block_obj = Block.create(
         block_number=5,
         previous_hash="00" * 32,

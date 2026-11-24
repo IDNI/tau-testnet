@@ -111,3 +111,39 @@ def test_python_dash_m_help_works():
     )
     assert result.returncode == 0, result.stderr
     assert "tau-testnet" in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# --fee only where it can change something
+# --------------------------------------------------------------------------- #
+
+_PK = "ab" * 48
+_ID = "cd" * 32
+
+
+@pytest.mark.parametrize("argv", [
+    ["approval", "approve", "--key", "k", _ID],
+    ["approval", "decline", "--key", "k", _ID],
+    ["retractable", "retract", "--key", "k", _ID],
+    ["gov", "propose", "--key", "k", "--file", "update.json"],
+    ["gov", "vote", "--key", "k", "--update-id", _ID],
+])
+def test_fee_exempt_commands_have_no_fee_flag(argv):
+    assert callable(cli.build_parser().parse_args(argv).func)
+    with redirect_stderr(io.StringIO()), pytest.raises(SystemExit) as exc:
+        cli.build_parser().parse_args(argv + ["--fee", "5"])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("argv", [
+    ["tx", "send", "--key", "k", "--to", _PK, "--amount", "1"],
+    ["rule", "offer", "--key", "k", "--to", _PK, "--rule", "always ( o5[t] = 1 )."],
+    ["rule", "accept", "--key", "k", _ID],
+    ["rule", "reject", "--key", "k", _ID],
+    ["approval", "request", "--key", "k", "--to", _PK, "--amount", "1"],
+    ["retractable", "send", "--key", "k", "--to", _PK, "--amount", "1",
+     "--release-in", "3"],
+])
+def test_fee_bearing_commands_default_to_the_node_estimate(argv):
+    assert cli.build_parser().parse_args(argv).fee is None
+    assert cli.build_parser().parse_args(argv + ["--fee", "7"]).fee == "7"

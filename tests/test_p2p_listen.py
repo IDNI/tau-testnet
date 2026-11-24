@@ -11,6 +11,7 @@ and every peer's dial reached the WebSocket server.
 import json
 import logging
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -193,12 +194,13 @@ class _Node:
 
 def _free_port_run(length):
     """First port of `length` consecutive free ports on 127.0.0.1."""
+    # Below every OS ephemeral range, so other workers' tcp/0 hosts never take these; one slice per worker.
+    slice_size = 750
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    index = int(worker[2:]) if worker.startswith("gw") and worker[2:].isdigit() else 0
+    lo = 20000 + (index % 16) * slice_size
     for _ in range(50):
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            base = probe.getsockname()[1]
-        if base + length > 65535:
-            continue
+        base = random.randrange(lo, lo + slice_size - length)
         try:
             for port in range(base, base + length):
                 with socket.socket() as s:

@@ -30,10 +30,11 @@ def test_set_database_path(temp_database):
 
 def test_authority_settings_defaults():
     # The "test" env sources its miner identity from data_local/ (gitignored).
-    # When present, MINER_PUBKEY is the local test miner (test_miner.pub ends in
-    # d5c45); absent (fresh checkout / CI) it falls back to the built-in default.
+    # When present, MINER_PUBKEY is that local test miner; absent (fresh
+    # checkout / CI) it falls back to the built-in default.
     if config.MINER_PRIVKEY:
-        assert config.MINER_PUBKEY.endswith("d5c45")
+        with open(os.path.join(config.DATA_LOCAL_DIR, "test_miner.pub")) as fh:
+            assert config.MINER_PUBKEY.strip().lower() == fh.read().strip().lower()
     else:
         assert len(config.MINER_PUBKEY) == 96 and config.MINER_PUBKEY == config.MINER_PUBKEY.lower()
     assert config.MINER_PUBKEYS == []

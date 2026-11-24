@@ -11,6 +11,7 @@ import pytest
 
 import config
 import db
+from bls_keys import SK_ALICE, pubkey_hex, sign_tx
 from errors import DatabaseError
 
 
@@ -196,7 +197,9 @@ class TestAdmissionLimits:
 
     def test_transfers_at_limit_accepted(self):
         from consensus.admission import validate_user_tx_reserved_domains, MAX_TRANSFERS_PER_TX
-        tx = {"operations": {"1": [["a", "b", "1"]] * MAX_TRANSFERS_PER_TX}}
+        from bls_keys import SK_ALICE, SK_BOB, pubkey_hex
+        tx = {"sender_pubkey": pubkey_hex(SK_ALICE),
+              "operations": {"1": [[pubkey_hex(SK_ALICE), pubkey_hex(SK_BOB), "1"]] * MAX_TRANSFERS_PER_TX}}
         assert validate_user_tx_reserved_domains(tx, self._tip_view()).is_valid
 
     def test_too_many_rule_revisions_rejected(self):
@@ -236,12 +239,12 @@ class TestAdmissionLimits:
 
     def test_user_rule_reading_recipient_and_time_now_allowed(self):
         # i3/i4 (from/to) and i5 (timestamp) are deterministic at admission and
-        # apply -> recipient/time policy rules are now admissible. Sender-scoped,
-        # which o5 rules must be regardless of which inputs they read.
+        # apply -> recipient/time policy clauses are admissible.
         from consensus.admission import validate_user_tx_reserved_domains
         for stream in ("i3", "i4", "i5"):
-            rule = self._scoped(f"o5[t]:bv[24] = {stream}[t]:bv[24]")
-            result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+            rule = f"always (o5[t]:bv[24] = {stream}[t]:bv[24])."
+            tx = {"sender_pubkey": "ab" * 48, "operations": {"0": rule}}
+            result = validate_user_tx_reserved_domains(tx, self._tip_view())
             assert result.is_valid, f"stream {stream} wrongly screened: {result.error}"
 
     def test_user_flat_fee_and_ladder_rules_pass(self):
@@ -339,10 +342,10 @@ class TestAdmissionLimits:
         assert "i13" in result.error
 
     def test_user_rule_scoping_on_i12_still_accepted_under_tau_validator_set(self):
-        # Reading i12 is how a policy rule scopes itself to its own sender; the
+        # Reading i12 is how a fee rule scopes itself to its own sender; the
         # reserved-set reuse for rule TEXT must keep excluding it.
         from consensus.admission import validate_user_tx_reserved_domains
-        rule = "always ( o5[t]:bv[24] = { 1 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384] )."
+        rule = "always ( o8[t]:bv[24] = { 1 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384] )."
         assert validate_user_tx_reserved_domains(
             {"operations": {"0": rule}}, self._tau_validator_set_tip_view()).is_valid
 
@@ -475,12 +478,11 @@ class TestAdmissionLimits:
 
 
 class TestUserRuleSenderScope:
-    """Issue #24 ask 3: o5/o8 rule text must be scoped to its author.
+    """o8 rule text must be scoped to its author.
 
     Tau composes every deployed user rule into one constraint, so an unscoped
-    rule applies to every sender: `always (o5[t] = 0)` is a one-transaction
-    network freeze and `always (o8[t] = 3)` taxes the whole network. Scoping was
-    already the documented contract; this makes it enforced.
+    fee rule applies to every sender: `always (o8[t] = 3)` taxes the whole
+    network. An o5 rule is a per-account clause and takes no scope at all.
     """
 
     def _tip_view(self):
@@ -489,15 +491,23 @@ class TestUserRuleSenderScope:
 
     def _screen(self, rule):
         from consensus.admission import validate_user_tx_reserved_domains
-        return validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+        tx = {"sender_pubkey": "ab" * 48, "operations": {"0": rule}}
+        return validate_user_tx_reserved_domains(tx, self._tip_view())
 
     PUBKEY = "{ #x" + "ab" * 48 + " }:bv[384]"
 
-    def test_unscoped_o5_deny_all_rejected(self):
-        result = self._screen("always (o5[t]:bv[24] = { #x000000 }:bv[24]).")
-        assert not result.is_valid, "the network-freeze rule was admitted"
-        assert result.code == "UNSCOPED_USER_RULE"
-        assert result.details["stream"] == "o5"
+    def test_an_unguarded_o5_rule_is_a_clause_declaration(self):
+        result = self._screen("always (o5[t]:bv[24] = i1[t]:bv[24]).")
+        assert result.is_valid, result.error
+        assert result.data["o5_clause_action"] == "declare"
+
+    def test_an_i12_guarded_o5_rule_is_refused_as_a_clause_shape(self):
+        result = self._screen(
+            f"always ((i12[t]:bv[384] = {self.PUBKEY}) -> "
+            f"o5[t]:bv[24] = {{ #x000000 }}:bv[24])."
+        )
+        assert not result.is_valid
+        assert result.code == "CLAUSE_SHAPE"
 
     def test_unscoped_o8_flat_fee_rejected(self):
         """Deliberate semantic change: a flat unconditional user fee is no longer
@@ -509,14 +519,14 @@ class TestUserRuleSenderScope:
 
     def test_scoped_on_i12_accepted(self):
         result = self._screen(
-            f"always ((i12[t]:bv[384] = {self.PUBKEY}) -> o5[t]:bv[24] = {{ #x000000 }}:bv[24])."
+            f"always ((i12[t]:bv[384] = {self.PUBKEY}) -> o8[t]:bv[24] = {{ #x000003 }}:bv[24])."
         )
         assert result.is_valid, result.error
 
     def test_scoped_on_i3_accepted(self):
         """i3 (from address) is the documented alternative to i12."""
         result = self._screen(
-            f"always ((i3[t]:bv[384] = {self.PUBKEY}) -> o5[t]:bv[24] = {{ #x000000 }}:bv[24])."
+            f"always ((i3[t]:bv[384] = {self.PUBKEY}) -> o8[t]:bv[24] = {{ #x000003 }}:bv[24])."
         )
         assert result.is_valid, result.error
 
@@ -524,7 +534,7 @@ class TestUserRuleSenderScope:
         """A comment scopes nothing, so it must not satisfy the screen — the
         inverse of the comment false-positive cases above."""
         result = self._screen(
-            "always (o5[t]:bv[24] = { #x000000 }:bv[24]). # scoped to i12 honest, promise"
+            "always (o8[t]:bv[24] = { #x000003 }:bv[24]). # scoped to i12 honest, promise"
         )
         assert not result.is_valid
         assert result.code == "UNSCOPED_USER_RULE"
@@ -534,10 +544,11 @@ class TestUserRuleSenderScope:
         policy stream and needs no scope."""
         result = self._screen("always (o50[t]:bv[24] = { #x000001 }:bv[24]).")
         assert result.is_valid, result.error
+        assert "o5_clause_action" not in result.data
 
     def test_i120_does_not_satisfy_the_scope(self):
         result = self._screen(
-            "always ((i120[t]:bv[24] = { #x000001 }:bv[24]) -> o5[t]:bv[24] = { #x000000 }:bv[24])."
+            "always ((i120[t]:bv[24] = { #x000001 }:bv[24]) -> o8[t]:bv[24] = { #x000003 }:bv[24])."
         )
         assert not result.is_valid
         assert result.code == "UNSCOPED_USER_RULE"
@@ -551,7 +562,7 @@ class TestUserRuleSenderScope:
         surprise: the screen is textual, so a rule that merely mentions i12
         without gating on it passes. Catching this needs formula analysis."""
         result = self._screen(
-            "always (o5[t]:bv[24] = { #x000000 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384])."
+            "always (o8[t]:bv[24] = { #x000003 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384])."
         )
         assert result.is_valid, (
             "if this now fails, the screen gained real scope analysis — good, "
@@ -572,16 +583,15 @@ class TestBalanceReadingPolicyRules:
         from consensus.admission import validate_user_tx_reserved_domains
         from consensus.facade import TipAdmissionView
         return validate_user_tx_reserved_domains(
-            {"operations": {"0": rule}}, TipAdmissionView())
+            {"sender_pubkey": "ab" * 48, "operations": {"0": rule}}, TipAdmissionView())
 
     SCOPE = "i12[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]"
 
     def test_min_balance_floor_policy_rule_is_admissible(self):
         """The exact template issue #20 asked for."""
-        rule = (f"always (({self.SCOPE}) -> "
-                f"(((i2[t]:bv[24] - i1[t]:bv[24]) < {{ #x0003e8 }}:bv[24]) "
+        rule = (f"always (((i2[t]:bv[24] - i1[t]:bv[24]) < {{ #x0003e8 }}:bv[24]) "
                 f"? o5[t]:bv[24] = {{ #x000000 }}:bv[24] "
-                f": o5[t]:bv[24] = {{ #x000001 }}:bv[24])).")
+                f": o5[t]:bv[24] = {{ #x000001 }}:bv[24]).")
         result = self._screen(rule)
         assert result.is_valid, f"min-balance policy rule rejected: {result.error}"
 
@@ -677,7 +687,6 @@ class TestPolicyWidthScreen:
         view.eligibility_mode = ""
         view.approval_slots_active = slots
         view.clause_for.return_value = None
-        view.clause_author_count.return_value = 0
         return view
 
     def _screen(self, rule, slots=False):
@@ -689,9 +698,7 @@ class TestPolicyWidthScreen:
         )
 
     def _scoped(self, body):
-        return (
-            f"always ((i12[t]:bv[384] = {self.PUBKEY}) -> {body})."
-        )
+        return f"always ( {body} )."
 
     def test_bv16_o5_is_refused(self):
         result = self._screen(self._scoped("o5[t]:bv[16] = { #x000001 }:bv[16]"))
@@ -718,7 +725,7 @@ class TestPolicyWidthScreen:
         assert result.code == "WIDTH_MISMATCH"
         assert result.details["found"] == 16
 
-    def test_bv24_scoped_unit_is_admitted(self):
+    def test_bv24_unit_is_admitted(self):
         result = self._screen(
             self._scoped("o5[t]:bv[24] = { #x000001 }:bv[24]")
         )
@@ -734,19 +741,16 @@ class TestPolicyWidthScreen:
         result = self._screen("always (o50[t]:bv[16] = {1}:bv[16]).")
         assert result.is_valid, result.error
 
-    def test_top_level_i12_conjunction_is_refused_while_routing_off(self):
-        result = self._screen(
+    def test_a_sender_guarded_o5_unit_is_refused_as_a_clause_shape(self):
+        for rule in (
             f"always (i12[t]:bv[384] = {self.PUBKEY} && "
-            f"o5[t]:bv[24] = {{ #x000000 }}:bv[24])."
-        )
-        assert not result.is_valid
-        assert "conjunction" in (result.error or "").lower()
-
-    def test_implication_guard_is_not_the_conjunction_heuristic(self):
-        result = self._screen(
-            self._scoped("o5[t]:bv[24] = { #x000001 }:bv[24]")
-        )
-        assert result.is_valid, result.error
+            f"o5[t]:bv[24] = {{ #x000000 }}:bv[24]).",
+            f"always ((i12[t]:bv[384] = {self.PUBKEY}) -> "
+            f"o5[t]:bv[24] = {{ #x000001 }}:bv[24]).",
+        ):
+            result = self._screen(rule)
+            assert not result.is_valid
+            assert result.code == "CLAUSE_SHAPE"
 
     def test_getgovernance_exposes_constant_stream_widths(self):
         import json
@@ -791,7 +795,7 @@ class TestApplyRuleHonesty:
     or charge a fee. A bv[16] unit is hard-rejected before Tau sees it.
     """
 
-    SENDER = "aa" * 48
+    SENDER = pubkey_hex(SK_ALICE)
     PROPOSER = "bb" * 48
 
     def _apply(self, rule, comm_return="ok", app_rules="", fee_limit="100",
@@ -799,17 +803,18 @@ class TestApplyRuleHonesty:
         from unittest.mock import MagicMock, patch
         from consensus.engine import TauConsensusEngine
         from consensus.state import TauStateSnapshot
+        from consensus.governance import ConsensusLifecycleManager
 
         engine = TauConsensusEngine(state_store=MagicMock())
         engine._state_store.commit.side_effect = lambda snap: snap
-        tx = {
+        tx = sign_tx({
             "tx_id": "r1",
             "tx_type": "user_tx",
             "sender_pubkey": self.SENDER,
             "sequence_number": 0,
             "fee_limit": fee_limit,
             "operations": {"0": rule},
-        }
+        })
         with patch("tau_manager.tau_ready") as ready, \
              patch("tau_manager.communicate_with_tau", return_value=comm_return) as comm, \
              patch("tau_manager.communicate_with_tau_multi", return_value={9: "7"}), \
@@ -823,14 +828,13 @@ class TestApplyRuleHonesty:
                 proposer_pubkey=self.PROPOSER,
                 block_height=1,
                 replay_mode=replay_mode,
+                # Ambient lifecycle may carry approval slots from other tests.
+                target_lifecycle=ConsensusLifecycleManager(),
             )
         return result, comm
 
     def test_apply_hard_rejects_a_bv16_unit(self):
-        rule = (
-            f"always ((i12[t]:bv[384] = {{ #x{self.SENDER} }}:bv[384]) -> "
-            f"o5[t]:bv[16] = {{ #x000001 }}:bv[16])."
-        )
+        rule = "always (o5[t]:bv[16] = { #x000001 }:bv[16])."
         result, comm = self._apply(rule)
         assert result.accepted_transactions == []
         assert result.rejected_transactions
@@ -875,14 +879,14 @@ class TestApplyRuleHonesty:
         assert result.accepted_transactions
         assert "Rule applied" in " | ".join(result.receipts["r1"]["logs"])
 
-    def test_apply_hard_rejects_i12_conjunction_while_routing_off(self):
+    def test_apply_hard_rejects_a_sender_guarded_o5_rule(self):
         rule = (
             f"always (i12[t]:bv[384] = {{ #x{self.SENDER} }}:bv[384] && "
             f"o5[t]:bv[24] = {{ #x000000 }}:bv[24])."
         )
         result, comm = self._apply(rule)
         assert result.accepted_transactions == []
-        assert result.receipts["r1"].get("reason") == "unsatisfiable_sender_conjunction"
+        assert result.receipts["r1"].get("reason") == "rule_not_applied"
         assert result.receipts["r1"].get("fee_charged") == 0
         comm.assert_not_called()
 
@@ -918,18 +922,21 @@ class TestApplyRuleHonesty:
         comm.assert_not_called()
 
     def test_apply_keeps_user_fee_and_free_output_rules(self):
-        for stream in ("o8", "o12"):
-            rule = self._reserved_rule(stream)
+        guarded_o8 = (
+            f"always ((i12[t]:bv[384] = {{ #x{self.SENDER} }}:bv[384]) -> "
+            f"(o8[t]:bv[24] = {{ #x000001 }}:bv[24]))."
+        )
+        for rule in (guarded_o8, self._reserved_rule("o12")):
             result, _ = self._apply(rule, app_rules=rule)
             assert result.receipts["r1"].get("reason") != "reserved_output_stream"
             assert result.accepted_transactions
 
-    def test_replay_keeps_rule_writing_consensus_output(self):
+    def test_replay_rejects_rule_writing_consensus_output(self):
         rule = self._reserved_rule("o9")
         result, comm = self._apply(rule, app_rules=rule, replay_mode=True)
-        comm.assert_called()
-        assert result.accepted_transactions
-        assert result.receipts["r1"].get("reason") != "reserved_output_stream"
+        assert result.accepted_transactions == []
+        assert result.receipts["r1"].get("reason") == "reserved_output_stream"
+        comm.assert_not_called()
 
     def test_word_boundary_does_not_match_custom_streams(self):
         for stream in ("o90", "o60", "o10", "o12", "o41"):

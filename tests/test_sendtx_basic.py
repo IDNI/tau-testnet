@@ -1,5 +1,6 @@
 
 
+import shutil, tempfile
 import unittest, os, sys, json, time, hashlib, importlib
 from unittest.mock import Mock, patch
 from py_ecc.bls import G2Basic as bls
@@ -33,14 +34,13 @@ class TestSendTxBasic(unittest.TestCase):
     def setUp(self):
         importlib.reload(sendtx)
         # cleanup and init
-        self.test_db = "test_tau_string_db.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_tau_string_db.sqlite")
         self.original_db_path = config.STRING_DB_PATH
         config.set_database_path(self.test_db)
         
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
             
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.load_genesis("data/genesis.json")
@@ -90,27 +90,16 @@ class TestSendTxBasic(unittest.TestCase):
         # Signatures are verified for real; fund the signing sender.
         chain_state._balances[SENDER] = 1000
         # Patch pubkey validation to bypass format checks for basic tests
-        patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
+        patch('commands.sendtx.validate_bls_pubkey', return_value=None).start()
 
     def tearDown(self):
         patch.stopall()
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.set_database_path(self.original_db_path)
         
-        # Reset globals that might affect other tests
-        if hasattr(sendtx, '_PY_ECC_AVAILABLE'):
-            # Re-detect or set to default
-            try:
-                import py_ecc.bls
-                sendtx._PY_ECC_AVAILABLE = True
-                sendtx._PY_ECC_BLS = py_ecc.bls
-            except ImportError:
-                sendtx._PY_ECC_AVAILABLE = False
-                sendtx._PY_ECC_BLS = None
 
     def _create_tx(self, transfers, expiration=None, sequence=None, sender_pubkey=None):
         ops = {"1": transfers}

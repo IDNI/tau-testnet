@@ -25,6 +25,7 @@ import pytest
 
 import chain_state
 import tau_defs
+from bls_keys import SK_ALICE, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine
 
 
@@ -37,8 +38,8 @@ def _native_available():
         return False
 
 
-SENDER = "11" * 48      # 96 hex chars == bv[384]
-RECIPIENT = "22" * 48
+SENDER = pubkey_hex(SK_ALICE)      # 96 hex chars == bv[384]
+RECIPIENT = pubkey_hex(0x22)      # unique to this file: apply reads other balances from chain_state
 PROPOSER = "33" * 48
 
 
@@ -47,15 +48,14 @@ def _snap():
 
 
 def _transfer_tx(transfers):
-    return {
+    return sign_tx({
         "tx_id": "tx_test",
         "sender_pubkey": SENDER,
         "sequence_number": 0,
         "tx_type": "user_tx",
         "operations": {"1": transfers},
         "fee_limit": "1000",
-        "signature": "00" * 48,
-    }
+    })
 
 
 class TestUserPolicyApplyEnforcement(unittest.TestCase):
@@ -126,7 +126,7 @@ class TestUserPolicyApplyEnforcement(unittest.TestCase):
             {1: "10", 5: "1"},   # transfer #1: allow
             {1: "20", 5: "0"},   # transfer #2: BLOCK
         ]
-        recip_b = "44" * 48
+        recip_b = pubkey_hex(0x44)
         tx = _transfer_tx([[SENDER, RECIPIENT, "10"], [SENDER, recip_b, "20"]])
         result, bals = self._apply(tx, {SENDER: 100000})
         self.assertIn(tx, result.rejected_transactions)

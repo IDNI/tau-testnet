@@ -114,7 +114,9 @@ class AdvisoryEvaluator:
         try:
             session = self._ensure_consensus(consensus_rules)
             result = session.step(self._named(inputs))
-            outputs = result.get("outputs") or {}
+            if self._refused(result):
+                return None
+            outputs = result["outputs"]
             return {t: outputs.get(f"o{t}") for t in targets}
         except (Exception, tau_speculation.WorkerLost) as exc:
             logger.warning("advisory consensus evaluation unavailable: %s", exc)
@@ -161,7 +163,9 @@ class AdvisoryEvaluator:
         try:
             session = self._ensure(canonical_spec)
             result = session.step(self._named(inputs))
-            outputs = result.get("outputs") or {}
+            if self._refused(result):
+                return None
+            outputs = result["outputs"]
             return {t: outputs.get(f"o{t}") for t in targets}
         except (Exception, tau_speculation.WorkerLost) as exc:
             logger.warning("advisory evaluation unavailable: %s", exc)
@@ -169,11 +173,32 @@ class AdvisoryEvaluator:
             return None
 
     @staticmethod
+    def _refused(result: dict) -> bool:
+        """A refused step gives no answer: a dict of None values reads as a
+        verdict of 0, while None lets the caller fall back. The worker stays
+        healthy and the step advanced nothing, so the session is kept."""
+        if result.get("ok") and result.get("outputs") is not None:
+            return False
+        logger.warning("advisory step failed: %s",
+                       str(result.get("diagnostics") or "").strip()[:200])
+        return True
+
+    @staticmethod
     def _named(inputs: dict) -> dict:
+        """Input values go bare, as the worker-backed authority feeds them.
+
+        Callers spell a pubkey `{ #x.. }:bv[384]` because that is the shape the
+        in-process shrink layer interns. Nothing interns here, and the engine
+        does not parse in-spec literal syntax as an input value: it refused the
+        step, the answer came back with no o6/o7, and every block proposed under
+        `tau_validator_set` was judged invalid.
+        """
+        import tau_session
+
         named = {}
         for key, value in (inputs or {}).items():
             name = key if isinstance(key, str) and key.startswith("i") else f"i{key}"
-            named[name] = "" if value is None else str(value)
+            named[name] = tau_session.WorkerSession._bare(value)
         return named
 
     def evaluate(self, canonical_spec: str, inputs: dict, target: int):
@@ -187,8 +212,9 @@ class AdvisoryEvaluator:
         try:
             session = self._ensure(canonical_spec)
             result = session.step(self._named(inputs))
-            outputs = result.get("outputs") or {}
-            return outputs.get(f"o{target}")
+            if self._refused(result):
+                return None
+            return result["outputs"].get(f"o{target}")
         except (Exception, tau_speculation.WorkerLost) as exc:
             logger.warning("advisory evaluation unavailable: %s", exc)
             self.dispose()

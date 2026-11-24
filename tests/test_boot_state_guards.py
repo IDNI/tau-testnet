@@ -124,7 +124,8 @@ def test_a_genesis_without_validators_has_nothing_to_restore_under_authority(
     path.write_text(json.dumps(genesis), encoding="utf-8")
     for name in ("_genesis_accounts_state", "_genesis_active_validators",
                  "_genesis_vote_quorum", "_genesis_eligibility_mode",
-                 "_genesis_fee_beneficiary", "_genesis_application_rules",
+                 "_genesis_fee_beneficiary", "_genesis_faucet_amount",
+                 "_genesis_application_rules",
                  "_genesis_consensus_rules"):
         monkeypatch.setattr(chain_state, name, getattr(chain_state, name))
     _damage_validator_row("deleted")

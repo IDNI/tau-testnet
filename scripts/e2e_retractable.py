@@ -218,7 +218,6 @@ class Node:
             "TAU_PEERSTORE_PATH": os.path.join(self.tree, "data", "peerstore"),
             "TAU_IDENTITY_KEY_PATH": os.path.join(self.tree, "data", "identity.key"),
             "TAU_LOG_LEVEL": "INFO",
-            "TAU_AUTO_FAUCET": "false",
             "PYTHONPATH": NATIVE,
             "PYTHONUNBUFFERED": "1",
         })
