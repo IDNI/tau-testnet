@@ -1,7 +1,7 @@
 # Bounty 02 (#42) — Design: rules in force, pinned to a block
 
-Status: built and measured on branch `bounty-02-rules-in-force` (HEAD
-`700949e`). Awaiting maintainer plan approval before opening a PR.
+Status: built and measured on branch `bounty-02-rules-in-force`.
+Pre-PR pass complete 2026-11-24 (full suite 4939 passed / 0 failed). Awaiting maintainer plan approval before opening a PR.
 
 ## The two gaps (measured on `main`)
 
@@ -43,6 +43,48 @@ enters the commit path raises the question of whether it is consensus
 data. The journal lookup also works for blocks applied before an
 upgrade, with no migration.
 
+## Ask 3: the dropped unit (measured, closed by routing — no new refusal)
+
+Ask 3 is conditional: *if* a user unit can be dropped because the spec
+already holds another account's total-form o5 unit, admission must refuse it
+(same class as `UNSCOPED_USER_RULE`) rather than charging a fee for a no-op.
+Measured on this branch, the condition does not occur for `user_tx`, so no
+new refusal code was added — adding one would be dead code:
+
+- A total-form o5 unit is routed to the per-account clause registry, never
+  to the shared specification (`validate_o5_clause_routing` at admission,
+  `_apply_o5_clause_routing` at apply, mirrored; a clause that does not land
+  is hard-rejected, never a soft no-op). The routing predates this branch
+  and is pinned on main (`tests/test_approval_o5_routing.py`,
+  `tests/test_approval_apply.py`).
+- The incident unit itself — i12-guarded total-form o5 — is refused at
+  admission with `CLAUSE_SHAPE` ("a clause is evaluated only for its owner,
+  so it must not carry a sender guard") and hard-rejected at apply with
+  reason `rule_not_applied`, fee `0`, nothing accumulated
+  (`tests/test_ask3_incident.py`, this branch, end-to-end over the mock
+  apply harness).
+- An unguarded total-form o5 unit registers as the sender's own clause and
+  is never fed to the engine for accumulation (same test file). A new author
+  is admitted however many clauses exist — per-account clauses do not
+  collide (`test_a_new_author_is_admitted_however_many_clauses_exist`).
+
+The refusal that fires (`CLAUSE_SHAPE`) already delivers ask 3's outcome
+for `user_tx` — no fee for a no-op — and the new receipts (ask 1) plus
+`getrulesinforce` (ask 2) make any future drop visible instead of silent.
+
+Not built, deliberately. A governance `consensus_rule_update` carrying a
+total-form o5 revision can still silently supersede an existing total-form
+o5 unit in the consensus rules: the staging compile feeds revisions
+sequentially through `i0`, and sequential application supersedes (measured
+in `tests/test_rule_scoping_native.py`, section 3). That is not a user unit
+and no fee is charged, so it is outside ask 3; refusing it would change
+consensus admission, where admission and apply must agree exactly or the
+chain forks. It is a follow-up for the maintainer to judge, not a silent
+part of this PR. The per-unit survival ledger (in_force /
+partially_displaced / displaced, as in kioway-dev #137) is likewise not
+built: it is not one of #42's asks, and it needs apply-time displacement
+tracking with cross-node-deterministic semantics.
+
 ## Invariants the tests pin
 
 - **Source of truth.** The view comes from the committed journal
@@ -79,10 +121,10 @@ upgrade, with no migration.
   transfer code never reads, so verdicts need the payment-decision
   wiring first.
 
-## Acceptance (measured at `700949e`)
+## Acceptance (re-measured 2026-11-24, run3, this tree)
 
-- Full mock suite: **4936 passed / 0 failed** (pristine main `a54a346`:
-  4864 passed / 0 failed). Delta +72 = new tests for these views; no
+- Full mock suite: **4939 passed / 0 failed** (pristine main `a54a346`:
+  4864 passed / 0 failed). Delta +75 = new tests for these views (incl. 3 ask-3 regression tests); no
   test present on main is missing.
 - E2E on the real engine (two live nodes, native Tau engine): **98/0**
   across 7 scenarios, including node restart agreement and follower
@@ -105,7 +147,7 @@ upgrade, with no migration.
   "in-place upgrade" section).
 - `gettaustate` / `getgovernance` byte-identical to main.
 
-## Files (26 files, +4768/−5 vs main)
+## Files (39 files, +5402/-21 vs main)
 
 - New commands: `commands/getrulesinforce.py`,
   `commands/getaccountrules.py`; extended `commands/gettxstatus.py`,
@@ -119,4 +161,5 @@ upgrade, with no migration.
 - Tests: `tests/test_rules_in_force_at_block.py`,
   `tests/test_tx_outcomes.py`, `tests/test_gap_ours.py`,
   `tests/test_running_spec.py`, `tests/test_running_spec_native.py`,
-  `tests/test_cli_policy.py`, `tests/test_worker_lost.py`.
+  `tests/test_ask3_incident.py`, `tests/test_cli_policy.py`,
+  `tests/test_worker_lost.py`.
