@@ -83,6 +83,22 @@ def _qt_ok(tx_hash: str, message: str = "Transaction queued.", **extra) -> dict:
     return out
 
 
+_PUBLIC_OK_KEYS = frozenset({"ok", "tx_hash", "message", "update_id"})
+_PUBLIC_ERROR_KEYS = frozenset({"ok", "code", "message", "details"})
+
+
+def public_result(result):
+    """The keys of a queue_transaction result that leave this node.
+
+    An allowlist, never dict(result): an internal key must not reach a client
+    or a peer.
+    """
+    if not isinstance(result, dict):
+        return result
+    keys = _PUBLIC_OK_KEYS if result.get("ok") else _PUBLIC_ERROR_KEYS
+    return {k: v for k, v in result.items() if k in keys}
+
+
 def _qt_err(code: str, message: str, **details) -> dict:
     out = {"ok": False, "code": code, "message": message}
     if details:
@@ -815,7 +831,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
     fee_limit_int = fees.parse_fee_limit(payload['fee_limit'])
     tx_type = payload.get("tx_type", "user_tx")
 
-    expected_seq = chain_state.get_sequence_number(sender_pubkey)
+    expected_seq = chain_state.get_committed_sequence_number(sender_pubkey)
 
     # Adjust expected sequence if the sender has pending transactions in the mempool
     pending_seq = db.get_pending_sequence(sender_pubkey)
@@ -1482,11 +1498,20 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             estimated_fee=estimated_fee_total if tx_type in FEE_BEARING_TX_TYPES else 0,
             lane=classify_lane(payload),
         )
-        chain_seq = chain_state.get_sequence_number(sender_pubkey)
+        chain_seq = chain_state.get_committed_sequence_number(sender_pubkey)
         if chain_seq > sequence_number:
             # A block used this sequence during admission. Its mempool
             # sweep ran before this row existed, so the row goes here.
             db.remove_mempool_by_hashes([tx_message_id])
+            sealed_in = db.get_canonical_tx_location(tx_message_id)
+            if sealed_in is not None:
+                return _qt_ok(
+                    tx_message_id,
+                    message=f"Transaction confirmed in block {sealed_in['block_number']}.",
+                    status="confirmed",
+                    block_hash=sealed_in["block_hash"],
+                    block_number=sealed_in["block_number"],
+                )
             return _qt_err(
                 "INVALID_SEQUENCE",
                 f"Invalid sequence number: a block used {sequence_number} during admission "
@@ -1578,14 +1603,13 @@ def execute(raw_command: str, container):
         return api_response.error_response("sendtx", str(exc), "INTERNAL_ERROR")
 
     if result.get("ok"):
-        # Explicit allowlist, never dict(result): an internal key added to the
-        # queue_transaction return must not leak into the wire envelope.
-        data = {
-            "message": result.get("message", "Transaction queued."),
-            "tx_hash": result["tx_hash"],
-        }
-        if result.get("update_id"):
-            data["update_id"] = result["update_id"]
+        data = public_result(result)
+        del data["ok"]
+        data = {"message": data.pop("message", "Transaction queued."), **data}
+        if result.get("status") == "confirmed":
+            data["status"] = "confirmed"
+            data["block_hash"] = result["block_hash"]
+            data["block_number"] = result["block_number"]
         return api_response.success_response("sendtx", data)
     return api_response.error_response(
         "sendtx",

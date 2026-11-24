@@ -1618,38 +1618,61 @@ def get_canonical_confirmation(block_hash: str, block_number: int) -> tuple[bool
     if _db_conn is None:
         init_db()
     with _db_lock:
-        cur = _db_conn.cursor()
-        head_hash_row = cur.execute(
-            "SELECT value FROM chain_state WHERE key = 'canonical_head_hash'"
-        ).fetchone()
-        head_num_row = cur.execute(
-            "SELECT value FROM chain_state WHERE key = 'canonical_head_number'"
-        ).fetchone()
-        if not head_hash_row or not head_hash_row[0]:
-            return (False, -1)
-        head_hash = head_hash_row[0]
-        try:
-            head_number = int(head_num_row[0]) if head_num_row else -1
-        except (ValueError, TypeError):
-            head_number = -1
-        if head_number < block_number:
+        return _canonical_confirmation_locked(_db_conn.cursor(), block_hash, block_number)
+
+
+def get_canonical_tx_location(tx_hash: str) -> Optional[Dict]:
+    """Return {'block_hash', 'block_number', 'head_number'} of the first canonical
+    block that holds tx_hash, or None."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        return _canonical_tx_location_locked(_db_conn.cursor(), tx_hash)
+
+
+def _canonical_tx_location_locked(cur, tx_hash: str) -> Optional[Dict]:
+    for block_hash, block_number in cur.execute(
+            "SELECT block_hash, block_number FROM tx_index WHERE tx_hash = ? "
+            "ORDER BY block_number ASC", (tx_hash,)).fetchall():
+        is_canonical, head_number = _canonical_confirmation_locked(cur, block_hash, block_number)
+        if is_canonical:
+            return {"block_hash": block_hash, "block_number": block_number,
+                    "head_number": head_number}
+    return None
+
+
+def _canonical_confirmation_locked(cur, block_hash: str, block_number: int) -> tuple[bool, int]:
+    head_hash_row = cur.execute(
+        "SELECT value FROM chain_state WHERE key = 'canonical_head_hash'"
+    ).fetchone()
+    head_num_row = cur.execute(
+        "SELECT value FROM chain_state WHERE key = 'canonical_head_number'"
+    ).fetchone()
+    if not head_hash_row or not head_hash_row[0]:
+        return (False, -1)
+    head_hash = head_hash_row[0]
+    try:
+        head_number = int(head_num_row[0]) if head_num_row else -1
+    except (ValueError, TypeError):
+        head_number = -1
+    if head_number < block_number:
+        return (False, head_number)
+    # Walk back from the head to the target height.
+    current = head_hash
+    steps = head_number - block_number
+    visited = set()
+    for _ in range(steps):
+        if not current or current in visited:
             return (False, head_number)
-        # Walk back from the head to the target height.
-        current = head_hash
-        steps = head_number - block_number
-        visited = set()
-        for _ in range(steps):
-            if not current or current in visited:
-                return (False, head_number)
-            visited.add(current)
-            row = cur.execute(
-                "SELECT previous_hash FROM blocks WHERE block_hash = ? LIMIT 1",
-                (current,),
-            ).fetchone()
-            if not row:
-                return (False, head_number)
-            current = row[0]
-        return (current == block_hash, head_number)
+        visited.add(current)
+        row = cur.execute(
+            "SELECT previous_hash FROM blocks WHERE block_hash = ? LIMIT 1",
+            (current,),
+        ).fetchone()
+        if not row:
+            return (False, head_number)
+        current = row[0]
+    return (current == block_hash, head_number)
 
 
 def get_mempool_entry(tx_hash: str) -> Optional[Dict]:
@@ -1956,7 +1979,7 @@ def remove_mempool_stale_sequences(chain_sequences: Dict[str, int]) -> int:
     """Remove each mempool row whose sequence number is below the chain sequence
     of its sender. Returns the number of rows removed.
 
-    A removed row that no block holds is recorded as `evicted`.
+    A removed row that no canonical block holds is recorded as `evicted`.
     """
     if not chain_sequences:
         return 0
@@ -1982,16 +2005,10 @@ def remove_mempool_stale_sequences(chain_sequences: Dict[str, int]) -> int:
             return 0
         ids = [row_id for row_id, _ in stale]
         cur.execute(f"DELETE FROM mempool WHERE id IN ({','.join('?' * len(ids))})", tuple(ids))
-        hashes = [tx_hash for _, tx_hash in stale]
-        sealed = {
-            r[0] for r in cur.execute(
-                f"SELECT tx_hash FROM tx_index WHERE tx_hash IN ({','.join('?' * len(hashes))})",
-                tuple(hashes),
-            ).fetchall()
-        }
+        unsealed = [tx_hash for _, tx_hash in stale
+                    if _canonical_tx_location_locked(cur, tx_hash) is None]
         import time as _time
-        _record_dropped_locked(cur, [h for h in hashes if h not in sealed], "evicted",
-                               int(_time.time() * 1000))
+        _record_dropped_locked(cur, unsealed, "evicted", int(_time.time() * 1000))
         _db_conn.commit()
         logger.debug("Removed %s mempool transactions with a used sequence number", len(stale))
         return len(stale)

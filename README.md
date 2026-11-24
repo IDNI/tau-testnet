@@ -745,7 +745,9 @@ For a wallet view that accounts for queued sends, use the additive commands
   `rejected`, or `unknown`. `unknown` is a normal answer, not an error.
 
 `sendtx` returns the computed `tx_hash` in its success `data`, so a wallet can
-poll `gettxstatus` immediately after queuing.
+poll `gettxstatus` immediately after queuing. When a block seals the transaction
+while `sendtx` admits it, the success `data` also has `status: "confirmed"`,
+`block_hash` and `block_number`.
 
 - **`checktx <json_payload>`** — read-only admission dry-run: would `sendtx`
   accept this? Nothing enters the mempool, nothing is broadcast, nothing is

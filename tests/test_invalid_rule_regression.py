@@ -63,7 +63,7 @@ class TestInvalidRuleRegression(unittest.TestCase):
                     "fee_limit": "0",
                 }, SK_ALICE)
 
-                sys.modules['chain_state'].get_sequence_number.return_value = 0
+                sys.modules['chain_state'].get_committed_sequence_number.return_value = 0
                 sys.modules['db'].get_pending_sequence.return_value = None
                 sys.modules['chain_state'].get_rules_state.return_value = None
 

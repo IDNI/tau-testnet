@@ -1482,7 +1482,7 @@ class NetworkService:
             res = await trio.to_thread.run_sync(
                 functools.partial(self._queue_tx, req.get("tx"))
             )
-            resp = {"ok": True, "result": res}
+            resp = {"ok": True, "result": sendtx.public_result(res)}
             await stream.write(json.dumps(resp).encode())
         except Exception:
             pass
