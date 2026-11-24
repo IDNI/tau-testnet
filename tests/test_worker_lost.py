@@ -792,6 +792,9 @@ _PROPAGATES = {os.path.join("consensus", "engine.py"),
 #: Modules that own a session or a proposal, and so must translate the loss.
 _OWNERS = {
     "chain_state.py": "boundary",
+    # The replay check drives a reconstruct session and fails closed on
+    # the loss (returns False), which is a translation at its own edge.
+    os.path.join("consensus", "active_rules.py"): "WorkerLost",
     os.path.join("commands", "createblock.py"): "boundary",
     "tau_admission.py": "WorkerLost",
     "tau_advisory.py": "WorkerLost",
