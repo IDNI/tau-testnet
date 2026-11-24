@@ -5,7 +5,6 @@ import json
 import tempfile
 import sys
 
-import threading
 import tau_manager
 import tau_defs
 import random
@@ -32,10 +31,8 @@ class TestStateReconstruction(unittest.TestCase):
         self._prev_tau_force_test = os.environ.get("TAU_FORCE_TEST", "1")
         if force_native:
             os.environ["TAU_FORCE_TEST"] = "0"
-        tau_manager.server_should_stop.clear()
         tau_manager.tau_ready.clear()
-        self.tau_thread = threading.Thread(target=tau_manager.start_and_manage_tau_process, daemon=True)
-        self.tau_thread.start()
+        self.tau_thread = tau_manager.start_manager_thread()
         ready = tau_manager.tau_ready.wait(timeout=60)
         if not ready:
             self.stop_tau()

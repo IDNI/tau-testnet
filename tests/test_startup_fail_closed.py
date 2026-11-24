@@ -22,14 +22,12 @@ import tau_manager
 @pytest.fixture
 def manager_thread(monkeypatch):
     monkeypatch.setenv("TAU_FORCE_TEST", "0")
-    tau_manager.server_should_stop.clear()
     tau_manager.tau_ready.clear()
     tau_manager.tau_test_mode = False
     threads = []
 
     def _start():
-        t = threading.Thread(target=tau_manager.start_and_manage_tau_process, daemon=True)
-        t.start()
+        t = tau_manager.start_manager_thread()
         threads.append(t)
         return t
 
@@ -72,10 +70,8 @@ def test_a_failed_restore_does_not_publish_readiness(manager_thread):
 def test_requested_test_mode_still_comes_up(monkeypatch):
     """The explicit mock configuration is unchanged -- guard the guard."""
     monkeypatch.setenv("TAU_FORCE_TEST", "1")
-    tau_manager.server_should_stop.clear()
     tau_manager.tau_ready.clear()
-    t = threading.Thread(target=tau_manager.start_and_manage_tau_process, daemon=True)
-    t.start()
+    t = tau_manager.start_manager_thread()
     try:
         assert tau_manager.tau_ready.wait(timeout=5)
         assert tau_manager.tau_test_mode is True
