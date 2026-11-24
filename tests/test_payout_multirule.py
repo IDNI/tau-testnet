@@ -561,3 +561,82 @@ def test_execute_admission_refuses_a_fee_over_the_rules_cap():
     result = validate_payout_execute_payload(exe, tip)
     assert not result.is_valid and result.code == "PAYOUT_REFUSED"
     assert "caps a manual execution's fee at 5" in result.error
+
+# --- Due-point updates: the old point must never fire after an update --------
+# Book-level: update() removes the old version before inserting the new one,
+# and _remove clears the old pending due point from BOTH the _due and the
+# _retry indexes (payout.py:1225). These tests pin that behavior.
+
+
+def test_an_update_removes_the_old_due_point_and_registers_the_new_one():
+    book = p.PayoutBook()
+    old = _terms(AKEY, 1, due_at=1000, due_every=256)
+    book.install(old, anchor=10)
+    assert book.due(1000, 0) == [(AKEY, old.rule_id)]
+    assert book.has_due(1000, 0)
+    new = _terms(AKEY, 1, due_at=5000, due_every=256)
+    _, updated = book.update(AKEY, old.rule_id, new, anchor=10)
+    assert updated.rule_id != old.rule_id and updated.version == 2
+    assert book.get(AKEY, old.rule_id) is None
+    assert book.count() == 1
+    # The old point is gone from both indexes: nothing is due at 1000.
+    assert book.due(1000, 0) == []
+    assert not book.has_due(1000, 0)
+    assert book.due(4999, 0) == []
+    # The new version's own point is registered from its own due_at.
+    assert book.due(5000, 0) == [(AKEY, updated.rule_id)]
+    st = book.state_of(AKEY, updated.rule_id)
+    assert st.due_index == 0 and st.next_due(updated) == 5000
+    assert book.current_id(old.rule_id) == updated.rule_id
+
+
+def test_an_update_removes_a_due_point_waiting_in_the_retry_window():
+    book = p.PayoutBook()
+    old = _terms(AKEY, 1, due_at=1000, due_every=256)
+    book.install(old, anchor=10)
+    # The point ran and could not pay; its window is still open, so the book
+    # retries it next block.
+    book.due_ran(AKEY, old.rule_id, 1000, paid=False)
+    assert (AKEY, old.rule_id) in book.due(1001, 0)
+    new = _terms(AKEY, 1, due_at=5000, due_every=256)
+    _, updated = book.update(AKEY, old.rule_id, new, anchor=10)
+    # The retried point is gone too: nothing is due at the old point, and the
+    # retry does not fire later.
+    assert book.due(1001, 0) == []
+    assert not book.has_due(1001, 0)
+    assert book.due(5000, 0) == [(AKEY, updated.rule_id)]
+    assert book.get(AKEY, old.rule_id) is None
+
+
+def test_an_update_moves_the_due_point_and_the_old_point_never_fires(evs):
+    ch, oracle, tx = _due_installed(evs)
+    upd = update_tx(rid(tx), seq=1, rule=CHOICE, slots=[BOB], cap_exec=100,
+                    cap_period=10000, period=10, due_at=HEIGHT + 50,
+                    due_every=256, expires_at=HEIGHT + 1000)
+    ch.block([upd], height=HEIGHT + 1, ts=TS + 1)
+    _, _, new_terms = p.parse_payout_rule_update(upd)
+    new_id = replace(new_terms, version=2).rule_id
+    assert _events(ch)[0] == {"account_pubkey": ALICE, "rule_id": new_id.hex(),
+                              "outcome": "updated", "tx_id": upd["tx_id"],
+                              "replaces": rid(tx)}
+    oracle.create(upd, fee=0)
+    book = ch.lm.payout_rules
+    assert book.get(ALICE, ridb(tx)) is None
+    assert book.get(ALICE, new_id) is not None
+    assert book.state_of(ALICE, new_id).next_due(
+        book.get(ALICE, new_id)) == HEIGHT + 50
+    # The old point arrives: nothing runs under the old terms.
+    ch.block([], height=HEIGHT + 5, ts=TS + 5)
+    assert _events(ch) == []
+    # The new point arrives: the new version pays, once, under the new terms.
+    ch.block([], height=HEIGHT + 50, ts=TS + 50)
+    ev = _events(ch)[0]
+    assert ev["outcome"] == "executed" and ev["due_at"] == HEIGHT + 50
+    assert ev["due_index"] == 0 and ev["total"] == 100
+    assert ev["rule_id"] == new_id.hex()
+    assert ev["legs"] == [{"slot": 0, "recipient_pubkey": BOB, "amount": 100}]
+    oracle.pay(ALICE, BOB, 100, ts=TS + 50)
+    oracle.check(ch)
+    st = ch.lm.payout_rules.state_of(ALICE, new_id)
+    assert st.due_index == 1 and st.missed == 0
+    assert st.next_due(book.get(ALICE, new_id)) == HEIGHT + 50 + 256
