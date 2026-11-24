@@ -60,13 +60,14 @@ SLOW_TX_TYPES = frozenset({
 # `approval_request` belongs here because it is fee-bearing and runs the full
 # per-transfer step; `transfer_vote` belongs because completing a request
 # executes the parked transfer, which needs o1/o5 too.
+from consensus.payments import FEE_BEARING_PAYMENT_TYPES
 TAU_EVALUATING_TX_TYPES = frozenset({
     "user_tx",
     "approval_request",
     "transfer_vote",
     "retractable_transfer",
     "rule_change_request",
-})
+}) | FEE_BEARING_PAYMENT_TYPES
 
 
 def classify_lane(tx: Optional[Dict[str, Any]]) -> int:

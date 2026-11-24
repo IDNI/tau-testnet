@@ -55,4 +55,7 @@ TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS = 32
 # A park and a retract each carry a few pubkeys, an amount and a signature.
 TAU_MAX_RETRACTABLE_TRANSFER_BYTES = 4096
 TAU_MAX_RETRACT_TRANSFER_BYTES = 4096
+# A payout rule carries up to eight legs and a short clause. The other
+# programmable-payment transactions are smaller.
+TAU_MAX_PAYMENT_TX_BYTES = 8192
 TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS = 32

@@ -640,6 +640,17 @@ Timing caveats:
 
 **Upgrade.** This adds a field to the consensus metadata hash with no activation flag, so it needs a regenesis and every node on the same build. An older binary forks at the first park block.
 
+## Programmable payments
+
+Long-form guide: [docs/programmable_payments.md](docs/programmable_payments.md).
+
+Standing payments, receive routes, payout rules and conditional allowances. Time is the block timestamp. The root joins the consensus meta hash only once a book has held an entry, so a chain that never uses them does not need a regenesis. `getpayments capability` reports the rounding, the hop rule and which side pays which fee.
+
+```bash
+python scripts/demo_programmable_payments.py
+# Alice -> Bob 5000, at most 500 a week from 2026-12-01, remainder back on 2027-01-01
+```
+
 ## Mempool policy
 
 - **Lanes** — every tx is classified `fast` (coin transfers) or `slow` (anything carrying Tau rule text: `rule_offer`, `rule_offer_accept`, `consensus_rule_update`, or a `user_tx` with a non-empty `operations["0"]`). A `user_tx` carrying both a rule and transfers is `slow` — the signature covers the whole payload, so it cannot be split. Applying a rule builds or recompiles Tau state, which costs far more than a transfer's one cheap step; without separation a burst of rule work delays every queued transfer. Fee priority cannot express the split, because a rule emits its own `o8` user fee and can therefore price itself to the front of the queue.

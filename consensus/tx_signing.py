@@ -123,6 +123,12 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    else:
+        # Programmable-payment types sign exactly the fields apply will read.
+        # Unknown types gain nothing: an absent type has an empty overlay.
+        from consensus.payments import PAYMENT_TX_TYPES, signing_overlay
+        if tx_type in PAYMENT_TX_TYPES:
+            signing_dict.update(signing_overlay(payload))
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

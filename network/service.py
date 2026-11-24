@@ -110,6 +110,19 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "transfer_vote",
     "retractable_transfer",
     "retract_transfer",
+    "standing_payment_create",
+    "standing_payment_cancel",
+    "standing_payment_update",
+    "standing_payment_execute",
+    "allowance_open",
+    "allowance_draw",
+    "allowance_release",
+    "receive_route_set",
+    "receive_route_remove",
+    "receive_route_release",
+    "payout_rule_set",
+    "payout_rule_remove",
+    "payout_execute",
 })
 
 
@@ -859,12 +872,14 @@ class NetworkService:
             logger.debug("Failed to connect to bootstrap peer", exc_info=True)
         
     async def _on_transaction_gossip(self, envelope: Dict[str, Any]) -> None:
-        from .protocols import TAU_MAX_USER_TX_BYTES
+        from .protocols import TAU_MAX_PAYMENT_TX_BYTES, TAU_MAX_USER_TX_BYTES
+        from consensus.payments import PAYMENT_TX_TYPES
         await self._process_gossip_payload(
-            envelope, 
-            allowed_types={"user_tx"},
+            envelope,
+            allowed_types={"user_tx"} | set(PAYMENT_TX_TYPES),
             type_limits={
-                "user_tx": TAU_MAX_USER_TX_BYTES
+                "user_tx": TAU_MAX_USER_TX_BYTES,
+                **{name: TAU_MAX_PAYMENT_TX_BYTES for name in PAYMENT_TX_TYPES},
             }
         )
 

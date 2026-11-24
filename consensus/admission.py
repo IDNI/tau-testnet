@@ -1706,6 +1706,50 @@ def validate_expire_at_height(payload: Dict, tip_view: TipAdmissionView) -> Opti
     return None
 
 
+def _payment_tx_types():
+    from consensus.payments import PAYMENT_TX_TYPES
+    return PAYMENT_TX_TYPES
+
+
+def _validate_payment_payload(payload: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+    """Shape, chain binding and tip-state preview. Apply repeats the decision."""
+    import time
+
+    import chain_state
+    import db
+    from consensus.payments import stage_tx
+
+    chain_id = ""
+    if getattr(db, "_db_conn", None) is not None:
+        try:
+            chain_id = (db.get_genesis_hash() or "").strip().lower()
+        except Exception:
+            chain_id = ""
+    lm = getattr(chain_state, "_lifecycle_manager", None)
+    if lm is None or not hasattr(lm, "programmable"):
+        return format_error("Programmable payments are not loaded.", code="PAYMENTS_UNAVAILABLE")
+
+    def read_bal(addr: str) -> int:
+        try:
+            return int(chain_state.get_balance(addr))
+        except Exception:
+            return 0
+
+    staged = stage_tx(
+        payload,
+        sender=str(payload.get("sender_pubkey") or ""),
+        sequence=int(payload.get("sequence_number") or 0),
+        height=int(getattr(tip_view, "next_block_height", 1) or 1),
+        ts=int(time.time()),
+        chain_id=chain_id,
+        lm=lm,
+        read_bal=read_bal,
+    )
+    if not staged.ok:
+        return format_error(staged.detail or staged.reason, code=staged.reason or "TX_REJECTED")
+    return success({"payment": staged.receipt})
+
+
 def validate_mempool_admission(
     payload: Dict, tip_view: TipAdmissionView, *, compile_rules: bool = True
 ) -> AdmissionResult:
@@ -1771,6 +1815,9 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type in _payment_tx_types():
+         return _validate_payment_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

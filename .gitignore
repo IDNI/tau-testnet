@@ -45,6 +45,8 @@ MagicMock
 !docs/approvals.md
 !docs/retractable.md
 !docs/packaging.md
+!docs/programmable_payments.md
+!docs/programmable_payments_amendment.md
 
 # Python
 __pycache__/

@@ -68,10 +68,12 @@ from .rule_offers import (
 # constant is deliberately duplicated there to keep the admission path free of
 # an engine import, and a divergence charges a different fee at admission than
 # at inclusion.
+from .payments import FEE_BEARING_PAYMENT_TYPES, PAYMENT_TX_TYPES
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
+    | set(FEE_BEARING_PAYMENT_TYPES)
 )
 
 
@@ -228,7 +230,11 @@ def _retractable_book(lm) -> Optional[RetractableBook]:
 
 def _escrow_total(lm) -> int:
     book = _retractable_book(lm)
-    return book.escrow_total() if book is not None else 0
+    total = book.escrow_total() if book is not None else 0
+    payments = getattr(lm, "programmable", None)
+    if payments is not None:
+        total += payments.escrow_total()
+    return total
 
 
 def _release_due_retractables(lm, balances, sequences, height, timestamp) -> List[str]:
@@ -903,6 +909,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         released_retractables = _release_due_retractables(
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
+        from .payments import sweep as sweep_payments
+        payment_events = sweep_payments(
+            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
+        )
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
@@ -1118,6 +1128,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "payment_events": payment_events,
             }
         )
         
@@ -1131,6 +1142,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "activated_updates": [u.update_id_hex for u in newly_active],
                 "released_retractables": released_retractables,
                 "retractable_events": retractable_events,
+                "payment_events": payment_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1654,6 +1666,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             fee_limit_int: Optional[int] = None
             fee_components: List[int] = []
             staged_writes: Dict[str, int] = {}
+            routable_credits: List[Tuple[str, int]] = []
+            pending_payment = None
             # An approval_request prices itself with the REAL transfer inputs, so
             # the generic transfer-less fee-query step (which feeds the canonical
             # mocked i1=i2=i3=i4=0) must not run for it as well and charge twice.
@@ -2019,6 +2033,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     staged_writes[from_addr] = current_from - amount
                     if not escrow:
                         staged_writes[to_addr] = _read_bal(to_addr) + amount
+                        # Only an ordinary user transfer is routable. Parked
+                        # escrow, standing payments and payouts credit elsewhere
+                        # and must not start a second hop.
+                        if tx_type == "user_tx":
+                            routable_credits.append((str(to_addr), amount))
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -2628,6 +2647,30 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Retractable transfer retracted: " + request.retractable_id.hex()
                             )
 
+            elif tx_type in PAYMENT_TX_TYPES:
+                from .payments import resolve_chain_id, stage_tx as stage_payment_tx
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    staged = stage_payment_tx(
+                        tx,
+                        sender=sender if isinstance(sender, str) else "",
+                        sequence=int(sequence_number or 0),
+                        height=int(block_height or 0),
+                        ts=int(block_timestamp or 0),
+                        chain_id=resolve_chain_id(snapshot),
+                        lm=lifecycle_mgr,
+                        read_bal=_read_bal,
+                    )
+                    if not staged.ok:
+                        tx_receipt["logs"].append(staged.detail)
+                        tx_receipt["reason"] = staged.reason or "payment_rejected"
+                        accepted_in_block = False
+                    else:
+                        for addr, new_bal in staged.writes.items():
+                            staged_writes[addr] = new_bal
+                        pending_payment = staged
+                        tx_receipt["payment"] = dict(staged.receipt)
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3162,6 +3205,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
 
             stamp_retractable_park = False
+            if (accepted_in_block and not hard_reject and routable_credits
+                    and getattr(lifecycle_mgr, "programmable", None) is not None):
+                from .payments import apply_receive_routes
+                route_events = apply_receive_routes(
+                    lifecycle_mgr.programmable, routable_credits,
+                    int(block_timestamp or 0), _read_bal, staged_writes,
+                )
+                if route_events:
+                    tx_receipt["receive_routes"] = route_events
+            if accepted_in_block and not hard_reject and pending_payment is not None:
+                if pending_payment.commit is not None:
+                    info = pending_payment.commit(_lifecycle_for_write().programmable)
+                    tx_receipt["payment"] = info
+                if pending_payment.stamp and target_last_transfer_ts is not None:
+                    for stamped in pending_payment.stamp:
+                        target_last_transfer_ts[stamped] = int(block_timestamp or 0)
             if accepted_in_block and not hard_reject:
                 if pending_retractable_park is not None or pending_retract_id is not None:
                     book = _lifecycle_for_write().retractable_transfers
