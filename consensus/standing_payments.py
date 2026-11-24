@@ -75,6 +75,22 @@ make two honest nodes disagree about admissibility, which forks.
   untouched: a retry still settles exactly its own period inside its own
   window, and a period settled by a catch-up execution drops any retry
   it owed (settlement is shared state, never two payments).
+- FIX 10 (the stage-2 deciding-rule form, S-3): a third form,
+  FORM_TAU_DECIDING_RULE. The stage-1 clause decided only WHAT a due
+  execution pays; the book's Python decided WHEN and WHETHER. A
+  deciding rule is stepped over the stage-1 input map PLUS the book's
+  own derived facts (standing_rule_inputs: the current period, whether
+  its window is open, how many periods the signed terms let settle now,
+  the next due date, the missed count, the remaining capacity, the
+  retry state, the cancellation flag) and reports a VERDICT (o29: 1
+  executes, anything else declines) and, on the execute path, how many
+  periods it settles (o28, oldest first). The clause decides; the book
+  enforces — it re-verifies the named periods against the same facts
+  it published, and the legs against the signed caps with the one cap
+  enforcer both clause forms share (_clause_amounts). No verdict, no
+  payment. What stays the book's is state integrity, not decision: a
+  cancelled or ended authorization cannot be revived by a verdict, and
+  a period the facts say is not settleable cannot be settled by one.
 """
 from __future__ import annotations
 
@@ -94,6 +110,7 @@ from consensus.payment_calendar import (
 from consensus.serialization import (
     compute_standing_payment_book_root,
     compute_standing_payment_id,
+    compute_standing_payment_rule_id,
     compute_standing_payment_tau_id,
 )
 
@@ -142,7 +159,13 @@ STATUS_ENDED = "ended"
 # payer signed.
 FORM_DECLARED = 1
 FORM_TAU_CLAUSE = 2
-STANDING_FORMS = frozenset({FORM_DECLARED, FORM_TAU_CLAUSE})
+# FIX 10: the stage-2 deciding-rule form — the clause, stepped over the
+# book's derived facts, reports the execute/decline verdict itself; the
+# book enforces the signed caps and the facts it published.
+FORM_TAU_DECIDING_RULE = 3
+STANDING_FORMS = frozenset(
+    {FORM_DECLARED, FORM_TAU_CLAUSE, FORM_TAU_DECIDING_RULE}
+)
 
 # The Tau form's clause text bound, in UTF-8 bytes — the same bound the
 # payout-rule form puts on its clause (consensus/payout_rules
@@ -156,6 +179,14 @@ MAX_STANDING_CLAUSE_BYTES = 8192
 # streams.
 STANDING_OUTPUT_COUNT_STREAM = 30
 STANDING_OUTPUT_FIRST_STREAM = 31
+
+# FIX 10: the deciding form's extra outputs, below the shared leg
+# encoding so a stage-2 clause writes its decision and its legs in one
+# step: o29 is the verdict (1 executes; anything else, or an absent or
+# unreadable value, declines) and o28 is how many of the settleable
+# periods the execution settles, oldest first.
+STANDING_VERDICT_STREAM = 29
+STANDING_PERIODS_STREAM = 28
 
 # A clause names at most this many legs in one execution (the payout
 # form's MAX_LEGS bound, shared across the stage).
@@ -252,6 +283,25 @@ class StandingPaymentEntry:
 
     @property
     def auth_id(self) -> bytes:
+        if self.form == FORM_TAU_DECIDING_RULE:
+            return compute_standing_payment_rule_id(
+                self.payer_pubkey,
+                self.recipient_pubkey,
+                self.amount,
+                self.schedule_kind,
+                self.signed_day,
+                self.anchor_ts,
+                self.window_seconds,
+                self.final_ts,
+                self.max_occurrences,
+                self.max_total,
+                self.fee_limit,
+                self.policy_version_ref,
+                int(self.allow_catch_up),
+                self.clause_text,
+                self.version,
+                self.due_retry_seconds,
+            )
         if self.form == FORM_TAU_CLAUSE:
             return compute_standing_payment_tau_id(
                 self.payer_pubkey,
@@ -525,6 +575,97 @@ def decode_clause_legs(
     return tuple(legs), ""
 
 
+# --- FIX 10: the deciding form's derived facts and decision decoding --------
+
+
+@dataclass(frozen=True)
+class StandingRuleFacts:
+    """The book's derived facts a deciding rule reads (FIX 10).
+
+    Every field is computed by the book from its own state — the same
+    state the book later enforces against — so the facts a clause
+    decides on and the facts its decision is checked against cannot
+    drift apart. Nothing here comes from a transaction.
+    """
+
+    current_period: int  # period containing ts; -1 before the first due date
+    window_open: bool  # the current period's execution window is open at ts
+    settleable_periods: Tuple[int, ...]  # periods the signed terms let settle now
+    next_due_ts: int  # the next due date after the current period; 0 when none
+    missed_count: int  # due periods whose window lapsed while unsettled
+    capacity_left: int  # occurrences the end conditions still allow
+    total_paid: int  # what this authorization version has paid in all
+    retry_state: int  # 0 none owed; 1 owed, window open; 2 owed, window closed
+    cancelled: bool
+    due_unsettled_count: int  # due and unsettled, ignoring the catch-up term
+
+
+def standing_rule_inputs(
+    entry: StandingPaymentEntry,
+    executor_pubkey: str,
+    ts: int,
+    payer_balance: int,
+    period_paid_total: int,
+    facts: StandingRuleFacts,
+) -> Dict[int, Any]:
+    """The input map a deciding rule is stepped over (FIX 10).
+
+    The stage-1 map (i1..i5, i26) verbatim — a stage-2 clause reads the
+    stage-1 streams with the stage-1 meanings — plus the book's derived
+    facts on fresh streams:
+
+    - i27: the current period index + 1 (0 before the first due date)
+    - i28: 1 when the current period's execution window is open, else 0
+    - i29: how many periods the signed terms let settle now
+    - i30: the next due timestamp (0 when the rule has none)
+    - i31: how many due periods were missed (window lapsed, unsettled)
+    - i32: the remaining occurrence capacity
+    - i33: the total this authorization has already paid
+    - i34: the retry state of the run being evaluated (0 none, 1 a
+      retry run is live — owed and open, or, at a discovery step, the
+      candidate period's own prospective retry run — 2 owed and its
+      window closed)
+    - i35: 1 when the authorization is cancelled, else 0
+    - i36: how many periods are due and unsettled in all
+
+    ONE definition, called by the engine at apply and by admission at
+    the tip through the book (clause_inputs_for), so the construction
+    cannot drift between them.
+    """
+    inputs = standing_clause_inputs(
+        entry, executor_pubkey, ts, payer_balance, period_paid_total
+    )
+    inputs[27] = str(int(facts.current_period) + 1)
+    inputs[28] = "1" if facts.window_open else "0"
+    inputs[29] = str(len(facts.settleable_periods))
+    inputs[30] = str(int(facts.next_due_ts))
+    inputs[31] = str(int(facts.missed_count))
+    inputs[32] = str(int(facts.capacity_left))
+    inputs[33] = str(int(facts.total_paid))
+    inputs[34] = str(int(facts.retry_state))
+    inputs[35] = "1" if facts.cancelled else "0"
+    inputs[36] = str(int(facts.due_unsettled_count))
+    return inputs
+
+
+def decode_rule_outputs(
+    entry: StandingPaymentEntry, outputs: Dict[str, Any]
+) -> Tuple[Optional[int], Optional[int], Optional[Tuple[Tuple[str, int], ...]], str]:
+    """A deciding rule's step, decoded: (verdict, periods, legs, why).
+
+    The verdict (o29) and the periods count (o28) are the clause's
+    decision; the legs ride the stage's shared encoding (o30/o31+),
+    decoded by the same reader the stage-1 form uses. A missing or
+    unreadable verdict reads as None — the book refuses an execution
+    the rule never decided. The legs are None exactly when
+    decode_clause_legs finds nothing settleable in them.
+    """
+    verdict = _parse_output_value(outputs.get(f"o{STANDING_VERDICT_STREAM}"))
+    periods = _parse_output_value(outputs.get(f"o{STANDING_PERIODS_STREAM}"))
+    legs, why = decode_clause_legs(entry, outputs)
+    return verdict, periods, legs, why
+
+
 # --- Parsing -------------------------------------------------------------------
 
 
@@ -559,7 +700,8 @@ def _form_field(tx: Dict[str, Any]) -> int:
     value = tx.get("standing_form", FORM_DECLARED)
     if not _is_int(value) or value not in STANDING_FORMS:
         raise StandingPaymentShapeError(
-            "standing_form must be 1 (declared) or 2 (Tau clause)"
+            "standing_form must be 1 (declared), 2 (Tau clause) "
+            "or 3 (Tau deciding rule)"
         )
     return int(value)
 
@@ -592,14 +734,15 @@ def parse_create_standing_payment(tx: Dict[str, Any]) -> StandingPaymentEntry:
         raise StandingPaymentShapeError("standing_allow_catch_up must be 0 or 1")
     form = _form_field(tx)
     clause_text = _clause_field(tx)
-    if form == FORM_TAU_CLAUSE:
+    if form in (FORM_TAU_CLAUSE, FORM_TAU_DECIDING_RULE):
         if not clause_text:
             raise StandingPaymentShapeError(
                 "a Tau-form standing payment must carry standing_clause"
             )
     elif clause_text:
         raise StandingPaymentShapeError(
-            "standing_clause is only for the Tau form (standing_form 2)"
+            "standing_clause is only for the Tau forms "
+            "(standing_form 2 or 3)"
         )
     return StandingPaymentEntry(
         payer_pubkey=_pubkey_field(tx, "sender_pubkey"),
@@ -692,7 +835,7 @@ def validate_standing_payment_shape(
         return "standing_version must start at 1"
     if entry.form not in STANDING_FORMS:
         return "unknown standing payment form"
-    if entry.form == FORM_TAU_CLAUSE:
+    if entry.form in (FORM_TAU_CLAUSE, FORM_TAU_DECIDING_RULE):
         if not entry.clause_text:
             return "a Tau-form standing payment must carry a clause"
         if len(entry.clause_text.encode("utf-8")) > MAX_STANDING_CLAUSE_BYTES:
@@ -800,7 +943,7 @@ class StandingPaymentBook:
                 raise ValueError(f"duplicate stored authorization: {entry.auth_id.hex()}")
             if entry.series_key in book._series:
                 raise ValueError("duplicate stored authorization series")
-            if entry.form == FORM_TAU_CLAUSE:
+            if entry.form in (FORM_TAU_CLAUSE, FORM_TAU_DECIDING_RULE):
                 # A clause-form total is the sum of its settled periods'
                 # fact amounts — variable per period, so it is verified
                 # against the facts below, once they are loaded.
@@ -849,7 +992,8 @@ class StandingPaymentBook:
             entry = book._entries.get(bytes(auth_id))
             if entry is None:
                 raise ValueError("stored retry names an unknown authorization")
-            if entry.form != FORM_TAU_CLAUSE or not entry.due_retry_seconds:
+            if entry.form not in (FORM_TAU_CLAUSE, FORM_TAU_DECIDING_RULE) \
+                    or not entry.due_retry_seconds:
                 raise ValueError("stored retry names an authorization with no retry term")
             if retry_due_ts != due_ts(entry, period):
                 raise ValueError("stored retry due date disagrees with its authorization")
@@ -1062,7 +1206,8 @@ class StandingPaymentBook:
         entry = self._entries.get(auth_id)
         if entry is None:
             return False
-        if entry.form != FORM_TAU_CLAUSE or not entry.due_retry_seconds:
+        if entry.form not in (FORM_TAU_CLAUSE, FORM_TAU_DECIDING_RULE) \
+                or not entry.due_retry_seconds:
             return False
         if (auth_id, period_index) in self._retries:
             return False
@@ -1137,6 +1282,7 @@ class StandingPaymentBook:
         ts: int,
         payer_balance: int,
         clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
+        clause_verdict: Optional[int] = None,
     ) -> ExecutionDecision:
         """What a run of one due period would do, under the retry window.
 
@@ -1186,6 +1332,12 @@ class StandingPaymentBook:
                 False, "the next due point has come", period_index, 0, 0,
                 progress.total_paid,
             )
+        if entry.form == FORM_TAU_DECIDING_RULE:
+            decision, _ = self._evaluate_deciding_period(
+                entry, progress, period_index, payer_balance,
+                clause_legs, clause_verdict,
+            )
+            return decision
         decision, _ = self._evaluate_clause(
             entry, progress, period_index, [period_index], payer_balance,
             clause_legs,
@@ -1207,7 +1359,8 @@ class StandingPaymentBook:
             (
                 entry
                 for entry in self._entries.values()
-                if entry.form == FORM_TAU_CLAUSE and entry.due_retry_seconds > 0
+                if entry.form in (FORM_TAU_CLAUSE, FORM_TAU_DECIDING_RULE)
+                and entry.due_retry_seconds > 0
             ),
             key=lambda e: e.auth_id.hex(),
         )
@@ -1377,7 +1530,7 @@ class StandingPaymentBook:
         if entry.max_occurrences:
             capacity = entry.max_occurrences - len(progress.settled_periods)
         if entry.max_total:
-            if entry.form == FORM_TAU_CLAUSE:
+            if entry.form in (FORM_TAU_CLAUSE, FORM_TAU_DECIDING_RULE):
                 # A clause names variable amounts, so max_total cannot
                 # be divided into whole occurrences: it bounds the
                 # money (checked on the clause total in the evaluation),
@@ -1401,6 +1554,142 @@ class StandingPaymentBook:
         fact = self._facts.get((entry.auth_id, period))
         return fact.amount if fact is not None else 0
 
+    def _settleable_periods(
+        self, entry: StandingPaymentEntry, progress: _Progress, ts: int
+    ) -> List[int]:
+        """The periods an execution at `ts` may settle, oldest first.
+
+        The calendar the deciding form's facts publish (i29) and its
+        verdict is enforced against — one computation, so the fact and
+        the enforcement cannot drift. It is exactly _evaluate's
+        calendar for the other forms: a live window on the current
+        period is required, and without the signed catch-up term only
+        the current period itself can settle.
+        """
+        current = period_index_at(entry, ts)
+        if current < 0:
+            return []
+        if entry.final_ts and ts >= entry.final_ts:
+            return []
+        if entry.final_ts and due_ts(entry, current) >= entry.final_ts:
+            return []
+        if ts >= due_ts(entry, current) + entry.window_seconds:
+            return []
+        if entry.allow_catch_up:
+            return [
+                j
+                for j in range(current + 1)
+                if j not in progress.settled_periods
+                and not (entry.final_ts and due_ts(entry, j) >= entry.final_ts)
+            ]
+        return [] if current in progress.settled_periods else [current]
+
+    def rule_facts(
+        self, auth_id: bytes, ts: int, retry_period: Optional[int] = None
+    ) -> StandingRuleFacts:
+        """The derived facts a deciding rule reads at `ts` (FIX 10).
+
+        `retry_period` names the period whose retry run is being
+        evaluated (the sweep's discovery and retry steps): for that
+        run the retry state reads as it will be when the run happens —
+        1 while the period is due, unpaid and inside its retry window
+        — because the run being decided is that period's retry run,
+        whether it is already owed (a retry step) or only a candidate
+        (a discovery step). Without it, the state is the book's own:
+        what is owed right now.
+        """
+        entry, progress = self._entry_and_progress(auth_id)
+        current = period_index_at(entry, ts)
+        window_open = (
+            current >= 0
+            and ts < due_ts(entry, current) + entry.window_seconds
+            and not (entry.final_ts and due_ts(entry, current) >= entry.final_ts)
+        )
+        next_due = 0
+        upcoming = due_ts(entry, current + 1) if current >= 0 else due_ts(entry, 0)
+        if not entry.final_ts or upcoming < entry.final_ts:
+            next_due = upcoming
+        missed = 0
+        due_unsettled = 0
+        if current >= 0:
+            for j in range(current + 1):
+                if entry.final_ts and due_ts(entry, j) >= entry.final_ts:
+                    break
+                if j in progress.settled_periods:
+                    continue
+                due_unsettled += 1
+                if ts >= due_ts(entry, j) + entry.window_seconds:
+                    missed += 1
+        retry_state = 0
+        owed = [
+            retry
+            for (owed_auth, _period), retry in self._retries.items()
+            if owed_auth == entry.auth_id
+        ]
+        if owed:
+            retry_state = (
+                1 if any(self.retry_live(retry, ts)[0] for retry in owed) else 2
+            )
+        if retry_period is not None and entry.due_retry_seconds:
+            due = due_ts(entry, retry_period)
+            next_due = due_ts(entry, retry_period + 1)
+            candidate_live = (
+                retry_period not in progress.settled_periods
+                and ts >= due
+                and ts < due + entry.due_retry_seconds
+                and (
+                    entry.final_ts
+                    and next_due >= entry.final_ts
+                    or ts < next_due
+                )
+            )
+            if candidate_live:
+                retry_state = 1
+        return StandingRuleFacts(
+            current_period=current,
+            window_open=window_open,
+            settleable_periods=tuple(
+                self._settleable_periods(entry, progress, ts)
+            ),
+            next_due_ts=next_due,
+            missed_count=missed,
+            capacity_left=self._capacity(entry, progress),
+            total_paid=progress.total_paid,
+            retry_state=retry_state,
+            cancelled=progress.cancelled,
+            due_unsettled_count=due_unsettled,
+        )
+
+    def clause_inputs_for(
+        self,
+        entry: StandingPaymentEntry,
+        executor_pubkey: str,
+        ts: int,
+        payer_balance: int,
+        retry_period: Optional[int] = None,
+    ) -> Dict[int, Any]:
+        """The input map for this entry's form, built from this book.
+
+        ONE construction for every caller (engine at apply, admission
+        at the tip, the sweep): the stage-1 map for the stage-1 clause
+        form, the facts map for the deciding form — the form selects
+        the map, so no caller can step a deciding rule over stage-1
+        inputs and starve it of the facts it decides on.
+        """
+        period_paid = self.period_paid_total(entry.auth_id, ts)
+        if entry.form == FORM_TAU_DECIDING_RULE:
+            return standing_rule_inputs(
+                entry,
+                executor_pubkey,
+                ts,
+                payer_balance,
+                period_paid,
+                self.rule_facts(entry.auth_id, ts, retry_period=retry_period),
+            )
+        return standing_clause_inputs(
+            entry, executor_pubkey, ts, payer_balance, period_paid
+        )
+
     def _evaluate(
         self,
         entry: StandingPaymentEntry,
@@ -1408,8 +1697,16 @@ class StandingPaymentBook:
         ts: int,
         payer_balance: int,
         clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
+        clause_verdict: Optional[int] = None,
+        clause_periods: Optional[int] = None,
     ) -> Tuple[ExecutionDecision, List[int]]:
         """Pure evaluation: the decision, plus the periods it would settle."""
+
+        if entry.form == FORM_TAU_DECIDING_RULE:
+            return self._evaluate_deciding(
+                entry, progress, ts, payer_balance, clause_legs,
+                clause_verdict, clause_periods,
+            )
 
         def refuse(reason: str, period_index: int = -1) -> Tuple[ExecutionDecision, List[int]]:
             return (
@@ -1514,6 +1811,42 @@ class StandingPaymentBook:
         cap, and a period the total does not reach is not settled.
         """
 
+        if clause_legs is None:
+            return (
+                ExecutionDecision(
+                    False, "the authorization's clause was not evaluated",
+                    current, 0, 0, progress.total_paid,
+                ),
+                [],
+            )
+        return self._clause_amounts(
+            entry, progress, current, to_settle, payer_balance, clause_legs
+        )
+
+    def _clause_amounts(
+        self,
+        entry: StandingPaymentEntry,
+        progress: _Progress,
+        current: int,
+        to_settle: List[int],
+        payer_balance: int,
+        clause_legs: Tuple[Tuple[str, int], ...],
+    ) -> Tuple[ExecutionDecision, List[int]]:
+        """The one cap enforcer both clause forms settle through.
+
+        The legs — whoever computed them, a stage-1 clause or a
+        stage-2 deciding rule — are re-checked against everything the
+        payer signed: the candidate set, the per-execution cap (the
+        signed amount times the periods being settled), the max_total
+        end condition and the balance. Attribution then fills the
+        periods oldest first at no more than the signed amount each
+        (the per-period cap), so every settled period's fact records
+        an amount inside its cap, and a period the total does not
+        reach is not settled. This is enforcement, not decision: it
+        never chooses periods or amounts, it only refuses what the
+        signed terms do not cover.
+        """
+
         def refuse(reason: str) -> Tuple[ExecutionDecision, List[int]]:
             return (
                 ExecutionDecision(
@@ -1522,8 +1855,6 @@ class StandingPaymentBook:
                 [],
             )
 
-        if clause_legs is None:
-            return refuse("the authorization's clause was not evaluated")
         for recipient, leg_amount in clause_legs:
             if recipient not in entry.candidates:
                 return refuse(
@@ -1570,6 +1901,111 @@ class StandingPaymentBook:
             settled,
         )
 
+    def _evaluate_deciding(
+        self,
+        entry: StandingPaymentEntry,
+        progress: _Progress,
+        ts: int,
+        payer_balance: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]],
+        clause_verdict: Optional[int],
+        clause_periods: Optional[int],
+    ) -> Tuple[ExecutionDecision, List[int]]:
+        """The deciding form's evaluation of one execution (FIX 10).
+
+        The rule has already decided, over the facts this book
+        published: the verdict says whether, the periods count says
+        how many of the settleable periods (oldest first) it settles,
+        the legs say what it pays. What remains here is enforcement
+        and state integrity, in that order: a cancelled or ended
+        authorization settles nothing whatever the verdict says; a
+        missing verdict is no decision; a declining verdict is the
+        decision; the named periods must be periods the signed terms
+        let settle now, inside the remaining capacity; and the legs
+        pass through the one cap enforcer (_clause_amounts) the
+        stage-1 form uses.
+        """
+        current = period_index_at(entry, ts)
+
+        def refuse(reason: str) -> Tuple[ExecutionDecision, List[int]]:
+            return (
+                ExecutionDecision(
+                    False, reason, current, 0, 0, progress.total_paid
+                ),
+                [],
+            )
+
+        if progress.cancelled:
+            return refuse("authorization is cancelled")
+        if entry.final_ts and ts >= entry.final_ts:
+            return refuse(
+                "authorization has ended: the final period has passed"
+            )
+        if clause_verdict is None:
+            return refuse("the authorization's rule was not evaluated")
+        if clause_verdict != 1:
+            return refuse("the authorization's rule declined to execute")
+        if clause_periods is None:
+            return refuse(
+                "the authorization's rule did not report how many "
+                "periods to settle"
+            )
+        if clause_periods <= 0:
+            return refuse("the authorization's rule named no periods")
+        settleable = self._settleable_periods(entry, progress, ts)
+        if clause_periods > len(settleable):
+            return refuse(
+                "the rule named more periods than the signed terms "
+                "let settle now"
+            )
+        if clause_periods > self._capacity(entry, progress):
+            return refuse("the authorization's end condition is reached")
+        if clause_legs is None:
+            return refuse("the authorization's rule named no legs")
+        return self._clause_amounts(
+            entry, progress, current, settleable[:clause_periods],
+            payer_balance, clause_legs,
+        )
+
+    def _evaluate_deciding_period(
+        self,
+        entry: StandingPaymentEntry,
+        progress: _Progress,
+        period_index: int,
+        payer_balance: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]],
+        clause_verdict: Optional[int],
+    ) -> Tuple[ExecutionDecision, List[int]]:
+        """The deciding form's verdict on ONE period (discovery/retry).
+
+        The sweep's paths name the period themselves — it is the
+        period that is owed or being discovered — so the rule's
+        decision is the verdict alone: 1 runs the period through the
+        cap enforcer, anything else declines it, and a missing verdict
+        is no decision. The window arithmetic of those paths (the
+        retry window replacing the execution window) is the caller's,
+        exactly as it is for the stage-1 form.
+        """
+
+        def refuse(reason: str) -> Tuple[ExecutionDecision, List[int]]:
+            return (
+                ExecutionDecision(
+                    False, reason, period_index, 0, 0, progress.total_paid
+                ),
+                [],
+            )
+
+        if clause_verdict is None:
+            return refuse("the authorization's rule was not evaluated")
+        if clause_verdict != 1:
+            return refuse("the authorization's rule declined to execute")
+        if clause_legs is None:
+            return refuse("the authorization's rule was not evaluated")
+        return self._clause_amounts(
+            entry, progress, period_index, [period_index],
+            payer_balance, clause_legs,
+        )
+
     def execution_due(
         self,
         auth_id: bytes,
@@ -1577,6 +2013,8 @@ class StandingPaymentBook:
         payer_balance: int,
         executor_pubkey: Optional[str] = None,
         clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
+        clause_verdict: Optional[int] = None,
+        clause_periods: Optional[int] = None,
     ) -> ExecutionDecision:
         """What an execution at `ts` would do, without doing it.
 
@@ -1585,11 +2023,15 @@ class StandingPaymentBook:
         the payer's clause. Declared entries never consult it; Tau
         entries REQUIRE it — None refuses, because stepping is the
         caller's job, exactly as the payer balance is a parameter.
+        `clause_verdict` / `clause_periods` are the deciding form's
+        decision (FIX 10), decoded from the same step; the other forms
+        never consult them.
         """
         entry, progress = self._entry_and_progress(auth_id)
         self._check_executor(executor_pubkey)
         decision, _ = self._evaluate(
-            entry, progress, ts, payer_balance, clause_legs=clause_legs
+            entry, progress, ts, payer_balance, clause_legs=clause_legs,
+            clause_verdict=clause_verdict, clause_periods=clause_periods,
         )
         return decision
 
@@ -1607,6 +2049,8 @@ class StandingPaymentBook:
         payer_balance: int,
         executor_pubkey: Optional[str] = None,
         clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
+        clause_verdict: Optional[int] = None,
+        clause_periods: Optional[int] = None,
     ) -> ExecutionDecision:
         """Settle what is due at `ts`, or settle nothing.
 
@@ -1624,7 +2068,8 @@ class StandingPaymentBook:
         entry, progress = self._entry_and_progress(auth_id)
         self._check_executor(executor_pubkey)
         decision, to_settle = self._evaluate(
-            entry, progress, ts, payer_balance, clause_legs=clause_legs
+            entry, progress, ts, payer_balance, clause_legs=clause_legs,
+            clause_verdict=clause_verdict, clause_periods=clause_periods,
         )
         if not decision.executed:
             return decision
@@ -1666,6 +2111,7 @@ class StandingPaymentBook:
         ts: int,
         payer_balance: int,
         clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
+        clause_verdict: Optional[int] = None,
     ) -> ExecutionDecision:
         """Run one owed retry at `ts` — a run like the one at the due point.
 
@@ -1694,10 +2140,16 @@ class StandingPaymentBook:
             return ExecutionDecision(
                 False, reason, retry.period_index, 0, 0, progress.total_paid
             )
-        decision, _settled = self._evaluate_clause(
-            entry, progress, retry.period_index, [retry.period_index],
-            payer_balance, clause_legs,
-        )
+        if entry.form == FORM_TAU_DECIDING_RULE:
+            decision, _settled = self._evaluate_deciding_period(
+                entry, progress, retry.period_index, payer_balance,
+                clause_legs, clause_verdict,
+            )
+        else:
+            decision, _settled = self._evaluate_clause(
+                entry, progress, retry.period_index, [retry.period_index],
+                payer_balance, clause_legs,
+            )
         if not decision.executed:
             return decision
         self._settle(entry, progress, decision, ts)
@@ -1747,6 +2199,40 @@ def standing_payment_capabilities() -> Dict[str, Any]:
         "forms": {
             "declared": FORM_DECLARED,
             "tau_clause": FORM_TAU_CLAUSE,
+            "tau_deciding_rule": FORM_TAU_DECIDING_RULE,
+        },
+        "deciding_rule_form": {
+            "decision": (
+                "the clause decides whether an execution runs; the "
+                "book enforces the signed caps and the facts it "
+                "published, and settles nothing without a verdict"
+            ),
+            "fact_streams": {
+                "i27": "the current period index + 1 (0 before the "
+                       "first due date)",
+                "i28": "1 when the current period's execution window "
+                       "is open, else 0",
+                "i29": "how many periods the signed terms let settle now",
+                "i30": "the next due timestamp (0 when the rule has none)",
+                "i31": "how many due periods were missed (window "
+                       "lapsed while unsettled)",
+                "i32": "the remaining occurrence capacity",
+                "i33": "the total this authorization has already paid",
+                "i34": "the retry state of the run being evaluated "
+                       "(0 none, 1 a retry run is live for it, 2 owed "
+                       "and its window closed)",
+                "i35": "1 when the authorization is cancelled, else 0",
+                "i36": "how many periods are due and unsettled in all",
+            },
+            "verdict_stream": (
+                f"o{STANDING_VERDICT_STREAM}: 1 executes; anything "
+                "else, or an absent value, declines"
+            ),
+            "periods_stream": (
+                f"o{STANDING_PERIODS_STREAM}: how many of the "
+                "settleable periods the execution settles, oldest first"
+            ),
+            "leg_encoding": "the shared o30/o31+ encoding of the clause form",
         },
         "clause_form": {
             "input_streams": {

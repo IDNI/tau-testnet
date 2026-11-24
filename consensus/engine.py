@@ -49,6 +49,7 @@ from .grants import (
 )
 from .payout_rules import (
     BASE_RECORDED_RECEIPT,
+    FORM_TAU_DECIDING_RULE as PAYOUT_FORM_TAU_DECIDING_RULE,
     FORM_TAU_RULE,
     PAYOUT_RULE_TX_TYPES,
     TX_TYPE_EXECUTE_PAYOUT_RULE,
@@ -60,6 +61,7 @@ from .payout_rules import (
     compute_payout_receipt_id,
     decode_clause_legs,
     parse_execute_payout_receipt_id,
+    decode_rule_outputs as decode_payout_rule_outputs,
     parse_execute_payout_rule,
     parse_install_payout_rule,
     parse_remove_payout_rule,
@@ -83,6 +85,7 @@ from .receive_routes import (
 )
 from .standing_payments import (
     FORM_TAU_CLAUSE as STANDING_FORM_TAU_CLAUSE,
+    FORM_TAU_DECIDING_RULE as STANDING_FORM_TAU_DECIDING_RULE,
     INSUFFICIENT_FUNDS_REASON_PREFIX as STANDING_INSUFFICIENT_FUNDS_PREFIX,
     MAX_DUE_RETRIES_PER_BLOCK as STANDING_MAX_DUE_RETRIES_PER_BLOCK,
     STANDING_PAYMENT_TX_TYPES,
@@ -92,6 +95,7 @@ from .standing_payments import (
     StandingPaymentBook,
     StandingPaymentShapeError,
     decode_clause_legs as decode_standing_clause_legs,
+    decode_rule_outputs as decode_standing_rule_outputs,
     parse_cancel_standing_payment,
     parse_create_standing_payment,
     parse_execute_standing_payment,
@@ -445,22 +449,32 @@ def _retry_due_standing_payments(
     grant = faucet.amount(lm)
     ts = int(timestamp)
 
-    def _step_clause(entry, payer_balance):
-        """The legs a retry run's clause names, or None when the clause
-        did not build or named nothing settleable. No executor submits
-        a retry, so the input map's submitter is empty."""
+    def _step_clause(entry, payer_balance, period=None):
+        """(legs, verdict) a retry/discovery run's clause names, or
+        (None, None) when the clause did not build or named nothing
+        settleable. No executor submits a retry, so the input map's
+        submitter is empty. The map is the book's own construction for
+        the entry's form (clause_inputs_for): a deciding rule (FIX 10)
+        is stepped over the facts map — with `period` naming the
+        period whose retry run is being decided, so its retry-state
+        fact describes that run — and its verdict comes back with its
+        legs; a stage-1 clause has no verdict (None)."""
         outputs, _detail = sender_policy.clause_outputs(
             entry.clause_text,
-            standing_clause_inputs(
-                entry, "", ts, payer_balance,
-                book.period_paid_total(entry.auth_id, ts),
+            book.clause_inputs_for(
+                entry, "", ts, payer_balance, retry_period=period
             ),
             pool="apply",
         )
         if outputs is None:
-            return None
+            return None, None
+        if entry.form == STANDING_FORM_TAU_DECIDING_RULE:
+            verdict, _periods, legs, _why = decode_standing_rule_outputs(
+                entry, outputs
+            )
+            return legs, verdict
         legs, _why = decode_standing_clause_legs(entry, outputs)
-        return legs
+        return legs, None
 
     # 1. Dead retries go, with their history marker.
     for retry in book.owed_retries():
@@ -488,12 +502,14 @@ def _retry_due_standing_payments(
         payer_balance = faucet.spendable(
             balances, sequences, entry.payer_pubkey, grant
         )
-        legs = _step_clause(entry, payer_balance)
+        legs, verdict = _step_clause(entry, payer_balance, retry.period_index)
         if legs is None:
             # The clause did not build: no run happened, the retry
             # stays owed — the window, not an engine failure, ends it.
             continue
-        decision = book.execute_retry(retry, ts, payer_balance, legs)
+        decision = book.execute_retry(
+            retry, ts, payer_balance, legs, clause_verdict=verdict
+        )
         attempted += 1
         if decision.executed:
             balances[entry.payer_pubkey] = payer_balance - decision.amount
@@ -529,11 +545,12 @@ def _retry_due_standing_payments(
         payer_balance = faucet.spendable(
             balances, sequences, entry.payer_pubkey, grant
         )
-        legs = _step_clause(entry, payer_balance)
+        legs, verdict = _step_clause(entry, payer_balance, period)
         if legs is None:
             continue
         decision = book.discovery_decision(
-            entry.auth_id, period, ts, payer_balance, legs
+            entry.auth_id, period, ts, payer_balance, legs,
+            clause_verdict=verdict,
         )
         if (
             not decision.executed
@@ -3601,17 +3618,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 sp_decision = None
                                 reason = ""
                                 sp_clause_legs = None
-                                if sp_entry.form == STANDING_FORM_TAU_CLAUSE:
+                                sp_clause_verdict = None
+                                sp_clause_periods = None
+                                if sp_entry.form in (
+                                    STANDING_FORM_TAU_CLAUSE,
+                                    STANDING_FORM_TAU_DECIDING_RULE,
+                                ):
                                     outputs, detail = (
                                         sender_policy.clause_outputs(
                                             sp_entry.clause_text,
-                                            standing_clause_inputs(
+                                            sp_book.clause_inputs_for(
                                                 sp_entry,
                                                 sender if isinstance(
                                                     sender, str) else "",
                                                 sp_ts, sp_balance,
-                                                sp_book.period_paid_total(
-                                                    sp_auth_id, sp_ts),
                                             ),
                                             pool="apply",
                                         )
@@ -3621,6 +3641,29 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             "the authorization's clause did "
                                             f"not produce legs ({detail})"
                                         )
+                                    elif (
+                                        sp_entry.form
+                                        == STANDING_FORM_TAU_DECIDING_RULE
+                                    ):
+                                        (
+                                            sp_clause_verdict,
+                                            sp_clause_periods,
+                                            sp_clause_legs,
+                                            why,
+                                        ) = decode_standing_rule_outputs(
+                                            sp_entry, outputs
+                                        )
+                                        if (
+                                            sp_clause_legs is None
+                                            and sp_clause_verdict is None
+                                        ):
+                                            # Nothing decoded at all:
+                                            # the clause produced no
+                                            # usable decision. A verdict
+                                            # without legs is handed to
+                                            # the book, which refuses it
+                                            # as the rule's own answer.
+                                            reason = why
                                     else:
                                         sp_clause_legs, why = (
                                             decode_standing_clause_legs(
@@ -3635,6 +3678,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             sender if isinstance(sender, str) else None
                                         ),
                                         clause_legs=sp_clause_legs,
+                                        clause_verdict=sp_clause_verdict,
+                                        clause_periods=sp_clause_periods,
                                     )
                                     reason = (
                                         "" if sp_decision.executed
@@ -3831,6 +3876,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 pr_decision = None
                                 reason = ""
                                 pr_clause_legs = None
+                                pr_clause_verdict = None
                                 # Fold (FIX 1-B clause-base pre-resolution):
                                 # a receipt-based rule's clause must read
                                 # the RESOLVED base — the receipt's recorded
@@ -3858,17 +3904,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         == pr_entry.owner_pubkey
                                     ):
                                         pr_clause_base = pr_receipt.amount
-                                if pr_entry.form == FORM_TAU_RULE:
+                                if pr_entry.form in (
+                                    FORM_TAU_RULE,
+                                    PAYOUT_FORM_TAU_DECIDING_RULE,
+                                ):
                                     outputs, detail = (
                                         sender_policy.clause_outputs(
                                             pr_entry.clause_text,
-                                            payout_clause_inputs(
+                                            pr_book.clause_inputs_for(
                                                 pr_entry,
                                                 sender if isinstance(
                                                     sender, str) else "",
                                                 pr_clause_base, pr_ts, pr_balance,
-                                                pr_book.period_paid_total(
-                                                    pr_entry, pr_ts),
                                             ),
                                             pool="apply",
                                         )
@@ -3878,6 +3925,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             "the payout rule's clause did "
                                             f"not produce legs ({detail})"
                                         )
+                                    elif (
+                                        pr_entry.form
+                                        == PAYOUT_FORM_TAU_DECIDING_RULE
+                                    ):
+                                        (
+                                            pr_clause_verdict,
+                                            pr_clause_legs,
+                                            why,
+                                        ) = decode_payout_rule_outputs(
+                                            pr_entry, outputs
+                                        )
+                                        if (
+                                            pr_clause_legs is None
+                                            and pr_clause_verdict is None
+                                        ):
+                                            reason = why
                                     else:
                                         pr_clause_legs, why = (
                                             decode_clause_legs(
@@ -3891,6 +3954,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         pr_ts, pr_balance,
                                         clause_legs=pr_clause_legs,
                                         receipt_id=pr_receipt_id,
+                                        clause_verdict=pr_clause_verdict,
                                     )
                                     reason = (
                                         "" if pr_decision.executed
@@ -4754,7 +4818,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         ),
                         clause_legs=(
                             _sp_decision.legs
-                            if sp_entry.form == STANDING_FORM_TAU_CLAUSE else None
+                            if sp_entry.form in (
+                                STANDING_FORM_TAU_CLAUSE,
+                                STANDING_FORM_TAU_DECIDING_RULE,
+                            ) else None
+                        ),
+                        clause_verdict=(
+                            1
+                            if sp_entry.form == STANDING_FORM_TAU_DECIDING_RULE
+                            else None
+                        ),
+                        clause_periods=(
+                            _sp_decision.periods_collected
+                            if sp_entry.form == STANDING_FORM_TAU_DECIDING_RULE
+                            else None
                         ),
                     )
                     sp_event = {
@@ -4862,7 +4939,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         int(block_timestamp or 0), pr_balance,
                         clause_legs=(
                             _pr_decision.legs
-                            if pr_entry.form == FORM_TAU_RULE else None
+                            if pr_entry.form in (
+                                FORM_TAU_RULE,
+                                PAYOUT_FORM_TAU_DECIDING_RULE,
+                            ) else None
+                        ),
+                        clause_verdict=(
+                            1
+                            if pr_entry.form == PAYOUT_FORM_TAU_DECIDING_RULE
+                            else None
                         ),
                         receipt_id=pr_receipt_id,
                     )

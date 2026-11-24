@@ -1041,6 +1041,58 @@ def compute_standing_payment_tau_id(
     return blake3(bytes(out)).digest()
 
 
+DOMAIN_STANDING_PAYMENT_RULE_V1 = b"tau.standing_payment.rule.v1"
+
+
+def compute_standing_payment_rule_id(
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    schedule_kind: int,
+    signed_day: int,
+    anchor_ts: int,
+    window_seconds: int,
+    final_ts: int,
+    max_occurrences: int,
+    max_total: int,
+    fee_limit: int,
+    policy_version_ref: int,
+    allow_catch_up: int,
+    clause_text: str,
+    version: int,
+    due_retry_seconds: int = 0,
+) -> bytes:
+    """BLAKE3 of a deciding-rule (FIX 10, stage-2) standing authorization.
+
+    The stage-2 counterpart of compute_standing_payment_tau_id, under its
+    own domain: the field layout is the Tau form's exactly, but the form
+    an authorization runs under is a signed term of its identity — a
+    stage-1 clause and a stage-2 deciding rule over the same clause text
+    and the same terms are different authorizations, because who decides
+    (the book, or the clause over the book's facts) is part of what the
+    payer signed.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_PAYMENT_RULE_V1.decode()))
+    out.extend(encode_pubkey48(payer_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(schedule_kind)))
+    out.extend(encode_uint64(int(signed_day)))
+    out.extend(encode_uint64(int(anchor_ts)))
+    out.extend(encode_uint64(int(window_seconds)))
+    out.extend(encode_uint64(int(final_ts)))
+    out.extend(encode_uint64(int(max_occurrences)))
+    out.extend(encode_uint64(int(max_total)))
+    out.extend(encode_uint64(int(fee_limit)))
+    out.extend(encode_uint64(int(policy_version_ref)))
+    out.extend(encode_uint64(int(allow_catch_up)))
+    out.extend(encode_string(str(clause_text or "")))
+    out.extend(encode_uint64(int(version)))
+    out.extend(encode_uint64(int(due_retry_seconds)))
+    return blake3(bytes(out)).digest()
+
+
 def encode_standing_payment_record(
     auth_id: Any,
     payer_pubkey: Any,
@@ -1391,6 +1443,47 @@ def compute_payout_rule_periods_from_id(
     out.extend(encode_uint64(int(shared_cap_amount)))
     if int(base_source) != 0:
         out.extend(encode_uint64(int(base_source)))
+    return blake3(bytes(out)).digest()
+
+
+DOMAIN_PAYOUT_RULE_DECIDING_V1 = b"tau.payout_rule.deciding.v1"
+
+
+def compute_payout_rule_deciding_id(
+    owner_pubkey: Any,
+    recipients: Any,
+    clause_text: str,
+    max_per_execution: int,
+    max_per_period: int,
+    period_seconds: int,
+    period_anchor_ts: int,
+    version: int,
+    rule_index: int = 0,
+    shared_cap_id: str = "",
+    shared_cap_amount: int = 0,
+) -> bytes:
+    """BLAKE3 of a deciding-rule (FIX 10, stage-2) payout rule.
+
+    The stage-2 counterpart of compute_payout_rule_tau_id, under its own
+    domain and with the same field layout: who decides — the book over
+    clause-computed legs (stage 1), or the clause itself over the book's
+    derived facts, with the book enforcing (stage 2) — is part of what
+    the owner signed, so the two forms over one clause text are
+    different rules.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RULE_DECIDING_V1.decode()))
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(_encode_pubkey_list(sorted(recipients or ())))
+    out.extend(encode_string(str(clause_text or "")))
+    out.extend(encode_uint64(int(max_per_execution)))
+    out.extend(encode_uint64(int(max_per_period)))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(period_anchor_ts)))
+    out.extend(encode_uint64(int(version)))
+    out.extend(encode_uint64(int(rule_index)))
+    out.extend(encode_string(str(shared_cap_id or "")))
+    out.extend(encode_uint64(int(shared_cap_amount)))
     return blake3(bytes(out)).digest()
 
 

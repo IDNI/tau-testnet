@@ -336,6 +336,9 @@ def test_capabilities_pin_the_tau_form():
     assert caps["forms"] == {
         "declared_program": FORM_DECLARED_PROGRAM,
         "tau_rule": FORM_TAU_RULE,
+        # FIX 10: the deciding-rule form joined the record — the pin
+        # grows by exactly the new form, nothing else moved.
+        "tau_deciding_rule": 3,
     }
     tau = caps["tau_rule"]
     assert tau["inputs"]["i1"] and tau["inputs"]["i5"]

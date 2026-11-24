@@ -115,6 +115,17 @@ make two honest nodes disagree about admissibility, which forks.
   the declared form's `compute_legs` here, and the Tau clause form's
   input map (its i1 is the base the engine hands this book) on the
   clause lineage, which must be fed the resolved base from here.
+- The deciding-rule form (FIX 10, stage 2): a third form,
+  FORM_TAU_DECIDING_RULE. A Tau-form clause computed the legs and the
+  book decided whether they ran; a deciding rule is stepped over the
+  stage-1 map PLUS the book's derived facts (payout_rule_inputs: its
+  period, its signed caps, the shared cap's usage and room — headroom
+  no stage-1 clause could see) and reports a VERDICT (o29: 1 executes,
+  anything else declines) alongside its legs. The clause decides; the
+  book enforces, through the same checks in the same order as every
+  other form. No verdict, no payment. The form is inside its own id
+  domain, so a stage-1 clause and a stage-2 deciding rule over one
+  clause text are different rules.
 - Removal follows the account's normal rules: an owner-signed removal
   transaction, screened by the book's can_remove at admission and apply
   verbatim. (A #33-style lock, if one is ever active on the account, binds
@@ -132,6 +143,7 @@ from consensus.payment_calendar import SECONDS_PER_DAY
 from consensus.serialization import (
     compute_payout_receipt_id,
     compute_payout_rule_book_root,
+    compute_payout_rule_deciding_id,
     compute_payout_rule_id,
     compute_payout_rule_periods_from_id,
     compute_payout_rule_tau_id,
@@ -161,7 +173,15 @@ MAX_LEG_BPS = 10_000
 # execution runs under is the form the owner signed.
 FORM_DECLARED_PROGRAM = 1
 FORM_TAU_RULE = 2
-PAYOUT_FORMS = frozenset({FORM_DECLARED_PROGRAM, FORM_TAU_RULE})
+# FIX 10: the stage-2 deciding-rule form — the clause, stepped over the
+# book's derived facts (its period, its caps' headroom, the shared
+# cap's usage and room), reports the execute/decline verdict itself
+# (o29); the book enforces the declared set, both caps, the shared cap
+# and the balance, exactly as for the other forms.
+FORM_TAU_DECIDING_RULE = 3
+PAYOUT_FORMS = frozenset(
+    {FORM_DECLARED_PROGRAM, FORM_TAU_RULE, FORM_TAU_DECIDING_RULE}
+)
 
 # The Tau form's clause text bound, in UTF-8 bytes — the same bound the
 # rule-offer path puts on rule text (consensus/rule_offers
@@ -181,6 +201,11 @@ PAYOUT_OUTPUT_FIRST_STREAM = 31
 BASE_SUBMITTED = 0
 BASE_RECORDED_RECEIPT = 1
 BASE_SOURCES = frozenset({BASE_SUBMITTED, BASE_RECORDED_RECEIPT})
+
+# FIX 10: the deciding form's verdict stream, below the shared leg
+# encoding: o29 is 1 when the rule executes, and anything else — or an
+# absent or unreadable value — when it declines.
+PAYOUT_VERDICT_STREAM = 29
 
 # Bounded state: at most MAX_RULES_PER_OWNER rules per owner (FIX 7), and
 # each rule itself is small. The slot bound is what makes "a ninth rule"
@@ -288,6 +313,20 @@ class PayoutRuleEntry:
                 self.shared_cap_id,
                 self.shared_cap_amount,
                 self.base_source,
+            )
+        if self.form == FORM_TAU_DECIDING_RULE:
+            return compute_payout_rule_deciding_id(
+                self.owner_pubkey,
+                self.recipients,
+                self.clause_text,
+                self.max_per_execution,
+                self.max_per_period,
+                self.period_seconds,
+                self.period_anchor_ts,
+                self.version,
+                self.rule_index,
+                self.shared_cap_id,
+                self.shared_cap_amount,
             )
         if self.form == FORM_TAU_RULE:
             return compute_payout_rule_tau_id(
@@ -513,6 +552,69 @@ def decode_clause_legs(
     return tuple(legs), ""
 
 
+def payout_rule_inputs(
+    entry: PayoutRuleEntry,
+    executor_pubkey: str,
+    base_amount: int,
+    ts: int,
+    owner_balance: int,
+    period_paid_total: int,
+    shared_cap_usage: int,
+) -> Dict[int, Any]:
+    """The input map a deciding rule is stepped over (FIX 10).
+
+    The Tau form's map (i1..i5, i26) verbatim, plus the book's derived
+    facts on fresh streams — the headroom a stage-1 clause could not
+    see at all:
+
+    - i27: the period index containing `ts`, + 1 (0 before the first)
+    - i28: the rule's signed max per period (0 = uncapped)
+    - i29: the rule's signed shared cap amount (0 = no shared cap)
+    - i30: what the shared-cap group has already paid this period,
+      from the book's recorded totals (0 when there is no shared cap)
+    - i31: the rule's signed max per execution (0 = uncapped)
+    - i32: the shared cap's room left this period (0 when there is
+      no shared cap)
+
+    ONE definition, called by the engine at apply and by admission at
+    the tip through the book (clause_inputs_for), so the construction
+    cannot drift between them. Nothing in the map comes from the
+    execution transaction beyond the base amount, exactly as in the
+    Tau form.
+    """
+    inputs = payout_clause_inputs(
+        entry, executor_pubkey, base_amount, ts, owner_balance,
+        period_paid_total,
+    )
+    period = period_index_at(entry, ts)
+    inputs[27] = str(int(period) + 1)
+    inputs[28] = str(int(entry.max_per_period))
+    inputs[29] = str(int(entry.shared_cap_amount))
+    inputs[30] = str(int(shared_cap_usage))
+    inputs[31] = str(int(entry.max_per_execution))
+    inputs[32] = (
+        str(max(0, int(entry.shared_cap_amount) - int(shared_cap_usage)))
+        if entry.shared_cap_id
+        else "0"
+    )
+    return inputs
+
+
+def decode_rule_outputs(
+    entry: PayoutRuleEntry, outputs: Dict[str, Any]
+) -> Tuple[Optional[int], Optional[Tuple[Tuple[str, int], ...]], str]:
+    """A deciding rule's step, decoded: (verdict, legs, why).
+
+    The verdict (o29) is the clause's decision; the legs ride the
+    shared encoding (o30/o31+), decoded by the same reader the Tau
+    form uses. A missing or unreadable verdict reads as None — the
+    book refuses an execution the rule never decided.
+    """
+    verdict = _parse_output_value(outputs.get(f"o{PAYOUT_VERDICT_STREAM}"))
+    legs, why = decode_clause_legs(entry, outputs)
+    return verdict, legs, why
+
+
 # --- Parsing -------------------------------------------------------------------
 
 
@@ -582,7 +684,8 @@ def _form_field(tx: Dict[str, Any]) -> int:
     value = tx.get("payout_form", FORM_DECLARED_PROGRAM)
     if not _is_int(value) or value not in PAYOUT_FORMS:
         raise PayoutRuleShapeError(
-            "payout_form must be 1 (declared program) or 2 (Tau rule)"
+            "payout_form must be 1 (declared program), 2 (Tau rule) "
+            "or 3 (Tau deciding rule)"
         )
     return value
 
@@ -613,7 +716,7 @@ def parse_install_payout_rule(tx: Dict[str, Any]) -> PayoutRuleEntry:
         raise PayoutRuleShapeError("transaction must be an object")
     form = _form_field(tx)
     clause_text = _clause_field(tx)
-    if form == FORM_TAU_RULE:
+    if form in (FORM_TAU_RULE, FORM_TAU_DECIDING_RULE):
         if not clause_text:
             raise PayoutRuleShapeError(
                 "a Tau-form payout rule must carry payout_clause"
@@ -627,7 +730,7 @@ def parse_install_payout_rule(tx: Dict[str, Any]) -> PayoutRuleEntry:
     else:
         if clause_text:
             raise PayoutRuleShapeError(
-                "payout_clause is only for the Tau form (payout_form 2)"
+                "payout_clause is only for the Tau forms (payout_form 2 or 3)"
             )
         legs = _legs_field(tx)
     return PayoutRuleEntry(
@@ -709,7 +812,7 @@ def validate_payout_rule_shape(
         return "a payout rule cannot pay its own owner"
     if entry.form not in PAYOUT_FORMS:
         return "unknown payout form"
-    if entry.form == FORM_TAU_RULE:
+    if entry.form in (FORM_TAU_RULE, FORM_TAU_DECIDING_RULE):
         if entry.legs:
             return "a Tau-form payout rule carries no leg program"
         if not entry.clause_text:
@@ -1263,6 +1366,40 @@ class PayoutRuleBook:
 
     # -- execution -------------------------------------------------------------------
 
+    def clause_inputs_for(
+        self,
+        entry: PayoutRuleEntry,
+        executor_pubkey: str,
+        base_amount: int,
+        ts: int,
+        owner_balance: int,
+    ) -> Dict[int, Any]:
+        """The input map for this entry's form, built from this book.
+
+        ONE construction for every caller (engine at apply, admission
+        at the tip): the Tau form's map for the Tau form, the facts
+        map for the deciding form (FIX 10) — the form selects the map,
+        so no caller can step a deciding rule over stage-1 inputs and
+        starve it of the headroom facts it decides on.
+        """
+        period_paid = self.period_paid_total(entry, ts)
+        if entry.form == FORM_TAU_DECIDING_RULE:
+            usage = (
+                self.shared_cap_usage(
+                    entry.owner_pubkey, entry.shared_cap_id, ts
+                )
+                if entry.shared_cap_id
+                else 0
+            )
+            return payout_rule_inputs(
+                entry, executor_pubkey, base_amount, ts, owner_balance,
+                period_paid, usage,
+            )
+        return payout_clause_inputs(
+            entry, executor_pubkey, base_amount, ts, owner_balance,
+            period_paid,
+        )
+
     def _evaluate(
         self,
         entry: PayoutRuleEntry,
@@ -1272,6 +1409,7 @@ class PayoutRuleBook:
         owner_balance: int,
         clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
         receipt_id: Optional[bytes] = None,
+        clause_verdict: Optional[int] = None,
     ) -> PayoutDecision:
         """Pure evaluation: the decision an execution would produce.
 
@@ -1281,6 +1419,11 @@ class PayoutRuleBook:
         there is no second way to compute its legs. A declared-form entry
         never consults the parameter; its legs come from compute_legs.
         Every check below the leg computation is shared by both forms.
+
+        `clause_verdict` is the deciding form's decision (FIX 10),
+        decoded from the same step: the rule decides whether, over the
+        book's facts; the checks below then enforce — they are the
+        same checks, in the same order, as for every other form.
         """
 
         def refuse(reason: str, period_index: int = -1) -> PayoutDecision:
@@ -1328,7 +1471,15 @@ class PayoutRuleBook:
         period = period_index_at(entry, ts)
         if period < 0:
             return refuse("the execution precedes the rule's first period")
-        if entry.form == FORM_TAU_RULE:
+        if entry.form == FORM_TAU_DECIDING_RULE:
+            if clause_verdict is None:
+                return refuse("the rule's clause was not evaluated", period)
+            if clause_verdict != 1:
+                return refuse("the rule declined to execute", period)
+            if clause_legs is None:
+                return refuse("the rule's clause was not evaluated", period)
+            legs = tuple(clause_legs)
+        elif entry.form == FORM_TAU_RULE:
             if clause_legs is None:
                 return refuse("the rule's clause was not evaluated", period)
             legs = tuple(clause_legs)
@@ -1387,13 +1538,13 @@ class PayoutRuleBook:
         owner_balance: int,
         clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
         receipt_id: Optional[bytes] = None,
+        clause_verdict: Optional[int] = None,
     ) -> PayoutDecision:
         """What an execution would do, without doing it."""
         entry = self._entry(rule_id)
         return self._evaluate(
             entry, bytes(settlement_id), base_amount, ts, owner_balance,
-            clause_legs,
-            receipt_id,
+            clause_legs, receipt_id, clause_verdict,
         )
 
     def execute(
@@ -1405,6 +1556,7 @@ class PayoutRuleBook:
         owner_balance: int,
         clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
         receipt_id: Optional[bytes] = None,
+        clause_verdict: Optional[int] = None,
     ) -> PayoutDecision:
         """Settle an execution, or settle nothing.
 
@@ -1421,8 +1573,8 @@ class PayoutRuleBook:
         entry = self._entry(rule_id)
         settlement_id = bytes(settlement_id)
         decision = self._evaluate(
-            entry, settlement_id, base_amount, ts, owner_balance, clause_legs,
-            receipt_id,
+            entry, settlement_id, base_amount, ts, owner_balance,
+            clause_legs, receipt_id, clause_verdict,
         )
         if not decision.executed:
             return decision
@@ -1467,6 +1619,33 @@ def payout_rule_capabilities() -> Dict[str, Any]:
         "forms": {
             "declared_program": FORM_DECLARED_PROGRAM,
             "tau_rule": FORM_TAU_RULE,
+            "tau_deciding_rule": FORM_TAU_DECIDING_RULE,
+        },
+        "deciding_rule": {
+            "decision": (
+                "the clause decides whether an execution runs, over "
+                "the book's derived facts; the book enforces the "
+                "declared set, both caps, the shared cap and the "
+                "balance, and settles nothing without a verdict"
+            ),
+            "fact_streams": {
+                "i27": "the period index containing the timestamp, + 1 "
+                       "(0 before the first period)",
+                "i28": "the rule's signed max per period (0 = uncapped)",
+                "i29": "the rule's signed shared cap amount (0 = no "
+                       "shared cap)",
+                "i30": "what the shared-cap group has already paid "
+                       "this period",
+                "i31": "the rule's signed max per execution "
+                       "(0 = uncapped)",
+                "i32": "the shared cap's room left this period "
+                       "(0 when there is no shared cap)",
+            },
+            "verdict_stream": (
+                f"o{PAYOUT_VERDICT_STREAM}: 1 executes; anything else, "
+                "or an absent value, declines"
+            ),
+            "leg_encoding": "the shared o30/o31+ encoding of the Tau form",
         },
         "leg_modes": {"fixed": LEG_FIXED, "bps_of_base": LEG_BPS_OF_BASE},
         "base_sources": {

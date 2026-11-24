@@ -633,7 +633,7 @@ def payout_payload_entry(text: str, sender_pubkey: str):
 
 def payout_payload_text(entry) -> str:
     """The canonical body text of a payout-rule entry (tx field names)."""
-    from consensus.payout_rules import FORM_TAU_RULE
+    from consensus.payout_rules import FORM_TAU_DECIDING_RULE, FORM_TAU_RULE
 
     obj: Dict[str, Any] = {
         "payout_form": entry.form,
@@ -653,7 +653,7 @@ def payout_payload_text(entry) -> str:
         "payout_shared_cap_id": entry.shared_cap_id,
         "payout_shared_cap_amount": entry.shared_cap_amount,
     }
-    if entry.form == FORM_TAU_RULE:
+    if entry.form in (FORM_TAU_RULE, FORM_TAU_DECIDING_RULE):
         obj["payout_clause"] = entry.clause_text
     else:
         obj["payout_legs"] = [
@@ -685,7 +685,11 @@ def standing_payload_entry(text: str, sender_pubkey: str):
 
 def standing_payload_text(entry) -> str:
     """The canonical body text of a standing-payment entry (tx field names)."""
-    from consensus.standing_payments import FORM_TAU_CLAUSE, SCHEDULE_NAME_TO_KIND
+    from consensus.standing_payments import (
+        FORM_TAU_CLAUSE,
+        FORM_TAU_DECIDING_RULE,
+        SCHEDULE_NAME_TO_KIND,
+    )
 
     schedule_name = {v: k for k, v in SCHEDULE_NAME_TO_KIND.items()}[
         entry.schedule_kind
@@ -711,7 +715,7 @@ def standing_payload_text(entry) -> str:
         # to exactly the catch-up permission it installs.
         "standing_catch_up_periods": entry.catch_up_periods,
     }
-    if entry.form == FORM_TAU_CLAUSE:
+    if entry.form in (FORM_TAU_CLAUSE, FORM_TAU_DECIDING_RULE):
         obj["standing_clause"] = entry.clause_text
     return _canonical_json(obj)
 

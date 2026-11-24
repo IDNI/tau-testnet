@@ -528,7 +528,10 @@ def test_route_restore_round_trip():
 
 def test_capabilities_pin_the_clause_forms():
     caps = standing_payment_capabilities()
-    assert caps["forms"] == {"declared": 1, "tau_clause": 2}
+    # FIX 10 added the deciding-rule form (3): the pin grows by exactly
+    # that entry; the stage-1 forms and their numbers are unchanged.
+    assert caps["forms"] == {
+        "declared": 1, "tau_clause": 2, "tau_deciding_rule": 3}
     assert caps["clause_form"]["candidate_set"].startswith("the signed recipient")
     assert caps["clause_form"]["max_clause_bytes"] == 8192
     rcaps = route_capabilities()
