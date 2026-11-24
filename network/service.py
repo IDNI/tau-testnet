@@ -16,6 +16,7 @@ from .host import HostManager, NetworkListenError
 from .dht_manager import DHTManager
 from .discovery import DiscoveryManager
 from .gossip import GossipManager
+from .peer_addrs import PeerAddrPolicy
 from .protocols import REQUEST_READ_TIMEOUT
 from commands import sendtx
 
@@ -123,6 +124,7 @@ class NetworkService:
         gossip_handler: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         self._config = config
+        self._addr_policy = PeerAddrPolicy.from_config(config)
         # Store both the raw submitter and a compatibility alias used by tests that monkeypatch _submit_tx.
         self._tx_submitter = tx_submitter
         # Default to None so we don't cache the module function; tests monkeypatch either
@@ -329,7 +331,8 @@ class NetworkService:
                     import db
 
                     try:
-                        addrs = [str(a) for a in (self.host.get_peerstore().addrs(peer_id) or [])]
+                        known = self.host.get_peerstore().addrs(peer_id) or []
+                        addrs = [str(a) for a in self._addr_policy.filter(peer_id, known)]
                     except Exception:
                         addrs = []
 
@@ -839,13 +842,14 @@ class NetworkService:
             if not maddrs:
                 return
 
-            try:
-                self.host.get_peerstore().add_addrs(pid, maddrs, 86400)
-            except Exception:
-                pass
-
             import random
             for attempt in range(5):
+                # FilteringPeerStore puts the configured addrs first again, also
+                # after identify replaced the addrs of this peer.
+                try:
+                    self.host.get_peerstore().add_addrs(pid, maddrs, 86400)
+                except Exception:
+                    pass
                 try:
                     await self.host.connect(PeerInfo(pid, maddrs))
                     logger.info("Connected to bootstrap peer: %s (attempt %d)", pid, attempt + 1)
@@ -1163,7 +1167,9 @@ class NetworkService:
                         try:
                             from libp2p.peer.peerinfo import PeerInfo
                             from .libp2p_compat import ensure_peer_id, seed_peerstore
-                            maddrs = seed_peerstore(self.host, pid_str, addrs_str, ttl=600)
+                            maddrs = seed_peerstore(
+                                self.host, pid_str, self._addr_policy.filter(pid_str, addrs_str), ttl=600
+                            )
                             if not maddrs:
                                 continue
                             pid = ensure_peer_id(pid_str)
@@ -1225,6 +1231,7 @@ class NetworkService:
                                             except Exception:
                                                 pass
                                         
+                                        maddrs = self._addr_policy.filter(pid_str, maddrs)
                                         pi = PeerInfo(pid, maddrs)
                                         self._dht_manager.dht.provider_store.add_provider(key, pi)
                             except Exception:
@@ -1855,6 +1862,7 @@ class NetworkService:
                         maddrs.append(multiaddr.Multiaddr(str(a)))
                 except Exception:
                     pass
+        maddrs = self._addr_policy.filter(pid_obj, maddrs)
 
         if maddrs:
             try:
@@ -1895,7 +1903,7 @@ class NetworkService:
                     addrs = prov.get("addrs", [])
                     try:
                         pid_obj = self._ensure_peer_id(pid)
-                        maddrs = [multiaddr.Multiaddr(a) for a in addrs] if addrs else []
+                        maddrs = self._addr_policy.filter(pid_obj, addrs) if addrs else []
                         pi = PeerInfo(pid_obj, maddrs)
                         try:
                             dht.provider_store.add_provider(key.encode(), pi)
@@ -2272,6 +2280,7 @@ class NetworkService:
                         pass
                 else:
                     maddrs.append(a)
+            maddrs = self._addr_policy.filter(pid, maddrs)
             
             if maddrs:
                 self.host.get_peerstore().add_addrs(pid, maddrs, 600)

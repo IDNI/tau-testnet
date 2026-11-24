@@ -376,6 +376,7 @@ Defaults shown; set via environment or `tau-testnet node run` flags. **Bold** va
 | `TAU_NETWORK_LISTEN` | `/ip4/0.0.0.0/tcp/0` | libp2p bind multiaddr(s); use a fixed port (e.g. `/ip4/0.0.0.0/tcp/4001`) to be reachable. |
 | `TAU_ANNOUNCE_ADDRS` | _(empty)_ | Multiaddrs advertised to peers (set to your public addr behind NAT). |
 | `TAU_BOOTSTRAP_PEERS` | `[]` | JSON `[{"peer_id":…,"addrs":[…]}]` for discovery. |
+| `TAU_ALLOW_PRIVATE_PEER_ADDRS` | `auto` | `true` = store and dial loopback, private and `0.0.0.0` addrs that peers advertise. `auto` allows them only when the node listens on a loopback or private IP, or a bootstrap peer has such an IP. A configured bootstrap addr is always dialed. On a LAN or Docker chain, set `true` on the bootnode that listens on `0.0.0.0`, and on each node whose bootstrap addr is a DNS name. |
 | `TAU_IDENTITY_KEY_PATH` | `data/identity.key` | Persistent libp2p identity (`--ephemeral-identity` to skip). |
 | `TAU_PEERSTORE_PATH` | `data/peerstore` | Persisted known-peer store. |
 

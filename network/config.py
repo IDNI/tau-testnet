@@ -19,6 +19,9 @@ class NetworkConfig:
     bootstrap_peers: List[BootstrapPeer] = field(default_factory=list)
     # Advertised instead of bound listeners when set (NAT/public address).
     announce_addrs: List[multiaddr.Multiaddr] = field(default_factory=list)
+    # Store and dial loopback/private addrs of other peers. None: decide from
+    # the listen and bootstrap addrs (see PeerAddrPolicy.from_config).
+    allow_private_peer_addrs: Optional[bool] = None
     agent: str = "tau-testnet/0.1"
     genesis_hash: str = ""
     peerstore_path: Optional[str] = None
