@@ -132,11 +132,19 @@ conditions a payment carries. They are **off on this build**:
 | `i28` | seconds until the funds expire; `0` = never |
 
 The conditions they describe are created by bounty 01, which has not landed, so
-`tau_defs.RECEIVE_FACTS_ACTIVE` is `False`: the node feeds only `i17`, the three
-indices stay ordinary custom inputs, and `consensus/approvals.py::screen_receive_fact_activation`
-**refuses at deploy** any clause that reads them. Judging such a clause against
-zeros would be indistinguishable from a real "no condition attached", and a rule
-that cannot be enforced must not be installable.
+`tau_defs.RECEIVE_FACTS_ACTIVE` is `False`: the node feeds only `i17` and the
+three indices stay ordinary custom inputs — senders may write them, and a clause
+that mentions one reads that custom input, exactly as before this change. This is
+the `i16` (cooldown) precedent deliberately: reserving an index before the node
+feeds it would break rule text and wallet templates that already use it, and the
+repository ships templates that do.
+
+Activation is therefore a network-wide upgrade, not a per-node switch: the node
+starts feeding the facts, the three indices become write-reserved, and a clause
+written against them changes meaning from "the sender's custom value" to "the
+condition this payment carries". Every node must run the same build. That break is
+the cost of the feature, and it is why the indices are provisional until the
+layout question on issue #47 is settled.
 
 The indices are provisional: a two-stream hold layout would put blocks on `i27`,
 and issue #47 is where that gets settled. Changing `tau_defs.RECEIVE_FACT_STREAMS`

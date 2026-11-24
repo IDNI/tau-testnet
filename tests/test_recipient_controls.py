@@ -440,16 +440,16 @@ MIN_ALLOWANCE = ("(i26[t]:bv[64] < { #x01F4 }:bv[64]) ? (o5[t]:bv[24] = { #x0000
                  " : (o5[t]:bv[24] = { #x000001 }:bv[24])")
 
 
-def test_the_extra_payment_facts_are_off_and_a_clause_reading_them_is_refused():
-    """Parts 3-5 compare bounty 01's conditions; until it lands they are inert."""
+def test_the_extra_payment_facts_are_off_and_change_nothing_until_activation():
+    """i16 precedent: while the node feeds nothing, the indices stay custom inputs."""
     assert tau_defs.RECEIVE_FACTS_ACTIVE is False
-    rejection = admission_mod._screen_clause_widths_and_structure(MIN_ALLOWANCE)
-    assert rejection and "i26" in rejection and "bounty 01" in rejection
-    # and a clause is not silently judged against zeros it cannot interpret
-    sender_policy.set_evaluator("apply", _Exploding())
-    assert recipient_policy.judge(
-        lambda _who, _stream: MIN_ALLOWANCE, ap.BOB, {}, 1, pool="apply"
-    ) == (False, "", "")
+    assert tau_defs.active_receive_fact_streams() == (tau_defs.RECEIVE_STREAM_INDEX,)
+    reserved = tau_defs.reserved_operation_keys()
+    assert 26 not in reserved and 27 not in reserved and 28 not in reserved
+    # a clause that mentions i26 today reads a sender-supplied custom input,
+    # exactly as before this change, and must stay deployable: the wallet ships
+    # such templates.
+    assert admission_mod._screen_clause_widths_and_structure(MIN_ALLOWANCE) is None
 
 
 def test_when_the_facts_are_on_the_node_feeds_them_and_the_clause_decides(monkeypatch):

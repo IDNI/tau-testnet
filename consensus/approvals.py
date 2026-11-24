@@ -334,34 +334,6 @@ def screen_receive_widths(text: str) -> Optional[str]:
     return None
 
 
-def screen_receive_fact_activation(text: str) -> Optional[str]:
-    """None when the clause only reads facts this build actually feeds.
-
-    Parts 3-5 compare conditions that bounty 01 creates. Until that lands the
-    node feeds only the hold, and a clause reading an allowance, refund or expiry
-    fact would be judged against 0 -- indistinguishable from a real "no condition
-    attached". Refusing it at deploy is the only honest answer: a rule that
-    cannot be enforced must not be installable.
-    """
-    from consensus.rule_offers import strip_clause_comments
-
-    if tau_defs.RECEIVE_FACTS_ACTIVE:
-        return None
-    scrubbed = strip_clause_comments(text or "")
-    inactive = [
-        i for i in tau_defs.RECEIVE_FACT_STREAMS[1:]
-        if re.search(rf"\bi{i}\b", scrubbed)
-    ]
-    if not inactive:
-        return None
-    names = ", ".join(f"i{i}" for i in inactive)
-    return (
-        f"this node feeds only i{tau_defs.RECEIVE_STREAM_INDEX}: the payment "
-        f"facts {names} arrive with bounty 01's condition record and are not "
-        f"active on this build, so a clause reading them cannot be enforced"
-    )
-
-
 def screen_stream_widths(body: str) -> Optional[str]:
     """None when every input/output mention carries one explicit width, else the reason.
 
