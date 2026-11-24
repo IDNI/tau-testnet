@@ -110,7 +110,7 @@ tau-testnet node run --test
 ```bash
 # clone tau-lang as a SIBLING of this repo (../tau-lang is auto-discovered)
 git clone https://github.com/IDNI/tau-lang.git ../tau-lang
-git -C ../tau-lang checkout c3ea334cd1e6612930ea9f404933211858f0009f   # pinned; matches Dockerfile.standalone
+git -C ../tau-lang checkout 6ea436e8d3113a7d90635b9d06113e5bc506176c   # pinned; matches Dockerfile.standalone
 ( cd ../tau-lang && ./dev dep-cvc5 && ./dev dep-boost \
   && TAU_PYTHON=/path/to/venv/bin/python ./dev build Release -DTAU_BUILD_BINDING_PYTHON_NANOBIND=ON -DTAU_PYTHON_VERSION=3.14 )   # → build-Release/bindings/python/nanobind/tau*.so
 # set -DTAU_PYTHON_VERSION to the major.minor of that python (default 3.14, as in the Docker image)
@@ -168,7 +168,7 @@ pip install -e .
 
 # 2. build the tau-lang native engine once (prerequisites: see "Run from source")
 git clone https://github.com/IDNI/tau-lang.git ../tau-lang
-git -C ../tau-lang checkout c3ea334cd1e6612930ea9f404933211858f0009f   # pinned; matches Dockerfile.standalone
+git -C ../tau-lang checkout 6ea436e8d3113a7d90635b9d06113e5bc506176c   # pinned; matches Dockerfile.standalone
 ( cd ../tau-lang && ./dev dep-cvc5 && ./dev dep-boost \
   && TAU_PYTHON=/path/to/venv/bin/python ./dev build Release -DTAU_BUILD_BINDING_PYTHON_NANOBIND=ON -DTAU_PYTHON_VERSION=3.14 )
 # only if auto-discovery of ../tau-lang fails:
