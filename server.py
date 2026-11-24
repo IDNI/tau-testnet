@@ -69,6 +69,7 @@ _EXPENSIVE_COMMANDS = frozenset({
     "getallaccounts",
     "gettaustate",
     "getgovernance",
+    "getpayments",
     "history",
 })
 

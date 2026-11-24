@@ -109,6 +109,28 @@ def clause_blocks(body, values: dict, *, pool: str,
     return verdict.blocked, str(verdict.o5)
 
 
+def clause_outputs(body, values: dict, *, pool: str,
+                   timeout=_SESSION_DEFAULT) -> tuple[dict | None, str]:
+    """(outputs, detail) for `body` against one input map: the FULL named
+    output map of the step, or (None, detail) when the clause does not
+    build or the engine refuses to step it -- the same failure mapping as
+    `clause_blocks`, so every node reaches the same result. Loss of the
+    evaluator propagates, because it says nothing about the clause.
+
+    The consumer is the payout rule evaluator: a payout clause's meaning
+    lives on its leg streams, not on o5, so a verdict cannot express it.
+    An empty body has no outputs: (None, "empty clause body")."""
+    if not body:
+        return None, "empty clause body"
+    try:
+        outputs = evaluator(pool).outputs(
+            body, clause_inputs(values), timeout=timeout
+        )
+    except (PolicyBuildError, PolicyStepError) as exc:
+        return None, str(exc)
+    return outputs, ""
+
+
 def clause_builds(body, *, pool: str, timeout=_SESSION_DEFAULT) -> tuple[bool, str]:
     """(ok, engine_error) for building `always ( body ).` in the pool's evaluator.
 
