@@ -10,7 +10,9 @@ cooldown stamps against an oracle that knows only the documented rules:
     every slot it writes or nothing;
   * 1 <= total <= cap per execution, period total <= cap per period, total <=
     the account's balance; an open slot pays only a recipient the executor named;
-  * the o5 clause is not consulted; the rule-change guard is (kinds 6 and 7).
+  * the payer's CURRENT o5 clause is re-checked at execution -- a frozen payer
+    pays nothing, no debt, no completion event; the rule-change guard is
+    (kinds 6 and 7).
 
 `apply_block` itself raises on any supply drift, so every block is also a
 conservation check.
@@ -278,14 +280,28 @@ def test_the_rule_sees_the_payout_abi(evs):
     assert second[1]["i26"] == "40" and second[1]["i2"] == "960"
 
 
-def test_o5_is_not_consulted_for_a_payout(evs):
+FREEZE = "(o5[t]:bv[24] = { #x000000 }:bv[24])"
+
+
+def test_a_frozen_payer_executes_nothing(evs):
+    ch, oracle, tx = _installed()
+    ch.lm.rule_offers.accepted_clauses[(ALICE, 5)] = FREEZE
+    evs["apply"].set_verdict(FREEZE, lambda inputs: 0)    # blocks every transfer
+    result = ch.block([exec_tx(rule_id=rid(tx), data={"0": 30})], height=HEIGHT + 1, ts=TS + 1)
+    assert result.outcomes[0].reason == "payout_not_executed"
+    assert "o5" in _logs(result)
+    assert ch.lm.payout_rules.state_of(ALICE, ridb(tx)).executions == 0
+    oracle.check(ch)
+    assert evs["apply"].verdict_calls  # the payer's o5 clause WAS consulted
+
+
+def test_an_unfrozen_payer_executes_normally(evs):
     ch, oracle, tx = _installed()
     ch.lm.rule_offers.accepted_clauses[(ALICE, 5)] = CLAUSE
-    evs["apply"].set_verdict(CLAUSE, lambda inputs: 0)    # blocks every transfer
+    evs["apply"].set_verdict(CLAUSE, lambda inputs: 1)    # allows every transfer
     ch.block([exec_tx(rule_id=rid(tx), data={"0": 30})], height=HEIGHT + 1, ts=TS + 1)
     _executed(oracle, legs=[(BOB, 30)], ts=TS + 1)
     oracle.check(ch)
-    assert evs["apply"].verdict_calls == []
 
 
 def test_an_open_slot_pays_the_named_recipient(evs):

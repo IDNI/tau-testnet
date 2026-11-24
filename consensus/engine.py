@@ -313,6 +313,48 @@ def _expire_payout_rules(lm, height, timestamp) -> List[Dict[str, Any]]:
     ]
 
 
+def _payout_o5_blocked(lm, payer, total, have, height, timestamp, *, timeout,
+                       replay_mode) -> str:
+    """Why the payer's CURRENT o5 clause blocks this payout, or "".
+
+    #34-7: a payout moves the payer's money, so at execution time -- after the
+    rule has decided the amount, before anything moves -- the node re-checks
+    the payer's o5 policy with the exact mechanism the transfer gate uses:
+    sender_policy.clause_blocks over the payer's registered clause in the
+    "apply" pool. The inputs mirror the transfer input map (i1 = amount,
+    i2 = balance, i3/i12 = payer, i5 = timestamp); i4 is 0 because a payout
+    has no single recipient -- the check judges the payer's freeze state, not
+    per-leg recipients. No clause registered means not frozen.
+
+    A block refuses the whole execution: no legs move, no debt is recorded
+    (book.record runs only on the paid path) and no completion event is
+    written -- the runners report due_not_paid / arrival_not_paid and the
+    direct path reports payout_not_executed. A refused due run stays in its
+    retry window, so it can pay if the payer unfreezes.
+    """
+    clause = lm.rule_offers.clause_for(payer, tau_defs.USER_POLICY_STREAM_INDEX)
+    if not clause:
+        return ""
+    values = {
+        1: str(int(total)),
+        2: str(int(have)),
+        3: "{ #x" + str(payer) + " }:bv[384]",
+        4: "0",
+        5: str(int(timestamp)),
+        12: "{ #x" + str(payer) + " }:bv[384]",
+    }
+    try:
+        blocked, detail = sender_policy.clause_blocks(
+            clause, values, pool="apply", timeout=timeout)
+    except Exception:
+        if not replay_mode:
+            raise
+        return "no evaluator during replay"
+    if blocked:
+        return f"the payer's o5 policy blocks this payout (o5={detail})"
+    return ""
+
+
 def _node_payout_step(lm, balances, sequences, rule, state, exe, height, timestamp, *,
                       timeout, replay_mode, what):
     """Step a payout rule for a run the node makes by itself: (reason, legs, have).
@@ -340,6 +382,11 @@ def _node_payout_step(lm, balances, sequences, rule, state, exe, height, timesta
             raise PayoutRefused("no evaluator during replay")
         legs = settle_payout(rule, state, exe, outputs, height=int(height),
                              ts=int(timestamp), balance=have)
+        frozen = _payout_o5_blocked(
+            lm, rule.account_pubkey, sum(a for _, _, a in legs), have,
+            height, timestamp, timeout=timeout, replay_mode=replay_mode)
+        if frozen:
+            raise PayoutRefused(frozen)
     except PayoutRefused as exc:
         return str(exc), [], have
     return "", legs, have
@@ -3155,6 +3202,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     rule, state, exe, outputs, height=height_now, ts=ts_now,
                                     balance=_read_bal(exe.account_pubkey),
                                 )
+                                frozen = _payout_o5_blocked(
+                                    lifecycle_mgr, exe.account_pubkey,
+                                    sum(a for _, _, a in legs),
+                                    _read_bal(exe.account_pubkey),
+                                    height_now, ts_now, timeout=budget,
+                                    replay_mode=replay_mode,
+                                )
+                                if frozen:
+                                    raise PayoutRefused(frozen)
                             except PayoutRefused as exc:
                                 reason = str(exc)
                         if reason:

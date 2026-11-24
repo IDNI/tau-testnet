@@ -27,8 +27,8 @@ from tests.chain_harness import (
     spend_tx,
 )
 from tests.test_payout_apply import (
-    _events, _executed, _installed, _reason, _logs, evs, exec_tx, rid, ridb,
-    set_tx, update_tx,
+    FREEZE, _events, _executed, _installed, _reason, _logs, evs, exec_tx, rid,
+    ridb, set_tx, update_tx,
 )
 from unittest.mock import MagicMock
 
@@ -303,6 +303,24 @@ def test_a_due_rule_retries_after_the_account_is_funded(evs):
     oracle.check(ch)
     st = ch.lm.payout_rules.state_of(ALICE, ridb(tx))
     assert st.due_index == 1 and st.missed == 0
+
+
+def test_a_frozen_payer_due_run_pays_nothing_then_pays_when_unfrozen(evs):
+    ch, oracle, tx = _due_installed(evs)
+    ch.lm.rule_offers.accepted_clauses[(ALICE, 5)] = FREEZE
+    evs["apply"].set_verdict(FREEZE, lambda inputs: 0)    # blocks every transfer
+    ch.block([], height=HEIGHT + 5, ts=TS + 5)
+    ev = _events(ch)[0]
+    assert ev["outcome"] == "due_not_paid" and ev["due_at"] == HEIGHT + 5
+    assert "o5" in ev["reason"]
+    oracle.check(ch)
+    evs["apply"].set_verdict(FREEZE, lambda inputs: 1)    # the payer unfreezes
+    ch.block([], height=HEIGHT + 6, ts=TS + 6)
+    paid = [e for e in _events(ch) if e.get("outcome") == "executed"]
+    assert len(paid) == 1 and paid[0]["due_at"] == HEIGHT + 5
+    assert paid[0]["total"] == 100
+    oracle.pay(ALICE, BOB, 100, ts=TS + 6)
+    oracle.check(ch)
 
 
 def test_a_missed_due_point_is_counted_and_the_next_point_runs(evs):
