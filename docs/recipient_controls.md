@@ -120,6 +120,17 @@ co-signed **the payer's** request; letting them through would let the payer's
 co-signature satisfy the recipient's rule, and the recipient never agreed to it.
 Zeroed rather than removed, so every clause sees the same shape of input map.
 
+## If a second hold stream is ever added
+
+`tau_defs.HOLD_STREAM_GROUP` names the streams that together describe the hold.
+Today it holds one unit-tagged stream, so the question does not arise: a bound in
+seconds refuses block-based parks by construction. If a block-denominated stream
+is added, `consensus/approvals.py::screen_hold_mentions` refuses at deploy time
+any clause that bounds one hold stream and not the other — the failure mode it
+prevents is a rule that caps seconds and silently admits a park of any length.
+The screen ships now, inert with a single stream and tested against a two-stream
+group, so the layout can change without reopening that hole.
+
 ## What is deliberately not gated
 
 - **A retract.** Only the sender may retract, and a retract moves no money to

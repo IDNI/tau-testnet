@@ -289,6 +289,15 @@ COOLDOWN_STREAM_ACTIVE = False
 # are refused instead of being silently shadowed.
 RECEIVE_STREAM_INDEX = 17
 RECEIVE_STREAM_BV_WIDTH = 64
+
+# The streams that together say how long a payment keeps the funds out of reach.
+# Today that is one unit-tagged stream, so a clause that bounds it bounds every
+# park kind by construction. If a block-denominated stream is added (the
+# two-stream layout discussed on issue #47), the tuple gains it here and
+# `screen_hold_mentions` refuses any clause that bounds only one of them:
+# ordering the two families on a single tagged stream is fail-closed, while
+# letting a clause bound one unit and silently admit the other is fail-open.
+HOLD_STREAM_GROUP = (RECEIVE_STREAM_INDEX,)
 RECEIVE_OUTBOUND = 0
 RECEIVE_FINAL = 1
 RECEIVE_BLOCKS_BASE = 1 << 63

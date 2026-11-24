@@ -272,6 +272,38 @@ _STREAM_MENTION_RE = re.compile(r"\b([io])(\d+)\b")
 _STREAM_TYPED_TAIL_RE = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
 
 
+def screen_hold_mentions(text: str, group=None) -> Optional[str]:
+    """None when a clause that mentions a hold stream mentions all of them.
+
+    A clause that caps the hold must bound **every** stream the node feeds for
+    it. With one unit-tagged stream this is automatic: a bound in seconds
+    already refuses block-based parks, so the worst case is refusing money you
+    would have accepted. With two streams it is not: a rule that bounds the
+    seconds stream and forgets the block stream silently *admits* a park of any
+    length, which is the failure this bounty exists to prevent. Authors will not
+    always remember the second stream, so the node refuses the rule at deploy
+    time instead of failing open at payment time.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    streams = tuple(tau_defs.HOLD_STREAM_GROUP if group is None else group)
+    if len(streams) < 2:
+        return None
+    scrubbed = strip_clause_comments(text or "")
+    mentioned = [i for i in streams if re.search(rf"\bi{i}\b", scrubbed)]
+    if not mentioned or len(mentioned) == len(streams):
+        return None
+    missing = [i for i in streams if i not in mentioned]
+    have = ", ".join(f"i{i}" for i in mentioned)
+    lack = ", ".join(f"i{i}" for i in missing)
+    return (
+        f"a clause that caps how long a payment may be held must bound every "
+        f"hold stream: this one mentions {have} but not {lack}. Bound the "
+        f"missing stream too (i17 = 1 refuses every timed park, i27 = 1 every "
+        f"block-based one) or drop the cap"
+    )
+
+
 def screen_receive_widths(text: str) -> Optional[str]:
     """None when every mention of i17 is typed bv[64], else the reason.
 

@@ -17,7 +17,8 @@ import db
 import tau_defs
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 from commands import sendtx
-from consensus import recipient_policy, sender_policy
+from consensus import approvals, recipient_policy, sender_policy
+from consensus import admission as admission_mod
 from consensus.approvals import screen_receive_widths
 from consensus.policy_mock import MockPolicyEvaluator
 from consensus.retractable import KIND_HEIGHT, KIND_TIME
@@ -401,3 +402,35 @@ def test_a_mistyped_receive_stream_is_refused(text):
 def test_a_correctly_typed_receive_stream_passes_the_screen():
     assert screen_receive_widths("i17[t]:bv[64] > { #x01 }:bv[64]") is None
     assert screen_receive_widths("i3[t]:bv[384]") is None
+
+
+def test_a_two_stream_layout_refuses_a_clause_that_bounds_only_one(monkeypatch):
+    """The screen that makes the two-stream layout fail closed at deploy time."""
+    body_one = ("(i17[t]:bv[64] > { #x0259 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24])"
+                " : (o5[t]:bv[24] = { #x000001 }:bv[24])")
+    body_both = ("((i17[t]:bv[64] > { #x0259 }:bv[64]) && (i27[t]:bv[64] > { #x0001 }:bv[64]))"
+                 " ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])")
+    body_none = "(i3[t]:bv[384] = { #x" + ap.ALICE + " }:bv[384]) ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24])"
+
+    # today the group is a single unit-tagged stream: nothing to enforce
+    assert approvals.screen_hold_mentions(body_one) is None
+    assert tau_defs.HOLD_STREAM_GROUP == (tau_defs.RECEIVE_STREAM_INDEX,)
+
+    # the day a block-denominated stream joins it, a half-bounded clause is refused
+    err = approvals.screen_hold_mentions(body_one, group=(17, 27))
+    assert err and "i27" in err and "i17" in err
+    assert approvals.screen_hold_mentions(body_both, group=(17, 27)) is None
+    assert approvals.screen_hold_mentions(body_none, group=(17, 27)) is None
+
+    # and the admission screen carries it, with the shared-rules prefix
+    monkeypatch.setattr(tau_defs, "HOLD_STREAM_GROUP", (17, 27))
+    rejection = admission_mod._screen_clause_widths_and_structure(body_one)
+    assert rejection and rejection.startswith("Shared rules: ") and "i27" in rejection
+    assert admission_mod._screen_clause_widths_and_structure(body_none) is None
+
+
+def test_a_comment_about_a_hold_stream_does_not_count_as_bounding_it():
+    body = ("# i27 is the block stream\n"
+            "(i17[t]:bv[64] > { #x0259 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24])"
+            " : (o5[t]:bv[24] = { #x000001 }:bv[24])")
+    assert approvals.screen_hold_mentions(body, group=(17, 27))

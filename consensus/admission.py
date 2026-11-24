@@ -44,6 +44,7 @@ from consensus.approvals import (
     parse_transfer_vote,
     screen_policy_widths,
     screen_slot_widths,
+    screen_hold_mentions,
     screen_receive_widths,
     screen_stream_widths,
     validate_request_shape,
@@ -1035,6 +1036,10 @@ def _screen_clause_widths_and_structure(body: str) -> Optional[str]:
     receive_error = screen_receive_widths(body)
     if receive_error:
         return "Shared rules: " + receive_error
+
+    hold_error = screen_hold_mentions(body)
+    if hold_error:
+        return "Shared rules: " + hold_error
 
     width_error = screen_stream_widths(body)
     if width_error:
