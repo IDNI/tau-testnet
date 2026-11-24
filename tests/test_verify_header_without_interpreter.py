@@ -16,6 +16,7 @@ import tau_manager
 from block import Block
 from consensus import engine as ce
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
+from errors import TauUnavailable
 
 A = "aa" * 48
 
@@ -64,10 +65,11 @@ def _verify(mode, advisory_answer, *, enabled=True):
 
 
 @pytest.mark.parametrize("mode", ["validator_set", "tau_validator_set"])
-def test_no_advisory_answer_and_no_interpreter_refuses_at_once(mode):
-    verdict, elapsed = _verify(mode, None)
-    assert verdict is False
-    assert elapsed < 5
+def test_no_advisory_answer_and_no_interpreter_stops_at_once(mode):
+    started = time.monotonic()
+    with pytest.raises(TauUnavailable, match="advisory evaluator gave no answer"):
+        _verify(mode, None)
+    assert time.monotonic() - started < 5
 
 
 @pytest.mark.parametrize("mode,answer", [
@@ -90,8 +92,9 @@ def test_without_authority_or_native_interface_the_interpreter_is_still_required
          patch.object(TauConsensusEngine, "_view_eligibility_mode",
                       staticmethod(lambda v: "validator_set")), \
          patch("consensus.engine.normalize_validator_set", return_value={A}):
-        assert TauConsensusEngine().verify_block_header(
-            _view("validator_set"), _block(), {"proof_ok": True}) is False
+        with pytest.raises(TauUnavailable, match="not ready"):
+            TauConsensusEngine().verify_block_header(
+                _view("validator_set"), _block(), {"proof_ok": True})
 
 
 def test_worker_backed_authority_makes_the_advisory_evaluator_available():

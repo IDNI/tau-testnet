@@ -118,14 +118,13 @@ def _apply_block(rule_text):
 
 
 def test_block_apply_bare_ref_of_a_shrunk_stream_is_node_local(in_process):
+    import tau_shrink
+
     engine = in_process(codes=(4,))
-    result = _apply_block(BARE_I13)
-    assert "r1" in [t.get("tx_id") for t in result.rejected_transactions]
-    receipt = result.receipts["r1"]
-    assert receipt["reason"] == "rule_type_conflict"
-    logs = "\n".join(receipt["logs"])
-    assert "Error: runtime type conflict: The rule references i13 without a width" in logs
-    assert "Write i13[t]:bv[384]" in logs
+    with pytest.raises(tau_shrink.ShrinkTypeConflict) as info:
+        _apply_block(BARE_I13)
+    assert "The rule references i13 without a width" in str(info.value)
+    assert "Write i13[t]:bv[384]" in str(info.value)
     assert engine.rules == []
 
 

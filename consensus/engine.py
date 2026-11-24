@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -75,8 +76,9 @@ FEE_BEARING_TX_TYPES = frozenset(
 )
 
 
-def _receipt_lookup_key(tx: Dict[str, Any], index: int) -> str:
-    """Receipt dict key; only used for receipts and ApplyBlockResult id lists."""
+def tx_receipt_key(tx: Dict[str, Any], index: int) -> str:
+    """The key of a transaction in its receipt, the ApplyBlockResult id lists
+    and the owner of a local error."""
     return tx.get("tx_id") or str(index)
 
 # Branches that mutate the lifecycle manager in place. They write only to the
@@ -96,16 +98,16 @@ import tau_advisory
 import tau_guard
 import tau_journal
 import tau_session
-import tau_shrink
 
 from errors import (
     BlockchainBug,
     TauCommunicationError,
     TauEngineBug,
     TauEngineCrash,
-    TauSpecIntegrationError,
     TauSpecRejected,
+    TauUnavailable,
 )
+from .local_errors import is_local_apply_error, mark_owner, owner_of as local_error_owner
 
 # We need to import chain_state and tau_manager, but we must be careful about circular imports.
 # We'll import them inside methods or use a lazy import pattern if needed.
@@ -113,6 +115,25 @@ import tau_manager
 # chain_state will be imported inside methods to avoid circular dependency if chain_state imports this module.
 
 logger = logging.getLogger(__name__)
+
+# The key of the transaction that `_apply` evaluates now, per context.
+_OPEN_TX: contextvars.ContextVar = contextvars.ContextVar("open_apply_tx", default=None)
+
+_NO_HEADER_EVALUATOR = ("the advisory evaluator gave no answer and the in-process "
+                        "interpreter is not ready")
+
+
+def _stops_apply(exc: Exception, step: str, tx_id=None) -> bool:
+    """True when `exc` is node-local: the caller re-raises, so the block gets no verdict."""
+    if not is_local_apply_error(exc):
+        return False
+    mark_owner(exc, tx_id)
+    where = step if tx_id is None else f"{step} of tx {tx_id}"
+    logger.error(
+        "Node-local error in the %s; the apply of the block stops with no "
+        "verdict: %s: %s", where, type(exc).__name__, exc,
+    )
+    return True
 
 
 def _application_rule_landed(rule_text: str) -> bool:
@@ -134,7 +155,10 @@ def _application_rule_landed(rule_text: str) -> bool:
         unit = raw
     try:
         app = chain_state.get_application_rules_state() or ""
-    except Exception:
+    except Exception as exc:
+        # The rule step logs it, with its transaction.
+        if is_local_apply_error(exc):
+            raise
         return False
     units = [u.strip() for u in app.split("\n") if u.strip()]
     if unit in units or raw in units:
@@ -672,8 +696,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return False
 
         if not _advisory_is_available() and not tau_manager.tau_ready.is_set():
-            logger.error("Consensus: Tau not ready for block verification.")
-            return False
+            raise TauUnavailable("Tau not ready for block verification")
             
         try:
             proposer_stake = 0
@@ -723,8 +746,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                 if outputs is None:
                     if not tau_manager.tau_ready.is_set():
-                        logger.error("Consensus: advisory evaluator gave no answer and the in-process interpreter is not ready.")
-                        return False
+                        raise TauUnavailable(_NO_HEADER_EVALUATOR)
                     with tau_manager.tau_comm_lock:
                         outputs = tau_manager.communicate_with_tau_multi(
                             input_stream_values=tau_inputs,
@@ -750,8 +772,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     output = None if answered is None else answered.get(6)
                 if output is None:
                     if not tau_manager.tau_ready.is_set():
-                        logger.error("Consensus: advisory evaluator gave no answer and the in-process interpreter is not ready.")
-                        return False
+                        raise TauUnavailable(_NO_HEADER_EVALUATOR)
                     output = tau_manager.communicate_with_tau(
                         target_output_stream_index=6,
                         input_stream_values=tau_inputs,
@@ -783,6 +804,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             logger.warning("Consensus: Block #%s rejected by Tau rules (o6: %s)", block.header.block_number, output)
             return False
         except Exception as e:
+            if _stops_apply(e, "header check of block #%s" % getattr(
+                    getattr(block, "header", None), "block_number", "?")):
+                raise
             logger.error("Header verification failed: %s", e)
             return False
 
@@ -934,7 +958,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # Receipt keys match apply(); id() membership keeps a content-equal
         # rejected duplicate distinct from the accepted object.
         for i, tx in enumerate(block.transactions):
-            tx_id = _receipt_lookup_key(tx, i)
+            tx_id = tx_receipt_key(tx, i)
             if id(tx) in accepted_obj:
                 # We consider all accepted ones as "applied" or "skipped/no-op"
                 # Internal execution logs tell us if it was essentially a no-op 
@@ -956,7 +980,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
         retractable_events = []
         for i, tx in enumerate(block.transactions):
-            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+            event = (exec_result.receipts.get(tx_receipt_key(tx, i)) or {}).get(
                 "retractable_event"
             )
             if event and id(tx) in accepted_obj:
@@ -982,13 +1006,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 ("consensus_rules", active_view.consensus_rules or ""),
                 ("application_rules", next_app_rules or ""),
             ]
+            # A read error stops the apply. An audit on fewer texts
+            # can differ per node.
             try:
-                texts.extend(
-                    ("builtin_rule_%d" % n, text)
-                    for n, text in enumerate(chain_state.load_builtin_rules_from_disk() or [])
-                )
-            except Exception:  # noqa: BLE001 - the audit is best-effort on disk reads
-                logger.warning("Could not read builtin rules for the activation audit")
+                builtin = chain_state.load_builtin_rules_from_disk() or []
+            except UnicodeDecodeError as exc:
+                raise OSError(f"a builtin rule file is not UTF-8: {exc}") from exc
+            texts.extend(
+                ("builtin_rule_%d" % n, text) for n, text in enumerate(builtin)
+            )
             texts.extend(
                 ("clause_%s_o%d" % (acceptor[:10], stream), body)
                 for (acceptor, stream), body in
@@ -1255,12 +1281,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         )
         if proposal is None:
             _refuse_in_process_authority("apply")
-            return self._apply(**kwargs)
+            return self._apply_owned(**kwargs)
         with tau_guard.ProposalIsolationGuard(
             strict=True, label=getattr(proposal, "label", "proposal")
         ):
             try:
-                return self._apply(**kwargs)
+                return self._apply_owned(**kwargs)
             except tau_guard.GlobalStateLeak as leak:
                 # The proposal was evaluated against state it does not own, so
                 # nothing it produced can be trusted -- including the parts that
@@ -1269,6 +1295,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # result.
                 proposal.poison(f"isolation breach: {leak}")
                 raise
+
+    def _apply_owned(self, **kwargs) -> TauExecutionResult:
+        """`_apply`, and a local error from any code of a transaction names that
+        transaction, also outside the catches of the apply steps."""
+        token = _OPEN_TX.set(None)
+        try:
+            return self._apply(**kwargs)
+        except Exception as exc:
+            if local_error_owner(exc) is None:
+                _stops_apply(exc, "transaction", _OPEN_TX.get())
+            raise
+        finally:
+            _OPEN_TX.reset(token)
 
     def _apply(
         self,
@@ -1532,6 +1571,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # One branch per transaction. Its journal child, allocator child and
             # state delta resolve together; a rejection that already stepped the
             # evaluator rebuilds the proposal worker from the accepted prefix.
+            _OPEN_TX.set(None)  # No transaction owns an error of that rebuild.
             _branch = None
             lifecycle_mgr = _block_lifecycle
             if proposal is not None:
@@ -1539,7 +1579,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     str(tx.get("tx_id") or tx.get("tx_hash") or f"tx{i}")
                 )
                 _session = proposal.session
-            tx_id = _receipt_lookup_key(tx, i)
+            tx_id = tx_receipt_key(tx, i)
+            _OPEN_TX.set(tx_id)
             # operations is signed only for user_tx.
             operations = tx.get('operations', {}) if tx.get('tx_type', 'user_tx') == 'user_tx' else {}
             sender = tx.get('sender_pubkey')
@@ -2022,6 +2063,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 except FeeRuleError:
                     raise
                 except Exception as e:
+                    if _stops_apply(e, "transfer step", tx_id):
+                        raise
                     logger.error("Error applying transfer: %s", e)
                     if not replay_mode:
                         accepted_in_block = False
@@ -2709,7 +2752,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             try:
                 if hasattr(chain_state, "get_application_rules_state"):
                     _rule_prior_rules_state = _rules_state()
-            except Exception:
+            except Exception as e:
+                if _stops_apply(e, "rules read before the transaction", tx_id):
+                    raise
                 _rule_prior_rules_state = None
 
             if reserved_error:
@@ -2761,13 +2806,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             # offers no rollback, so which evaluator runs a rule
                             # cannot be a module-level fact. Dispatch is unchanged.
                             if not _session.ready(timeout=5):
+                                if not replay_mode:
+                                    raise FeeRuleError(
+                                        f"Tau unavailable during rule execution (tx {tx_id})"
+                                    )
                                 logger.error("Tau process not ready for rule execution")
                                 execution_success = False
                                 tx_receipt["logs"].append("Tau not ready")
-                                if not replay_mode:
-                                    accepted_in_block = False
-                                    hard_reject = True
-                                    tx_receipt["reason"] = "rule_not_applied"
                             else:
                                 output = _session.apply_rule(rule_text, target=0)
 
@@ -2847,8 +2892,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         val = _rules_state()
                                         if isinstance(val, str):
                                             rules_text = val
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        if _stops_apply(e, "rules read after the rule", tx_id):
+                                            raise
 
                                     if rules_text is not None:
                                         current_tau_bytes = rules_text.encode("utf-8")
@@ -2857,19 +2903,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     _rule_touched_canonical = True
                                     tx_receipt["logs"].append("Rule applied")
 
-                          except tau_shrink.ShrinkTypeConflict as e:
-                            # W3: node-local. This process cannot represent the
-                            # rule because of a width it already committed to;
-                            # another node, or this one after a restart, can.
-                            # Must never rewrite history on replay, and must
-                            # never be reported as an invalid rule.
-                            logger.error("Cannot represent rule in this process: %s", e)
-                            execution_success = False
-                            tx_receipt["logs"].append(f"Error: runtime type conflict: {e}")
-                            if not replay_mode:
-                                accepted_in_block = False
-                                hard_reject = True
-                                tx_receipt["reason"] = "rule_type_conflict"
+                          except FeeRuleError:
+                            raise
                           except TauSpecRejected as e:
                             # W9: the engine refused the AUTHOR's text. Measured to
                             # be a clean no-op (no revision, no type established,
@@ -2883,22 +2918,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             accepted_in_block = False
                             hard_reject = True
                             tx_receipt["reason"] = "rule_rejected"
-                          except TauSpecIntegrationError as e:
-                            # W9: the author's rule was fine and the runtime text
-                            # THIS NODE generated from it was not. Node-local
-                            # integration failure: never report it as an invalid
-                            # rule, and never rewrite history on replay.
-                            logger.error(
-                                "Node-generated runtime text was refused by Tau "
-                                "(integration failure, not an invalid rule): %s", e
-                            )
-                            execution_success = False
-                            tx_receipt["logs"].append(f"Error: runtime preparation failure: {e}")
-                            if not replay_mode:
-                                accepted_in_block = False
-                                hard_reject = True
-                                tx_receipt["reason"] = "rule_not_applied"
                           except Exception as e:
+                            # ShrinkTypeConflict and TauSpecIntegrationError
+                            # pass too: the node failed, not the rule.
+                            if _stops_apply(e, "rule step", tx_id):
+                                raise
                             logger.error("Error applying rule: %s", e)
                             execution_success = False
                             tx_receipt["logs"].append(f"Error: {e}")
@@ -3000,6 +3024,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             tx_receipt["logs"].append("Transfer balance state failed")
                                             break
                                 except Exception as e:
+                                    if _stops_apply(e, "transfer step", tx_id):
+                                        raise
                                     logger.error("Error applying transfer: %s", e)
                                     if not replay_mode:
                                         accepted_in_block = False
@@ -3029,6 +3055,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                  tx_receipt["logs"].append(f"Custom logic error: {res_eval}")
                                  execution_success = False
                     except Exception as e:
+                         if _stops_apply(e, "custom-input step", tx_id):
+                             raise
                          logger.error("Error applying unified custom log: %s", e)
                          execution_success = False
                          tx_receipt["logs"].append(f"Error (unified custom): {e}")
@@ -3078,6 +3106,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 except FeeRuleError:
                     raise
                 except Exception as e:
+                    if _stops_apply(e, "fee-query step", tx_id):
+                        raise
                     logger.error("Error during fee-query step for tx %s: %s", tx_id, e)
                     if not replay_mode:
                         accepted_in_block = False
@@ -3282,6 +3312,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     rejected_receipt["fee_charged"] = 0
                 receipts[tx_id] = rejected_receipt
                 logger.error("TX REJECTED during apply: %s", tx_receipt["logs"])
+        _OPEN_TX.set(None)
 
         # Create new snapshot
         new_snapshot = TauStateSnapshot(

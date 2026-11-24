@@ -12,6 +12,8 @@ import block
 import chain_state
 import config
 from errors import EvaluatorLost
+from consensus.engine import tx_receipt_key
+from consensus.local_errors import is_local_apply_error, owner_of as local_error_owner
 from consensus.state import compute_state_hash
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
 
@@ -390,15 +392,43 @@ def _backing_off() -> set:
             if eligible_at > now}
 
 
+def _owner_hashes(key_of, tx_id, execution_transactions, row_ids, reserved_txs) -> list:
+    """Mempool hashes of the batch transactions whose key is `tx_id`."""
+    hashes = {rtx["id"]: rtx.get("tx_hash") for rtx in reserved_txs}
+    owners = [hashes.get(row_ids[i]) for i, tx in enumerate(execution_transactions)
+              if isinstance(tx, dict) and key_of(tx, i) == tx_id]
+    return [tx_hash for tx_hash in owners if tx_hash]
+
+
+def _defer_local(exc, execution_transactions, row_ids, reserved_txs) -> None:
+    """A node-local error is never a verdict about its transaction. Retrying it at
+    once meets the same error, so it waits and the rest of the batch is mined."""
+    if not is_local_apply_error(exc):
+        return
+    tx_id = local_error_owner(exc)
+    if tx_id is None:
+        logger.warning("createblock: node-local error with no owning transaction "
+                       "(%s: %s); nothing deferred", type(exc).__name__, exc)
+        return
+    owners = _owner_hashes(tx_receipt_key, tx_id, execution_transactions,
+                           row_ids, reserved_txs)
+    if not owners:
+        logger.warning("createblock: node-local error but no queued transaction "
+                       "owns %r; nothing deferred", tx_id)
+    for tx_hash in owners:
+        strikes, delay = _defer(tx_hash)
+        logger.warning("createblock: transaction %s met a node-local error (%s: %s); "
+                       "deferred for %ss (strike %d)",
+                       tx_hash, type(exc).__name__, exc, delay, strikes)
+
+
 def _defer_lost(exc, execution_transactions, row_ids, reserved_txs) -> None:
     """The transaction stays pending: a lost evaluator is never a verdict about
     it, and retrying it at once would lose the evaluator again."""
     if not isinstance(exc, EvaluatorLost) or (exc.tx_id is None and not exc.timed_out):
         return
-    hashes = {rtx["id"]: rtx.get("tx_hash") for rtx in reserved_txs}
-    owners = [hashes.get(row_ids[i]) for i, tx in enumerate(execution_transactions)
-              if isinstance(tx, dict) and tau_proposal.branch_id(tx, i) == exc.tx_id]
-    owners = [tx_hash for tx_hash in owners if tx_hash]
+    owners = _owner_hashes(tau_proposal.branch_id, exc.tx_id, execution_transactions,
+                           row_ids, reserved_txs)
     if exc.timed_out:
         what = f"a request outran the {config.MINING_BUDGET}s mining budget"
         cause = f"outran the {config.MINING_BUDGET}s mining budget"
@@ -753,7 +783,8 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             # becomes an ordinary operational failure -- and the `finally` below
             # still runs first, so the worker is disposed either way. Without
             # this the node would unwind over something node-local.
-            with tau_proposal.boundary(sim_proposal, label="createblock"):
+            with tau_proposal.boundary(sim_proposal, label="createblock"), \
+                    tau_manager.reexec_on_width_overflow():
                 # Call the unified path
                 apply_result = engine.apply_block(
                     active_view, candidate_block, parent_snapshot,
@@ -956,6 +987,7 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             if sim_proposal is not None:
                 sim_proposal.dispose()
             _defer_lost(e, execution_transactions, filtered_reserved_ids, reserved_txs)
+            _defer_local(e, execution_transactions, filtered_reserved_ids, reserved_txs)
         msg = str(e)
         return {"error": msg, "message": msg}
         
