@@ -686,7 +686,8 @@ The seal ends when the rule ends: at `expires_at`, or after the last run the
 node owes it. Then the key holds the account again. So a sealed rule should pay
 out or return everything before its end, as the grant below does at its due
 point, and whoever relies on it checks `sealed`, `due_at` and `expires_at` in
-`getpayoutrule` before sending money.
+`getpayoutrule` before sending money, and that the account holds no other rule
+([Several rules per account](#several-rules-per-account)).
 
 ```bash
 # the 5,000 for Bob, in an account nobody's key can touch until 1 March
@@ -730,7 +731,10 @@ tau-testnet payout revoke --key alice --rule-index 1
 - A set that replaces the rule in its place keeps what that place has paid this
   period (see "Installing"); the other places are not touched.
 - A sealed rule in any place seals the account: until it ends, the account
-  signs nothing, so no rule of it can be set or revoked.
+  signs nothing, so no rule of it can be set or revoked. The seal freezes the
+  other places as they are: a rule set in another place before the seal stays
+  and keeps paying by its own terms. So whoever relies on a sealed account
+  reads every place of it in `getpayoutrule`, not only the sealed rule.
 - The 4,096 rules of the book count rules, not accounts.
 
 `tests/test_payout_triggers.py` pins all of this without an engine, including

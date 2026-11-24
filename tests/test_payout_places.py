@@ -506,12 +506,16 @@ def test_a_replacement_with_a_lower_cap_pays_nothing_more_this_period(evs):
 
 def test_a_sealed_rule_in_another_place_seals_the_account(evs):
     ch = Chain(_bal())
-    ch.block([set_tx(rule=DATA), set_tx(seq=1, rule=DATA, rule_index=2, sealed=True,
-                                        expires_at=HEIGHT + 5)])
+    first = set_tx(rule=DATA)
+    ch.block([first, set_tx(seq=1, rule=DATA, rule_index=2, sealed=True,
+                            expires_at=HEIGHT + 5)])
     assert ch.lm.payout_rules.sealed(ALICE)
     late = set_tx(seq=2, rule=DATA, rule_index=3)
     ch.block([late, spend_tx(ALICE, BOB, 10, 2)], height=HEIGHT + 1, ts=TS + 1)
     assert _reason(ch.last, late) == "account_sealed" and ch.bal[ALICE] == 1_000
+    # The seal freezes the other places as they are: the rule set before it still pays.
+    ch.block([exec_tx(rule_id=rid(first), data={"0": 100})], height=HEIGHT + 2, ts=TS + 2)
+    assert (ch.bal[ALICE], ch.bal[BOB]) == (900, 100) and ch.lm.payout_rules.sealed(ALICE)
     ch.block([], height=HEIGHT + 5, ts=TS + 5)
     assert _outcomes(ch) == ["expired"] and not ch.lm.payout_rules.sealed(ALICE)
 
