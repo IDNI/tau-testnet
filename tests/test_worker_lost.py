@@ -793,6 +793,7 @@ _PROPAGATES = {os.path.join("consensus", "engine.py"),
 _OWNERS = {
     "chain_state.py": "boundary",
     os.path.join("commands", "createblock.py"): "boundary",
+    os.path.join("consensus", "active_rules.py"): "WorkerLost",
     "tau_admission.py": "WorkerLost",
     "tau_advisory.py": "WorkerLost",
     "tau_authority.py": "WorkerLost",
