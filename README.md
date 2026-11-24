@@ -599,7 +599,10 @@ earlier block of the canonical chain: the clauses, the guard and the running
 spec the account had when that block committed, and says what a node that did
 not record the block cannot know. For a rule the engine was given,
 `gettxstatus` also reads the engine's verdict from the block's committed
-journal (`rule_outcome`).
+journal (`rule_outcome`). `fee_rules` lists every unit that writes the fee
+stream `o8`, with the account that sent it: the engine works out `o8` from the
+whole specification, so a fee rule of one account can change what another pays
+(#183), and a wallet that shows a fee reads all of them.
 
 ### Checking conflict status
 
@@ -770,7 +773,8 @@ For a wallet view that accounts for queued sends, use the additive commands
   read at one tip: its registry clauses and rule-change guard with their
   sha256, application rules naming it, its open rule-change requests, requests
   waiting for its vote, pending offers, queued rule transactions and the latest
-  rule changes, and `running_spec`, what the engine runs. With a block number
+  rule changes, `running_spec`, what the engine runs, and `fee_rules`, every
+  fee rule (`o8`) of any account with its sender. With a block number
   or block hash: the clauses, guard, units, running spec and history as they
   were when that block committed. CLI: `tau-testnet policy show <address>
   [--block N]`.

@@ -152,6 +152,9 @@ tau-testnet rpc getaccountrules <address>
  "rule_change_guard": {"body": "…", "sha256": "…",
                        "since": {"block_number": 12, "request_id": "…"}},
  "application_rules": [],
+ "fee_rules": [{"unit": "always ( … -> (o8[t]:bv[24] = { #x000064 }:bv[24]) ).", "sha256": "…",
+                "names_this_account": false, "sent_by": ["c41d…"],
+                "since": {"block_number": 33, "tx_hash": "…"}}],
  "running_spec": {"text": "always (…) && o27[t]:bv[24] = { 9 }:bv[24] && o26[t]:bv[24] = { 3 }:bv[24]",
                   "sha256": "…", "block_hash": "…"},
  "open_rule_changes": [{"request_id": "…", "kind": "set_policy", "body_sha256": "…",
@@ -173,6 +176,7 @@ tau-testnet rpc getaccountrules <address>
 | `rule_change_guard` | The guard clause, same shape, or `null`. |
 | `since` | The block, and the transaction or released request, that put this exact text in place, from this node's records; `null` when that happened before the node began recording. |
 | `application_rules` | Units of the application-rules accumulation whose text names the account's key (`#x<address>`), each with its sha256. |
+| `fee_rules` | Every unit of the accumulation that writes the fee stream `o8`, whoever sent it, in the order the units joined. The engine works out `o8` from the whole specification for every transaction, so a unit that never names the account can still change what it pays (#183); `application_rules` does not show such a unit. `names_this_account` says whether its text names the account's key. `sent_by` lists the accounts whose rule transaction brought it, from this node's record: the sender of the transaction, never a key the text names. `null` when the node has no record of it (a genesis unit, or one from before it began recording). The same list for every account that asks. |
 | `running_spec` | The specification the engine runs at `running_spec.block_hash`, as the engine revised it, in canonical (full-width) form, with the sha256 of that text. See [What the engine runs](#what-the-engine-runs-running_spec). |
 | `open_rule_changes` | The account's own rule-change requests that are still open: kind, hash of the requested body, approvers by slot, votes, declines, whether the guard already allows it (`ready`), and the expiry height. |
 | `awaiting_my_vote` | Open rule-change requests from other accounts that name this account as an approver, with their `sender_pubkey`. |
@@ -285,6 +289,7 @@ committed:
               "since": {"block_number": 40, "tx_hash": "…"}}],
  "rule_change_guard": null,
  "application_rules": [],
+ "fee_rules": [],
  "running_spec": {"text": "…", "sha256": "…", "block_hash": "…", "spec_revision": 11},
  "history": [{"block_number": 40, "kind": "clause", "stream": 5,
               "action": "registered", "tx_hash": "…", "sha256": "…"}]}
@@ -295,6 +300,7 @@ committed:
 | `at_block`, `head_block_number` | The answer is for an earlier block, read while this was the head. |
 | `clauses`, `rule_change_guard` | What the registry held for the account when the block committed, with the text and where it was set. |
 | `application_rules` | The units naming the account that were accumulated up to the block, each with the block and transaction that brought it. |
+| `fee_rules` | The units writing `o8` accumulated up to the block, as at the tip. |
 | `running_spec` | What the engine ran when the block committed, with the engine's revision counter of that block. |
 | `history` | The latest 20 rule effects up to the block, newest first. |
 | `complete` | `true` when every part of the answer is certain. |
@@ -325,8 +331,9 @@ node that was upgraded in place did not record its earlier blocks:
 - A clause that was set in a block the node did not record is listed with
   `unavailable` and without a text. If nothing touched the stream since, the
   text is what the registry holds now, and it is given.
-- `application_rules` is `null` with `application_rules_unavailable` when the
-  record does not reach back to block 1.
+- `application_rules` and `fee_rules` are `null`, with
+  `application_rules_unavailable`, when the record does not reach back to
+  block 1.
 - If the record's newest word on a stream is not what the registry holds, the
   node answers `unavailable: "this node's record does not match its registry"`
   and nothing from the record.

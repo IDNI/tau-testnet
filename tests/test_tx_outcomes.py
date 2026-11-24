@@ -400,6 +400,91 @@ def test_getaccountrules_refuses_a_bad_address(temp_database):
     assert resp["error"]["code"] == "INVALID_PARAMS"
 
 
+# --- fee rules: every unit that writes o8, whoever sent it (#183) ---------------------
+
+FEE_OWN = ("always ( (i12[t]:bv[384] = { #x" + ALICE + " }:bv[384]) -> "
+           "(o8[t]:bv[24] = { #x00000a }:bv[24]) ).")
+FEE_OTHER = ("always ( ((i12[t]:bv[384] = { #x" + BOB + " }:bv[384]) || "
+             "(i1[t]:bv[24] > { #x000000 }:bv[24])) -> (o8[t]:bv[24] = { #x000064 }:bv[24]) ).")
+FEE_GENESIS = "always ( (i3[t]:bv[384] = i3[t]:bv[384]) -> (o8[t]:bv[24] = { #x000001 }:bv[24]) )."
+
+
+def _app_effect(text, sender):
+    return {"account": sender, "kind": "application_rule", "action": "accumulated",
+            "sha256": _sha(text)}
+
+
+def _fee_view(address=ALICE):
+    blocks = _chain_of(3)
+    fork = Block.create(block_number=2, previous_hash=blocks[1].block_hash, transactions=[],
+                        proposer_pubkey="b" * 96, timestamp=1_700_000_099)
+    db.add_block(fork)
+    _set_head(blocks[2])
+    db.record_tx_outcomes(blocks[1].block_hash, 1, [{
+        "tx_hash": "01" * 32, "index": 0, "status": "applied",
+        "rule_effects": [_app_effect(FEE_OWN, ALICE)]}])
+    db.record_tx_outcomes(blocks[2].block_hash, 2, [{
+        "tx_hash": "02" * 32, "index": 0, "status": "applied",
+        "rule_effects": [_app_effect(FEE_OTHER, BOB)]}])
+    db.record_tx_outcomes(fork.block_hash, 2, [{                  # off the canonical chain
+        "tx_hash": "0f" * 32, "index": 0, "status": "applied",
+        "rule_effects": [_app_effect(FEE_OTHER, ALICE)]}])
+    state = _state(rc_lm(), blocks[2])
+    state._application_rules_state = "\n".join(
+        [FEE_GENESIS, APP_UNIT, FEE_OWN, OTHER_UNIT, FEE_OTHER])
+    resp = json.loads(getaccountrules.execute(
+        f"getaccountrules {address}", types.SimpleNamespace(db=db, chain_state=state)))
+    assert resp["status"] == "ok", resp
+    return resp["data"]
+
+
+def test_every_fee_rule_is_listed_with_who_sent_it_in_the_order_they_joined(temp_database):
+    data = _fee_view()
+    assert data["fee_rules"] == [
+        {"unit": FEE_GENESIS, "sha256": _sha(FEE_GENESIS), "names_this_account": False,
+         "sent_by": None, "since": None},
+        {"unit": FEE_OWN, "sha256": _sha(FEE_OWN), "names_this_account": True,
+         "sent_by": [ALICE], "since": {"block_number": 1, "tx_hash": "01" * 32}},
+        {"unit": FEE_OTHER, "sha256": _sha(FEE_OTHER), "names_this_account": False,
+         "sent_by": [BOB], "since": {"block_number": 2, "tx_hash": "02" * 32}},
+    ]
+
+
+def test_a_fee_rule_that_never_names_the_account_is_shown_only_among_the_fee_rules(temp_database):
+    """The case of #183: another account's fee rule can charge this one, and the
+    units naming the account do not show it."""
+    data = _fee_view()
+    assert FEE_OTHER not in [u["unit"] for u in data["application_rules"]]
+    assert FEE_OTHER in [u["unit"] for u in data["fee_rules"]]
+
+
+def test_the_fee_rules_are_the_same_whichever_account_asks(temp_database):
+    alice, bob = _fee_view(ALICE), _fee_view(BOB)
+    strip = lambda rows: [{k: v for k, v in r.items() if k != "names_this_account"} for r in rows]
+    assert strip(alice["fee_rules"]) == strip(bob["fee_rules"])
+    assert [r["names_this_account"] for r in bob["fee_rules"]] == [False, False, True]
+
+
+def test_a_unit_that_writes_no_fee_is_not_a_fee_rule(temp_database):
+    units = [r["unit"] for r in _fee_view()["fee_rules"]]
+    assert APP_UNIT not in units and OTHER_UNIT not in units
+
+
+def test_the_sender_of_a_fee_rule_is_the_account_that_sent_it_not_the_key_it_names():
+    """A unit sent by one account can name another key: `sent_by` comes from the
+    transaction, never from the text."""
+    text = ("always ( (i12[t]:bv[384] = { #x" + ap.BOB + " }:bv[384]) -> "
+            "(o8[t]:bv[24] = { #x000005 }:bv[24]) ).")
+    result, _, _ = ap._apply([ap.rule_tx(text)])
+    (row,) = result.next_snapshot.metadata["tx_outcomes"]
+    assert row["status"] == "applied", row
+    unit = (chain_state._preprocess_tau_spec_text(text) or text).strip()
+    assert row["rule_effects"] == [{
+        "account": ap.ALICE, "kind": "application_rule", "action": "accumulated",
+        "sha256": _sha(unit),
+    }]
+
+
 def test_the_fee_actually_charged_is_reported():
     tx = ap.rule_tx(ap.UNGUARDED_RULE)
     result, _, _ = ap._apply([tx], fee=7)

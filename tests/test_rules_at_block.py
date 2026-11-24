@@ -414,6 +414,33 @@ def test_units_recorded_without_their_text_are_not_guessed(temp_database):
         "this node did not keep the text of every unit")
 
 
+FEE_BOB = ("always ( ((i12[t]:bv[384] = { #x" + BOB + " }:bv[384]) || "
+           "(i1[t]:bv[24] > { #x000000 }:bv[24])) -> (o8[t]:bv[24] = { #x000064 }:bv[24]) ).")
+
+
+def test_the_fee_rules_of_a_block_are_those_accumulated_up_to_it(temp_database):
+    genesis_fee = "always ( (i3[t]:bv[384] = i3[t]:bv[384]) -> (o8[t]:bv[24] = { #x000001 }:bv[24]) )."
+    blocks = _chain(5)
+    _record(blocks[2], _unit(OTHER), tx="02", bodies=[OTHER])
+    _record(blocks[3], _unit(FEE_BOB), tx="03", bodies=[FEE_BOB])
+    lm = rc_lm()
+    at = lambda n: _at(lm, blocks[-1], n, genesis_rules=genesis_fee + "\n" + OTHER)
+    genesis_row = {"unit": genesis_fee, "sha256": _sha(genesis_fee),
+                   "names_this_account": False, "sent_by": None, "since": None}
+    assert at(2)["fee_rules"] == [genesis_row]
+    assert at(3)["fee_rules"] == at(4)["fee_rules"] == [genesis_row, {
+        "unit": FEE_BOB, "sha256": _sha(FEE_BOB), "names_this_account": False,
+        "sent_by": [BOB], "since": {"block_number": 3, "tx_hash": "03" * 32}}]
+    assert at(4)["application_rules"] == []
+
+
+def test_fee_rules_recorded_without_their_text_are_not_guessed(temp_database):
+    blocks = _chain(4)
+    _record(blocks[2], _unit(FEE_BOB), tx="02")
+    data = _at(rc_lm(), blocks[-1], 3)
+    assert data["fee_rules"] is None and data["complete"] is False
+
+
 # --- the running spec at a block -----------------------------------------------------------
 
 RULE_A = "always ( o26[t]:bv[24] = { 7 }:bv[24] && o27[t]:bv[24] = { 9 }:bv[24] )."

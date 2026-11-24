@@ -44,6 +44,13 @@ SCENARIOS
        the block's committed journal what the engine did with each rule
        (`rule_outcome`), and it agrees with the recorded revision. `policy
        show --block` prints the same. All of it after A's restart and on B.
+    9. Every fee rule, and who sent it: Bob installs a fee rule (o8) for himself.
+       Alice's read lists it under `fee_rules` with Bob as its sender, though it
+       does not name her and is not among her own rules; Bob's read gives the
+       same list and marks the rule as naming him. It is the rule in force: Bob
+       pays 5 on top of the base fee, Alice the base fee alone. The block before
+       it does not list it, its own block does. `policy show` prints it with its
+       sender, and node B gives the same, after replay and after a restart.
 
 USAGE
     python scripts/e2e_rules_in_force.py provision --dir .local/e2e-rules-in-force
@@ -80,6 +87,15 @@ RUNS_3 = "o26[t]:bv[24] = { 3 }:bv[24]"
 RUNS_9 = "o27[t]:bv[24] = { 9 }:bv[24]"
 PROBE_C = "always ( o27[t]:bv[24] = { 4 }:bv[24] )."
 RUNS_4 = "o27[t]:bv[24] = { 4 }:bv[24]"
+FEE_PLUS = 5
+
+
+def own_fee_rule(pk):
+    """The sender `pk` pays FEE_PLUS on top of the base fee; nobody else pays a
+    custom fee. o8 is on no other rule of this network."""
+    return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) ? "
+            "(o8[t]:bv[24] = { #x%06x }:bv[24]) : "
+            "(o8[t]:bv[24] = { #x000000 }:bv[24]) )." % (pk, FEE_PLUS))
 
 
 def guard_text(cosigner_pk):
@@ -494,6 +510,73 @@ def scenario_earlier_blocks(rig, st):
           == (at_1.get("sha256"), True), (on_b.get("running_spec") or {}).get("sha256"))
 
 
+def _fees(view):
+    """The fee rules of a read, by hash, in the order the read gives them."""
+    return {u.get("sha256"): u for u in view.get("fee_rules") or []}
+
+
+def _fee_rows(view):
+    """What every account's read has to give alike: all but `names_this_account`."""
+    return [(u.get("sha256"), u.get("unit"), u.get("sent_by"), u.get("since"))
+            for u in view.get("fee_rules") or []]
+
+
+def scenario_fee_rules(rig, st):
+    say("9. Every fee rule, and who sent it")
+    before = rules(rig, "alice")
+    check("the read lists the fee rules (o8) in force", isinstance(before.get("fee_rules"), list),
+          before.get("fee_rules"))
+    h = landed(rig, rule_tx(rig, "bob", own_fee_rule(rig.pk["bob"])), "bob's fee rule")
+    st["txs"].append(h)
+    effect = next((e for e in outcome(rig, h).get("rule_effects") or []
+                   if e.get("action") == "accumulated"), {})
+    sha = effect.get("sha256")
+    alice, bob = rules(rig, "alice"), rules(rig, "bob")
+    row = _fees(alice).get(sha) or {}
+    check("Alice's read lists Bob's fee rule with Bob as its sender, though it does not name her",
+          bool(sha) and row.get("sent_by") == [rig.pk["bob"]]
+          and row.get("names_this_account") is False
+          and (row.get("since") or {}).get("tx_hash") == h
+          and sha not in _fees(before), {"sha": sha, "row": row})
+    check("it is not among her own application rules, it is among Bob's",
+          sha not in [u.get("sha256") for u in alice.get("application_rules") or []]
+          and sha in [u.get("sha256") for u in bob.get("application_rules") or []],
+          ([u.get("sha256") for u in alice.get("application_rules") or []],
+           [u.get("sha256") for u in bob.get("application_rules") or []]))
+    check("Bob's read gives the same fee rules and marks his as naming him",
+          _fee_rows(bob) == _fee_rows(alice)
+          and (_fees(bob).get(sha) or {}).get("names_this_account") is True,
+          (_fee_rows(bob), _fee_rows(alice)))
+
+    fee_b = rig.transfer("bob", "carol", 7)
+    fee_a = rig.transfer("alice", "carol", 7)
+    hb, ha = landed(rig, fee_b, "bob's transfer"), tx_hash(fee_a)
+    rig.settle(lambda: rig.tx_status(ha).get("status") == "confirmed", "alice's transfer to confirm",
+               tries=3)
+    st["txs"] += [hb, ha]
+    paid_b, paid_a = outcome(rig, hb).get("fee_charged"), outcome(rig, ha).get("fee_charged")
+    check(f"it is the rule in force: Bob pays {FEE_PLUS} on top of the base fee, Alice the base fee",
+          paid_b == BASE_FEE + FEE_PLUS and paid_a == BASE_FEE, {"bob": paid_b, "alice": paid_a})
+
+    then = rig.read(f"getaccountrules {rig.pk['alice']} {before.get('block_number')}") or {}
+    its_block = rig.read(f"getaccountrules {rig.pk['alice']} {alice.get('block_number')}") or {}
+    check("the block before it does not list it, its own block does, with its sender",
+          then.get("complete") is True and _fee_rows(then) == _fee_rows(before)
+          and sha not in _fees(then)
+          and _fee_rows(its_block) == _fee_rows(alice), (_fee_rows(then), _fee_rows(its_block)))
+
+    proc = rig.cli("policy", "show", rig.pk["alice"])
+    check("`policy show` prints the fee rules of every account and who sent each",
+          proc.returncode == 0 and "fee rules (o8) of every account" in proc.stdout
+          and f"sha256 {sha}  sent by {rig.pk['bob'][:12]}..." in proc.stdout,
+          proc.stdout[-700:] + proc.stderr[-300:])
+    rig.mine()
+    rig.follower_agrees([f"getaccountrules {rig.pk['alice']}",
+                         f"getaccountrules {rig.pk['bob']}",
+                         f"getaccountrules {rig.pk['alice']} {alice.get('block_number')}",
+                         f"gettxstatus {h}", f"gettxstatus {hb}"], label="B (fee rules)")
+
+
 def run(root: str) -> int:
     rig = Rig(root)
     st: dict = {"txs": []}
@@ -508,6 +591,7 @@ def run(root: str) -> int:
             scenario_running_spec(rig, st)
             scenario_restart_and_follower(rig, st)
             scenario_earlier_blocks(rig, st)
+            scenario_fee_rules(rig, st)
     except Exception:
         import traceback
         check("the run completed", False, traceback.format_exc()[-1500:])
