@@ -18,7 +18,8 @@ height, so the run takes seconds.
 
 SCENARIOS (balances through an accounting oracle, fees to the miner included)
     1. The grant account installs the same rule as before with two more signed
-       numbers (`--periods-from`, `--due-at`), its o5 lock and its guard. Alice
+       numbers (`--periods-from`, `--due-at`) and `--policy-exempt`, its o5
+       lock and its guard. Alice
        sends 5,000.
     2. Bob spends 500 at the start. Ten blocks after the INSTALL nothing has
        come back; ten blocks after the START the next 500 is paid.
@@ -105,7 +106,8 @@ def scenario_setup(rig, st):
                    "--fee", FEE_LIMIT, "--slot", "open", "--slot", rig.pk["alice"],
                    "--cap-per-execution", str(4 * AMOUNT), "--cap-per-period", str(8 * AMOUNT),
                    "--period-blocks", str(PERIOD), "--ends-in", "400",
-                   "--periods-from", str(st["start"]), "--due-at", str(st["deadline"]))
+                   "--periods-from", str(st["start"]), "--due-at", str(st["deadline"]),
+                   "--policy-exempt")
     check("`payout set --periods-from --due-at` is admitted", proc.returncode == 0,
           proc.stdout[-400:] + proc.stderr[-400:])
     rig.mine(empty=False)

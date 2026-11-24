@@ -203,6 +203,11 @@ class PayoutShort(PayoutRefused):
     whose rule carries `due_retry` is run again later."""
 
 
+class PayoutPolicyBlocked(PayoutRefused):
+    """The account's current o5 clause blocks a payment of the run. Nothing
+    moves, and nothing is owed for it later."""
+
+
 def abi_width(name: str, slot_count: int = MAX_SLOTS, per_sale: bool = False) -> Optional[int]:
     """The width stream `name` must carry in a payout rule, or None if it may not
     be mentioned at all."""
@@ -314,11 +319,13 @@ class PayoutTerms:
     rule_index: Optional[int] = None     # the rule's place on the account, 1..7; left out = 0
     due_retry: Optional[int] = None      # a due point that found the account short is run
                                          # again until this much later on the rule's clock
+    policy_exempt: bool = False          # the account's o5 clause is not asked for its runs
 
     @property
     def options(self) -> Tuple:
         return (self.periods_from, self.due_at, self.due_every, self.due_months,
-                self.on_arrival, self.sealed, self.rule_index, self.due_retry)
+                self.on_arrival, self.sealed, self.rule_index, self.due_retry,
+                self.policy_exempt)
 
     @property
     def key(self) -> str:
@@ -334,7 +341,8 @@ class PayoutTerms:
 
     @property
     def newest_terms(self) -> bool:
-        return self.rule_index is not None or self.due_retry is not None
+        return (self.rule_index is not None or self.due_retry is not None
+                or self.policy_exempt)
 
     @property
     def repeats(self) -> bool:
@@ -429,7 +437,8 @@ class PayoutState:
         """(periods_from, due_at, last_clock, due_done) for an extended rule,
         followed by (due_every, due_months, on_arrival, sealed, due_index) when
         the rule carries one of those, followed by (rule_index, due_retry,
-        retry_at, retry_until) when it carries one of the last two."""
+        retry_at, retry_until) when it carries one of the last two, and (True,)
+        when it is signed with policy_exempt."""
         if not terms.extended:
             return None
         head = (terms.periods_from, terms.due_at, self.last_clock, self.due_done)
@@ -439,7 +448,8 @@ class PayoutState:
                  terms.sealed, self.due_index)
         if not terms.newest_terms:
             return head
-        return head + (terms.rule_index, terms.due_retry, self.retry_at, self.retry_until)
+        head += (terms.rule_index, terms.due_retry, self.retry_at, self.retry_until)
+        return head + (True,) if terms.policy_exempt else head
 
     def spent_at(self, terms: PayoutTerms, clock: int) -> int:
         return self.spent_in_period if self.period_index == self.period_at(terms, clock) else 0
@@ -518,7 +528,7 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
             optional[field] = _u64(fields, field)
     if "rule_index" in optional:
         _check_rule_index(optional["rule_index"])
-    for field in ("on_arrival", "sealed"):
+    for field in ("on_arrival", "sealed", "policy_exempt"):
         if field in fields:
             if fields[field] is not True:
                 raise PayoutShapeError(f"{field} must be true or left out")
@@ -541,7 +551,7 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
 SPEC_FIELDS = ("rule_text", "slots", "cap_per_execution", "cap_per_period",
                "period_blocks", "period_seconds", "expires_at", "per_sale",
                "periods_from", "due_at", "due_every", "due_months", "on_arrival",
-               "sealed", "rule_index", "due_retry")
+               "sealed", "rule_index", "due_retry", "policy_exempt")
 
 
 def parse_payout_rule_set(tx: Dict[str, Any]) -> PayoutTerms:
@@ -1020,6 +1030,49 @@ def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
     return legs
 
 
+def policy_inputs(account: str, recipient: str, amount: int, *, parent_balance: Any,
+                  since_last: Optional[Any], slots_active: bool, timestamp: int) -> Dict[int, str]:
+    """The o5 inputs of one payment of a run: those of a plain transfer of `amount`
+    from the account to `recipient`, same keys, values and order, with no custom
+    input and every approval slot empty (nobody co-signs a run). `since_last` is
+    None while the cooldown stream is off."""
+    values: Dict[int, str] = {1: str(amount), 2: str(parent_balance)}
+    if since_last is not None:
+        values[16] = str(since_last)
+    values[3] = "{ #x" + str(account) + " }:bv[384]"
+    values[4] = "{ #x" + str(recipient) + " }:bv[384]"
+    values[12] = "{ #x" + str(account) + " }:bv[384]"
+    if slots_active:
+        for idx in tau_defs.approval_slot_indices():
+            values[idx] = "0"
+    values[5] = str(timestamp)
+    return values
+
+
+def check_policy(terms: PayoutTerms, legs: List[Tuple[int, str, int]], clause: Optional[str], *,
+                 pool: str, timeout: Any, replay_mode: bool = False, **feed: Any) -> None:
+    """PayoutPolicyBlocked when the account's current o5 clause blocks a payment.
+
+    Every payment of a run is asked like a transfer from the account. Not asked
+    without a clause, nor for a rule signed with `policy_exempt`. A replay
+    without an evaluator moves nothing, as for the rule itself.
+    """
+    if terms.policy_exempt or not clause:
+        return
+    from consensus import sender_policy
+
+    for k, who, amount in legs:
+        values = policy_inputs(terms.account_pubkey, who, amount, **feed)
+        try:
+            blocked, _ = sender_policy.clause_blocks(clause, values, pool=pool, timeout=timeout)
+        except Exception:
+            if not replay_mode:
+                raise
+            raise PayoutRefused("no evaluator during replay") from None
+        if blocked:
+            raise PayoutPolicyBlocked(f"the account's o5 clause blocks the payment of slot {k}")
+
+
 # --- The book --------------------------------------------------------------------
 
 # The 16 fields of encode_payout_entry; then `sales` for a per-sale rule; then
@@ -1042,19 +1095,23 @@ def _restore_more(more: Any, rid: bytes) -> Dict[str, Any]:
                            "due_months": None, "on_arrival": False, "sealed": False,
                            "last_clock": 0, "due_done": False, "due_index": 0,
                            "rule_index": None, "due_retry": None, "retry_at": 0,
-                           "retry_until": 0}
+                           "retry_until": 0, "policy_exempt": False}
     if more is None:
         return out
     try:
         more = tuple(more)
-        if len(more) not in (4, 9, 13):
+        if len(more) not in (4, 9, 13, 14):
             raise ValueError
         out["periods_from"], out["due_at"], out["last_clock"], out["due_done"] = more[:4]
         if len(more) >= 9:
             (out["due_every"], out["due_months"], out["on_arrival"], out["sealed"],
              out["due_index"]) = more[4:9]
-        if len(more) == 13:
-            out["rule_index"], out["due_retry"], out["retry_at"], out["retry_until"] = more[9:]
+        if len(more) >= 13:
+            out["rule_index"], out["due_retry"], out["retry_at"], out["retry_until"] = more[9:13]
+        if len(more) == 14:
+            if more[13] is not True and more[13] != 1:
+                raise ValueError
+            out["policy_exempt"] = True
     except (TypeError, ValueError):
         raise ValueError(f"stored payout rule has malformed optional terms: {rid.hex()}") from None
     for name in ("periods_from", "due_at", "due_every", "due_months", "rule_index",
@@ -1167,7 +1224,8 @@ class PayoutBook:
                                 cap_period, kind, period, expires_at, sales is not None,
                                 kept["periods_from"], kept["due_at"], kept["due_every"],
                                 kept["due_months"], kept["on_arrival"], kept["sealed"],
-                                kept["rule_index"], kept["due_retry"])
+                                kept["rule_index"], kept["due_retry"],
+                                kept["policy_exempt"])
             rid = terms.rule_id
             if rid != bytes(stored_id):
                 raise ValueError(f"stored payout rule id does not match its terms: {rid.hex()}")
@@ -1668,6 +1726,7 @@ def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
         **({"next_due": state.next_due(terms)} if terms.repeats else {}),
         **({"on_arrival": True} if terms.on_arrival else {}),
         **({"sealed": True} if terms.sealed else {}),
+        **({"policy_exempt": True} if terms.policy_exempt else {}),
         **({"rule_index": terms.rule_index} if terms.rule_index is not None else {}),
         **({"due_retry": terms.due_retry} if terms.due_retry is not None else {}),
         **({"retry_at": state.retry_at, "retry_until": state.retry_until}

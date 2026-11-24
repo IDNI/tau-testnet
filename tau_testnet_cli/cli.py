@@ -2464,6 +2464,7 @@ def _payout_fields(args, tip: int, now: int) -> dict:
            if getattr(args, "due_months", None) is not None else {}),
         **({"on_arrival": True} if getattr(args, "on_arrival", False) else {}),
         **({"sealed": True} if getattr(args, "sealed", False) else {}),
+        **({"policy_exempt": True} if getattr(args, "policy_exempt", False) else {}),
         **({"rule_index": int(args.rule_index)}
            if getattr(args, "rule_index", None) is not None else {}),
         **({"due_retry": int(args.due_retry)}
@@ -2684,6 +2685,9 @@ def _add_payout_subparsers(sub) -> None:
     p_set.add_argument("--sealed", action="store_true",
                        help="Until the rule ends the account signs nothing and the rule "
                             "cannot be changed: money leaves by the rule only")
+    p_set.add_argument("--policy-exempt", action="store_true",
+                       help="The account's o5 clause is not asked for this rule's "
+                            "payments (an escrow or a grant whose o5 blocks its key)")
     p_set.add_argument("--rule-index", type=int, metavar="K",
                        help="The rule's place on the account, 1..7 (default: the first); "
                             "a set replaces only the rule in its own place")

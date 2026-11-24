@@ -51,6 +51,7 @@ from .payout import (
     PayoutShort,
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_RULE_SET,
+    check_policy as check_payout_policy,
     execution_inputs as payout_execution_inputs,
     parse_payout_execute,
     parse_payout_rule_revoke_place,
@@ -301,14 +302,41 @@ def _payout_rule_event(rule) -> Dict[str, Any]:
             **({"rule_index": rule.rule_index} if rule.rule_index else {})}
 
 
+def _payout_policy(lm, balances, sequences, last_ts, timestamp, *, timeout, replay_mode,
+                   slots_active):
+    """The o5 check of the runs the node makes in a block: each payment is asked
+    like a transfer the account sends in it. The block passes its parent's
+    balances and cooldown clocks, which a transfer in it reads."""
+    grant = faucet.amount(lm)
+    cooldown = getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False)
+    offers = getattr(lm, "rule_offers", None)
+
+    def check(rule, legs):
+        account = rule.account_pubkey
+        clause = (offers.clause_for(account, tau_defs.USER_POLICY_STREAM_INDEX)
+                  if offers is not None else None)
+        since = None
+        if cooldown:
+            previous = int((last_ts or {}).get(account, 0) or 0)
+            since = (tau_defs.COOLDOWN_NEVER_SENT if previous <= 0 else
+                     max(0, min(int(timestamp) - previous, tau_defs.COOLDOWN_NEVER_SENT)))
+        held = faucet.spendable(balances or {}, sequences or {}, account, grant)
+        check_payout_policy(
+            rule, legs, clause, pool="apply", timeout=timeout, replay_mode=replay_mode,
+            parent_balance=max(0, min(held, tau_defs.MAX_TRANSFER_VALUE)), since_last=since,
+            slots_active=slots_active, timestamp=timestamp)
+    return check
+
+
 def _node_payout_step(lm, balances, sequences, rule, state, exe, height, timestamp, *,
-                      timeout, replay_mode, what):
+                      timeout, replay_mode, what, policy=None):
     """Step a payout rule for a run the node makes by itself: (reason, legs,
     have, short).
 
     `have` is the balance the block has reached for the account, which is what
     the rule reads on i2. Nothing has moved; `reason` says why nothing will,
-    and `short` whether that is because the account holds too little.
+    and `short` whether that is because the account holds too little. `policy`
+    asks the account's current o5 clause about the payments.
     """
     have = faucet.spendable(balances, sequences, rule.account_pubkey, faucet.amount(lm))
     try:
@@ -330,6 +358,8 @@ def _node_payout_step(lm, balances, sequences, rule, state, exe, height, timesta
             raise PayoutRefused("no evaluator during replay")
         legs = settle_payout(rule, state, exe, outputs, height=int(height),
                              ts=int(timestamp), balance=have)
+        if policy is not None:
+            policy(rule, legs)
     except PayoutRefused as exc:
         return str(exc), [], have, isinstance(exc, PayoutShort)
     return "", legs, have, False
@@ -353,7 +383,7 @@ def _node_payout_pay(lm, book, balances, sequences, last_ts, rule, legs, have, h
 
 
 def _run_arrival_payouts(lm, balances, sequences, last_ts, height, timestamp, *, timeout=None,
-                         replay_mode=False) -> List[Dict[str, Any]]:
+                         replay_mode=False, policy=None) -> List[Dict[str, Any]]:
     """Run every rule that pays on arrival for the sales waiting on it; their events.
 
     A sale is a signed payment the chain recorded for the account. The node
@@ -366,12 +396,15 @@ def _run_arrival_payouts(lm, balances, sequences, last_ts, height, timestamp, *,
     book = _payout_book(lm)
     if book is None or not book.has_arrivals():
         return []
+    policy = policy or _payout_policy(
+        lm, balances, sequences, last_ts, timestamp, timeout=timeout,
+        replay_mode=replay_mode, slots_active=getattr(lm, "approval_slots_active", False) is True)
     events: List[Dict[str, Any]] = []
     for key, sale_id in book.arrivals():
         rule, state, exe = book.arrival_execution(key, sale_id)
         reason, legs, have, _short = _node_payout_step(
             lm, balances, sequences, rule, state, exe, height, timestamp,
-            timeout=timeout, replay_mode=replay_mode, what="arrival")
+            timeout=timeout, replay_mode=replay_mode, what="arrival", policy=policy)
         _, payer, amount, _ = state.sale(sale_id)
         event = dict(_payout_rule_event(rule), sale_id=sale_id.hex(), sale_amount=amount,
                      payer_pubkey=payer)
@@ -386,7 +419,7 @@ def _run_arrival_payouts(lm, balances, sequences, last_ts, height, timestamp, *,
 
 
 def _run_due_payouts(lm, balances, sequences, last_ts, height, timestamp, *, timeout=None,
-                     replay_mode=False) -> List[Dict[str, Any]]:
+                     replay_mode=False, policy=None) -> List[Dict[str, Any]]:
     """Run every payout rule whose due point this block reached; their events.
 
     Runs after the transaction loop, the retractable release and the runs on
@@ -403,12 +436,15 @@ def _run_due_payouts(lm, balances, sequences, last_ts, height, timestamp, *, tim
     book = _payout_book(lm)
     if book is None or not book.has_due(int(height), int(timestamp)):
         return []
+    policy = policy or _payout_policy(
+        lm, balances, sequences, last_ts, timestamp, timeout=timeout,
+        replay_mode=replay_mode, slots_active=getattr(lm, "approval_slots_active", False) is True)
     events: List[Dict[str, Any]] = []
     for key in book.due(int(height), int(timestamp)):
         rule, state, exe = book.due_execution(key)
         reason, legs, have, short = _node_payout_step(
             lm, balances, sequences, rule, state, exe, height, timestamp,
-            timeout=timeout, replay_mode=replay_mode, what="due")
+            timeout=timeout, replay_mode=replay_mode, what="due", policy=policy)
         event = dict(_payout_rule_event(rule), due_at=state.next_due(rule))
         if rule.repeats:
             event["due_index"] = state.due_index
@@ -423,7 +459,7 @@ def _run_due_payouts(lm, balances, sequences, last_ts, height, timestamp, *, tim
 
 
 def _run_retry_payouts(lm, balances, sequences, last_ts, height, timestamp, *, timeout=None,
-                       replay_mode=False) -> List[Dict[str, Any]]:
+                       replay_mode=False, policy=None) -> List[Dict[str, Any]]:
     """Run again the due points that found their account short; their events.
 
     Only for a rule that carries `due_retry`. Runs after the due points of the
@@ -440,6 +476,9 @@ def _run_retry_payouts(lm, balances, sequences, last_ts, height, timestamp, *, t
     book = _payout_book(lm)
     if book is None or not book.has_retry(int(height), int(timestamp)):
         return []
+    policy = policy or _payout_policy(
+        lm, balances, sequences, last_ts, timestamp, timeout=timeout,
+        replay_mode=replay_mode, slots_active=getattr(lm, "approval_slots_active", False) is True)
     events: List[Dict[str, Any]] = []
     run, ended = book.retries(int(height), int(timestamp))
     for key in ended:
@@ -450,7 +489,7 @@ def _run_retry_payouts(lm, balances, sequences, last_ts, height, timestamp, *, t
         rule, state, exe = book.retry_execution(key)
         reason, legs, have, short = _node_payout_step(
             lm, balances, sequences, rule, state, exe, height, timestamp,
-            timeout=timeout, replay_mode=replay_mode, what="retry")
+            timeout=timeout, replay_mode=replay_mode, what="retry", policy=policy)
         event = dict(_payout_rule_event(rule), retry=True)
         retry_at = book.retry_ran(key, rule.clock(int(height), int(timestamp)), short=short)
         if reason:
@@ -1188,20 +1227,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
         _block_session = session if session is not None else getattr(proposal, "session", None)
+        # The runs ask the account's o5 clause as a transfer in this block would
+        # be asked: parent balances and cooldown clocks, the parent's slot flag.
+        payout_policy = _payout_policy(
+            lm, metadata.get('balances'), metadata.get('sequence_numbers'),
+            metadata.get('last_transfer_ts'), block.header.timestamp,
+            timeout=getattr(_block_session, "request_budget", None), replay_mode=replay_mode,
+            slots_active=getattr(parent_lm, "approval_slots_active", False) is True)
         payout_arrivals = _run_arrival_payouts(
             lm, t_bals, t_seqs, t_lts, block.header.block_number, block.header.timestamp,
             timeout=getattr(_block_session, "request_budget", None),
-            replay_mode=replay_mode,
+            replay_mode=replay_mode, policy=payout_policy,
         )
         payout_due = _run_due_payouts(
             lm, t_bals, t_seqs, t_lts, block.header.block_number, block.header.timestamp,
             timeout=getattr(_block_session, "request_budget", None),
-            replay_mode=replay_mode,
+            replay_mode=replay_mode, policy=payout_policy,
         )
         payout_due += _run_retry_payouts(
             lm, t_bals, t_seqs, t_lts, block.header.block_number, block.header.timestamp,
             timeout=getattr(_block_session, "request_budget", None),
-            replay_mode=replay_mode,
+            replay_mode=replay_mode, policy=payout_policy,
         )
         payout_expired = _expire_payout_rules(
             lm, block.header.block_number, block.header.timestamp
@@ -3065,6 +3111,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     rule, state, exe, outputs, height=height_now, ts=ts_now,
                                     balance=_read_bal(exe.account_pubkey),
                                 )
+                                # Each payment is asked like a transfer the
+                                # account sends in this block.
+                                check_payout_policy(
+                                    rule, legs, lifecycle_mgr.rule_offers.clause_for(
+                                        exe.account_pubkey, tau_defs.USER_POLICY_STREAM_INDEX),
+                                    pool="apply", timeout=budget, replay_mode=replay_mode,
+                                    parent_balance=_parent_bal(exe.account_pubkey),
+                                    since_last=(_since_last_transfer(exe.account_pubkey)
+                                                if cooldown_active else None),
+                                    slots_active=approval_slots_on, timestamp=block_timestamp)
                             except PayoutRefused as exc:
                                 reason = str(exc)
                         if reason:

@@ -26,7 +26,10 @@ SCENARIOS (balances through an accounting oracle, fees to the miner included)
        in a block with no transaction. The blocks after it pay nothing.
     2. The shop installs the route. Carol pays 101: the creator has 20, the
        shop 81, Carol paid 101 and her one fee. 4 is too small to share. Two
-       payments in one block are each split on their own.
+       payments in one block are each split on their own. Then the shop
+       installs an o5 clause that blocks its transfers: the next payment
+       arrives whole and no share leaves. It lifts the clause and the payment
+       after that is shared again.
     3. The creator shares what it is paid with Alice the same way. A share that
        came from the shop's rule stays whole; a payment someone signs to the
        creator is shared.
@@ -69,6 +72,11 @@ RENT_RULE = (f"always ( {NOBODY} ? (o30[t]:bv[24] = {c(RENT)}) "
              f": (o30[t]:bv[24] = {c(0)}) ).")
 ROUTE_RULE = f"always ( o30[t]:bv[24] = i27[t]:bv[24] / {c(5)} )."
 HALF_RULE = f"always ( o30[t]:bv[24] = i27[t]:bv[24] / {c(2)} )."
+# An o5 clause that blocks every transfer its account sends, and the neutral
+# clause that removes an account's clause.
+BLOCK_ALL = ("always ( i1[t]:bv[24] > { #x000000 }:bv[24] -> "
+             "( o5[t]:bv[24] = { #x000000 }:bv[24] ) ).")
+NEUTRAL = "always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
 
 
 def vault_rule(bob):
@@ -108,6 +116,12 @@ def execute(rig, who, account, ask=0):
         **rig.common(who), account_pubkey=rig.pk[account],
         rule_id=rule(rig, account).get("rule_id"), recipients={},
         data={0: ask} if ask else {}, fee_limit=FEE_LIMIT)
+    return rig.submit(who, payload)
+
+
+def set_clause(rig, who, text):
+    payload = rig.common(who)
+    payload.update({"tx_type": "user_tx", "fee_limit": FEE_LIMIT, "operations": {"0": text}})
     return rig.submit(who, payload)
 
 
@@ -199,6 +213,29 @@ def scenario_route(rig, st):
     rig.mine(empty=False)
     orc.move("shop", "creator", 11 + 2)
     orc.verify("two payments in one block, each split on its own (11 and 2)")
+
+    # The shop's own o5 clause judges the share the node routes, in the block.
+    res = set_clause(rig, "shop", BLOCK_ALL)
+    check("the shop's o5 clause that blocks its transfers is admitted",
+          res.get("status") == "ok", res)
+    rig.mine(empty=False)
+    orc.fee("shop")
+    pay(rig, orc, "carol", "shop", 50, "Carol pays 50 while the clause is in force")
+    rig.mine(empty=False)
+    orc.verify("the clause blocks the routed share (all 50 stay with the shop)")
+    event = newest(rig, "shop")
+    check("the history names the clause and the sale is closed",
+          event.get("outcome") == "arrival_not_paid"
+          and "o5 clause blocks the payment" in (event.get("reason") or "")
+          and not (rule(rig, "shop").get("open_sales") or []), event)
+    res = set_clause(rig, "shop", NEUTRAL)
+    check("the shop lifts its clause", res.get("status") == "ok", res)
+    rig.mine(empty=False)
+    orc.fee("shop")
+    pay(rig, orc, "carol", "shop", 50, "Carol pays 50 again")
+    rig.mine(empty=False)
+    orc.move("shop", "creator", 10)
+    orc.verify("without the clause the share is routed again (10 of 50)")
 
 
 def scenario_no_second_hop(rig, st):

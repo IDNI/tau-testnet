@@ -82,6 +82,11 @@ def semantics() -> dict:
             "runs_per_block": payout.MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK,
             "fee": "none: the payer pays the fee of its own payment and nothing more",
         },
+        "policy_exempt": {
+            "term": "policy_exempt: true",
+            "meaning": "the account's o5 clause is not asked for this rule's payments: "
+                       "an escrow or a grant whose o5 blocks its key pays by the rule",
+        },
         "sealed": {
             "term": "sealed: true",
             "meaning": "while the rule is installed the node takes no transaction "
@@ -93,8 +98,9 @@ def semantics() -> dict:
         "execution": "anyone may execute; the rule is stepped once, all slots are "
                      "paid or none; 1 <= total <= cap_per_execution, the period "
                      "cap and the account's balance",
-        "o5": "not consulted; the payout rule is the account's own second "
-              "authorization for its money",
+        "o5": "every payment of a run is asked of the account's current o5 clause "
+              "like a transfer the account sends; one blocked payment refuses the "
+              "run; not asked for a rule signed with policy_exempt",
         "rule_change_guard": "install, replace and revoke are rule changes "
                              "(kinds 6 and 7): a guarded account uses a "
                              "rule_change_request",

@@ -12,12 +12,15 @@ at most so much per period; an allowance anyone can trigger for a named
 recipient, at most once a week; a royalty of 5% on every sale, paid once per
 sale ([Per sale](#per-sale-royalties)).
 
-The rule is a second, separate authorization for the account's money, chosen by
-the account. The `o5` policy governs transfers the account signs; the payout
-rule governs executions. To lock money to the payout rule (escrow), combine
-three things: the payout rule, an `o5` clause that blocks signed transfers, and
-a rule-change guard that needs co-signers for any change (see
-[Escrow](#escrow)).
+The rule is a second authorization for the account's money, chosen by the
+account. It does not replace the account's `o5` policy: every payment a rule
+makes is asked of the account's current `o5` clause, like a transfer the account
+sends, so a freeze or a stricter clause the account installs later stops the
+rule's payments too ([Policy at execution time](#policy-at-execution-time)). A
+rule signed with `policy_exempt` is the one exception. To lock money to the
+payout rule (escrow), combine three things: a payout rule signed with
+`policy_exempt`, an `o5` clause that blocks signed transfers, and a rule-change
+guard that needs co-signers for any change (see [Escrow](#escrow)).
 
 Short reference: [README](../README.md#payout-rules). CLI summary:
 [developer_cli.md](developer_cli.md#payout-rules). This guide is the long form.
@@ -62,6 +65,7 @@ tau-testnet payout set --key treasury --file payout.tau \
 | `sealed` | Optional, `true` or left out. Until the rule ends the account signs nothing and the rule cannot be changed. |
 | `rule_index` | Optional, 1 to 7 or left out. The rule's place on the account; left out, the first ([Several rules per account](#several-rules-per-account)). |
 | `due_retry` | Optional, a number or left out, with `due_at`. A due point that found the account short is run again until this much later ([A due point tried again](#a-due-point-tried-again)). |
+| `policy_exempt` | Optional, `true` or left out. The account's `o5` clause is not asked for this rule's payments ([Policy at execution time](#policy-at-execution-time)). |
 
 Admission and apply refuse a rule that pays the account itself in a fixed slot,
 names one fixed recipient in two slots, or does not fit the ABI. The rule is
@@ -259,9 +263,46 @@ period than the account signed, whatever the sale.
 
 ### Policy at execution time
 
-The account's `o5` clause is **not** consulted: the payout rule is the account's
-own authorization for these payments. The rule-change guard is not consulted for
-executions either; it governs installing and revoking (below).
+Every payment of a run is asked of the account's **current** `o5` clause, the
+one registered when the run happens, not the one the account had when it
+installed the rule. This holds for every way a rule is started: an execution
+someone sends, a due point, a retry and a run on arrival.
+
+- **Asked like a transfer.** Each payment is one question with the inputs a
+  transfer of that amount from the account to that recipient gets: `i1` the
+  amount, `i2` the account's balance in the parent block, `i16` the seconds
+  since the account last sent (while that stream is active), `i3` and `i12` the
+  account, `i4` the real recipient, the approval slots `i18`..`i25` empty
+  (nobody co-signs a run), `i5` the block time. A run carries no custom
+  inputs: a clause that reads one reads 0 for it, as it does for a transfer
+  sent without that input.
+- **One answer for the run.** A run with several slots asks once per payment,
+  as a transaction with several transfers does. One blocked payment refuses the
+  whole run: all slots are paid or none.
+- **A refused run moves nothing.** An execution is refused at admission
+  (`PAYOUT_REFUSED`) and is not included in a block, so nobody pays a fee for
+  it. A due point is recorded as `due_not_paid` and a run on arrival as
+  `arrival_not_paid`, each with the reason `the account's o5 clause blocks the
+  payment of slot k`. A due point the clause blocked is not tried again, also
+  with `due_retry`: a retry is owed only to an account that was short.
+- **Once.** The clause is asked once per payment, after the rule and the caps
+  have passed. A paid run counts once for the account's cooldown clock, like one
+  transfer.
+- **The exception is signed.** A rule installed with `policy_exempt: true`
+  (`payout set --policy-exempt`) is not asked: its payments are judged by the
+  rule and its caps alone, whatever the clause says now or later. The term is
+  part of the signed terms and of the rule id, `getpayoutrule` shows it, and it
+  cannot be added to an installed rule: that takes a new rule, which a
+  rule-change guard judges. Use it where the clause blocks the key on purpose
+  and the rule is the only way out, as in an [escrow](#escrow).
+
+A clause that only limits transfers (an amount cap, an allow-list, a cooldown,
+a balance floor) therefore limits the rule's payments the same way, and a
+clause that needs a co-signer above an amount blocks a payment above it, since
+a run carries no co-signature.
+
+The rule-change guard is not consulted for executions; it governs installing
+and revoking (below).
 
 ## Revoking
 
@@ -306,7 +347,8 @@ A payout rule plus a blocking `o5` plus a guard is an escrow without a third
 party holding the money:
 
 1. The escrow account installs a payout rule that pays the seller only when a
-   named arbiter executes it (the reviewer example above).
+   named arbiter executes it (the reviewer example above). The rule is signed
+   with `policy_exempt`, so the clause of step 2 does not stop its payments.
 2. It installs an `o5` clause that blocks every signed transfer.
 3. It installs a guard that needs the buyer's and the seller's co-signature for
    any rule change.
@@ -357,9 +399,9 @@ week. Reading it top to bottom:
   account's whole balance (`i2`) goes to Alice. Bob's own late execution does
   the same.
 
-The account is set up like an escrow: the rule, an `o5` clause that blocks every
-transfer the account could sign, and a guard that needs Alice's and Bob's
-co-signature for any rule change. `cap_per_execution` and `cap_per_period` only
+The account is set up like an escrow: the rule (signed with `policy_exempt`),
+an `o5` clause that blocks every transfer the account could sign, and a guard
+that needs Alice's and Bob's co-signature for any rule change. `cap_per_execution` and `cap_per_period` only
 have to be large enough for the return; the rule holds Bob to his cap.
 
 What follows from the form:
@@ -656,7 +698,11 @@ tau-testnet payout set --key grant --file conditions.tau \
 ```
 
 Use an account made for the purpose: a sealed account cannot do anything else
-with its key, votes and approvals included.
+with its key, votes and approvals included. It cannot change its `o5` clause
+either, and the clause is asked for the rule's payments like for any rule
+([Policy at execution time](#policy-at-execution-time)). So seal an account
+that has no clause, or sign the rule with `policy_exempt`; whoever sends money
+to a sealed account checks that too.
 
 ## Several rules per account
 
@@ -807,6 +853,14 @@ execution signed for another network is refused here.
   the second part of its entry. Retries run after the due points, in the order
   (retry point, key), at most 4 a block. A rule without these terms hashes
   exactly as before.
+- A rule signed with `policy_exempt` marks the second part of its entry and adds
+  one byte to its id. A rule without the term has the id and the entry it always
+  had.
+- The `o5` check of a run reads what a transfer in the same block reads: the
+  clause registered when the run happens, the parent block's balance and
+  cooldown clock, and the parent's approval-slot flag. Admission asks with the
+  tip's balance and without `i16`, as it does for a transfer. Replay without a
+  policy evaluator cannot ask the clause: such a run moves nothing.
 - The seal is checked in the block against the book as the block has built it,
   so a transaction of the account later in the block that installed the sealed
   rule is refused too.
@@ -859,9 +913,13 @@ replay could not run the rule; nothing moves, and the state hash says so.
   the caps bound the damage of a rule that decides badly.
 - Anyone can send executions. A rule that pays on any input pays whoever asks
   first, up to the caps.
-- A payout rule bypasses the account's `o5` clause by design. An account that
-  relies on `o5` limits should not install one, or should use the guard so that
-  a stolen key cannot install one.
+- A payout rule does not get around the account's `o5` clause: each payment is
+  asked of the clause in force when it is made. Only a rule signed with
+  `policy_exempt` is not asked. Whoever relies on `o5` limits checks
+  `policy_exempt` in `getpayoutrule`, and uses the guard so that a stolen key
+  cannot install an exempt rule: installing one is a rule change (kind 6).
+- The clause is asked with the inputs of a plain transfer. A clause that reads a
+  custom input reads 0 for it in a run, as for a transfer sent without it.
 - Executions are bounded per block (16), and refused ones cost the executor
   nothing but are not included either, so they cannot fill blocks.
 - Runs the node makes are bounded per block too (16 at due points, 16 on

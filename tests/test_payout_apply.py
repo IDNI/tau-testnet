@@ -10,7 +10,8 @@ cooldown stamps against an oracle that knows only the documented rules:
     every slot it writes or nothing;
   * 1 <= total <= cap per execution, period total <= cap per period, total <=
     the account's balance; an open slot pays only a recipient the executor named;
-  * the o5 clause is not consulted; the rule-change guard is (kinds 6 and 7).
+  * each payment is asked of the account's o5 clause like a transfer (in full
+    in tests/test_payout_policy.py); the rule-change guard judges kinds 6 and 7.
 
 `apply_block` itself raises on any supply drift, so every block is also a
 conservation check.
@@ -235,10 +236,22 @@ def test_the_rule_sees_the_payout_abi(evs):
     assert second[1]["i26"] == "40" and second[1]["i2"] == "960"
 
 
-def test_o5_is_not_consulted_for_a_payout(evs):
-    ch, oracle, tx = _installed()
+def test_an_o5_clause_that_blocks_every_transfer_blocks_the_payout_too(evs):
+    ch, oracle, tx = _installed(fee=7)
     ch.lm.rule_offers.accepted_clauses[(ALICE, 5)] = CLAUSE
     evs["apply"].set_verdict(CLAUSE, lambda inputs: 0)    # blocks every transfer
+    blocked = exec_tx(rule_id=rid(tx), data={"0": 30})
+    result = ch.block([blocked], height=HEIGHT + 1, ts=TS + 1)
+    assert _reason(result, blocked) == "payout_not_executed"
+    assert "the account's o5 clause blocks the payment of slot 0" in _logs(result)
+    oracle.check(ch)                                      # nothing moved, nobody paid a fee
+    assert [body for body, _ in evs["apply"].verdict_calls] == [CLAUSE]
+
+
+def test_a_rule_signed_with_policy_exempt_is_not_asked(evs):
+    ch, oracle, tx = _installed(policy_exempt=True)
+    ch.lm.rule_offers.accepted_clauses[(ALICE, 5)] = CLAUSE
+    evs["apply"].set_verdict(CLAUSE, lambda inputs: 0)
     ch.block([exec_tx(rule_id=rid(tx), data={"0": 30})], height=HEIGHT + 1, ts=TS + 1)
     _executed(oracle, legs=[(BOB, 30)], ts=TS + 1)
     oracle.check(ch)

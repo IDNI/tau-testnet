@@ -60,6 +60,7 @@ from consensus.payout import (
     PayoutRefused,
     PayoutShapeError,
     PayoutState,
+    check_policy as check_payout_policy,
     execution_inputs as payout_execution_inputs,
     parse_payout_execute,
     parse_payout_rule_revoke_place,
@@ -1800,6 +1801,7 @@ def validate_payout_rule_set_payload(
         **({"due_months": terms.due_months} if terms.due_months is not None else {}),
         **({"on_arrival": True} if terms.on_arrival else {}),
         **({"sealed": True} if terms.sealed else {}),
+        **({"policy_exempt": True} if terms.policy_exempt else {}),
         **({"rule_index": terms.rule_index} if terms.rule_index is not None else {}),
         **({"due_retry": terms.due_retry} if terms.due_retry is not None else {}),
     })
@@ -1860,6 +1862,13 @@ def validate_payout_execute_payload(
             lambda budget: sender_policy.payout_outputs(
                 rule.body, values, pool=PAYOUT_POOL_ADMISSION, timeout=budget))
         legs = settle_payout(rule, state, exe, outputs, height=height, ts=ts, balance=balance)
+        # Each payment is asked like a transfer the account sends now, with the
+        # inputs a transfer gets at admission (commands/sendtx.py).
+        clause = tip_view.clause_for(exe.account_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
+        _payout_evaluator_call(lambda budget: check_payout_policy(
+            rule, legs, clause, pool="admission", timeout=budget,
+            parent_balance=max(0, min(balance, tau_defs.MAX_TRANSFER_VALUE)), since_last=None,
+            slots_active=approval_slots_active(tip_view), timestamp=ts))
     except PayoutRefused as exc:
         return format_error(f"payout_execute refused: {exc}", code="PAYOUT_REFUSED")
     return success({

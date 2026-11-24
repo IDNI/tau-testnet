@@ -809,6 +809,7 @@ def build_payout_rule_set_tx(
     on_arrival: bool = False,
     sealed: bool = False,
     rule_index: int | None = None,
+    policy_exempt: bool = False,
     due_retry: int | None = None,
 ) -> dict:
     """Construct a ``tx_type='payout_rule_set'`` payload (without signature).
@@ -828,6 +829,7 @@ def build_payout_rule_set_tx(
     ``rule_index`` (1..7): the rule's place on the account; left out, the
     first. ``due_retry`` (with ``due_at``, on the period's clock): a due point
     that found the account short is run again until this much later.
+    ``policy_exempt``: the account's o5 clause is not asked for the rule's payments.
 
     ``slots`` lists one entry per slot: a recipient's 96-hex key, or "" for an
     open slot the executor names. ``expires_at`` is on the period's clock: a
@@ -874,6 +876,8 @@ def build_payout_rule_set_tx(
         tx["on_arrival"] = True
     if sealed:
         tx["sealed"] = True
+    if policy_exempt:
+        tx["policy_exempt"] = True
     if rule_index is not None:
         tx["rule_index"] = int(rule_index)
     if due_retry is not None:

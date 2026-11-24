@@ -17,8 +17,11 @@ included, and on the rule's history every node records)
        Over the per-execution cap: refused. Up to the period cap: paid; one
        more: refused; in the next period: paid again.
     4. Node A restarts: the rule and its period count survive.
-    5. A signed transfer is blocked by the treasury's own o5 clause, yet the
-       payout rule still pays: it is the account's second authorization.
+    5. The treasury's own o5 clause judges the rule's payments like its
+       transfers. It installs a clause that blocks everything: a signed
+       transfer is refused and so is the reviewer's execution, for no fee. It
+       replaces the clause with a limit of 150 a payment: 151 is refused and
+       100 is paid.
     6. The treasury replaces its rule (a fixed and an open slot, both the asked
        amount): an execution pinned to the old rule id is refused; a stranger
        names Dave for the open slot and both slots are paid together.
@@ -53,6 +56,9 @@ PASSTHROUGH = "always ( o30[t]:bv[24] = i40[t]:bv[24] )."
 TWO_SLOTS = "always ( (o30[t]:bv[24] = i40[t]:bv[24]) && (o31[t]:bv[24] = i40[t]:bv[24]) )."
 BLOCK_ALL = ("always ( i1[t]:bv[24] > { #x000000 }:bv[24] -> "
              "( o5[t]:bv[24] = { #x000000 }:bv[24] ) ).")
+LIMIT_150 = ("always ( (i1[t]:bv[24] > { #x000096 }:bv[24]) ? "
+             "(o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).")
+BLOCKED = "o5 clause blocks the payment"
 
 
 ROYALTY = "always ( o30[t]:bv[24] = i27[t]:bv[24] / { 20 }:bv[24] )."
@@ -170,24 +176,43 @@ def scenario_restart_and_next_period(rig, st):
     orc.verify("the next period")
 
 
-def scenario_o5_does_not_apply(rig, st):
-    say("5. The treasury's own o5 blocks its signed transfers; the payout rule still pays")
+def set_clause(rig, who, text):
+    payload = rig.common(who)
+    payload.update({"tx_type": "user_tx", "fee_limit": FEE_LIMIT, "operations": {"0": text}})
+    return rig.submit(who, payload)
+
+
+def scenario_o5_applies(rig, st):
+    say("5. The treasury's own o5 clause judges the rule's payments like its transfers")
     orc = Oracle(rig, "5", ("treasury", "reviewer", "bob", "carol"))
-    payload = rig.common("treasury")
-    payload.update({"tx_type": "user_tx", "fee_limit": FEE_LIMIT, "operations": {"0": BLOCK_ALL}})
-    res = rig.submit("treasury", payload)
+    res = set_clause(rig, "treasury", BLOCK_ALL)
     check("the blocking o5 clause is admitted", res.get("status") == "ok", res)
     rig.mine(empty=False)
     orc.fee("treasury")
     res = rig.transfer("treasury", "carol", 50)
     check("a signed transfer from the treasury is refused by its o5", refused(res), res)
     proc = execute(rig, "reviewer", "--data", "0=100")
-    check("the reviewer's execution is admitted", proc.returncode == 0,
+    out = proc.stdout[-400:] + proc.stderr[-400:]
+    check("the reviewer's execution is refused too: the clause blocks the payment",
+          proc.returncode != 0 and BLOCKED in out, out)
+    rig.mine()
+    orc.verify("a freeze installed after the rule stops the rule (nothing moved, no fee)")
+
+    res = set_clause(rig, "treasury", LIMIT_150)
+    check("the treasury replaces the clause with a limit of 150 a payment",
+          res.get("status") == "ok", res)
+    rig.mine(empty=False)
+    orc.fee("treasury")
+    proc = execute(rig, "reviewer", "--data", "0=151")
+    out = proc.stdout[-400:] + proc.stderr[-400:]
+    check("151 is over the clause's limit: refused", proc.returncode != 0 and BLOCKED in out, out)
+    proc = execute(rig, "reviewer", "--data", "0=100")
+    check("100 is inside it: admitted", proc.returncode == 0,
           proc.stdout[-300:] + proc.stderr[-300:])
     rig.mine(empty=False)
     orc.fee("reviewer")
     orc.move("treasury", "bob", 100)
-    orc.verify("o5 blocks transfers, the payout rule pays")
+    orc.verify("the clause in force judges each payment (151 refused, 100 paid)")
 
 
 def scenario_replace(rig, st):
@@ -301,7 +326,7 @@ def run(root: str) -> int:
             scenario_install(rig, st)
             scenario_executions(rig, st)
             scenario_restart_and_next_period(rig, st)
-            scenario_o5_does_not_apply(rig, st)
+            scenario_o5_applies(rig, st)
             scenario_replace(rig, st)
             scenario_expire_and_revoke(rig, st)
             scenario_per_sale(rig, st)

@@ -559,7 +559,9 @@ def test_getpayoutrule_shows_the_rule_and_its_history(temp_database, container, 
     assert rule["slots"] == [{"slot": 0, "recipient_pubkey": B, "open": False}]
     assert (rule["spent_this_period"], rule["left_this_period"]) == (30, 270)
     assert data["semantics"]["limits"]["executions_per_block"] == 16
-    assert data["semantics"]["o5"].startswith("not consulted")
+    assert data["semantics"]["o5"].startswith("every payment of a run is asked")
+    assert data["semantics"]["policy_exempt"]["term"] == "policy_exempt: true"
+    assert "policy_exempt" not in rule
 
     events = [{"account_pubkey": A, "rule_id": terms.rule_id.hex(), "outcome": "installed",
                "tx_id": "t1"},

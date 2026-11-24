@@ -14,9 +14,10 @@ RPC port and the CLI; node B receives A's blocks only. Periods are 10 blocks so
 the run takes seconds; the clock the rule reads is the block height (i6).
 
 SCENARIOS (balances through an accounting oracle, fees to the miner included)
-    1. The grant account installs the rule, an o5 clause that blocks every
-       transfer it could sign, and a guard that needs Alice's and Bob's
-       co-signature for any rule change. Alice sends it 5,000.
+    1. The grant account installs the rule (signed with `policy_exempt`, so
+       the clause that follows does not stop its payments), an o5 clause that
+       blocks every transfer it could sign, and a guard that needs Alice's and
+       Bob's co-signature for any rule change. Alice sends it 5,000.
     2. Before the start Bob's spend is refused.
     3. From the start: Bob spends 300 to a shop, then 201 is refused, 200 is
        paid, 1 more is refused. A stranger's and Alice's executions pay nothing.
@@ -121,13 +122,15 @@ def scenario_setup(rig, st):
     proc = rig.cli("payout", "set", "--privkey", rig.privkey("grant"), "--body", body,
                    "--fee", FEE_LIMIT, "--slot", "open", "--slot", rig.pk["alice"],
                    "--cap-per-execution", str(4 * AMOUNT), "--cap-per-period", str(8 * AMOUNT),
-                   "--period-blocks", str(PERIOD), "--ends-in", "400")
-    check("`payout set` with the conditions is admitted", proc.returncode == 0,
+                   "--period-blocks", str(PERIOD), "--ends-in", "400", "--policy-exempt")
+    check("`payout set --policy-exempt` with the conditions is admitted", proc.returncode == 0,
           proc.stdout[-400:] + proc.stderr[-400:])
     rig.mine(empty=False)
     check("the rule is installed in the next block, so its periods start there",
           payout(rig).get("installed") and rig.a.height() == tip + 1,
           (rig.a.height(), tip, payout(rig)))
+    check("the rule shows that the account's o5 clause is not asked for it",
+          rule(rig).get("policy_exempt") is True, rule(rig))
     orc.fee("grant")
 
     payload = rig.common("grant")

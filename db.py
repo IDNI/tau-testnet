@@ -2796,11 +2796,14 @@ def _write_payout_rows(state: Dict) -> None:
             if len(row[17]) > 9:
                 # A rule in another place than the first, or one that retries
                 # an unpaid due point. Its `account` is the rule's key.
-                rule_index, due_retry, retry_at, retry_until = row[17][9:]
+                rule_index, due_retry, retry_at, retry_until = row[17][9:13]
                 more[account].update({
                     'rule_index': None if rule_index is None else int(rule_index),
                     'due_retry': None if due_retry is None else int(due_retry),
                     'retry_at': int(retry_at), 'retry_until': int(retry_until)})
+            if len(row[17]) > 13:
+                # Signed with policy_exempt; a rule without it stores no key.
+                more[account]['policy_exempt'] = True
         _db_conn.execute(
             f'INSERT INTO payout_rules_v1 ({_PAYOUT_COLUMNS}) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -2865,6 +2868,8 @@ def load_payout_state() -> tuple[List[tuple], int, bytes]:
             if 'retry_until' in entry:
                 head += (entry['rule_index'], entry['due_retry'], entry['retry_at'],
                          entry['retry_until'])
+            if 'policy_exempt' in entry:
+                head += (entry['policy_exempt'],)
             row += (kept, head)
         elif kept is not None:
             row += (kept,)

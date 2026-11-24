@@ -151,10 +151,11 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # The optional terms, signed when present: where the periods count from,
         # the points at which the node runs the rule itself, whether it runs it
         # for each payment that arrives, whether the account is sealed, the
-        # rule's place on the account and how long an unpaid due point is
-        # tried again.
+        # rule's place on the account, how long an unpaid due point is tried
+        # again, and whether its payments skip the account's o5 clause.
         for field in ("periods_from", "due_at", "due_every", "due_months",
-                      "on_arrival", "sealed", "rule_index", "due_retry"):
+                      "on_arrival", "sealed", "rule_index", "due_retry",
+                      "policy_exempt"):
             if field in payload:
                 signing_dict[field] = payload.get(field)
     elif tx_type == TX_TYPE_PAYOUT_EXECUTE:

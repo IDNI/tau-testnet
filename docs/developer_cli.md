@@ -611,7 +611,7 @@ Raw transactions (root fields only; a nested `payload` is ignored):
 
 | `tx_type` | Signed fields beyond the envelope |
 |---|---|
-| `payout_rule_set` | `genesis_hash`, `rule_text`, `slots`, `cap_per_execution`, `cap_per_period`, exactly one of `period_blocks` / `period_seconds`, `expires_at`; each optional term when present (`per_sale`, `periods_from`, `due_at`, `due_every`, `due_months`, `on_arrival`, `sealed`, `rule_index`, `due_retry`) |
+| `payout_rule_set` | `genesis_hash`, `rule_text`, `slots`, `cap_per_execution`, `cap_per_period`, exactly one of `period_blocks` / `period_seconds`, `expires_at`; each optional term when present (`per_sale`, `periods_from`, `due_at`, `due_every`, `due_months`, `on_arrival`, `sealed`, `rule_index`, `due_retry`, `policy_exempt`) |
 | `payout_execute` | `genesis_hash`, `account_pubkey`, `rule_id`, `recipients` (slot -> key), `data` (k -> value), `sale_id` when present |
 | `payout_rule_revoke` | `genesis_hash`, `rule_index` when present (feeless) |
 
