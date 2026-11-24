@@ -13,7 +13,11 @@ the two come from different records:
 * The shared spec is the one in force at the requested block, resolved
   exactly as `getactiverules` resolves it (the stored snapshot, or the
   committed journal cut for a height that predates the snapshots; the
-  answer carries `derived` when the cut served it).
+  answer carries `derived` when the cut served it). When no spec can
+  be resolved, `spec.status` says why: `NOT_FOUND` (no record covers
+  the height), `TAMPERED` (a commit record exists but the journal it
+  names no longer verifies), or `UNAVAILABLE` (the mirror cannot
+  speak for the cut).
 * Each side's condition is that account's registered o5 clause (the
   clause registry, key `USER_POLICY_STREAM_INDEX`), evaluated through
   the same helper admission and apply use --
@@ -115,7 +119,7 @@ def execute(raw_command: str, container):
         block_ts = int(time.time())
 
     try:
-        view = active_rules.resolve_answer(height)
+        view, view_status = active_rules.resolve_answer_with_status(height)
     except Exception as exc:
         logger.exception("Failed to resolve spec view for payment conditions")
         return api_response.error_response(
@@ -170,4 +174,11 @@ def execute(raw_command: str, container):
         }
         if view.get("derived"):
             data["spec"]["derived"] = view["derived"]
+    elif view_status is not None:
+        # No spec could be resolved for the block; say which kind of
+        # no-answer it was (B02-6): NOT_FOUND -- the record does not
+        # cover the height; TAMPERED -- a commit record exists but the
+        # journal it names no longer verifies; UNAVAILABLE -- the
+        # mirror cannot speak for the cut.
+        data["spec"] = {"status": view_status}
     return api_response.success_response(_CMD, data)

@@ -420,6 +420,91 @@ def resolve_snapshot(height: Optional[int] = None) -> Optional[Dict]:
     return _view_shape(db.get_earliest_spec_snapshot())
 
 
+# Why a journal cut is unavailable, when it is (B02-6, issue #42):
+# the read path distinguishes a height the record simply does not cover
+# from a record that exists but no longer checks out -- the same
+# explicit codes the answer surfaces instead of one silent None.
+CUT_NOT_FOUND = "NOT_FOUND"    # no commit record (or none naming a cut)
+CUT_TAMPERED = "TAMPERED"      # record exists; the journal does not verify
+CUT_UNAVAILABLE = "UNAVAILABLE"  # the mirror cannot speak for the cut
+
+
+def _journal_cut_at_height(
+        height: int) -> Tuple[Optional[Dict], Optional[str]]:
+    """`journal_cut_at_height` with its failure classified.
+
+    Returns (cut, None) on success, else (None, code) with code one of
+    CUT_NOT_FOUND / CUT_TAMPERED / CUT_UNAVAILABLE.
+    """
+    import db
+    import tau_journal
+
+    try:
+        height = int(height)
+        if height == 0:
+            block_hash = db.get_genesis_hash() or None
+            if not block_hash:
+                return None, CUT_NOT_FOUND
+            revision: Optional[int] = 0
+            cut_len = 0
+            commit = None
+        else:
+            commit = db.block_commit_at_height(height)
+            if commit is None:
+                return None, CUT_NOT_FOUND
+            block_hash = commit["block_hash"]
+            revision = commit.get("spec_revision")
+            if revision is None:
+                # A commit that names a journal head but no revision
+                # cannot pin the cut to a spec_revision; not an answer.
+                return None, CUT_NOT_FOUND
+            cut_len = -1  # resolved against the journal head below
+        journal = tau_journal.journal_from_rows(
+            db.committed_journal_entries())
+        entries = journal.entries()
+        if height > 0:
+            head_link = commit.get("journal_head")
+            if head_link is None:
+                return None, CUT_NOT_FOUND
+            cut_len = None
+            for i, entry in enumerate(entries):
+                if entry.link == head_link:
+                    cut_len = i + 1
+            if cut_len is None:
+                # The commit names a journal head the journal no
+                # longer holds: rows were removed or rewritten after
+                # the commit -- the record exists, the journal does
+                # not match it.
+                return None, CUT_TAMPERED
+        # Verify the cut itself, not the whole journal: the entries at
+        # or before the block's journal head are the record this answer
+        # rests on, and their chain must check out (a tamper after the
+        # height does not poison an earlier height's answer; a tamper
+        # inside the cut does).
+        try:
+            tau_journal.verify_entries(entries[:cut_len])
+        except Exception:
+            return None, CUT_TAMPERED
+        iface = _new_mirror_iface()
+        _feed_from_scratch(iface, entries[:cut_len])
+        text = iface.get_current_spec()
+        if not text:
+            return None, CUT_UNAVAILABLE
+        return {
+            "spec_revision": revision,
+            "height": height,
+            "block_hash": block_hash,
+            "spec_hash": spec_hash_of(text),
+            "spec_text": text,
+            "derived": "journal_cut",
+        }, None
+    except Exception:
+        logger.warning(
+            "active_rules: journal cut at height %s unavailable", height,
+            exc_info=True)
+        return None, CUT_UNAVAILABLE
+
+
 def journal_cut_at_height(height: int) -> Optional[Dict]:
     """The spec in force at `height`, derived from the committed journal.
 
@@ -434,67 +519,58 @@ def journal_cut_at_height(height: int) -> Optional[Dict]:
     head, a journal head the journal no longer holds, a journal that
     does not verify, or a mirror that cannot speak. Height 0 is the
     empty cut: the program baseline before any committed entry.
+    `journal_cut_status` classifies the None.
+    """
+    cut, _code = _journal_cut_at_height(height)
+    return cut
+
+
+def journal_cut_status(height: int) -> Optional[str]:
+    """Why the journal cut at `height` is unavailable, or None when it is.
+
+    CUT_NOT_FOUND: no commit record for the height (or a record naming
+    no journal head / no spec revision -- nothing recorded to read).
+    CUT_TAMPERED: a commit record exists, but the journal it names no
+    longer verifies -- a head the journal no longer holds, or a cut
+    whose chain does not check out. CUT_UNAVAILABLE: the cut verifies
+    but the mirror cannot speak for it.
+    """
+    cut, code = _journal_cut_at_height(height)
+    return None if cut is not None else code
+
+
+def resolve_answer_with_status(
+        height: Optional[int] = None) -> Tuple[Optional[Dict], Optional[str]]:
+    """`resolve_answer` with the no-answer case classified.
+
+    Returns (answer, None) whenever an answer exists, else
+    (None, code) with the journal cut's failure code for the height
+    (CUT_NOT_FOUND when the record does not cover it, CUT_TAMPERED
+    when a record exists but its journal no longer verifies,
+    CUT_UNAVAILABLE when the mirror cannot speak) -- so a caller
+    answering `available: false` can say which of those it was.
     """
     import db
-    import tau_journal
 
-    try:
-        height = int(height)
-        if height == 0:
-            block_hash = db.get_genesis_hash() or None
-            if not block_hash:
-                return None
-            revision: Optional[int] = 0
-            cut_len = 0
-            commit = None
-        else:
-            commit = db.block_commit_at_height(height)
-            if commit is None:
-                return None
-            block_hash = commit["block_hash"]
-            revision = commit.get("spec_revision")
-            if revision is None:
-                # A commit that names a journal head but no revision
-                # cannot pin the cut to a spec_revision; not an answer.
-                return None
-            cut_len = -1  # resolved against the journal head below
-        journal = tau_journal.journal_from_rows(
-            db.committed_journal_entries())
-        entries = journal.entries()
-        if height > 0:
-            head_link = commit.get("journal_head")
-            if head_link is None:
-                return None
-            cut_len = None
-            for i, entry in enumerate(entries):
-                if entry.link == head_link:
-                    cut_len = i + 1
-            if cut_len is None:
-                return None
-        # Verify the cut itself, not the whole journal: the entries at
-        # or before the block's journal head are the record this answer
-        # rests on, and their chain must check out (a tamper after the
-        # height does not poison an earlier height's answer; a tamper
-        # inside the cut does).
-        tau_journal.verify_entries(entries[:cut_len])
-        iface = _new_mirror_iface()
-        _feed_from_scratch(iface, entries[:cut_len])
-        text = iface.get_current_spec()
-        if not text:
-            return None
-        return {
-            "spec_revision": revision,
-            "height": height,
-            "block_hash": block_hash,
-            "spec_hash": spec_hash_of(text),
-            "spec_text": text,
-            "derived": "journal_cut",
-        }
-    except Exception:
-        logger.warning(
-            "active_rules: journal cut at height %s unavailable", height,
-            exc_info=True)
-        return None
+    if height is None:
+        snap = db.get_latest_spec_snapshot()
+        if snap is not None:
+            return _view_shape(snap), None
+        tip = db.canonical_tip_height()
+        if tip is None:
+            return None, CUT_NOT_FOUND
+        cut, code = _journal_cut_at_height(tip)
+        return cut, (None if cut is not None else code)
+    snap = db.get_spec_snapshot_at_or_before(int(height))
+    if snap is not None:
+        return _view_shape(snap), None
+    cut, code = _journal_cut_at_height(int(height))
+    if cut is not None:
+        return cut, None
+    earliest = _view_shape(db.get_earliest_spec_snapshot())
+    if earliest is not None:
+        return earliest, None
+    return None, code
 
 
 def resolve_answer(height: Optional[int] = None) -> Optional[Dict]:
@@ -510,23 +586,8 @@ def resolve_answer(height: Optional[int] = None) -> Optional[Dict]:
     the cut at the canonical tip answers. When neither a snapshot nor
     a cut exists, None (the caller answers `available: false`).
     """
-    import db
-
-    if height is None:
-        snap = db.get_latest_spec_snapshot()
-        if snap is not None:
-            return _view_shape(snap)
-        tip = db.canonical_tip_height()
-        if tip is None:
-            return None
-        return journal_cut_at_height(tip)
-    snap = db.get_spec_snapshot_at_or_before(int(height))
-    if snap is not None:
-        return _view_shape(snap)
-    cut = journal_cut_at_height(int(height))
-    if cut is not None:
-        return cut
-    return _view_shape(db.get_earliest_spec_snapshot())
+    answer, _code = resolve_answer_with_status(height)
+    return answer
 
 
 # --- Account attribution -------------------------------------------------
