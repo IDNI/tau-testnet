@@ -187,14 +187,14 @@ def test_a_value_wider_than_the_clauses_input_type_is_a_blocked_verdict(evaluato
         sender_policy.set_evaluator("apply", None)
 
 
-def test_a_refused_step_in_a_warm_worker_keeps_the_worker(evaluator):
+def test_a_refused_step_in_a_warm_worker_is_judged_again_in_a_fresh_one(evaluator):
     assert evaluator.validate(NARROW).ok
     assert not evaluator.verdict(NARROW, {"i1": "50"}).blocked
     warm = evaluator.worker_pid()
     before = evaluator.stats()["fresh_fallbacks"]
     _refusal(evaluator, {"i1": "2000"})
-    assert evaluator.stats()["fresh_fallbacks"] == before
-    assert evaluator.worker_pid() == warm
+    assert evaluator.stats()["fresh_fallbacks"] == before + 1
+    assert evaluator.worker_pid() != warm
 
 
 BALANCE_FLOOR = (
@@ -209,3 +209,13 @@ def test_a_balance_floor_clause_judges_both_sides_of_the_floor(evaluator):
     assert not evaluator.verdict(BALANCE_FLOOR, {"i1": "4000", "i2": "5000"}).blocked
     assert evaluator.verdict(BALANCE_FLOOR, {"i1": "4001", "i2": "5000"}).blocked
     assert evaluator.verdict(BALANCE_FLOOR, {"i1": "5000", "i2": "5000"}).blocked
+
+
+def test_dissimilar_clauses_interleaved_in_one_worker_keep_their_verdicts(evaluator):
+    t_inputs = {"i1": "3000", **_approvers(OTHER, OTHER, OTHER)}
+    b_inputs = {"i1": "3000", "i2": "5000"}
+    for _ in range(4):
+        assert evaluator.verdict(THREE_SLOT, t_inputs).blocked
+        assert not evaluator.verdict(BALANCE_FLOOR, b_inputs).blocked
+    stats = evaluator.stats()
+    assert stats["retries"] == 0 and stats["fresh_fallbacks"] == 0
