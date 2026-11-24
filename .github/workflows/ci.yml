@@ -136,5 +136,7 @@ jobs:
           tests/test_rule_change_guard_native.py
           tests/test_multirule_native.py
           tests/test_sharedcap_native.py
+          tests/test_catchup_native.py
+          tests/test_grant5000_bounty01.py
           -p no:asyncio -v
           "

@@ -706,6 +706,10 @@ def standing_payload_text(entry) -> str:
         "standing_version": entry.version,
         "standing_form": entry.form,
         "standing_due_retry_seconds": entry.due_retry_seconds,
+        # FIX 9: the body names the signed catch-up bound, by the same
+        # unconditional-field discipline — a kind 10/11 change is bound
+        # to exactly the catch-up permission it installs.
+        "standing_catch_up_periods": entry.catch_up_periods,
     }
     if entry.form == FORM_TAU_CLAUSE:
         obj["standing_clause"] = entry.clause_text

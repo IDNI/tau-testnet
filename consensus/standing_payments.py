@@ -29,7 +29,11 @@ make two honest nodes disagree about admissibility, which forks.
 - No unbounded catch-up: an execution must land inside a live execution
   window. A period whose window lapses is skipped — unless the signed terms
   explicitly permit catch-up, in which case an execution inside a later live
-  window also settles the earlier unsettled periods, oldest first.
+  window also settles the earlier unsettled periods, oldest first. FIX 9
+  makes that permission a signed COUNT (`catch_up_periods`, 0..8): the
+  default 0 is the issue-#34 default exactly — a lapsed period is never
+  collected — and a signed N > 0 lets one execution collect at most N
+  lapsed periods, oldest first, on top of the period it lands in.
 - The executor cannot alter the signed terms: execution reads only the
   stored entry. Amount, recipient, cadence, expiry and fee terms are the
   entry's, and the authorization's identity is a hash of exactly those
@@ -62,6 +66,15 @@ make two honest nodes disagree about admissibility, which forks.
   due_retry) closes, the next due point comes, or the rule ends. The
   retry is book state (rooted like a settled-period marker); a run
   refused for any other reason is never tried again.
+- FIX 9 (catch_up_periods, the S-1 term): the signed catch-up permission
+  is a count, not just the `allow_catch_up` flag. The effective bound is
+  `catch_up_periods` when the flag is set and 0 otherwise, so an
+  authorization that signs only the flag — every authorization written
+  before this term existed — collects nothing late: the flag alone no
+  longer opens an unbounded catch-up. The retry machinery above is
+  untouched: a retry still settles exactly its own period inside its own
+  window, and a period settled by a catch-up execution drops any retry
+  it owed (settlement is shared state, never two payments).
 """
 from __future__ import annotations
 
@@ -157,6 +170,14 @@ MAX_DUE_RETRY_SECONDS = 366 * SECONDS_PER_DAY
 # sweep, longest waiting first (the competitor's "at most 4 a block").
 MAX_DUE_RETRIES_PER_BLOCK = 4
 
+# FIX 9 (catch_up_periods, the S-1 term): the signed bound on how many
+# lapsed periods one execution may collect, oldest first, on top of the
+# period it lands in. 0 — the default — is the issue-#34 default: a
+# period whose window has lapsed is skipped and never collected. The
+# cap keeps a signed permission from becoming an unbounded sweep of a
+# long-neglected authorization's whole history in one execution.
+MAX_CATCH_UP_PERIODS = 8
+
 # The refusal reason that owes a retry. Both forms refuse a short
 # account with exactly this prefix, so the engine and the sweep key
 # the retry decision on it and on nothing else: a run refused for any
@@ -207,6 +228,27 @@ class StandingPaymentEntry:
     # execution runs under is the window the payer signed. Declared
     # entries always carry 0.
     due_retry_seconds: int = 0
+    # FIX 9: the signed catch-up bound (a count of lapsed periods,
+    # 0..MAX_CATCH_UP_PERIODS). 0 — the default — means a lapsed period
+    # is never collected, whatever the allow_catch_up flag says: the
+    # flag alone permitted an UNBOUNDED catch-up before this term
+    # existed, and the issue-#34 default is that an expired period is
+    # skipped unless the signed terms explicitly permit collecting it.
+    # The count is that explicit permission, made measurable. It is a
+    # term of both forms — the calendar machinery is shared — and sits
+    # inside both ids whenever it is non-zero (a zero count keeps the
+    # pre-term id, by the serialization layer's non-default gate).
+    catch_up_periods: int = 0
+
+    @property
+    def catch_up_limit(self) -> int:
+        """How many lapsed periods one execution may collect.
+
+        The signed count, gated by the signed flag: an authorization
+        that does not permit catch-up at all collects nothing late,
+        and one that permits it collects at most the count it signed.
+        """
+        return int(self.catch_up_periods) if self.allow_catch_up else 0
 
     @property
     def auth_id(self) -> bytes:
@@ -228,6 +270,7 @@ class StandingPaymentEntry:
                 self.clause_text,
                 self.version,
                 self.due_retry_seconds,
+                self.catch_up_periods,
             )
         return compute_standing_payment_id(
             self.payer_pubkey,
@@ -244,6 +287,7 @@ class StandingPaymentEntry:
             self.policy_version_ref,
             int(self.allow_catch_up),
             self.version,
+            self.catch_up_periods,
         )
 
     @property
@@ -575,6 +619,7 @@ def parse_create_standing_payment(tx: Dict[str, Any]) -> StandingPaymentEntry:
         form=form,
         clause_text=clause_text,
         due_retry_seconds=_u64_field(tx, "standing_due_retry_seconds", default=0),
+        catch_up_periods=_u64_field(tx, "standing_catch_up_periods", default=0),
     )
 
 
@@ -663,6 +708,20 @@ def validate_standing_payment_shape(
         return "a declared-form standing payment carries no clause"
     if entry.form == FORM_DECLARED and entry.due_retry_seconds:
         return "a declared-form standing payment carries no due_retry"
+    # FIX 9: the catch-up permission is a signed count with a bound,
+    # and a count without the permission flag is a contradiction in
+    # the signed terms — fail closed at creation, on both forms.
+    if not 0 <= entry.catch_up_periods <= MAX_CATCH_UP_PERIODS:
+        return (
+            "standing_catch_up_periods must be in "
+            f"0..{MAX_CATCH_UP_PERIODS}"
+        )
+    if entry.catch_up_periods and not entry.allow_catch_up:
+        return (
+            "standing_catch_up_periods requires standing_allow_catch_up: "
+            "a catch-up count is only meaningful under the signed "
+            "catch-up permission"
+        )
     return None
 
 
@@ -670,7 +729,7 @@ def validate_standing_payment_shape(
 
 _EntryRow = Tuple[
     bytes, str, str, int, int, int, int, int, int, int, int, int, int, int, int,
-    Tuple[int, ...], int, int, int, int, int, str, int,
+    Tuple[int, ...], int, int, int, int, int, str, int, int,
 ]
 _FactRow = Tuple[bytes, str, int, int, int, int, int]
 # One owed due_retry, in encode_standing_retry argument order.
@@ -718,14 +777,20 @@ class StandingPaymentBook:
         book = cls()
         tau_entries: List[StandingPaymentEntry] = []
         for row in rows:
+            # FIX 9: a row written before the catch_up_periods term
+            # existed has no trailing element; it restores with the
+            # term at its default 0 (no catch-up), and its id must
+            # still recompute exactly under the new preimage.
+            if len(row) == 23:
+                row = tuple(row) + (0,)
             (auth_id, payer, recipient, amount, kind, day, anchor, window,
              final_ts, max_occ, max_total, fee_limit, policy_ref, catch_up,
              version, settled, total_paid, last_exec, cancelled, cancelled_ts,
-             form, clause_text, due_retry_seconds) = row
+             form, clause_text, due_retry_seconds, catch_up_periods) = row
             entry = StandingPaymentEntry(
                 payer, recipient, amount, kind, day, anchor, window, final_ts,
                 max_occ, max_total, fee_limit, policy_ref, bool(catch_up), version,
-                form, clause_text, due_retry_seconds,
+                form, clause_text, due_retry_seconds, catch_up_periods,
             )
             if entry.auth_id != bytes(auth_id):
                 raise ValueError(
@@ -826,6 +891,7 @@ class StandingPaymentBook:
                     entry.form,
                     entry.clause_text,
                     entry.due_retry_seconds,
+                    entry.catch_up_periods,
                 )
             )
         return out
@@ -1364,15 +1430,23 @@ class StandingPaymentBook:
             return refuse("authorization has ended: the final period has passed")
         if ts >= due_ts(entry, current) + entry.window_seconds:
             return refuse("the execution window for this period has lapsed", current)
-        if current in progress.settled_periods and not entry.allow_catch_up:
+        if current in progress.settled_periods and not entry.catch_up_limit:
             return refuse("this period is already settled", current)
-        if entry.allow_catch_up:
-            to_settle = [
+        if entry.catch_up_limit:
+            # FIX 9: at most `catch_up_limit` LAPSED periods, oldest
+            # first, on top of the period this execution lands in.
+            # Every period before the current one has a lapsed window
+            # by construction (a window never reaches the next due
+            # date), so the lapsed set is exactly the unsettled past.
+            lapsed = [
                 j
-                for j in range(current + 1)
+                for j in range(current)
                 if j not in progress.settled_periods
                 and not (entry.final_ts and due_ts(entry, j) >= entry.final_ts)
             ]
+            to_settle = lapsed[: entry.catch_up_limit]
+            if current not in progress.settled_periods:
+                to_settle.append(current)
         else:
             to_settle = [current]
         if not to_settle:
@@ -1394,7 +1468,7 @@ class StandingPaymentBook:
                 current,
             )
         if affordable < len(to_settle):
-            if not entry.allow_catch_up:
+            if not entry.catch_up_limit:
                 return refuse(
                     INSUFFICIENT_FUNDS_REASON_PREFIX
                     + " the occurrence is not settled and "
@@ -1654,6 +1728,18 @@ def standing_payment_capabilities() -> Dict[str, Any]:
         ),
         "execution": "any party may trigger; the signed terms cannot be altered",
         "catch_up": "only when the signed terms permit it",
+        "catch_up_periods": {
+            "term": "standing_catch_up_periods",
+            "range": f"0..{MAX_CATCH_UP_PERIODS}",
+            "semantics": (
+                "the signed count of lapsed periods one execution may "
+                "collect, oldest first, on top of the period it lands "
+                "in; 0 — the default — means a period whose window has "
+                "lapsed is skipped and never collected, and the count "
+                "only takes effect under the signed catch-up permission "
+                "(standing_allow_catch_up)"
+            ),
+        },
         "fee": (
             "the submitter pays the ordinary fee; payer funding only under "
             "the authorization's signed fee_limit"

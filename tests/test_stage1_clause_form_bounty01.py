@@ -436,7 +436,8 @@ def test_clause_execution_max_total_and_balance_bounds():
 
 def test_clause_execution_attribution_over_catch_up():
     book, entry = _live_clause_book(
-        anchor_ts=TS - 3 * DAY, window_seconds=3600, allow_catch_up=True)
+        anchor_ts=TS - 3 * DAY, window_seconds=3600, allow_catch_up=True,
+        catch_up_periods=3)
     # Three periods are due (0, 1, 2); the clause names 1200 against a
     # 500 per-period cap: attribution fills oldest first, 500/500/200,
     # and every fact records its own period's attributed amount.

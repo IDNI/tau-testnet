@@ -192,6 +192,13 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["standing_due_retry_seconds"] = payload.get(
             "standing_due_retry_seconds"
         )
+        # FIX 9: the signed catch-up bound is a term of both forms, so
+        # it is signed with the rest — a proposer cannot widen how many
+        # lapsed periods an execution collects beyond what the payer
+        # chose.
+        signing_dict["standing_catch_up_periods"] = payload.get(
+            "standing_catch_up_periods"
+        )
     elif tx_type == TX_TYPE_CANCEL_STANDING_PAYMENT:
         # The id names the exact authorization (a hash of its signed terms),
         # so signing it binds the cancellation to that authorization alone.

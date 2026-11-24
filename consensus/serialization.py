@@ -951,6 +951,7 @@ def compute_standing_payment_id(
     policy_version_ref: int,
     allow_catch_up: int,
     version: int,
+    catch_up_periods: int = 0,
 ) -> bytes:
     """BLAKE3 of the canonical standing-payment authorization. Returns 32 bytes.
 
@@ -958,7 +959,12 @@ def compute_standing_payment_id(
     every term the payer signed is in the hash, so a tampered copy of an
     authorization is a different, unknown authorization — never the same one
     with different terms. `version` keeps an update from colliding with the
-    version it supersedes.
+    version it supersedes. FIX 9's `catch_up_periods` (default 0, no
+    catch-up) is appended only when non-zero — the same non-default gate
+    the book root uses for the retry section — so an authorization that
+    does not sign a catch-up count keeps the id it had before the term
+    existed, and two authorizations that differ only in a non-zero count
+    are different authorizations.
     """
     out = bytearray()
     out.extend(encode_string(DOMAIN_STANDING_PAYMENT_V1.decode()))
@@ -976,6 +982,8 @@ def compute_standing_payment_id(
     out.extend(encode_uint64(int(policy_version_ref)))
     out.extend(encode_uint64(int(allow_catch_up)))
     out.extend(encode_uint64(int(version)))
+    if int(catch_up_periods):
+        out.extend(encode_uint64(int(catch_up_periods)))
     return blake3(bytes(out)).digest()
 
 
@@ -996,6 +1004,7 @@ def compute_standing_payment_tau_id(
     clause_text: str,
     version: int,
     due_retry_seconds: int = 0,
+    catch_up_periods: int = 0,
 ) -> bytes:
     """BLAKE3 of a Tau-form (clause) standing-payment authorization.
 
@@ -1027,6 +1036,8 @@ def compute_standing_payment_tau_id(
     out.extend(encode_string(str(clause_text or "")))
     out.extend(encode_uint64(int(version)))
     out.extend(encode_uint64(int(due_retry_seconds)))
+    if int(catch_up_periods):
+        out.extend(encode_uint64(int(catch_up_periods)))
     return blake3(bytes(out)).digest()
 
 
@@ -1054,6 +1065,7 @@ def encode_standing_payment_record(
     form: int = 1,
     clause_text: str = "",
     due_retry_seconds: int = 0,
+    catch_up_periods: int = 0,
 ) -> bytes:
     """One authorization for the book root: signed fields + live progress.
 
@@ -1095,6 +1107,13 @@ def encode_standing_payment_record(
         out.extend(encode_uint64(int(form)))
         out.extend(encode_string(str(clause_text or "")))
         out.extend(encode_uint64(int(due_retry_seconds)))
+    # FIX 9: the signed catch-up bound is a term of BOTH forms (the
+    # calendar machinery is shared). Like the ids, it is appended only
+    # when non-zero, after the form-specific tail: a record whose
+    # authorization signs no catch-up count stays byte-identical to
+    # the encoding before the term existed.
+    if int(catch_up_periods):
+        out.extend(encode_uint64(int(catch_up_periods)))
     return bytes(out)
 
 

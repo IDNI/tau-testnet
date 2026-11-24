@@ -1933,6 +1933,7 @@ def _tip_standing_book(row: Optional[Dict]) -> StandingPaymentBook:
         int(row.get("form", 1)),
         str(row.get("clause_text", "")),
         int(row.get("due_retry_seconds", 0)),
+        int(row.get("catch_up_periods", 0)),
     )
     fact_rows = [
         (

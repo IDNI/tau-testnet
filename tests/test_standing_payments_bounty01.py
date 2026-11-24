@@ -62,11 +62,13 @@ def sp(
     fee_limit=0,
     policy_ref=0,
     catch_up=False,
+    catch_up_periods=0,
     version=1,
 ):
     return StandingPaymentEntry(
         payer, recipient, amount, kind, day, anchor, window, final, max_occ,
         max_total, fee_limit, policy_ref, catch_up, version,
+        catch_up_periods=catch_up_periods,
     )
 
 
@@ -275,23 +277,31 @@ def test_paid_for_period_fact_written_and_readable():
 
 
 def test_catch_up_only_when_signed_terms_permit():
-    """No unbounded catch-up by default; with the signed permission, one
-    execution inside a live window settles the missed periods too — whole
-    periods only, oldest first, bounded by the payer's balance."""
+    """No catch-up by default; with the signed permission AND the signed
+    count (FIX 9), one execution inside a live window settles the missed
+    periods too — whole periods only, oldest first, bounded by the
+    payer's balance. The flag alone (the pre-FIX 9 terms, count 0)
+    collects nothing late: the count is the explicit permission."""
     strict = sp(window=DAY, max_occ=10)
     book = book_with(strict)
     settled = book.execute(strict.auth_id, ANCHOR + WEEK, 10_000)  # period 0 missed
     assert settled.executed and settled.periods_collected == 1
     assert book.paid_for_period(strict.auth_id, 0) is None
 
-    lax = sp(window=DAY, max_occ=10, catch_up=True)
+    flag_only = sp(window=DAY, max_occ=10, catch_up=True)
+    book = book_with(flag_only)
+    settled = book.execute(flag_only.auth_id, ANCHOR + WEEK, 10_000)
+    assert settled.executed and settled.periods_collected == 1
+    assert book.paid_for_period(flag_only.auth_id, 0) is None
+
+    lax = sp(window=DAY, max_occ=10, catch_up=True, catch_up_periods=1)
     book = book_with(lax)
     settled = book.execute(lax.auth_id, ANCHOR + WEEK, 10_000)
     assert settled.executed and settled.periods_collected == 2 and settled.amount == 1000
     assert book.paid_for_period(lax.auth_id, 0).execution_ts == ANCHOR + WEEK
     assert book.total_executed(lax.auth_id) == (2, 1000)
 
-    short = sp(window=DAY, max_occ=10, catch_up=True)
+    short = sp(window=DAY, max_occ=10, catch_up=True, catch_up_periods=1)
     book = book_with(short)
     settled = book.execute(short.auth_id, ANCHOR + WEEK, 500)  # covers one period
     assert settled.executed and settled.periods_collected == 1 and settled.amount == 500
@@ -381,7 +391,7 @@ def test_create_parses_root_fields_and_rejects_bad_shapes():
 
 
 def test_restore_recomputes_ids_and_root_is_deterministic():
-    weekly = sp(window=DAY, max_occ=10, catch_up=True)
+    weekly = sp(window=DAY, max_occ=10, catch_up=True, catch_up_periods=2)
     monthly = sp(kind=SCHEDULE_MONTHLY, day=31, anchor=JAN31, window=3 * DAY, max_occ=3)
     book = book_with(weekly)
     book.create(monthly, JAN31)
