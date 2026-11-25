@@ -354,6 +354,7 @@ class AuthoritativeTauOwner:
         import tau_proposal
         import tau_reconstruction
         import tau_session
+        import tau_shrink
 
         store = self.store
         baseline = baseline or self._baseline
@@ -376,7 +377,7 @@ class AuthoritativeTauOwner:
                     history_rules=history, candidate_rules=list(candidate_rules),
                 )
         snapshot = tau_allocator.DbMappingSnapshot()
-        allocator = tau_allocator.Allocator(snapshot, width=plan.width,
+        allocator = tau_allocator.Allocator(snapshot, width=tau_shrink.allocator_width(plan),
                                             label="proposal")
 
         def _respawn(current_plan):
@@ -647,6 +648,7 @@ class AuthoritativeTauOwner:
         import tau_journal
         import tau_reconstruction
         import tau_session
+        import tau_shrink
 
         store = self.store
         if not self._baseline:
@@ -660,7 +662,8 @@ class AuthoritativeTauOwner:
             plan = tau_reconstruction.plan_representation(
                 history_rules=[u["text"] for u in units])
         snapshot = tau_allocator.DbMappingSnapshot()
-        allocator = tau_allocator.Allocator(snapshot, width=plan.width, label="genesis")
+        allocator = tau_allocator.Allocator(snapshot, width=tau_shrink.allocator_width(plan),
+                                            label="genesis")
         journal = tau_journal.Journal(authoritative=False)
 
         try:

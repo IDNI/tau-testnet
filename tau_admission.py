@@ -183,9 +183,11 @@ class AdmissionContext:
         representation the authority runs under. Returns the normalized receipt
         (`accepted`, `outcome`, diagnostics).
         """
+        import tau_manager
         self._check()
         try:
-            self._session.apply_rule(rule_text, target=0, record=False)
+            with tau_manager.reexec_on_width_overflow():
+                self._session.apply_rule(rule_text, target=0, record=False)
         except (Exception, WorkerLost) as exc:
             # Preparation that cannot represent the rule, a capacity overflow, a
             # dead worker: all node-local, none of them the author's fault.
@@ -194,9 +196,11 @@ class AdmissionContext:
 
     def step(self, inputs: dict) -> dict:
         """One evaluation step; the indexed outputs, or StepRefused."""
+        import tau_manager
         self._check()
         try:
-            return self._session.evaluate(inputs, multi=True, record=False)
+            with tau_manager.reexec_on_width_overflow():
+                return self._session.evaluate(inputs, multi=True, record=False)
         except StepRefused:
             raise
         except (Exception, WorkerLost) as exc:
@@ -280,6 +284,7 @@ def _build(*, candidate_rules, label, deadline, cwd, env, store):
     import tau_authority
     import tau_journal
     import tau_session
+    import tau_shrink
 
     owner = tau_authority.owner()
     baseline = getattr(owner, "_baseline", None) or tau_authority.program_baseline()
@@ -300,7 +305,8 @@ def _build(*, candidate_rules, label, deadline, cwd, env, store):
     snapshot = tau_allocator.PinnedDbMappingSnapshot(
         epoch=anchor["epoch"], high_water=anchor["high_water"], store=store,
     )
-    allocator = tau_allocator.Allocator(snapshot, width=plan.width, label=label)
+    allocator = tau_allocator.Allocator(snapshot, width=tau_shrink.allocator_width(plan),
+                                        label=label)
 
     def respawn():
         session = tau_session.WorkerSession.spawn(

@@ -61,6 +61,7 @@ import tau_policy  # noqa: E402
 import tau_proposal as tp  # noqa: E402
 import tau_reconstruction as tr  # noqa: E402
 import tau_session as ts  # noqa: E402
+import tau_shrink  # noqa: E402
 from consensus import sender_policy  # noqa: E402
 from consensus.clause_registry import ClauseRegistry  # noqa: E402
 from consensus.engine import TauConsensusEngine  # noqa: E402
@@ -182,7 +183,8 @@ class Harness:
         def rebuild(journal, current_plan):
             session = ts.WorkerSession.spawn(self.router, cwd=REPO, env=worker_env(),
                                              plan=current_plan)
-            session.begin_proposal(alloc.Allocator(self.snapshot, width=current_plan.width))
+            session.begin_proposal(alloc.Allocator(
+                self.snapshot, width=tau_shrink.allocator_width(current_plan)))
             for entry in journal.entries():
                 if entry.kind == tj.REVISION:
                     session.apply_rule(entry.rule_text, record=False,
@@ -194,7 +196,8 @@ class Harness:
         return tp.ProposalContext(
             session=rebuild(tj.Journal(authoritative=False), plan),
             journal=tj.Journal(authoritative=False),
-            allocator=alloc.Allocator(self.snapshot, width=plan.width, label="proposal"),
+            allocator=alloc.Allocator(self.snapshot, width=tau_shrink.allocator_width(plan),
+                                      label="proposal"),
             plan=plan, rebuild=rebuild, lifecycle=self.lm,
         )
 

@@ -456,14 +456,19 @@ def _union_runtime_shrunk_streams(streams) -> None:
 def _handle_width_overflow(exc: "tau_shrink.ShrinkWidthOverflow"):
     """A newly-interned address overflowed the current process shrink width. The
     width cannot grow in-process (the native engine's per-stream bv typing is
-    sticky), so re-exec the process: a fresh process re-reads the now-larger intern
-    table and picks the wider width. The overflowing id is already persisted, and
-    the in-flight tx/block was NOT committed, so nothing is lost; it is re-processed
+    sticky), so re-exec the process: a fresh process picks the wider of the width
+    for the intern table and the width that holds the overflowing id. The
+    in-flight tx/block was NOT committed, so nothing is lost; it is re-processed
     after restart. Tests set TAU_NO_WIDTH_REEXEC=1 (or run in tau_test_mode) to
     observe the exception instead of replacing the process."""
     import sys
     if tau_test_mode or os.environ.get("TAU_NO_WIDTH_REEXEC") == "1":
         raise exc
+    required = getattr(exc, "required_id", None)
+    if required is not None:
+        width = max(tau_shrink.width_for_count(required),
+                    tau_shrink.min_width_from_env())
+        os.environ[tau_shrink.MIN_WIDTH_ENV] = str(width)
     logger.warning(
         "tau_shrink: %s -- re-exec to grow the shrink bv width (sticky per-stream "
         "typing cannot widen in-process).", exc
