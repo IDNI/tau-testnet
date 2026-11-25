@@ -4,7 +4,11 @@ import pytest
 
 import tau_defs
 from consensus import rule_offers
-from consensus.admission import _screen_clause_domains, _screen_guard_domains
+from consensus.admission import (
+    _screen_clause_domains,
+    _screen_guard_domains,
+    is_rule_fragment_error,
+)
 from consensus.engine import _clause_domain_rejection
 from consensus.rule_offers import (
     ALLOWED_TARGET_STREAMS,
@@ -25,6 +29,10 @@ _OFF = "(o5[t]:bv[24] = { #x000000 }:bv[24])"
 
 def _cond(condition):
     return f"always ( ({condition}) ? {_ON} : {_OFF} )."
+
+
+def _body_of(rule):
+    return rule[len("always ( "):-len(" ).")]
 
 
 GOOD = {
@@ -53,6 +61,10 @@ BAD = {
     ),
     "writes_nothing": "always ( i1[t]:bv[24] = { #x000001 }:bv[24] ).",
     "temporal": "always ( o5[t]:bv[24] = i1[t-1]:bv[24] ).",
+    "operator_word": "always ( o5[t]:bv[24] = i1[t]:bv[24] && F ( i1[t]:bv[24] = 1 ) ).",
+    "time_constraint": "always ( [t > 3] && o5[t]:bv[24] = i1[t]:bv[24] ).",
+    "quantifier": "always ( ex x ( o5[t]:bv[24] = i1[t]:bv[24] ) ).",
+    "untyped": "always ( o5[t]:bv[24] = i1[t] ).",
 }
 
 
@@ -93,18 +105,18 @@ def test_kinds_and_guard_index():
 
 @pytest.mark.parametrize("name", GOOD)
 def test_guard_screen_accepts(name):
-    assert _screen_guard_domains(GOOD[name]) is None
-    assert _clause_domain_rejection(GOOD[name], guard=True) is None
+    assert _screen_guard_domains(_body_of(GOOD[name])) is None
+    assert _clause_domain_rejection(_body_of(GOOD[name]), guard=True) is None
 
 
 @pytest.mark.parametrize("name", BAD)
 def test_guard_screen_rejects(name):
-    assert _screen_guard_domains(BAD[name]) is not None
+    assert _screen_guard_domains(_body_of(BAD[name])) is not None
 
 
 @pytest.mark.parametrize("name", list(GOOD) + list(BAD))
 def test_apply_variant_agrees_with_admission(name):
-    body = GOOD[name] if name in GOOD else BAD[name]
+    body = _body_of(GOOD[name] if name in GOOD else BAD[name])
     error = _screen_guard_domains(body)
     rejection = _clause_domain_rejection(body, guard=True)
     assert (rejection is None) == (error is None)
@@ -112,14 +124,14 @@ def test_apply_variant_agrees_with_admission(name):
         assert rejection[0] == error
 
 
-def test_comment_mentions_do_not_trip_the_guard_screen():
-    body = "# uses i2 and o8 in prose\n" + GOOD["kind"]
-    assert _screen_guard_domains(body) is None
+def test_guard_bodies_may_not_carry_comments():
+    body = "# uses i2 and o8 in prose\n" + _body_of(GOOD["kind"])
+    assert is_rule_fragment_error(_screen_guard_domains(body))
 
 
 def test_policy_screen_still_admits_what_the_guard_screen_refuses():
-    assert _screen_clause_domains(BAD["i2"]) is None
-    assert _screen_guard_domains(BAD["i2"]) is not None
+    assert _screen_clause_domains(_body_of(BAD["i2"])) is None
+    assert _screen_guard_domains(_body_of(BAD["i2"])) is not None
 
 
 # --- offers never reach the guard key --------------------------------------------

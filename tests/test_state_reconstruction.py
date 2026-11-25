@@ -431,7 +431,7 @@ class TestStateReconstruction(unittest.TestCase):
         self.start_tau()
         try:
             # start_tau loads no builtin rules, so an untyped i1 here would be typed :tau before rule 02.
-            rule_text = "o12[t]:bv[24] = i1[t]:bv[24]."
+            rule_text = "always ( o12[t]:bv[24] = i1[t]:bv[24] )."
 
             # Create a transaction containing both the rule and a transfer
             tx1 = self.create_test_transaction(
@@ -478,7 +478,7 @@ class TestStateReconstruction(unittest.TestCase):
         tx1 = self.create_test_transaction(
             sender_pubkey=self.addr1,
             sequence_number=0,
-            rules="test_rule_for_tau_processing"
+            rules="always ( o13[t]:bv[24] = i1[t]:bv[24] )."
         )
         
         block_1 = Block.create(

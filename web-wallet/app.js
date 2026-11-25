@@ -1103,13 +1103,13 @@ function generateRandomTauRule() {
         () => [
             `# Example 1 - Constant flag output (sanity test)`,
             `# Writes a stable 0/1 into an unused output stream every step.`,
-            `always (o${outA}[t] = ${hx(bit)}).`
+            `always (o${outA}[t]:bv[24] = ${hx(bit)}).`
         ].join('\n'),
 
         () => [
             `# Example 2 - Threshold gate (classifier-like)`,
             `# If i${inA}+i${inB} >= 0x80 then output 1 else 0 (bv[24]).`,
-            `always ( ((i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) >= ${hx(0x80)} && o${outA}[t] = ${hx(1)}) || ((i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) < ${hx(0x80)} && o${outA}[t] = ${hx(0)}) ).`
+            `always ( ((i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) >= ${hx(0x80)} && o${outA}[t]:bv[24] = ${hx(1)}) || ((i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) < ${hx(0x80)} && o${outA}[t]:bv[24] = ${hx(0)}) ).`
         ].join('\n'),
 
         () => [
@@ -1125,18 +1125,20 @@ function generateRandomTauRule() {
         ].join('\n'),
 
         () => [
-            `# Example 5 - "Network" style rule with local variables`,
+            `# Example 5 - "Network" style rule with two score gates`,
             `# Computes two hidden gates and outputs:`,
             `# - o${outA}[t] allow flag (bv[24])`,
             `# - o${outB}[t] risk-ish score (bv[24])`,
-            `always ( ex s1 ex s2 ex h1 ex h2 (`,
-            `  (s1 = (i${inA}[t]:bv[24] * ${hx(0x03)}) + (i${inB}[t]:bv[24] * ${hx(0x02)}))`,
-            `  && ((s1 >= ${hx(0x80)} && h1 = ${hx(1)}) || (s1 < ${hx(0x80)} && h1 = ${hx(0)}))`,
-            `  && (s2 = (i${inC}[t]:bv[24] * ${hx(0x05)}) + (${hx(0x00)} - i${inA}[t]:bv[24]))`,
-            `  && ((s2 >= ${hx(0x40)} && h2 = ${hx(1)}) || (s2 < ${hx(0x40)} && h2 = ${hx(0)}))`,
-            `  && (o${outB}[t]:bv[24] = (h2:bv[24] * ${hx(0xC8)}) + ((${hx(0x01)} - h1:bv[24]) * ${hx(0x32)}))`,
-            `  && ( (h2 = ${hx(0)} && o${outA}[t] = ${hx(1)}) || (h2 = ${hx(1)} && o${outA}[t] = ${hx(0)}) )`,
-            `) ).`
+            `# Four-way branch on the two scores, each case setting both outputs.`,
+            `always (`,
+            `  ((((i${inA}[t]:bv[24] * ${hx(0x03)}) + (i${inB}[t]:bv[24] * ${hx(0x02)})) >= ${hx(0x80)})`,
+            `    ? ( (((i${inC}[t]:bv[24] * ${hx(0x05)}) + (${hx(0x00)} - i${inA}[t]:bv[24])) >= ${hx(0x40)})`,
+            `        ? (o${outA}[t]:bv[24] = ${hx(0)} && o${outB}[t]:bv[24] = ${hx(0xC8)})`,
+            `        : (o${outA}[t]:bv[24] = ${hx(1)} && o${outB}[t]:bv[24] = ${hx(0)}) )`,
+            `    : ( (((i${inC}[t]:bv[24] * ${hx(0x05)}) + (${hx(0x00)} - i${inA}[t]:bv[24])) >= ${hx(0x40)})`,
+            `        ? (o${outA}[t]:bv[24] = ${hx(0)} && o${outB}[t]:bv[24] = ${hx(0xFA)})`,
+            `        : (o${outA}[t]:bv[24] = ${hx(1)} && o${outB}[t]:bv[24] = ${hx(0x32)}) ) )`,
+            `).`
         ].join('\n'),
     ];
 

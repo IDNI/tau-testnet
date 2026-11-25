@@ -246,6 +246,7 @@ def _release_due_retractables(lm, balances, sequences, height, timestamp) -> Lis
 
 
 TEMPORAL_REFERENCE_REASON = "temporal_reference"
+RULE_FRAGMENT_REASON = "rule_fragment"
 RULE_CHANGE_NEEDS_APPROVAL_REASON = "rule_change_needs_approval"
 
 
@@ -256,6 +257,7 @@ def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tupl
         _screen_clause_domains,
         _screen_guard_domains,
         _width_mismatch_details,
+        is_rule_fragment_error,
         is_temporal_reference_error,
     )
 
@@ -264,6 +266,8 @@ def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tupl
         return None
     if is_temporal_reference_error(error):
         return error, TEMPORAL_REFERENCE_REASON
+    if is_rule_fragment_error(error):
+        return error, RULE_FRAGMENT_REASON
     if _width_mismatch_details(error):
         return error, "width_mismatch"
     return error, "rule_not_applied"
@@ -2090,22 +2094,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                     # Lazy: consensus.admission imports chain_state, which imports this module.
                     from consensus.admission import (
-                        _temporal_backreference,
+                        revision_fragment_error,
                         revision_policy_width_error,
                     )
 
-                    temporal_ref = _temporal_backreference(update.rule_revisions)
+                    fragment_error = revision_fragment_error(update.rule_revisions)
                     width_error = revision_policy_width_error(update.rule_revisions)
                     if min_activation is not None and update.activate_at_height < min_activation:
                         tx_receipt["logs"].append(
                             "Update ignored (activation delay breached): "
                             f"{update.activate_at_height} < {min_activation}"
                         )
-                    elif temporal_ref:
-                        # Activation would reset into a spec with lookback.
+                    elif fragment_error:
                         tx_receipt["logs"].append(
-                            "Update ignored (consensus rule revision reads a "
-                            f"previous step): {temporal_ref}"
+                            f"Update ignored (consensus rule revision: {fragment_error})"
                         )
                     elif width_error:
                         tx_receipt["logs"].append(

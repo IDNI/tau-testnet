@@ -187,7 +187,7 @@ class TestCustomInputs(unittest.TestCase):
             "expiration_time": 9999999999,
             "expire_at_height": 5000,
             "operations": {
-                "0": "some rule",
+                "0": "always ( o13[t]:bv[24] = i1[t]:bv[24] ).",
                 "100": "42"
             },
             "fee_limit": 100,
@@ -203,7 +203,7 @@ class TestCustomInputs(unittest.TestCase):
         # Rule validated via isolated subprocess compile (once, with the rule).
         self.mock_isolated.assert_called_once()
         iso_args, _iso_kwargs = self.mock_isolated.call_args
-        self.assertEqual(iso_args[1], ["some rule"])
+        self.assertEqual(iso_args[1], ["always ( o13[t]:bv[24] = i1[t]:bv[24] )."])
 
         # communicate_with_tau is now used only for the custom-input step.
         self.assertEqual(self.mock_communicate.call_count, 1)
@@ -227,7 +227,7 @@ class TestCustomInputs(unittest.TestCase):
             "tx_id": "tx1",
             "sender_pubkey": SENDER,
             "operations": {
-                "0": "new rule",
+                "0": "always ( o13[t]:bv[24] = i1[t]:bv[24] ).",
                 "100": "99"
             }
         })
@@ -237,7 +237,7 @@ class TestCustomInputs(unittest.TestCase):
 
         with patch(
             "chain_state.get_application_rules_state",
-            return_value="new rule",
+            return_value="always ( o13[t]:bv[24] = i1[t]:bv[24] ).",
         ):
             result = engine.apply(snapshot, [tx], 1700000000, target_sequences={})
 
@@ -249,7 +249,7 @@ class TestCustomInputs(unittest.TestCase):
         
         # Call 1: Rule
         args1, kwargs1 = self.mock_communicate.call_args_list[0]
-        self.assertEqual(kwargs1['rule_text'], "new rule")
+        self.assertEqual(kwargs1['rule_text'], "always ( o13[t]:bv[24] = i1[t]:bv[24] ).")
         self.assertEqual(kwargs1['apply_rules_update'], True)
         self.assertIn("Tau(rule) o0: output_rule", logs)
         

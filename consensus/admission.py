@@ -27,6 +27,14 @@ from consensus.rule_offers import (
     screen_clause_structure,
 )
 from consensus.facade import TipAdmissionView
+from consensus.rule_fragment import (
+    FRAGMENT_CODE,
+    RULE_FRAGMENT_PREFIX,
+    TEMPORAL_REFERENCE_PHRASE,
+    RuleFragmentError,
+    clause_unit,
+    parse_rule_unit,
+)
 from consensus.approvals import (
     MAX_APPROVAL_WINDOW_BLOCKS,
     audit_stream_collisions,
@@ -145,56 +153,47 @@ def screen_reserved_rule_outputs(rule_text: str) -> Optional[str]:
     return None
 
 
-_SPECIAL_STREAMS = {
-    "u": "the spec-update stream: writing it revises the running spec itself",
-    "this": "the current-spec input: its value is the executing spec",
-}
-_SPECIAL_NAME_RE = re.compile(r"\b(" + "|".join(_SPECIAL_STREAMS) + r")\b")
-_INDEXED_NAME_RE = re.compile(r"(:\s*)?\b([A-Za-z_]\w*)\s*\[")
-_USER_STREAM_NAME_RE = re.compile(r"[io]\d+")
-
-
-def screen_stream_names(rule_text: str) -> Optional[str]:
-    """Error text when a rule names an engine-special stream or a non-i/o stream."""
-    scrubbed = _strip_tau_comments(rule_text)
-    special = _SPECIAL_NAME_RE.search(scrubbed)
-    if special:
-        name = special.group(1)
-        return (
-            f"rule references reserved engine stream '{name}', "
-            f"{_SPECIAL_STREAMS[name]}."
-        )
-    for match in _INDEXED_NAME_RE.finditer(scrubbed):
-        if match.group(1):
-            continue
-        name = match.group(2)
-        if not _USER_STREAM_NAME_RE.fullmatch(name):
-            return (
-                f"rule references unknown stream '{name}'; only i<N> inputs "
-                f"and o<N> outputs may be indexed."
-            )
-    return None
-
-
 # Lookback is global to the evaluator's spec: one unit reading another step
 # leaves every output at 0 for the steps after each later revision or rebuild.
 TEMPORAL_REFERENCE_CODE = "TEMPORAL_REFERENCE"
-_TEMPORAL_REFERENCE_PHRASE = "reads a step other than the current one"
+RULE_FRAGMENT_CODE = FRAGMENT_CODE
+RULE_FRAGMENT_REASON = "rule_fragment"
 
 
-def screen_temporal_rule(rule_text: str) -> Optional[str]:
-    """Error text when a user rule references any step other than `[t]`."""
-    ref = _temporal_backreference([rule_text])
-    if ref is None:
-        return None
-    return (
-        f"rule {_TEMPORAL_REFERENCE_PHRASE} ({ref}); user rules may reference "
-        f"[t] only."
-    )
+def screen_rule_fragment(unit_text: str) -> Optional[str]:
+    """Error text when `unit_text` is not one `always ( ... )` unit of the admitted syntax.
+
+    The single entry point every admission and apply screen goes through.
+    """
+    try:
+        parse_rule_unit(unit_text)
+    except RuleFragmentError as exc:
+        if exc.temporal_reference:
+            return exc.message
+        return RULE_FRAGMENT_PREFIX + exc.message
+    return None
 
 
 def is_temporal_reference_error(error_text: Optional[str]) -> bool:
-    return bool(error_text) and _TEMPORAL_REFERENCE_PHRASE in error_text
+    return bool(error_text) and TEMPORAL_REFERENCE_PHRASE in error_text
+
+
+def is_rule_fragment_error(error_text: Optional[str]) -> bool:
+    return bool(error_text) and RULE_FRAGMENT_PREFIX in error_text
+
+
+def revision_fragment_error(revisions) -> Optional[str]:
+    """First fragment error among consensus revisions as the engine receives them."""
+    import tau_native
+
+    for revision in revisions or []:
+        if isinstance(revision, str):
+            error = screen_rule_fragment(
+                tau_native.TauInterface.preprocess_spec_text(revision)
+            )
+            if error:
+                return error
+    return None
 
 
 class AdmissionResult:
@@ -241,6 +240,8 @@ def _admission_from_domain_error(domain_error: str, prefix: str = "") -> Admissi
     msg = f"{prefix}{domain_error}" if prefix else domain_error
     if is_temporal_reference_error(domain_error):
         return format_error(msg, code=TEMPORAL_REFERENCE_CODE)
+    if is_rule_fragment_error(domain_error):
+        return format_error(msg, code=RULE_FRAGMENT_CODE)
     mismatch = _width_mismatch_details(domain_error)
     if mismatch:
         return format_error(msg, code="WIDTH_MISMATCH", **mismatch)
@@ -284,19 +285,21 @@ def screen_user_rule_text(
     A proposer can include a tx that never passed admission, so apply must refuse
     exactly what admission refuses.
     """
-    stream_error = screen_stream_names(rule_text)
-    if stream_error:
-        return UserRuleRejection(stream_error, "special_stream", "TX_REJECTED")
+    import tau_native
+
+    fragment_error = screen_rule_fragment(
+        tau_native.TauInterface.preprocess_spec_text(rule_text)
+    )
+    if is_temporal_reference_error(fragment_error):
+        return UserRuleRejection(fragment_error, "temporal_reference", TEMPORAL_REFERENCE_CODE)
+    if fragment_error:
+        return UserRuleRejection(fragment_error, RULE_FRAGMENT_REASON, RULE_FRAGMENT_CODE)
 
     # A user rule on a consensus-owned output forges verdicts or fees, or makes the spec unsat.
     # Governance revisions are exempt because writing those streams is their job.
     reserved_error = screen_reserved_rule_outputs(rule_text)
     if reserved_error:
         return UserRuleRejection(reserved_error, "reserved_output_stream", "TX_REJECTED")
-
-    temporal_error = screen_temporal_rule(rule_text)
-    if temporal_error:
-        return UserRuleRejection(temporal_error, "temporal_reference", TEMPORAL_REFERENCE_CODE)
 
     # A balance-reading fee rule is quoted against the current head but charged
     # against the parent block, so the sender pays a different fee than quoted.
@@ -624,41 +627,6 @@ def revision_policy_width_error(revisions) -> Optional[str]:
     return None
 
 
-def _temporal_backreference(revisions):
-    """The first stream reference whose time expression is not exactly `t`.
-
-    Grammar-based rather than string-matched: `i7[t-1]`, `i7[t - 1]` and `i7[3]`
-    are all references to something other than the current step, and a screen that
-    recognised only one spelling would be a screen in name only. Reuses the
-    structural scanner, which already parses a reference into stream, time
-    expression and annotation.
-
-    Fails closed on a stream-shaped token it cannot parse: an occurrence the
-    scanner does not understand cannot be shown to be current.
-    """
-    import tau_shrink
-
-    for revision in revisions or []:
-        if not isinstance(revision, str):
-            continue
-        text = _strip_tau_comments(revision)
-        try:
-            tokens = tau_shrink._tokenize(text)
-        except Exception:
-            return "unparsable rule text"
-        for pos, token in enumerate(tokens):
-            if token.kind == "streamref":
-                ref = tau_shrink._ref_of(token, pos)
-                if ref is None:
-                    return token.text.strip()
-                if ref.time_expr != "t":
-                    return f"{ref.io}{ref.index}[{ref.time_expr}]"
-            elif token.kind == "ident" and re.fullmatch(r"[io]\d+", token.text):
-                # a stream name the scanner could not resolve into a reference
-                return token.text
-    return None
-
-
 def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """
     Validate the core fields and parameters of a consensus_rule_update payload.
@@ -680,24 +648,17 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
     if sum(len(rev.encode("utf-8")) for rev in tx["rule_revisions"]) > MAX_RULE_REVISIONS_BYTES:
         return format_error(f"'rule_revisions' total size exceeds MAX_RULE_REVISIONS_BYTES ({MAX_RULE_REVISIONS_BYTES}).")
 
-    # Header verification runs on an ISOLATED evaluator, because stepping the
-    # authoritative one for a header that may be verified twice, rejected, or
-    # never become a block corrupts the history every later transaction reads
-    # (measured: an advisory step changed the next verdict from 5 to 255). That
-    # isolated evaluator is reconstructed from rules, not from the input history,
-    # so it cannot answer a consensus rule that reads a PREVIOUS step.
-    #
-    # This is a boundary rather than a comment on purpose: today's consensus rules
-    # contain no back-reference, and nothing should be able to introduce one while
-    # the verifier cannot reproduce the history it would read.
-    temporal = _temporal_backreference(tx["rule_revisions"])
-    if temporal:
+    # Header verification runs on an isolated evaluator reconstructed from rules
+    # alone, so a revision that reads a previous step cannot be verified.
+    fragment_error = revision_fragment_error(tx["rule_revisions"])
+    if fragment_error:
         return format_error(
-            f"consensus rule revision reads a previous step ({temporal}). Header "
-            "verification runs on an evaluator reconstructed from rules alone, so "
-            "it cannot reproduce that history; such a revision is refused until "
-            "verification replays the execution journal.",
-            code="TEMPORAL_CONSENSUS_RULE",
+            f"consensus rule revision: {fragment_error}",
+            code=(
+                "TEMPORAL_CONSENSUS_RULE"
+                if is_temporal_reference_error(fragment_error)
+                else RULE_FRAGMENT_CODE
+            ),
         )
 
     width_error = revision_policy_width_error(tx["rule_revisions"])
@@ -970,13 +931,9 @@ def _screen_clause_domains(body: str) -> Optional[str]:
     type a reserved input stream, and may reference [t] only. It may read i2:
     the policy evaluator is fed the parent-block balance at admission and apply.
     """
-    stream_error = screen_stream_names(body)
-    if stream_error:
-        return stream_error
-
-    temporal_error = screen_temporal_rule(body)
-    if temporal_error:
-        return temporal_error
+    fragment_error = screen_rule_fragment(clause_unit(body))
+    if fragment_error:
+        return fragment_error
 
     writes = _streams_referenced(body, CONSENSUS_OWNED_OUTPUT_STREAMS)
     if writes:
@@ -1049,13 +1006,9 @@ GUARD_READABLE_INPUTS = frozenset({
 def _screen_guard_domains(body: str) -> Optional[str]:
     """Domain screen for a rule-change guard body: reads i1, i5 and the approval
     slots only, and writes o5 only."""
-    stream_error = screen_stream_names(body)
-    if stream_error:
-        return stream_error
-
-    temporal_error = screen_temporal_rule(body)
-    if temporal_error:
-        return temporal_error
+    fragment_error = screen_rule_fragment(clause_unit(body))
+    if fragment_error:
+        return fragment_error
 
     scrubbed = _strip_tau_comments(body)
     for match in re.finditer(r"\bi(\d+)\b", scrubbed):
