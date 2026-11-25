@@ -16,8 +16,12 @@ naming it are added. The clauses are a POSITIVE registry read only: a clause
 is listed because `rule_clauses_v1` holds it, with the sha256 of the stored
 body. The registry and the application rules are current-tip state; at a
 historical block they are labelled as such, because no per-block registry
-snapshot exists. An o5 clause names no revision: the registry is not the
+registry snapshot exists. An o5 clause names no revision: the registry is not the
 engine, and a clause body is not a revision of the specification.
+`fee_rules` lists every accumulated unit that writes the fee stream o8, with
+the account that sent it (see `commands.getaccountrules.fee_rules_for`): a fee
+rule of one account can change what another pays (#183). It is read from the
+current-tip accumulation, like `application_rules`, even at a historical block.
 """
 import hashlib
 import logging
@@ -154,6 +158,7 @@ def execute(raw_command: str, container):
             # Registry and accumulation are current-tip state; at a historical
             # block they describe now, not that block.
             "registry_as_of": "this block" if block_arg is None else "current tip",
+            "fee_rules_as_of": "this block" if block_arg is None else "current tip",
         }
         try:
             (_head_hash, _lm, app_rules) = getaccountrules._tip_view(
@@ -171,7 +176,10 @@ def execute(raw_command: str, container):
                                   "since": getaccountrules._since(
                                       history, sha=sha, kind="application_rule")})
             data["account"]["application_rules"] = units
+            data["account"]["fee_rules"] = getaccountrules.fee_rules_for(
+                database, address, app_rules)
         except Exception:
             logger.exception("Failed to read application rules for %s", address)
             data["account"]["application_rules"] = []
+            data["account"]["fee_rules"] = []
     return api_response.success_response(_CMD, data)

@@ -363,3 +363,25 @@ def test_policy_show_defaults_to_the_key_and_passes_json_through(alice):
     assert rc == 0
     assert recorded == [f"getaccountrules {alice}"]
     assert json.loads(out)["data"]["clauses"][0]["sha256"] == "22" * 32
+
+
+# --- policy show: fee rules ------------------------------------------------------
+
+def test_policy_show_lists_every_fee_rule_and_who_sent_it(alice):
+    fees = dict(ACCOUNT_RULES, fee_rules=[
+        {"unit": "always (x).", "sha256": "77" * 32, "names_this_account": True,
+         "sent_by": [APPROVER], "since": {"block_number": 30, "tx_hash": "88" * 32}},
+        {"unit": "always (y).", "sha256": "99" * 32, "names_this_account": False,
+         "sent_by": None, "since": None}])
+    rc, out, err = _run(["policy", "show", APPROVER], [_ok(fees)])
+    assert rc == 0, err
+    assert "fee rules (o8) of every account, any of which can change this account's fee: 2" in out
+    assert "sha256 " + "77" * 32 + "  sent by " + APPROVER[:12] + "...  names this account" in out
+    assert "sha256 " + "99" * 32 + "  sent by sender not recorded" in out
+
+
+def test_policy_show_says_when_the_fee_rules_are_not_known(alice):
+    partial = dict(ACCOUNT_RULES, fee_rules=None)
+    rc, out, err = _run(["policy", "show", APPROVER], [_ok(partial)])
+    assert rc == 0, err
+    assert "fee rules (o8) of every account: not known" in out

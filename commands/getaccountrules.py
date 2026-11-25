@@ -11,6 +11,15 @@ for "did my last rule transaction change anything". This answers it in one call:
                        recorded it, the block and transaction that set it
   rule_change_guard    the guard clause, same shape, or null
   application_rules    accumulated units that name the account's key, as stored
+  fee_rules            every accumulated unit that writes the fee stream o8,
+                       whoever sent it, in the order the units joined. The
+                       engine works out o8 from the whole specification for
+                       every transaction, so a unit that never names this
+                       account can still change what it pays (#183). Each
+                       carries `names_this_account` and `sent_by`: the
+                       accounts whose rule transaction accumulated it, from
+                       this node's record, or null where the node has none
+                       (a genesis unit, or one from before it began recording)
   running_spec         the specification the engine runs at this head, as the
                        engine revised it (canonical form), with its sha256. A
                        later unit can revise part of an earlier one, so the
@@ -59,6 +68,86 @@ _RULE_TX_TYPES = (
 
 def _sha256(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+_FEE_STREAM = "o%d" % tau_defs.CUSTOM_FEE_STREAM_INDEX
+
+
+def _writes_fee(unit: str) -> bool:
+    from consensus.admission import _streams_referenced
+
+    return bool(_streams_referenced(unit, (_FEE_STREAM,)))
+
+
+def _fee_rules(units, accumulated, address: str) -> list:
+    """The units among `units` that write o8, with who sent each one.
+
+    `accumulated` are this node's records of units joining the accumulation on
+    the canonical chain, oldest first; a unit without one gets `sent_by` null.
+    """
+    needle = "#x" + address
+    senders, first = {}, {}
+    for effect in accumulated:
+        sha = effect.get("sha256")
+        senders.setdefault(sha, set()).add(effect["account"])
+        first.setdefault(sha, effect)
+    rows, seen = [], set()
+    for unit in units:
+        if not unit or unit in seen or not _writes_fee(unit):
+            continue
+        seen.add(unit)
+        sha = _sha256(unit)
+        rows.append({
+            "unit": unit,
+            "sha256": sha,
+            "names_this_account": needle in unit.lower(),
+            "sent_by": sorted(senders[sha]) if sha in senders else None,
+            "since": _since_of(first[sha]) if sha in first else None,
+        })
+    return rows
+
+
+def _since_of(effect) -> dict:
+    since = {"block_number": int(effect["block_number"])}
+    for key in ("tx_hash", "request_id"):
+        if effect.get(key):
+            since[key] = effect[key]
+    return since
+
+
+def _canonical_accumulated(database) -> list:
+    """`accumulated` application-rule effects on the canonical chain, oldest first."""
+    try:
+        rows = database.get_rule_effect_rows(kind="application_rule")
+    except Exception:
+        logger.exception("Failed to read who sent the accumulated units")
+        return []
+    canonical = {}
+    out = []
+    for effect in rows:
+        if effect.get("action") != "accumulated":
+            continue
+        block_hash = effect.get("block_hash")
+        if block_hash not in canonical:
+            try:
+                canonical[block_hash] = database.get_canonical_confirmation(
+                    block_hash, int(effect["block_number"]))[0]
+            except Exception:
+                canonical[block_hash] = False
+        if canonical[block_hash]:
+            out.append(effect)
+    return out
+
+
+def fee_rules_for(database, address: str, app_rules: str) -> list:
+    """Every accumulated unit that writes o8, with who sent it (see `_fee_rules`).
+
+    Read-only view over the node-local rule-effects record and the current
+    accumulation; no state-hash change, no new consensus behaviour.
+    """
+    return _fee_rules(
+        [u.strip() for u in (app_rules or "").split("\n")],
+        _canonical_accumulated(database), address)
 
 
 def _tip_view(chain_state):
@@ -194,6 +283,8 @@ def execute(raw_command: str, container):
                 units.append({"unit": unit, "sha256": sha,
                               "since": _since(history, sha=sha, kind="application_rule")})
 
+        fee_rules = fee_rules_for(database, address, app_rules)
+
         approvals = lm.approval_requests
         open_changes = [
             _request_row(rid, entry)
@@ -213,6 +304,7 @@ def execute(raw_command: str, container):
             "clauses": clauses,
             "rule_change_guard": guard,
             "application_rules": units,
+            "fee_rules": fee_rules,
             "running_spec": running,
             "open_rule_changes": open_changes,
             "awaiting_my_vote": to_vote,

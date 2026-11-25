@@ -2986,6 +2986,36 @@ def get_canonical_rule_effects(account: str, limit: int = 20) -> List[Dict]:
     return out
 
 
+def get_rule_effect_rows(account: Optional[str] = None, kind: Optional[str] = None) -> List[Dict]:
+    """Recorded rule effects, oldest first, on any chain: the caller keeps the
+    rows of the blocks it asks about. Within a block the transactions come
+    first, in their order, then the release sweep. `body` is always None: this
+    node keeps no per-text table (unlike #144's `rule_bodies`); callers that
+    need a unit's text read it from the accumulation, keyed by `sha256`.
+    """
+    if _db_conn is None:
+        init_db()
+    where, args = [], []
+    if account is not None:
+        where.append('account = ?')
+        args.append(account.lower())
+    if kind is not None:
+        where.append('kind = ?')
+        args.append(kind)
+    sql = ('SELECT account, block_hash, block_number, tx_hash, request_id, kind, '
+           'stream, action, sha256, detail FROM rule_effects '
+           + ('WHERE ' + ' AND '.join(where) + ' ' if where else '')
+           + "ORDER BY block_number, (tx_hash = ''), tx_index, effect_index")
+    with _db_lock:
+        rows = _db_conn.execute(sql, args).fetchall()
+    keys = ("account", "block_hash", "block_number", "tx_hash", "request_id", "kind",
+            "stream", "action", "sha256", "detail")
+    out = [dict(zip(keys, row)) for row in rows]
+    for row in out:
+        row["body"] = None
+    return out
+
+
 def get_canonical_retractable_events(retractable_id: str) -> List[Dict]:
     """Events for this id recorded by blocks on the canonical chain, oldest first."""
     if _db_conn is None:

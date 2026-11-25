@@ -2201,6 +2201,18 @@ def _format_account_rules(data: dict) -> str:
     lines.append(f"  application rules naming this account: {len(units)}")
     for unit in units:
         lines.append(f"    sha256 {unit.get('sha256')}  {_since(unit)}")
+    fees = data.get("fee_rules")
+    if fees is None and "fee_rules" in data:
+        lines.append("  fee rules (o8) of every account: not known")
+    elif fees is not None:
+        lines.append(f"  fee rules (o8) of every account, any of which can change "
+                     f"this account's fee: {len(fees)}")
+        for unit in fees:
+            senders = unit.get("sent_by")
+            who = (", ".join(_short(s) for s in senders) if senders
+                   else "sender not recorded")
+            mine = "  names this account" if unit.get("names_this_account") else ""
+            lines.append(f"    sha256 {unit.get('sha256')}  sent by {who}{mine}")
     changes = data.get("open_rule_changes") or []
     lines.append(f"  open rule-change requests: {len(changes)}")
     for change in changes:
@@ -2273,6 +2285,18 @@ def _format_rules_in_force(data) -> str:
                      + (f"sha256 {guard.get('sha256')}" if guard else "none"))
         for unit in account.get("application_rules") or []:
             lines.append(f"  application rule sha256 {unit.get('sha256')}")
+        fees = account.get("fee_rules")
+        if fees is None and "fee_rules" in account:
+            lines.append("  fee rules (o8) of every account: not known")
+        elif fees is not None:
+            lines.append(f"  fee rules (o8) of every account, any of which can change "
+                         f"this account's fee: {len(fees)}")
+            for unit in fees:
+                senders = unit.get("sent_by")
+                who = (", ".join(_short(s) for s in senders) if senders
+                       else "sender not recorded")
+                mine = "  names this account" if unit.get("names_this_account") else ""
+                lines.append(f"    sha256 {unit.get('sha256')}  sent by {who}{mine}")
     return "\n".join(lines)
 
 

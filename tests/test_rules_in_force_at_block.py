@@ -19,9 +19,12 @@ import db
 import tau_authority
 import tau_journal
 import tau_running_spec as rs
+from block import Block
 from commands import getrulesinforce, gettxstatus
 from tau_commit import _entry_row
+from test_rule_change_requests import ALICE, BOB
 from test_running_spec import A, B, BASE, FakeEngine
+from test_tx_outcomes import _chain_of, _set_head
 
 C = "always ( o27[t]:bv[24] = { 4 }:bv[24] )."
 
@@ -502,3 +505,51 @@ def test_a_db_written_before_outcomes_answers_old_blocks(temp_database):
     assert out == {"text": f"c1 && {A} && {B}", "sha256": _sha(f"c1 && {A} && {B}"),
                    "block_hash": "tip-1", "spec_revision": 2}
     assert db.committed_rule_history_at("missing") == (None, None)
+
+
+# --- getrulesinforce: fee rules from the tip -------------------------------------
+
+_FEE_OWN = ("always ( (i12[t]:bv[384] = { #x" + ALICE + " }:bv[384]) -> "
+            "(o8[t]:bv[24] = { #x00000a }:bv[24]) ).")
+_FEE_OTHER = ("always ( ((i12[t]:bv[384] = { #x" + BOB + " }:bv[384]) || "
+              "(i1[t]:bv[24] > { #x000000 }:bv[24])) -> (o8[t]:bv[24] = { #x000064 }:bv[24]) ).")
+_FEE_GENESIS = "always ( (i3[t]:bv[384] = i3[t]:bv[384]) -> (o8[t]:bv[24] = { #x000001 }:bv[24]) )."
+
+
+def test_getrulesinforce_account_lists_fee_rules_from_the_tip(temp_database):
+    """Fee rules are the tip accumulation's o8 units with their senders (#183),
+    even when the account section is read through getrulesinforce."""
+    blocks = _chain_of(3)
+    _set_head(blocks[2])
+    db.record_tx_outcomes(blocks[1].block_hash, 1, [{
+        "tx_hash": "01" * 32, "index": 0, "status": "applied",
+        "rule_effects": [{"account": ALICE, "kind": "application_rule",
+                          "action": "accumulated", "sha256": _sha(_FEE_OWN)}]}])
+    db.record_tx_outcomes(blocks[2].block_hash, 2, [{
+        "tx_hash": "02" * 32, "index": 0, "status": "applied",
+        "rule_effects": [{"account": BOB, "kind": "application_rule",
+                          "action": "accumulated", "sha256": _sha(_FEE_OTHER)}]}])
+    state = types.SimpleNamespace(
+        _balance_lock=threading.Lock(), _sequence_lock=threading.Lock(),
+        _rules_lock=threading.Lock(), _lifecycle_manager=None,
+        _application_rules_state="\n".join([_FEE_GENESIS, _FEE_OWN, _FEE_OTHER]),
+        _canonical_head_hash=blocks[2].block_hash)
+    container = types.SimpleNamespace(db=db, chain_state=state)
+    with patch.object(tau_authority, "owner", return_value=_enabled_owner()), \
+            patch.object(rs, "at_head", return_value={
+                "text": "x", "sha256": _sha("x"), "block_hash": blocks[2].block_hash}):
+        resp = json.loads(getrulesinforce.execute(
+            f"getrulesinforce {ALICE}", container))
+    assert resp["status"] == "ok", resp
+    account = resp["data"]["account"]
+    assert account["fee_rules"] == [
+        {"unit": _FEE_GENESIS, "sha256": _sha(_FEE_GENESIS),
+         "names_this_account": False, "sent_by": None, "since": None},
+        {"unit": _FEE_OWN, "sha256": _sha(_FEE_OWN),
+         "names_this_account": True, "sent_by": [ALICE],
+         "since": {"block_number": 1, "tx_hash": "01" * 32}},
+        {"unit": _FEE_OTHER, "sha256": _sha(_FEE_OTHER),
+         "names_this_account": False, "sent_by": [BOB],
+         "since": {"block_number": 2, "tx_hash": "02" * 32}},
+    ]
+    assert account["fee_rules_as_of"] == "this block"
