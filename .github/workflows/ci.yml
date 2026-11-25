@@ -141,6 +141,5 @@ jobs:
           tests/test_payout_periods_from_twonode_native.py
           tests/test_standing_deciding_rule_native.py
           tests/test_payout_deciding_rule_native.py
-          tests/test_payout_periods_from_twonode_native.py
           -p no:asyncio -v
           "

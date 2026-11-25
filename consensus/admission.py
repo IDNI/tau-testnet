@@ -73,6 +73,7 @@ from consensus.payout_rules import (
     decode_clause_legs,
     parse_execute_payout_receipt_id,
     decode_rule_outputs as decode_payout_rule_outputs,
+    parse_execute_payout_receipt_id,
     parse_execute_payout_rule,
     parse_install_payout_rule,
     parse_remove_payout_rule,

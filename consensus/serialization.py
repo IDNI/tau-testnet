@@ -1383,6 +1383,54 @@ def compute_payout_rule_tau_id(
     return blake3(bytes(out)).digest()
 
 
+DOMAIN_PAYOUT_RULE_DECIDING_V1 = b"tau.payout_rule.deciding.v1"
+
+
+def compute_payout_rule_deciding_id(
+    owner_pubkey: Any,
+    recipients: Any,
+    clause_text: str,
+    max_per_execution: int,
+    max_per_period: int,
+    period_seconds: int,
+    period_anchor_ts: int,
+    version: int,
+    rule_index: int = 0,
+    shared_cap_id: str = "",
+    shared_cap_amount: int = 0,
+    base_source: int = 0,
+) -> bytes:
+    """BLAKE3 of a deciding-rule (FIX 10, stage-2) payout rule.
+
+    The stage-2 counterpart of compute_payout_rule_tau_id, under its own
+    domain and with the same field layout: who decides — the book over
+    clause-computed legs (stage 1), or the clause itself over the book's
+    derived facts, with the book enforcing (stage 2) — is part of what
+    the owner signed, so the two forms over one clause text are
+    different rules.
+
+    `base_source` (FIX 1-B) is encoded only when it is not the legacy
+    submitted-base source (0): a deciding rule that predates the field
+    keeps its id byte-for-byte.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RULE_DECIDING_V1.decode()))
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(_encode_pubkey_list(sorted(recipients or ())))
+    out.extend(encode_string(str(clause_text or "")))
+    out.extend(encode_uint64(int(max_per_execution)))
+    out.extend(encode_uint64(int(max_per_period)))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(period_anchor_ts)))
+    out.extend(encode_uint64(int(version)))
+    out.extend(encode_uint64(int(rule_index)))
+    out.extend(encode_string(str(shared_cap_id or "")))
+    out.extend(encode_uint64(int(shared_cap_amount)))
+    if int(base_source) != 0:
+        out.extend(encode_uint64(int(base_source)))
+    return blake3(bytes(out)).digest()
+
+
 def compute_payout_rule_periods_from_id(
     owner_pubkey: Any,
     recipients: Any,
@@ -1402,109 +1450,6 @@ def compute_payout_rule_periods_from_id(
 ) -> bytes:
     """BLAKE3 of a payout rule that carries a `periods_from` anchor.
 
-    The periods-from counterpart of the two ids above, under its own
-    domain: a rule whose periods count from a signed fixed start
-    (periods_from_ts) instead of the recorded install anchor is a
-    different rule from the same terms without it — the period grid its
-    caps are counted on differs, so the anchor is inside the hash, and
-    the form is encoded so a declared-form and a Tau-form rule over the
-    same terms and anchor never collide either. Entries WITHOUT
-    periods_from keep the original ids byte-for-byte; this function is
-    only ever called for entries that carry the anchor.
-
-    Fold adaptation (FIX 9 line): the FIX 7 slot and FIX 8 shared-cap
-    terms are appended after `version`, exactly as in the declared and
-    Tau ids on this line — the G4 line this function came from has
-    neither, and without them two periods-from rules differing only in
-    slot or shared cap would collide in this domain.
-
-    `base_source` (FIX 1-B) is encoded only when it is not the legacy
-    submitted-base source (0): a rule that predates the field keeps its
-    id byte-for-byte, and only a rule that declares the recorded-receipt
-    base pays for the wider preimage.
-    """
-    out = bytearray()
-    out.extend(encode_string(DOMAIN_PAYOUT_RULE_PERIODS_FROM_V1.decode()))
-    out.extend(encode_pubkey48(owner_pubkey))
-    out.extend(_encode_pubkey_list(sorted(recipients or ())))
-    out.extend(encode_uint64(int(form)))
-    if int(form) == 2:
-        out.extend(encode_string(str(clause_text or "")))
-    else:
-        out.extend(_encode_leg_list(legs))
-    out.extend(encode_uint64(int(max_per_execution)))
-    out.extend(encode_uint64(int(max_per_period)))
-    out.extend(encode_uint64(int(period_seconds)))
-    out.extend(encode_uint64(int(period_anchor_ts)))
-    out.extend(encode_uint64(int(periods_from_ts)))
-    out.extend(encode_uint64(int(version)))
-    out.extend(encode_uint64(int(rule_index)))
-    out.extend(encode_string(str(shared_cap_id or "")))
-    out.extend(encode_uint64(int(shared_cap_amount)))
-    if int(base_source) != 0:
-        out.extend(encode_uint64(int(base_source)))
-    return blake3(bytes(out)).digest()
-
-
-DOMAIN_PAYOUT_RULE_DECIDING_V1 = b"tau.payout_rule.deciding.v1"
-
-
-def compute_payout_rule_deciding_id(
-    owner_pubkey: Any,
-    recipients: Any,
-    clause_text: str,
-    max_per_execution: int,
-    max_per_period: int,
-    period_seconds: int,
-    period_anchor_ts: int,
-    version: int,
-    rule_index: int = 0,
-    shared_cap_id: str = "",
-    shared_cap_amount: int = 0,
-) -> bytes:
-    """BLAKE3 of a deciding-rule (FIX 10, stage-2) payout rule.
-
-    The stage-2 counterpart of compute_payout_rule_tau_id, under its own
-    domain and with the same field layout: who decides — the book over
-    clause-computed legs (stage 1), or the clause itself over the book's
-    derived facts, with the book enforcing (stage 2) — is part of what
-    the owner signed, so the two forms over one clause text are
-    different rules.
-    """
-    out = bytearray()
-    out.extend(encode_string(DOMAIN_PAYOUT_RULE_DECIDING_V1.decode()))
-    out.extend(encode_pubkey48(owner_pubkey))
-    out.extend(_encode_pubkey_list(sorted(recipients or ())))
-    out.extend(encode_string(str(clause_text or "")))
-    out.extend(encode_uint64(int(max_per_execution)))
-    out.extend(encode_uint64(int(max_per_period)))
-    out.extend(encode_uint64(int(period_seconds)))
-    out.extend(encode_uint64(int(period_anchor_ts)))
-    out.extend(encode_uint64(int(version)))
-    out.extend(encode_uint64(int(rule_index)))
-    out.extend(encode_string(str(shared_cap_id or "")))
-    out.extend(encode_uint64(int(shared_cap_amount)))
-    return blake3(bytes(out)).digest()
-
-
-def compute_payout_rule_periods_from_id(
-    owner_pubkey: Any,
-    recipients: Any,
-    legs: Any,
-    clause_text: str,
-    form: int,
-    max_per_execution: int,
-    max_per_period: int,
-    period_seconds: int,
-    period_anchor_ts: int,
-    periods_from_ts: int,
-    version: int,
-    rule_index: int = 0,
-    shared_cap_id: str = "",
-    shared_cap_amount: int = 0,
-) -> bytes:
-    """BLAKE3 of a payout rule that carries a `periods_from` anchor.
-
     The periods-from counterpart of the three ids above, under its own
     domain: a rule whose periods count from a signed fixed start
     (periods_from_ts) instead of the recorded install anchor is a
@@ -1521,6 +1466,11 @@ def compute_payout_rule_periods_from_id(
     and deciding ids on this line — the G4 line this function came from
     has neither, and without them two periods-from rules differing only
     in slot or shared cap would collide in this domain.
+
+    `base_source` (FIX 1-B) is encoded only when it is not the legacy
+    submitted-base source (0): a rule that predates the field keeps its
+    id byte-for-byte, and only a rule that declares the recorded-receipt
+    base pays for the wider preimage.
     """
     out = bytearray()
     out.extend(encode_string(DOMAIN_PAYOUT_RULE_PERIODS_FROM_V1.decode()))
@@ -1544,6 +1494,8 @@ def compute_payout_rule_periods_from_id(
     out.extend(encode_uint64(int(rule_index)))
     out.extend(encode_string(str(shared_cap_id or "")))
     out.extend(encode_uint64(int(shared_cap_amount)))
+    if int(base_source) != 0:
+        out.extend(encode_uint64(int(base_source)))
     return blake3(bytes(out)).digest()
 
 

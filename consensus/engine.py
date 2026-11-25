@@ -3889,7 +3889,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 # When the receipt cannot be resolved, fall
                                 # back to the submitted base and let
                                 # evaluate_execution refuse with the precise
-                                # receipt reason.
+                                # receipt reason. The pre-resolution is
+                                # form-agnostic: a deciding-form rule (FIX
+                                # 10) is stepped over the resolved base
+                                # too, and its verdict is read alongside
+                                # the legs.
                                 pr_clause_base = pr_base
                                 if (
                                     pr_entry.base_source

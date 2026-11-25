@@ -126,6 +126,27 @@ make two honest nodes disagree about admissibility, which forks.
   other form. No verdict, no payment. The form is inside its own id
   domain, so a stage-1 clause and a stage-2 deciding rule over one
   clause text are different rules.
+- FIX 1-B (recorded-receipt base): a rule may declare its base source as
+  the node's own record of an incoming transfer instead of the amount an
+  execution submits. When an ordinary (or claimed-payment) credit lands
+  on the account of an owner whose rule is receipt-based, the node
+  records a receipt in this book — sender, recipient, gross amount,
+  timestamp, under an id derived from the containing transaction — at
+  the post-settlement site, so a fee-rejected transfer records nothing.
+  An execution of a receipt-based rule names a receipt id; the node
+  fills the base from the recorded amount and the submitted
+  `payout_base_amount` is ignored entirely, so no executor can inflate
+  the base a royalty computes over. A receipt funds exactly one
+  execution: settling consumes it, and a second execution naming it
+  settles nothing. Receipts are rooted with the book and survive rule
+  removal and replacement, like settlements. The base resolution lives
+  in this book's evaluation — the one point both leg forms draw from:
+  the declared form's `compute_legs` here, and the Tau clause form's
+  input map (its i1 is the base the engine hands this book) on the
+  clause lineage, which must be fed the resolved base from here. A
+  deciding-form rule (FIX 10) is clause-based too: its clause is
+  stepped over the resolved base, and its verdict is read from o29
+  alongside the legs.
 - Removal follows the account's normal rules: an owner-signed removal
   transaction, screened by the book's can_remove at admission and apply
   verbatim. (A #33-style lock, if one is ever active on the account, binds
@@ -206,6 +227,14 @@ BASE_SOURCES = frozenset({BASE_SUBMITTED, BASE_RECORDED_RECEIPT})
 # encoding: o29 is 1 when the rule executes, and anything else — or an
 # absent or unreadable value — when it declines.
 PAYOUT_VERDICT_STREAM = 29
+
+# Base sources (FIX 1-B). Where the base a rule's basis-point legs
+# compute over comes from: the amount an execution submits (the legacy
+# source), or the node's own recorded receipt of an incoming transfer
+# (the execution names the receipt; the node fills the amount).
+BASE_SUBMITTED = 0
+BASE_RECORDED_RECEIPT = 1
+BASE_SOURCES = frozenset({BASE_SUBMITTED, BASE_RECORDED_RECEIPT})
 
 # Bounded state: at most MAX_RULES_PER_OWNER rules per owner (FIX 7), and
 # each rule itself is small. The slot bound is what makes "a ninth rule"
@@ -327,6 +356,7 @@ class PayoutRuleEntry:
                 self.rule_index,
                 self.shared_cap_id,
                 self.shared_cap_amount,
+                self.base_source,
             )
         if self.form == FORM_TAU_RULE:
             return compute_payout_rule_tau_id(
