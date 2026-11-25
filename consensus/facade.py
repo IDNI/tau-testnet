@@ -628,6 +628,7 @@ class TipAdmissionView:
         periods_from = int(row[15]) if len(row) > 15 else 0
         base_source = int(row[16]) if len(row) > 16 else 0
         ts = self.next_block_timestamp
+        period = period_index_at(entry, ts)
         return {
             "rule_id": entry.rule_id.hex(),
             "rule_index": rule_index,

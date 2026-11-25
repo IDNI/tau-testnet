@@ -345,8 +345,8 @@ def test_rows_and_restore_with_periods_from():
     decision = book.execute(entry.rule_id, SID_1, 1, DEC1, 10_000)
     assert decision.executed, decision.reason
     (row,) = book.rows()
-    # The anchor rides as a thirteenth field, after the legacy twelve.
-    assert len(row) == 13 and row[12] == DEC1
+    # The anchor rides as a sixteenth field, after the legacy fifteen.
+    assert len(row) == 16 and row[15] == DEC1
     clone = PayoutRuleBook.restore(book.rows(), book.settlement_rows())
     restored = clone.get(OWNER)
     assert restored is not None
@@ -363,7 +363,7 @@ def test_mixed_book_of_legacy_and_anchored_rows_restores():
     book.install(legacy, NOV26)
     book.install(anchored, NOV26)
     rows = book.rows()
-    assert sorted(len(r) for r in rows) == [12, 13]
+    assert sorted(len(r) for r in rows) == [15, 16]
     clone = PayoutRuleBook.restore(rows, book.settlement_rows())
     assert clone.root() == book.root()
     assert clone.get(OWNER).periods_from_ts == 0
