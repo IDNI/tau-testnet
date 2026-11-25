@@ -16,6 +16,7 @@ import db
 import tau_manager
 from commands import checktx, createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance, getupdateid, getaccountstate, gettxstatus
 from commands import getofferid, getruleoffers, getruleoffer, getruleconflict
+from commands import getrecipientpolicy
 from commands import (
     getapprovalpreview,
     getapprovalrequest,
@@ -90,6 +91,9 @@ class ServiceContainer:
         # in server.py.
         "getapprovalslots": getapprovalslots,
         "getapprovalpreview": getapprovalpreview,
+        # Recipient controls pre-flight: runs one gate evaluation, so it is
+        # advisory and rate-limited like the approval conveniences above.
+        "getrecipientpolicy": getrecipientpolicy,
         }
 
         mempool = override_map.get("mempool") or []

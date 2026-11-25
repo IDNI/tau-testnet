@@ -29,6 +29,7 @@ from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
+    recipient_policy_active,
     RULE_CHANGE_TX_TYPES,
     TX_TYPE_APPROVAL_REQUEST,
     TX_TYPE_RULE_CHANGE_REQUEST,
@@ -232,6 +233,12 @@ def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
         values[int(k)] = str(v)
     for slot in _approval_slot_feed(tip_view):
         values[slot] = "0"
+    # The measurement is a sender-perspective step, so it carries the
+    # outgoing recipient-controls overlay too, exactly as apply's
+    # _transfer_input_map does for it.
+    if recipient_policy_active(tip_view):
+        values[tau_defs.HOLD_STREAM_INDEX] = "0"
+        values[tau_defs.CONTEXT_STREAM_INDEX] = str(tau_defs.CONTEXT_OUTGOING)
     values[5] = str(admission_ts)
     return values
 
@@ -519,6 +526,58 @@ def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     return _policy_call(lambda: sender_policy.clause_blocks(
         body, values, pool="admission", timeout=budget
     ))
+
+
+def _recipient_gate_refusal(tip_view, recipient_pubkey, values, *, hold, context,
+                            budget, transfer_details, transfer_index):
+    """The rejection envelope when the recipient's own policy refuses one
+    transfer, or None when it does not.
+
+    The mirror of the sender-clause check above, judged through the same
+    consensus helper apply uses (sender_policy.recipient_clause_blocks), so
+    admission and apply never disagree: an allow-list refusal is a plain
+    TX_REJECTED; a hold refusal carries the RECIPIENT_MAX_HOLD code with the
+    measured hold and — only when the gate verified it against this payer's
+    own evaluation — the recipient's actual cap.
+    """
+    blocked, info = _policy_call(lambda: sender_policy.recipient_clause_blocks(
+        tip_view.clause_for, recipient_pubkey, values,
+        hold=hold, context=context, pool="admission", timeout=budget,
+    ))
+    if not blocked:
+        return None
+    if info.get("reason") == "recipient_max_hold":
+        details = {
+            "code": "RECIPIENT_MAX_HOLD",
+            "hold": info.get("hold"),
+            "unit": info.get("unit"),
+            "cap_kind": info.get("cap_kind"),
+        }
+        if info.get("cap_kind") == "threshold":
+            if info.get("unit") == "seconds":
+                details["max_hold_seconds"] = info.get("max_hold_seconds")
+            else:
+                details["max_hold_blocks"] = info.get("max_hold_blocks")
+        return _qt_err(
+            "RECIPIENT_MAX_HOLD",
+            (
+                f"Transaction rejected: the recipient's policy caps the hold "
+                f"for transfer #{transfer_index} ({transfer_details}); this "
+                f"transfer would be held {info.get('hold')} {info.get('unit')}. "
+                f"Policy output: {info.get('o5')}"
+            ),
+            transfer_index=transfer_index,
+            recipient_policy=details,
+        )
+    return _qt_err(
+        "TX_REJECTED",
+        (
+            f"Transaction rejected: the recipient's policy refused transfer "
+            f"#{transfer_index} ({transfer_details}). "
+            f"Policy output: {info.get('o5')}"
+        ),
+        transfer_index=transfer_index,
+    )
 
 
 def _clause_build_refusal(body, budget):
@@ -936,6 +995,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         or idx in tau_defs.reserved_operation_keys(
                             tip_view.eligibility_mode,
                             approval_slots_active=approval_slots_active(tip_view),
+                            recipient_policy_active=recipient_policy_active(tip_view),
                         ):
                     return _qt_err(
                         "TX_INVALID",
@@ -1253,6 +1313,17 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         # Reserved upstream, so a sender cannot pre-fill one.
                         for slot in _approval_slot_feed(tip_view):
                             tau_input_stream_values[slot] = "0"
+                        # Recipient controls (i17/i16). The sender pass always
+                        # carries the outgoing overlay (hold 0, context 0),
+                        # forced after the custom merge and the slot feed,
+                        # byte-identically at apply, so a sender-supplied
+                        # i17/i16 never survives and an owner's inbound rules
+                        # never fire on their own outgoing payments.
+                        if recipient_policy_active(tip_view):
+                            tau_input_stream_values[tau_defs.HOLD_STREAM_INDEX] = "0"
+                            tau_input_stream_values[tau_defs.CONTEXT_STREAM_INDEX] = str(
+                                tau_defs.CONTEXT_OUTGOING
+                            )
                         # i5: advisory block timestamp (see admission_ts above) so
                         # time-lock o5 rules pre-check at admission; apply is
                         # authoritative.
@@ -1309,6 +1380,37 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 ),
                                 transfer_index=i + 1,
                             )
+
+                        # Recipient policy: the recipient's own clause, judged
+                        # immediately after the sender's through the same
+                        # helper apply uses, so the two never disagree. A
+                        # retractable transfer is judged with the hold it
+                        # would actually park under — measured from the same
+                        # release_kind/release_at the park validator computed,
+                        # against the same clock apply uses (the block being
+                        # built); any other transfer is a final payment.
+                        # Retracts and releases never pass through here.
+                        if recipient_policy_active(tip_view) and \
+                                tau_input_dict['to_addr'].lower() != sender_pubkey.lower():
+                            if tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+                                recip_hold, recip_context = sender_policy.park_hold(
+                                    admission_eval.data.get("release_kind"),
+                                    admission_eval.data.get("release_at"),
+                                    tip_view.next_block_height,
+                                    tip_view.next_block_timestamp,
+                                )
+                            else:
+                                recip_hold, recip_context = 0, tau_defs.CONTEXT_INCOMING_FINAL
+                            refusal = _recipient_gate_refusal(
+                                tip_view, tau_input_dict['to_addr'],
+                                tau_input_stream_values,
+                                hold=recip_hold, context=recip_context,
+                                budget=admission_tau.budget,
+                                transfer_details=transfer_details,
+                                transfer_index=i + 1,
+                            )
+                            if refusal is not None:
+                                return refusal
 
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.

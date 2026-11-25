@@ -34,6 +34,7 @@ def execute(raw_command: str, container):
 
         pending_updates = []
         scheduled_updates = []
+        deferred_prechecks = []
         archival_updates = sorted(_normalize_hexish(uid) for uid in chain_state._lifecycle_manager.archival_updates)
         votes = []
         lifecycle = {}
@@ -102,12 +103,14 @@ def execute(raw_command: str, container):
             # between (issue #24 ask 4). Informational only — consensus never
             # reads it, so an operator gets a warning window while the terminal
             # behaviour of a bad activation is unchanged.
-            precheck = precheck_scheduled_update(
-                payload_obj, chain_state._lifecycle_manager.active_validators
-            )
-            entry["precheck"] = precheck["status"]
-            if precheck["error"]:
-                entry["precheck_error"] = precheck["error"]
+            #
+            # DEFERRED until after this lock block: for a patch carrying an
+            # activation flag (approval_slots_active / recipient_policy_active)
+            # the precheck audits the tip's effective spec texts, and the
+            # chain_state getters it reads take _rules_lock — which this block
+            # already holds, and the lock is not re-entrant. Running it here
+            # deadlocked the read (and, with it, the balance/sequence locks).
+            deferred_prechecks.append((entry, payload_obj))
             scheduled_updates.append(entry)
 
         for uid, voter_set in chain_state._lifecycle_manager.votes.items():
@@ -181,6 +184,44 @@ def execute(raw_command: str, container):
             "votes": sorted(votes, key=lambda entry: (entry["update_id"], entry["voter_pubkey"])),
             "lifecycle": lifecycle,
             "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
+            # Recipient controls (issues #47/#76): whether i17/i16 are
+            # reserved and the recipient gate runs, plus the capability
+            # summary a wallet needs to phrase the ask ("accepts payments
+            # held for up to ..."). The i17/i16 widths live here, in
+            # capabilities, NOT in HOST_STREAM_WIDTHS: that dict feeds
+            # clause-domain and width screens for live rules, and widening
+            # it would silently change what pre-existing rules may declare.
+            "recipient_policy_active": bool(
+                getattr(chain_state._lifecycle_manager, "recipient_policy_active", False)
+            ),
+            "capabilities": {
+                "recipient_controls": {
+                    "active": bool(
+                        getattr(chain_state._lifecycle_manager, "recipient_policy_active", False)
+                    ),
+                    "hold_stream": tau_defs.HOLD_STREAM_INDEX,
+                    "context_stream": tau_defs.CONTEXT_STREAM_INDEX,
+                    "hold_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
+                    "context_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
+                    "contexts": {
+                        "outgoing": tau_defs.CONTEXT_OUTGOING,
+                        "incoming_final": tau_defs.CONTEXT_INCOMING_FINAL,
+                        "incoming_time_park": tau_defs.CONTEXT_INCOMING_TIME_PARK,
+                        "incoming_height_park": tau_defs.CONTEXT_INCOMING_HEIGHT_PARK,
+                    },
+                    "preflight_command": "getrecipientpolicy",
+                },
+            },
         }
+
+    # The deferred prechecks run only now, with the state locks released:
+    # the entries they fill are the same dicts `payload` already references,
+    # so the verdicts land in the response below. The validator set is the
+    # snapshot taken under the lock — the same set the entries describe.
+    for entry, payload_obj in deferred_prechecks:
+        precheck = precheck_scheduled_update(payload_obj, active_validators)
+        entry["precheck"] = precheck["status"]
+        if precheck["error"]:
+            entry["precheck_error"] = precheck["error"]
 
     return api_response.success_response("getgovernance", payload)

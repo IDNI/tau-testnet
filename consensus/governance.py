@@ -4,6 +4,7 @@ import logging
 import re
 from dataclasses import dataclass
 
+import tau_defs
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.retractable import RetractableBook
@@ -11,6 +12,7 @@ from consensus.retractable import RetractableBook
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
     ApprovalRequestLifecycleManager,
+    audit_recipient_stream_collisions,
     audit_stream_collisions,
 )
 
@@ -93,6 +95,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "fee_beneficiary",
     "max_rule_txs_per_block",
     "approval_slots_active",
+    "recipient_policy_active",
 })
 
 
@@ -106,6 +109,31 @@ def validate_approval_slots_active(value: Any) -> Optional[str]:
     """
     if value is not True:
         return "must be true; approval slots cannot be deactivated once active"
+    return None
+
+
+def validate_recipient_policy_active(value: Any) -> Optional[str]:
+    """Recipient-control activation is a ONE-WAY switch to True.
+
+    Turning it back off would un-reserve i17/i16 while registered clauses
+    read them as the host-forced hold/context streams: a sender could then
+    supply both values and forge the recipient gate's own inputs. So only
+    `True` is a legal patch value, exactly as for the approval slots.
+
+    Activation is also refused while the i16 cooldown feed is live: i16
+    carries the recipient context tag, and the two feeds are mutually
+    exclusive (see the stream notes in tau_defs.py). The flag is a code
+    constant, so this refusal is identical on every node — admission
+    rejects the patch here, and block apply raises on the same string.
+    """
+    if value is not True:
+        return "must be true; recipient controls cannot be deactivated once active"
+    if getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False):
+        return (
+            "cannot activate while the i16 cooldown feed is live "
+            "(COOLDOWN_STREAM_ACTIVE): i16 is the recipient context "
+            "stream, and the two feeds are mutually exclusive"
+        )
     return None
 
 
@@ -198,6 +226,7 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    recipient_policy_active: bool = False,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -234,6 +263,11 @@ def build_mechanism_metadata(
     # unaffected.
     if approval_slots_active:
         mech["approval_slots_active"] = True
+    # Recipient controls: same non-default gate, same reasoning — emitted
+    # only once activated, so a chain that never turns the feature on hashes
+    # exactly as it did before the field existed.
+    if recipient_policy_active:
+        mech["recipient_policy_active"] = True
     if approval_requests_root:
         mech["approval_requests_root"] = approval_requests_root
     if faucet_amount:
@@ -457,6 +491,11 @@ class ConsensusLifecycleManager:
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
+        # Recipient controls (issues #47/#76). A FIELD for the same reason,
+        # a one-way flag for the same reason: held in consensus state, read
+        # from the parent snapshot, so an activation recorded in block H
+        # governs H+1 onward.
+        self.recipient_policy_active: bool = False
         # Pinned by genesis for the life of the network: no patch sets it.
         # Bound into the meta hash only when non-zero.
         self.faucet_amount: int = 0
@@ -546,6 +585,7 @@ class ConsensusLifecycleManager:
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
+            recipient_policy_active=self.recipient_policy_active,
         )
         return compute_consensus_meta_hash(
             host_contract={},
@@ -657,6 +697,27 @@ class ConsensusLifecycleManager:
                 )
             else:
                 self.activate_approval_slots()
+
+        if "recipient_policy_active" in patch:
+            # Same two-phase activation as the approval slots, for the same
+            # reason: an in-force rule already reading i17/i16 with a meaning
+            # of its own would silently change meaning the moment the gate
+            # starts forcing those streams. Raising would freeze the chain,
+            # so a collision leaves the flag False and the chain running.
+            err = validate_recipient_policy_active(patch["recipient_policy_active"])
+            if err:
+                raise ValueError(f"recipient_policy_active: {err}")
+
+            corpus = effective_spec_texts() if callable(effective_spec_texts) else effective_spec_texts
+            findings = audit_recipient_stream_collisions(corpus or ())
+            if findings:
+                logger.error(
+                    "recipient_policy_active activation REFUSED at this height; "
+                    "the effective spec already collides: %s",
+                    "; ".join(findings),
+                )
+            else:
+                self.activate_recipient_policy()
         self.recompute_approval_threshold()
 
     def activate_approval_slots(self) -> None:
@@ -667,6 +728,26 @@ class ConsensusLifecycleManager:
         depend on them, letting a sender write their own approval slots.
         """
         self.approval_slots_active = True
+
+    def activate_recipient_policy(self) -> None:
+        """Turn recipient controls on. Idempotent, and there is no way back.
+
+        Deactivation is unrepresentable on purpose: it would un-reserve
+        i17/i16 while registered clauses read them as the host-forced
+        hold/context streams, letting a sender supply both values and forge
+        the recipient gate's own inputs.
+        """
+        if getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False):
+            # Backstop behind validate_recipient_policy_active: replay,
+            # restore and genesis paths reach this method without the
+            # patch validator, and no path may ever switch the gate on
+            # while the cooldown feed owns i16.
+            raise ValueError(
+                "recipient controls cannot activate while the i16 "
+                "cooldown feed is live (COOLDOWN_STREAM_ACTIVE): i16 is "
+                "the recipient context stream"
+            )
+        self.recipient_policy_active = True
 
     def knows_update(self, update_id: bytes) -> bool:
         """Check if an update is currently known in any state."""
