@@ -70,8 +70,11 @@ transaction hash, its amount what that transaction paid the account (capped at
 bv[24]). An execution must name one open sale; the rule reads the sale's amount
 and payer (i27, i28), and a paid execution closes the sale, so a second
 execution naming it is refused. A refused execution leaves it open. At most
-MAX_OPEN_SALES are open at once; a sale that arrives while that many are open is
-not recorded and is counted as missed. Revoking or expiring the rule drops its
+MAX_OPEN_SALES are open at once. When that many are open, a larger sale takes
+the place of the smallest open one and the smaller is counted as missed; a sale
+no larger than every open one is not recorded and is counted as missed. So sales
+too small to pay anything (a 5% royalty pays nothing on 19 or less) cannot hold
+every place and keep later sales out. Revoking or expiring the rule drops its
 open sales.
 
 ON ARRIVAL
@@ -1175,6 +1178,22 @@ def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
 _Row = Tuple  # the fields of encode_payout_entry, plus `sales` and `more`
 
 
+def _with_sale(open_sales: Tuple[Tuple[bytes, str, int, int, str], ...],
+               entry: Tuple[bytes, str, int, int, str]):
+    """`open_sales` with `entry` recorded, and the sale left out (None if none).
+
+    Below MAX_OPEN_SALES the sale is added. At the bound it takes the place of
+    the smallest open sale if it is larger (of equally small ones, the one
+    recorded last gives way), else it is the one left out.
+    """
+    if len(open_sales) < MAX_OPEN_SALES:
+        return open_sales + (entry,), None
+    low = min(range(len(open_sales)), key=lambda i: (open_sales[i][2], -i))
+    if entry[2] <= open_sales[low][2]:
+        return open_sales, entry
+    return open_sales[:low] + open_sales[low + 1:] + (entry,), open_sales[low]
+
+
 def _restore_sales(sales: Any, rid: bytes) -> Tuple[Tuple[Tuple[bytes, str, int, int, str], ...], int]:
     """A stored (missed, open sales) pair, checked; ((), 0) for a rule without it.
     Accepts the old 4-field entries (kind user_tx) and the new 5-field ones."""
@@ -1669,7 +1688,9 @@ class PayoutBook:
     def note_sale(self, account: str, sale_id: bytes, payer: str, amount: int,
                   height: int) -> Optional[str]:
         """A signed transaction paid `account` `amount` in total. Kept for the
-        transfer loop: records it for every per-sale rule of the account."""
+        transfer loop: records it for every per-sale rule of the account. A
+        recorded sale may have taken the place of a smaller open one, which is
+        then counted as missed."""
         outcomes = self.note_arrival(account, sale_id, payer, amount, height,
                                      ARRIVAL_USER_TX)
         return outcomes[0][1] if outcomes else None
@@ -1681,7 +1702,9 @@ class PayoutBook:
         rule of the account that takes it. A per-sale rule takes only signed
         transfers (`user_tx`); an on-arrival rule takes every kind. Returns
         [(rule_id, outcome)] with outcome "recorded", "missed" (a per-sale
-        rule already has MAX_OPEN_SALES open), or None when the rule takes no
+        rule already has MAX_OPEN_SALES open and the arrival is no larger than
+        the smallest open sale -- a larger arrival is recorded in its place
+        and the smaller one is the missed one), or None when the rule takes no
         arrival of this kind, the payer is the account itself, or the arrival
         is already recorded. An on-arrival rule never turns an arrival away,
         and takes none once its end is reached: the node would owe a run the
@@ -1705,13 +1728,19 @@ class PayoutBook:
             if terms.on_arrival and ts is not None and terms.clock(height, ts) >= terms.expires_at:
                 out.append((terms.rule_id, None))
                 continue
-            if len(state.open_sales) >= MAX_OPEN_SALES and not terms.on_arrival:
-                self.state[key] = replace(state, sales_missed=state.sales_missed + 1)
-                self._root = None
-                out.append((terms.rule_id, "missed"))
-                continue
             entry = (sale_id, payer, min(int(amount), tau_defs.MAX_TRANSFER_VALUE),
                      int(height), kind)
+            if len(state.open_sales) >= MAX_OPEN_SALES and not terms.on_arrival:
+                # A larger sale takes the place of the smallest open one; the
+                # one left out -- the arriving sale, or the smallest open one --
+                # is counted as missed.
+                open_sales, left_out = _with_sale(state.open_sales, entry)
+                self.state[key] = replace(state, open_sales=open_sales,
+                                          sales_missed=state.sales_missed + 1)
+                self._root = None
+                out.append((terms.rule_id,
+                            "missed" if left_out is entry else "recorded"))
+                continue
             self.state[key] = replace(state, open_sales=state.open_sales + (entry,))
             if terms.on_arrival:
                 self._arrivals.add(key)

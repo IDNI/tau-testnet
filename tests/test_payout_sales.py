@@ -292,6 +292,63 @@ def test_open_sales_are_bounded_and_the_rest_are_counted_missed():
     assert book.note_sale(integ.B, b"\x01" * 32, integ.C, 10, 12) is None
 
 
+def test_a_larger_sale_takes_the_place_of_the_smallest_open_one():
+    """Sales too small to pay anything cannot hold every place: a 5% royalty
+    pays nothing on 19 or less, so such a sale could never be closed by a paid
+    execution, and 64 of them would keep every later sale out."""
+    book = PayoutBook()
+    terms = _terms()
+    book.install(terms, 10)
+    for n in range(MAX_OPEN_SALES):
+        assert book.note_sale(integ.A, n.to_bytes(32, "big"), integ.C, 1, 11) == "recorded"
+    real = b"\xee" * 32
+    assert book.note_sale(integ.A, real, integ.B, 10_000, 12) == "recorded"
+    state = book.state_of(integ.A, terms.rule_id)
+    assert len(state.open_sales) == MAX_OPEN_SALES and state.sales_missed == 1
+    assert state.sale(real)[2] == 10_000
+    # of the equally small sales the one recorded last gave way
+    assert state.sale((MAX_OPEN_SALES - 1).to_bytes(32, "big")) is None
+    assert state.sale((0).to_bytes(32, "big")) is not None
+    # a sale no larger than every open one is the one left out
+    assert book.note_sale(integ.A, b"\xdd" * 32, integ.C, 1, 13) == "missed"
+    assert book.state_of(integ.A, terms.rule_id).sales_missed == 2
+    # to keep a sale out, every place must hold a larger one
+    for n in range(MAX_OPEN_SALES):
+        book.note_sale(integ.A, (1000 + n).to_bytes(32, "big"), integ.C, 20_000, 14)
+    assert book.note_sale(integ.A, b"\xcc" * 32, integ.B, 10_000, 15) == "missed"
+    assert {e[2] for e in book.state_of(integ.A, terms.rule_id).open_sales} == {20_000}
+    again = PayoutBook.restore(book.store_rows(), *book.resolved_state())
+    assert again.root() == book.root()
+
+
+def test_small_sales_cannot_keep_a_real_sale_from_being_paid(royalty):
+    """64 transfers of 1 into the account, each a sale the royalty pays nothing
+    on, and then a real sale: it is recorded and paid."""
+    ch, oracle, rule = _store()
+    rid = parse_payout_rule_set(rule).rule_id
+    dust = [spend_tx(CAROL, ALICE, 1, n) for n in range(MAX_OPEN_SALES)]
+    ch.block(dust, height=HEIGHT + 1, ts=TS + 1)
+    for _ in dust:
+        oracle.spend(CAROL, ALICE, 1, ts=TS + 1)
+    assert len(ch.lm.payout_rules.state_of(ALICE, rid).open_sales) == MAX_OPEN_SALES
+    # a sale the rule pays nothing on stays open: a refused execution never
+    # closes a sale, whoever sends it
+    tx = _pay(rule, _sale_id(dust[0]))
+    result = ch.block([tx], height=HEIGHT + 2, ts=TS + 2)
+    assert _reason(result, tx) == "payout_not_executed"
+    assert any("pays nothing" in line for o in result.outcomes for line in o.receipt_logs)
+
+    sale = _sale_id(_sell(ch, oracle, amount=300, seq=MAX_OPEN_SALES, height=HEIGHT + 3))
+    state = ch.lm.payout_rules.state_of(ALICE, rid)
+    assert state.sale(bytes.fromhex(sale)) is not None and state.sales_missed == 1
+    # the refused execution was not included, so BOB's next sequence is still 0
+    ch.block([_pay(rule, sale)], height=HEIGHT + 4, ts=TS + 4)
+    _executed(oracle, executor=BOB, legs=[(BOB, 15)], ts=TS + 4)
+    oracle.check(ch)
+    state = ch.lm.payout_rules.state_of(ALICE, rid)
+    assert state.paid_total == 15 and state.sale(bytes.fromhex(sale)) is None
+
+
 def test_a_paid_sale_closes_and_the_root_follows_the_sales():
     book = PayoutBook()
     terms = _terms()
