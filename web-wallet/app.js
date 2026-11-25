@@ -1125,19 +1125,15 @@ function generateRandomTauRule() {
         ].join('\n'),
 
         () => [
-            `# Example 5 - "Network" style rule with two score gates`,
-            `# Computes two hidden gates and outputs:`,
+            `# Example 5 - "Network" style rule with a score gate`,
+            `# Computes one gate and outputs:`,
             `# - o${outA}[t] allow flag (bv[24])`,
             `# - o${outB}[t] risk-ish score (bv[24])`,
-            `# Four-way branch on the two scores, each case setting both outputs.`,
+            `# Two-way branch on the score, each case setting both outputs.`,
             `always (`,
             `  ((((i${inA}[t]:bv[24] * ${hx(0x03)}) + (i${inB}[t]:bv[24] * ${hx(0x02)})) >= ${hx(0x80)})`,
-            `    ? ( (((i${inC}[t]:bv[24] * ${hx(0x05)}) + (${hx(0x00)} - i${inA}[t]:bv[24])) >= ${hx(0x40)})`,
-            `        ? (o${outA}[t]:bv[24] = ${hx(0)} && o${outB}[t]:bv[24] = ${hx(0xC8)})`,
-            `        : (o${outA}[t]:bv[24] = ${hx(1)} && o${outB}[t]:bv[24] = ${hx(0)}) )`,
-            `    : ( (((i${inC}[t]:bv[24] * ${hx(0x05)}) + (${hx(0x00)} - i${inA}[t]:bv[24])) >= ${hx(0x40)})`,
-            `        ? (o${outA}[t]:bv[24] = ${hx(0)} && o${outB}[t]:bv[24] = ${hx(0xFA)})`,
-            `        : (o${outA}[t]:bv[24] = ${hx(1)} && o${outB}[t]:bv[24] = ${hx(0x32)}) ) )`,
+            `    ? (o${outA}[t]:bv[24] = ${hx(1)} && o${outB}[t]:bv[24] = ${hx(0xC8)})`,
+            `    : (o${outA}[t]:bv[24] = ${hx(0)} && o${outB}[t]:bv[24] = ${hx(0x32)}) )`,
             `).`
         ].join('\n'),
     ];

@@ -32,6 +32,7 @@ from consensus.rule_fragment import (
     RULE_FRAGMENT_PREFIX,
     TEMPORAL_REFERENCE_PHRASE,
     RuleFragmentError,
+    RuleShape,
     clause_unit,
     parse_rule_unit,
 )
@@ -77,6 +78,8 @@ from consensus.governance import (
     HOST_CONTRACT_PATCH_KEYS,
     validate_fee_beneficiary,
     validate_approval_slots_active,
+    validate_shared_rule_limits,
+    SharedRuleLimits,
 )
 
 logger = logging.getLogger(__name__)
@@ -363,6 +366,67 @@ def screen_user_rule_text(
     return None
 
 
+RULE_BUDGET_CODE = "RULE_BUDGET"
+RULE_BUDGET_REASON = "shared_rule_budget"
+
+
+def counts_toward_shared_budget(rule_text: str) -> bool:
+    """Whether an op-0 rule accumulates in the shared spec, as opposed to registering an o5 clause."""
+    return tau_defs.USER_POLICY_STREAM_INDEX not in clause_output_streams(rule_text)
+
+
+def shared_rule_shape(rule_text: str) -> Optional[RuleShape]:
+    """The shape of the exact text `screen_user_rule_text` screens, or None if it is not one unit."""
+    import tau_native
+
+    try:
+        return parse_rule_unit(tau_native.TauInterface.preprocess_spec_text(rule_text))
+    except RuleFragmentError:
+        return None
+
+
+def shared_rule_budget_error(
+    shape: RuleShape, limits: SharedRuleLimits, count: int, nodes: int
+) -> Optional[str]:
+    """Why one more accumulated rule exceeds the limits, else None."""
+    if shape.nodes > limits.rule_nodes:
+        return f"rule has {shape.nodes} nodes; the limit is {limits.rule_nodes} per rule."
+    if shape.depth > limits.rule_depth:
+        return f"rule is {shape.depth} levels deep; the limit is {limits.rule_depth}."
+    if shape.unit_bytes > limits.rule_bytes:
+        return f"rule is {shape.unit_bytes} bytes; the limit is {limits.rule_bytes}."
+    if shape.max_width > limits.width:
+        return f"rule uses bv[{shape.max_width}]; the widest allowed is bv[{limits.width}]."
+    if count + 1 > limits.occurrences:
+        return (
+            f"the shared spec already holds {count} accepted rules; "
+            f"the limit is {limits.occurrences}."
+        )
+    if nodes + shape.nodes > limits.total_nodes:
+        return (
+            f"the shared spec holds {nodes} rule nodes and this rule adds "
+            f"{shape.nodes}; the limit is {limits.total_nodes}."
+        )
+    return None
+
+
+def screen_shared_rule_budget(
+    shape: RuleShape, limits: SharedRuleLimits, count: int, nodes: int
+) -> Optional[UserRuleRejection]:
+    """Budget screen for a rule that already passed `screen_user_rule_text`.
+
+    Shared by admission and block apply so both refuse the same rules.
+    """
+    error = shared_rule_budget_error(shape, limits, count, nodes)
+    if error is None:
+        return None
+    return UserRuleRejection(
+        f"user_tx rule exceeds the shared rule budget: {error}",
+        RULE_BUDGET_REASON,
+        RULE_BUDGET_CODE,
+    )
+
+
 def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """
     Ensure user_tx does not interact with governance fields or reserved domains.
@@ -444,6 +508,17 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
             return format_error(
                 rejection.error, code=rejection.code, **(rejection.details or {})
             )
+
+        budget = getattr(tip_view, "shared_rule_budget", None)
+        if (
+            isinstance(budget, tuple) and len(budget) == 3
+            and isinstance(budget[0], SharedRuleLimits)
+            and counts_toward_shared_budget(rule_text)
+        ):
+            shape = shared_rule_shape(rule_text)
+            rejection = shape and screen_shared_rule_budget(shape, *budget)
+            if rejection:
+                return format_error(rejection.error, code=rejection.code)
 
     return success()
 
@@ -614,6 +689,10 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         err = validate_fee_beneficiary(patch["fee_beneficiary"])
         if err:
             return f"Unsupported fee_beneficiary inside host_contract_patch: {err}"
+    if "shared_rule_limits" in patch:
+        err = validate_shared_rule_limits(patch["shared_rule_limits"])
+        if err:
+            return f"Unsupported shared_rule_limits inside host_contract_patch: {err}"
     return None
 
 

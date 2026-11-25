@@ -8,12 +8,12 @@
       "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
       "timestamp": 0,
       "merkle_root": "0000000000000000000000000000000000000000000000000000000000000000",
-      "state_hash": "3580b4fd39ad852ec23def9fda827af7315757ac2671acf24ecf1d0738c0acd2",
+      "state_hash": "5780ce4e34cf89cda893c99d209f388ab6c8893c138a952cacd171fa9fd7e58d",
       "proposer_pubkey": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
     },
     "transactions": [],
     "consensus_proof": {},
-    "hash": "ebd27b9daabfbe16d7b6058e71b1e6d738c21a4aac2cd9b8ae17ab9c7331c096"
+    "hash": "204421c43fbb01342f8ae7f92898b901d4dd50172104cd82d99b802220394f9f"
   },
   "consensus_rules": "# Tau-Driven Consensus v1 Interface\n#\n# i6: Block height\n# i7: Block timestamp\n# i8: Proposer identity (yid)\n# i9: Previous block hash (yid)\n# i10: Host proof validity (1 for valid, 0 for invalid)\n# i11: Claims summary (yid)\n#\n# o6: Block validity\n# o7: Proposer eligibility\n\n# Initial V1 Rule:\n# All authorized proposals handled by host PoA are considered eligible (o7 = 1)\n# Blocks are valid strictly if the host cryptographically verifies the proof (o6 = i10)\nalways (\n    o6[t]:bv[16] = i10[t]:bv[16] &&\n    o7[t]:bv[16] = { 1 }:bv[16]\n &&\n    o9[t]:bv[24] = { #x00000a }:bv[24]\n)\n",
   "application_rules": "((!(i0[t] = 0)) ? ( u[t] = i0[t] && o0[t] = 0 ) : o0[t] = 1)\n",
@@ -45,7 +45,17 @@
       "vote_quorum": "supermajority",
       "approval_slots_active": true,
       "faucet_amount": 100000,
-      "retractable_transfers_root": "227f3389139ae7138cc8900312e884a77597a0e22a8c8604a63305a4c92c6131"
+      "retractable_transfers_root": "227f3389139ae7138cc8900312e884a77597a0e22a8c8604a63305a4c92c6131",
+      "shared_rule_limits": {
+        "occurrences": 10,
+        "total_nodes": 80,
+        "rule_nodes": 32,
+        "rule_depth": 8,
+        "rule_bytes": 1024,
+        "width": 384
+      },
+      "shared_rule_count": 0,
+      "shared_rule_nodes": 0
     }
   }
 }

@@ -2,8 +2,9 @@ from typing import Any, Dict, List, Optional, Iterable, Union
 import copy
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
+from consensus.rule_fragment import MAX_WIDTH
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.retractable import RetractableBook
@@ -92,6 +93,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "eligibility_mode",
     "fee_beneficiary",
     "max_rule_txs_per_block",
+    "shared_rule_limits",
     "approval_slots_active",
 })
 
@@ -187,6 +189,57 @@ def validate_max_rule_txs_per_block(value: Any) -> Optional[str]:
     return None
 
 
+INT_LIMIT_MAX = 2**31 - 1
+
+
+@dataclass(frozen=True)
+class SharedRuleLimits:
+    """Resource limits on the op-0 rules that accumulate in the shared spec."""
+
+    occurrences: int = 10
+    total_nodes: int = 80
+    rule_nodes: int = 32
+    rule_depth: int = 8
+    rule_bytes: int = 1024
+    width: int = MAX_WIDTH
+
+
+DEFAULT_SHARED_RULE_LIMITS = SharedRuleLimits()
+
+_SHARED_RULE_LIMIT_BOUNDS = {
+    "occurrences": (0, INT_LIMIT_MAX),
+    "total_nodes": (0, INT_LIMIT_MAX),
+    "rule_nodes": (1, INT_LIMIT_MAX),
+    "rule_depth": (1, INT_LIMIT_MAX),
+    "rule_bytes": (1, INT_LIMIT_MAX),
+    "width": (1, MAX_WIDTH),
+}
+
+
+def validate_shared_rule_limits(value: Any) -> Optional[str]:
+    """Return an error string if `value` is not a full, in-range limits object."""
+    if not isinstance(value, dict):
+        return "must be an object"
+    keys = set(value)
+    expected = set(_SHARED_RULE_LIMIT_BOUNDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        extra = sorted(str(k) for k in keys - expected)
+        parts = []
+        if missing:
+            parts.append(f"missing {', '.join(missing)}")
+        if extra:
+            parts.append(f"unknown {', '.join(extra)}")
+        return "must carry exactly " + ", ".join(sorted(expected)) + " (" + "; ".join(parts) + ")"
+    for name, (low, high) in _SHARED_RULE_LIMIT_BOUNDS.items():
+        item = value[name]
+        if isinstance(item, bool) or not isinstance(item, int):
+            return f"{name} must be an integer"
+        if not low <= item <= high:
+            return f"{name} must be between {low} and {high}"
+    return None
+
+
 def build_mechanism_metadata(
     vote_quorum: str,
     eligibility_mode: str = DEFAULT_ELIGIBILITY_MODE,
@@ -198,6 +251,9 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    shared_rule_limits: SharedRuleLimits = DEFAULT_SHARED_RULE_LIMITS,
+    shared_rule_count: int = 0,
+    shared_rule_nodes: int = 0,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -243,6 +299,11 @@ def build_mechanism_metadata(
     if retractable_transfers_root is None:
         retractable_transfers_root = RetractableBook().root().hex()
     mech["retractable_transfers_root"] = retractable_transfers_root
+    # Always present: the budget has no activation gate, so the limits and the
+    # usage counters are part of every chain's hash from genesis.
+    mech["shared_rule_limits"] = asdict(shared_rule_limits)
+    mech["shared_rule_count"] = shared_rule_count
+    mech["shared_rule_nodes"] = shared_rule_nodes
     return mech
 
 
@@ -447,6 +508,10 @@ class ConsensusLifecycleManager:
         # interpreter rebuilds a validator must pay to verify one block.
         # Governance-patchable; bound into the meta hash only when non-default.
         self.max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK
+        # Budget on accumulated op-0 rules; the counters only ever grow.
+        self.shared_rule_limits: SharedRuleLimits = DEFAULT_SHARED_RULE_LIMITS
+        self.shared_rule_count: int = 0
+        self.shared_rule_nodes: int = 0
 
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
@@ -546,6 +611,9 @@ class ConsensusLifecycleManager:
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
+            shared_rule_limits=self.shared_rule_limits,
+            shared_rule_count=self.shared_rule_count,
+            shared_rule_nodes=self.shared_rule_nodes,
         )
         return compute_consensus_meta_hash(
             host_contract={},
@@ -628,6 +696,13 @@ class ConsensusLifecycleManager:
             if err:
                 raise ValueError(f"max_rule_txs_per_block: {err}")
             self.max_rule_txs_per_block = int(budget)
+
+        if "shared_rule_limits" in patch:
+            limits = patch["shared_rule_limits"]
+            err = validate_shared_rule_limits(limits)
+            if err:
+                raise ValueError(f"shared_rule_limits: {err}")
+            self.shared_rule_limits = SharedRuleLimits(**limits)
 
         if "approval_slots_active" in patch:
             # Same "only consensus-binding validation" reasoning as

@@ -139,6 +139,22 @@ def test_shape_of_guarded_rule():
     assert shape.unit_bytes == len(text.encode())
 
 
+def test_shape_max_width_covers_refs_and_annotated_literals():
+    guarded = parse_rule_unit(
+        f"always ((i12[t]:bv[384] = {{#x{PUBKEY}}}:bv[384]) -> "
+        f"o12[t]:bv[24] = {{#x000101}}:bv[24])."
+    )
+    assert guarded.max_width == 384
+    assert parse_rule_unit(unit(f"{A} = {B}")).max_width == 24
+    assert parse_rule_unit(unit(f"{A} = {{ #x0f }}:bv[48]")).max_width == 48
+    assert parse_rule_unit(unit(f"{A} = 0:bv[40]")).max_width == 40
+
+
+def test_shape_max_width_ignores_unannotated_numerals():
+    assert parse_rule_unit(unit(f"{A} = 1")).max_width == 24
+    assert parse_rule_unit(unit(f"{A}' = 0")).max_width == 24
+
+
 def test_shape_counts_every_operator_and_leaf():
     shape = parse_rule_unit(unit(f"({A} + {B}) = {A}"))
     assert (shape.nodes, shape.depth, shape.comparisons) == (5, 3, 1)

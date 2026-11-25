@@ -70,6 +70,7 @@ class RuleShape:
     comparisons: int
     unit_bytes: int
     refs: Tuple[StreamRef, ...]
+    max_width: int = 0
 
 
 def clause_unit(body: str) -> str:
@@ -212,6 +213,7 @@ class _Parser:
         self.pos = 0
         self.nest = 0
         self.widths: dict = {}
+        self.literal_width = 0
         self.match = self._match_parens(tokens)
 
     @staticmethod
@@ -323,6 +325,7 @@ class _Parser:
                     raise _fail("decimal constants may not have leading zeros.")
                 number = int(body)
             width = self.annotation(required=True)
+            self.literal_width = max(self.literal_width, width)
             if number >= 1 << width:
                 raise _fail(f"constant {_clip(body)} does not fit in bv[{width}].")
             return self.postfix(_leaf(literal=True))
@@ -333,7 +336,9 @@ class _Parser:
                     f"braced typed constant."
                 )
             self.pos += 1
-            self.annotation(required=False)
+            width = self.annotation(required=False)
+            if width is not None:
+                self.literal_width = max(self.literal_width, width)
             return self.postfix(_leaf(literal=True))
         raise self.unexpected(tok)
 
@@ -470,6 +475,7 @@ def _parse(text: str) -> RuleShape:
         comparisons=node.comparisons,
         unit_bytes=len(text.encode("utf-8")),
         refs=refs,
+        max_width=max([parser.literal_width, *parser.widths.values()]),
     )
 
 

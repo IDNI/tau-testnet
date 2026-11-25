@@ -40,15 +40,11 @@ def get_templates():
             f"always ( (o{outA}[t]:bv[24] = i{inA}[t]:bv[24] + i{inB}[t]:bv[24]) && (o{outB}[t]:bv[24] = i{inC}[t]:bv[24] - i{inB}[t]:bv[24]) ).",
         ]),
         "\n".join([
-            "# Example 5 - Network style rule with two score gates",
+            "# Example 5 - Network style rule with a score gate",
             "always (",
             f"  ((((i{inA}[t]:bv[24] * {hx(0x03)}) + (i{inB}[t]:bv[24] * {hx(0x02)})) >= {hx(0x80)})",
-            f"    ? ( (((i{inC}[t]:bv[24] * {hx(0x05)}) + ({hx(0x00)} - i{inA}[t]:bv[24])) >= {hx(0x40)})",
-            f"        ? (o{outA}[t]:bv[24] = {hx(0)} && o{outB}[t]:bv[24] = {hx(0xC8)})",
-            f"        : (o{outA}[t]:bv[24] = {hx(1)} && o{outB}[t]:bv[24] = {hx(0)}) )",
-            f"    : ( (((i{inC}[t]:bv[24] * {hx(0x05)}) + ({hx(0x00)} - i{inA}[t]:bv[24])) >= {hx(0x40)})",
-            f"        ? (o{outA}[t]:bv[24] = {hx(0)} && o{outB}[t]:bv[24] = {hx(0xFA)})",
-            f"        : (o{outA}[t]:bv[24] = {hx(1)} && o{outB}[t]:bv[24] = {hx(0x32)}) ) )",
+            f"    ? (o{outA}[t]:bv[24] = {hx(1)} && o{outB}[t]:bv[24] = {hx(0xC8)})",
+            f"    : (o{outA}[t]:bv[24] = {hx(0)} && o{outB}[t]:bv[24] = {hx(0x32)}) )",
             ").",
         ]),
     ]

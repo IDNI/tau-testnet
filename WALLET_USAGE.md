@@ -234,6 +234,8 @@ may not read `i2`: admission estimates it against the current head, so the fee
 charged at inclusion could differ from the estimate quoted to the sender. Fee
 rules, unlike clauses, accumulate in a shared specification and must reference
 `i12` or `i3` to scope themselves to you (`UNSCOPED_USER_RULE`).
+Such rules also count against the network's shared rule budget and are refused
+with `RULE_BUDGET` once a limit is reached (see the README).
 
 ## Sharing Rules With Another User
 

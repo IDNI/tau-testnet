@@ -1,4 +1,5 @@
 import unittest
+import unittest.mock
 from unittest.mock import patch
 import os
 import json
@@ -52,6 +53,13 @@ class TestStateReconstruction(unittest.TestCase):
         os.environ["TAU_FORCE_TEST"] = getattr(self, "_prev_tau_force_test", "1")
     def setUp(self):
         """Set up a temporary database for testing state reconstruction."""
+        # Rebuilds start from a fresh manager; nine rules need more room than the defaults give.
+        from dataclasses import replace
+        from consensus.governance import DEFAULT_SHARED_RULE_LIMITS
+        roomy = replace(DEFAULT_SHARED_RULE_LIMITS, occurrences=100, total_nodes=1000)
+        limits_patch = unittest.mock.patch("consensus.governance.DEFAULT_SHARED_RULE_LIMITS", roomy)
+        limits_patch.start()
+        self.addCleanup(limits_patch.stop)
         # Create a temporary database file
         self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix='.sqlite')
         os.close(self.temp_db_fd)  # Close the file descriptor, but keep the path

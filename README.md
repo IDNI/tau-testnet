@@ -199,7 +199,7 @@ tau-testnet --host localhost status      # node started via Docker (CLI installe
 
 > The Docker image ships only the node, not the `tau-testnet` CLI. To query a Docker node, install the client on the host with `pip install -e .` (no `tau-lang` build needed — the CLI is a thin RPC client), or just read the container's foreground logs.
 
-A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `ebd27b9d…c096`). The node logs the exact reason for any mismatch.
+A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `204421c4…4f9f`). The node logs the exact reason for any mismatch.
 
 ### Run as a validator
 
@@ -429,6 +429,8 @@ Per-account `o5` policy clauses are evaluated in separate policy worker processe
   - A constant is `{ 10 }:bv[W]`, `{ #xF0 }:bv[W]` or `{ #b101 }:bv[W]` and must fit `W`; `0` and `1` may omit the type. `W` is 1 to 384 and one stream keeps one width within a rule.
   - Definitions, quantifiers, other streams (`u`, `this`) and every other construct are refused.
 
+  **Shared rule budget** (`RULE_BUDGET`): every accepted `user_tx` rule that joins the shared specification counts against a budget, repeats included (the same text accepted three times counts three times); `o5` clauses, offers, accepts and governance revisions are excluded. The usage counters never decrease. A rule is refused, at admission and again at block apply, when it exceeds any of six limits: `occurrences` (default 10 rules since genesis), `total_nodes` (80 nodes across those rules), `rule_nodes` (32 nodes in one rule), `rule_depth` (8 levels), `rule_bytes` (1024 bytes of normalised text) and `width` (384, the widest `bv[N]`). Parentheses do not count as nodes. Governance changes the limits through a `host_contract_patch` carrying a complete `shared_rule_limits` object with all six keys; a patch never touches the counters, and a limit lowered below current usage only refuses further rules. The limits and both counters are bound into the state hash.
+
 **Python host enforces _before_ Tau** (the inputs Tau trusts):
 - Transaction BLS signature verification + canonical decoding (`commands/sendtx.py` at admission, and again for every transaction at block apply).
 - **Block proposer signature** — `Block.verify_consensus_proof()` verifies the proposer's BLS signature over the canonical header and feeds the result to Tau as `i10`; the `o6 = i10` rule then rejects an unsigned/forged block. Validator-set membership alone proves only that the named proposer is _listed_, not that the sender holds its key — the signature check is what binds them.
@@ -652,7 +654,7 @@ Timing caveats:
 - **Sequences** — admission checks projected (confirmed + pending) state; a sender may stack contiguous sequences, but a **gap is rejected**. There is **no replacement / RBF** — a stuck low-fee tx must expire or be evicted, not be replaced.
 - **Duplicates** — a repeat `tx_id` is idempotently ignored.
 - **Capacity & eviction** — the cap is `TAU_MAX_MEMPOOL_TXS` (default 5000), enforced on both the soft admission pre-check and the DB-layer eviction, each counting pending rows only. Eviction is **quota-first**: the slow lane may hold at most `TAU_MEMPOOL_RULE_LANE_MAX_FRACTION` of the cap (default 0.1) and overflow inside it is evicted from its own rows, so a burst of rule transactions cannot evict queued fee-paying transfers. Otherwise the **oldest pending** tx is evicted (FIFO, fee-blind; reserved txs are never evicted).
-- **Per-block rule budget** — a block may carry at most `max_rule_txs_per_block` rule transactions (default 8, governance-patchable, bound into the state hash when non-default): every rule-sharing transaction, and every `user_tx` whose rule writes `o5`. This is **block validity**, not policy: without it a proposer could author a block every validator times out on. A proposer may be more conservative via `TAU_BLOCK_MAX_RULE_TXS`, never more permissive.
+- **Per-block rule budget** — a block may carry at most `max_rule_txs_per_block` rule transactions (default 8, governance-patchable, bound into the state hash when non-default): every rule-sharing transaction, and every `user_tx` carrying a rule in `operations["0"]`. This is **block validity**, not policy: without it a proposer could author a block every validator times out on. A proposer may be more conservative via `TAU_BLOCK_MAX_RULE_TXS`, never more permissive.
 - **Sequence contiguity under quotas** — lane quotas can leave a sender's lower-numbered tx behind while including a higher one. The engine hard-rejects such a gap and the tx would be disposed with the block, so the builder defers the whole sender instead and it waits for its predecessor.
 - **Expiry** — expired txs are pruned opportunistically on insert (no background reaper).
 - **Persistence** — the mempool survives restart (same SQLite file) and is not re-validated on boot.
@@ -698,7 +700,7 @@ Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSoc
 
 - `status` is `"ok"` or `"error"`; `command` echoes the request; `data` on success, `error.code`/`error.message`(+`details`) on failure.
 - Types: addresses/hashes/IDs and token amounts are **strings** (overflow-safe); counts/heights/sequence numbers are integers; timestamps are ISO 8601 strings.
-- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `TEMPORAL_REFERENCE`, `RULE_FRAGMENT`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `ESTIMATE_BUSY`, `APPROVAL_NOT_NEEDED`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
+- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `TEMPORAL_REFERENCE`, `RULE_FRAGMENT`, `RULE_BUDGET`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `ESTIMATE_BUSY`, `APPROVAL_NOT_NEEDED`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
 - `DUPLICATE_UPDATE` carries `details.update_id` and `details.lifecycle_state`, so a
   wallet retrying a `consensus_rule_update` can tell "already landed" from a real
   rejection. `ADMISSION_TIMEOUT` / `ADMISSION_UNAVAILABLE` mean the isolated rule
