@@ -381,26 +381,32 @@ class AuthoritativeTauOwner:
         allocator = tau_allocator.Allocator(snapshot, width=plan.width,
                                             label="proposal")
 
-        def _respawn(current_plan):
-            return tau_session.WorkerSession.spawn(
-                baseline, cwd=cwd, env=env, plan=current_plan, allocation=allocator,
+        def _respawn(current_plan, allocation=None, on_spawn=None):
+            session = tau_session.WorkerSession.spawn(
+                baseline, cwd=cwd, env=env, plan=current_plan,
+                allocation=allocation or allocator,
             )
+            if on_spawn is not None:
+                on_spawn(session)
+            return session
 
-        def _spawn(current_plan):
+        def _spawn(current_plan, allocation=None, on_spawn=None):
             # Semantic fingerprints, so a replay under a different representation
             # still has to MEAN the same thing. A proposal built on a state the
             # committed journal does not describe is worse than no proposal.
             return tau_session.replay_entries(
-                None, committed.entries(), respawn=lambda: _respawn(current_plan),
+                None, committed.entries(),
+                respawn=lambda: _respawn(current_plan, allocation, on_spawn),
                 expected=fingerprints, start_at_last_reset=True,
             )
 
-        def rebuild(proposal_journal, current_plan):
-            session = _spawn(current_plan)
+        def rebuild(proposal_journal, current_plan, *, allocation=None,
+                    on_spawn=None, extra=()):
+            session = _spawn(current_plan, allocation, on_spawn)
             try:
                 return tau_session.replay_entries(
-                    session, proposal_journal.entries(),
-                    respawn=lambda: _respawn(current_plan),
+                    session, list(proposal_journal.entries()) + list(extra),
+                    respawn=lambda: _respawn(current_plan, allocation, on_spawn),
                 )
             except BaseException:
                 session.dispose()

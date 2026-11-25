@@ -95,6 +95,11 @@ class RepresentationPlan:
             payload["widths"] = [list(pair) for pair in self.widths]
         return tau_journal.fingerprint(payload)
 
+    @classmethod
+    def no_shrink(cls, width: int) -> "RepresentationPlan":
+        """A plan that interns nothing: every stream runs at full width."""
+        return cls(width=width, widths=())
+
     def excludes(self) -> frozenset:
         """Streams the optimizer must leave alone under this plan."""
         return frozenset(self.plain)

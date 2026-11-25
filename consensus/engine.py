@@ -1383,6 +1383,29 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             else tau_session.InProcessSession(manager=tau_manager)
         )
 
+        def _step(inputs, **kwargs):
+            """`_session.evaluate`, and a refusal is a verdict only when a fresh
+            full-width evaluator refuses the same step too."""
+            try:
+                return _session.evaluate(inputs, **kwargs)
+            except tau_session.StepRefusedLocally:
+                raise
+            except tau_session.StepRefused as refused:
+                if proposal is None:
+                    raise
+                try:
+                    proposal.recheck_step(inputs, branch=_branch)
+                except tau_session.StepRefused:
+                    raise refused from None
+                except Exception as exc:
+                    raise tau_session.StepRefusedLocally(
+                        f"the full-width recheck of a refused step failed: {exc}"
+                    ) from exc
+                raise tau_session.StepRefusedLocally(
+                    "only the shrunk evaluator refuses the step",
+                    diagnostics=refused.diagnostics,
+                ) from refused
+
         def _rules_state() -> str:
             if proposal is not None:
                 return proposal.state.get("application_rules", "") or ""
@@ -1893,7 +1916,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         f"Tau unavailable measuring a parked transfer (tx {tx_id})"
                     )
                 with tau_manager.tau_comm_lock:
-                    outputs = _session.evaluate(
+                    outputs = _step(
                         inputs, multi=True, apply_rules_update=False,
                     )
                 # o5 semantics, identical to the transfer path: absent -> allow,
@@ -1980,7 +2003,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                     else:
                         with tau_manager.tau_comm_lock:
-                            tau_outputs = _session.evaluate(
+                            tau_outputs = _step(
                                 tau_input_stream_values, multi=True,
                                 apply_rules_update=False,
                             )
@@ -2436,12 +2459,30 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             else:
                                 # Price it, and confirm the sender's own policy
                                 # really does gate this amount with no votes in.
-                                allows, parked_fee = _measure_parked_transfer(
-                                    request.sender_pubkey, request.recipient_pubkey,
-                                    request.amount, request.custom_inputs,
-                                    _approval_slot_values(),
-                                )
-                                if allows:
+                                refused = None
+                                try:
+                                    allows, parked_fee = _measure_parked_transfer(
+                                        request.sender_pubkey, request.recipient_pubkey,
+                                        request.amount, request.custom_inputs,
+                                        _approval_slot_values(),
+                                    )
+                                except tau_session.StepRefusedLocally:
+                                    raise
+                                except tau_session.StepRefused as exc:
+                                    refused = exc
+                                if refused is not None:
+                                    # As at a refused transfer step.
+                                    logger.error("Engine refused the transfer of approval "
+                                                 "request tx %s: %s", tx_id, refused)
+                                    tx_receipt["logs"].append(
+                                        f"Approval request rejected: the engine refused "
+                                        f"its transfer: {refused}"
+                                    )
+                                    if not replay_mode:
+                                        accepted_in_block = False
+                                        hard_reject = True
+                                    execution_success = False
+                                elif allows:
                                     # Nothing to wait for: parking it would strand
                                     # funds behind approvers the policy never asks
                                     # for. Soft, so the block stays valid.
@@ -2534,10 +2575,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     vote.request_id, vote
                                 )
                                 prospective = _approval_slot_values(prospective_raw)
-                                allows, _released_fee = _measure_parked_transfer(
-                                    entry.sender_pubkey, entry.recipient_pubkey,
-                                    entry.amount, entry.custom_inputs, prospective,
-                                )
+                                refused = None
+                                try:
+                                    allows, _released_fee = _measure_parked_transfer(
+                                        entry.sender_pubkey, entry.recipient_pubkey,
+                                        entry.amount, entry.custom_inputs, prospective,
+                                    )
+                                except tau_session.StepRefusedLocally:
+                                    raise
+                                except tau_session.StepRefused as exc:
+                                    refused = exc
                                 approvals.commit_vote(vote)
                                 tx_receipt["logs"].append(
                                     "Transfer vote recorded: %s %s"
@@ -2545,7 +2592,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                        "approve" if vote.approve else "decline")
                                 )
 
-                                if allows:
+                                if refused is not None:
+                                    # The release refuses the same inputs.
+                                    approvals.resolve(vote.request_id, STATUS_FAILED)
+                                    tx_receipt["reason"] = "parked_transfer_failed"
+                                    tx_receipt["logs"].append(
+                                        "Parked transfer could not be executed; "
+                                        "request marked failed: " + vote.request_id_hex
+                                    )
+                                elif allows:
                                     # Release it through the SAME closure an
                                     # ordinary transfer uses, so o5, the balance
                                     # check and the staged-write discipline are
@@ -2993,7 +3048,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     tau_input_stream_values[5] = str(block_timestamp)
 
                                     if _session.ready(timeout=0):
-                                        tau_output_transfer = _session.evaluate(
+                                        tau_output_transfer = _step(
                                             tau_input_stream_values, target=1,
                                             apply_rules_update=False,
                                         )
@@ -3046,7 +3101,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                          unified_inputs[5] = str(block_timestamp)
                          
                          if _session.ready(timeout=0):
-                             res_eval = _session.evaluate(
+                             res_eval = _step(
                                  unified_inputs, target=0,
                                  apply_rules_update=False,
                              )
@@ -3090,7 +3145,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                     else:
                         with tau_manager.tau_comm_lock:
-                            fee_outputs = _session.evaluate(
+                            fee_outputs = _step(
                                 fee_query_inputs, multi=True,
                                 apply_rules_update=False,
                             )

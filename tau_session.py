@@ -59,6 +59,11 @@ class StepRefused(RuntimeError):
         self.diagnostics = diagnostics
 
 
+class StepRefusedLocally(StepRefused):
+    """A refusal that a fresh full-width evaluator does not confirm, or could
+    not check. It depends on this node, so it is never a verdict."""
+
+
 def _first_error(text: str) -> str:
     for line in (text or "").splitlines():
         if "rror" in line:
