@@ -128,21 +128,32 @@ class PeerAddrPolicy:
         return list(self._bootstrap_addrs.get(str(peer_id), ()))
 
 
-def self_advertised_addrs(config: Any, policy: PeerAddrPolicy, host: Any) -> List[Any]:
+def advertised_addrs(config: Any, policy: PeerAddrPolicy, own_id: Any, candidates: Iterable[Any]) -> List[multiaddr.Multiaddr]:
     """Addrs that a node tells its peers to dial.
 
-    Configured announce addrs win. Else only the bound addrs that `policy`
+    Configured announce addrs win. Else only the `candidates` that `policy`
     accepts, so a node on `0.0.0.0` with no announce addr sends none.
     """
     announce = getattr(config, "announce_addrs", None)
     if isinstance(announce, (list, tuple)) and announce:
-        return list(announce)
+        parsed: List[multiaddr.Multiaddr] = []
+        for a in announce:
+            try:
+                parsed.append(a if isinstance(a, multiaddr.Multiaddr) else multiaddr.Multiaddr(str(a)))
+            except Exception:
+                logger.warning("Skipped announce address %r: not a multiaddr", a)
+        if parsed:
+            return parsed
+    return policy.filter(own_id, candidates)
+
+
+def self_advertised_addrs(config: Any, policy: PeerAddrPolicy, host: Any) -> List[multiaddr.Multiaddr]:
     try:
         bound = list(host.get_addrs() or [])
         own_id = host.get_id()
     except Exception:
-        return []
-    return policy.filter(own_id, bound)
+        bound, own_id = [], None
+    return advertised_addrs(config, policy, own_id, bound)
 
 
 class FilteringPeerStore(PeerStore):

@@ -56,3 +56,24 @@ TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS = 32
 TAU_MAX_RETRACTABLE_TRANSFER_BYTES = 4096
 TAU_MAX_RETRACT_TRANSFER_BYTES = 4096
 TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS = 32
+# A request carries up to 8 KiB of Tau text and 8 approvers, like a rule offer.
+# A cancel carries only a request id.
+TAU_MAX_RULE_CHANGE_REQUEST_BYTES = 24576
+TAU_MAX_RULE_CHANGE_CANCEL_BYTES = 4096
+
+# Gossip drops a payload over the cap of its type. Mempool admission refuses
+# it too, so a node never admits a transaction that its peers drop.
+TAU_MAX_TX_BYTES_BY_TYPE = {
+    "user_tx": TAU_MAX_USER_TX_BYTES,
+    "consensus_rule_update": TAU_MAX_GOVERNANCE_UPDATE_BYTES,
+    "consensus_rule_vote": TAU_MAX_GOVERNANCE_VOTE_BYTES,
+    "rule_offer": TAU_MAX_RULE_OFFER_BYTES,
+    "rule_offer_accept": TAU_MAX_RULE_OFFER_ACCEPT_BYTES,
+    "rule_offer_reject": TAU_MAX_RULE_OFFER_REJECT_BYTES,
+    "approval_request": TAU_MAX_APPROVAL_REQUEST_BYTES,
+    "transfer_vote": TAU_MAX_TRANSFER_VOTE_BYTES,
+    "rule_change_request": TAU_MAX_RULE_CHANGE_REQUEST_BYTES,
+    "rule_change_cancel": TAU_MAX_RULE_CHANGE_CANCEL_BYTES,
+    "retractable_transfer": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
+    "retract_transfer": TAU_MAX_RETRACT_TRANSFER_BYTES,
+}

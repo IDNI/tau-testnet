@@ -108,7 +108,7 @@ async def test_mempool_snapshot_bounds(network_service, monkeypatch):
         def __init__(self):
              self.calls = []
         async def __call__(self, topic, payload, target_peers=None):
-             self.calls.append((topic, payload))
+             self.calls.append((topic, json.loads(payload)))
              
     amock = AsyncMock()
     network_service.publish_gossip = amock

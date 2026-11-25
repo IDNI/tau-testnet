@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Any, List, Optional
 
@@ -19,7 +20,7 @@ from .libp2p_compat import (
     seed_peerstore_persisted,
     split_listen_outcome,
 )
-from .peer_addrs import FilteringPeerStore, PeerAddrPolicy
+from .peer_addrs import FilteringPeerStore, PeerAddrPolicy, advertised_addrs
 
 logger = logging.getLogger(__name__)
 
@@ -70,22 +71,19 @@ class HostManager:
             import os
             key_pair = keypair_from_seed(os.urandom(32))
 
-        try:
-            expected_peer_id = str(ID.from_pubkey(key_pair.public_key))
-            logger.info(
-                "Network identity ready peer_id=%s source=%s",
-                expected_peer_id,
-                identity_source,
-            )
-        except Exception:
-            logger.debug("Failed to compute peer_id from identity key", exc_info=True)
+        own_id = ID.from_pubkey(key_pair.public_key)
+        logger.info("Network identity ready peer_id=%s source=%s", own_id, identity_source)
 
         resource_manager = build_tau_resource_manager(self._config)
+        addr_policy = PeerAddrPolicy.from_config(self._config)
         self._host = new_host(
             key_pair=key_pair,
             listen_addrs=self._config.listen_addrs,
             resource_manager=resource_manager,
-            peerstore_opt=FilteringPeerStore(PeerAddrPolicy.from_config(self._config)),
+            peerstore_opt=FilteringPeerStore(addr_policy),
+            # identify, the signed peer record and KadDHT provider messages
+            # all send host.get_addrs().
+            addrs_factory=functools.partial(advertised_addrs, self._config, addr_policy, own_id),
         )
         attach_resource_manager(self._host, resource_manager)
         self._host.get_network().register_notifee(self._notifee)

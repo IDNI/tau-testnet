@@ -57,6 +57,7 @@ FEE_BEARING_TX_TYPES = frozenset(
 )
 from db import add_mempool_tx
 from network import bus as network_bus
+from network.protocols import TAU_MAX_TX_BYTES_BY_TYPE
 import api_response
 from rate_limit import KeyedBuckets
 
@@ -633,6 +634,16 @@ def _check_tx_envelope(payload: dict) -> dict | None:
             "TX_REJECTED",
             f"Unknown or legacy tx_type explicitly rejected natively: {tx_type}",
             tx_type=tx_type,
+        )
+
+    size = len(_canonicalize_transaction(payload).encode("utf-8"))
+    cap = TAU_MAX_TX_BYTES_BY_TYPE[tx_type]
+    if size > cap:
+        return _qt_err(
+            "TX_TOO_LARGE",
+            f"Transaction is {size} bytes; peers drop a {tx_type} over {cap} bytes.",
+            size=size,
+            limit=cap,
         )
 
     if tx_type == "user_tx":

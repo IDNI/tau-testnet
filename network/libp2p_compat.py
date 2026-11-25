@@ -247,12 +247,14 @@ def collect_listen_addrs(host: IHost) -> List[multiaddr.Multiaddr]:
     """Return host listen addresses with fallback chain for the py-libp2p quirk
     where `host.get_addrs()` can return [] right after start.
 
-    Order: host.get_addrs() → network.get_addrs() → iterate network.listeners.
-    Strips trailing /p2p/<id> suffix (some shims include it, callers don't want it).
-    Returns ONLY observed addresses — no config fallback. Callers needing config
-    fallback (e.g. logging) should layer it on themselves.
+    Order: host.get_transport_addrs() → network.get_addrs() → iterate
+    network.listeners. `host.get_addrs()` gives the advertised addrs, not the
+    bound ones. Strips trailing /p2p/<id> suffix (some shims include it, callers
+    don't want it). Returns ONLY observed addresses — no config fallback. Callers
+    needing config fallback (e.g. logging) should layer it on themselves.
     """
-    addrs = list(host.get_addrs() or [])
+    get_transport_addrs = getattr(host, "get_transport_addrs", None)
+    addrs = list(get_transport_addrs() or []) if callable(get_transport_addrs) else []
     network = host.get_network()
     get_addrs = getattr(network, "get_addrs", None)
     if not addrs and callable(get_addrs):

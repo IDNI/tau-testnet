@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import multiaddr
 import pytest
 from libp2p.crypto.ed25519 import create_new_key_pair
+from libp2p.identity.identify.identify import _mk_identify_protobuf
 from libp2p.identity.identify.pb.identify_pb2 import Identify
 from libp2p.identity.update import update_peerstore_from_identify
 from libp2p.peer.id import ID
@@ -344,3 +345,60 @@ def test_dht_self_provider_entry_holds_only_usable_addrs():
     assert dm.put_record_sync(b"state:abc", b"v")
     (_, provider), _ = dm._dht.provider_store.add_provider.call_args
     assert [str(a) for a in provider.addrs] == [PUBLIC]
+
+
+async def _identify_listen_addrs(config: NetworkConfig, *bound: str):
+    manager = HostManager(config)
+    await manager.start()
+    host = manager.host
+    with patch.object(host, "get_transport_addrs", return_value=[multiaddr.Multiaddr(a) for a in bound]):
+        message = _mk_identify_protobuf(host, None)
+    return [str(multiaddr.Multiaddr(a)).split("/p2p/", 1)[0] for a in message.listen_addrs], message
+
+
+@pytest.mark.trio
+async def test_identify_of_node_with_public_bound_addr_sends_only_that_addr():
+    sent, _ = await _identify_listen_addrs(_config(), UNSPECIFIED, LOOPBACK, PRIVATE, PUBLIC)
+    assert sent == [PUBLIC]
+
+
+@pytest.mark.trio
+async def test_identify_sends_the_announce_addr():
+    config = _config()
+    config.announce_addrs = [multiaddr.Multiaddr(OTHER_PUBLIC)]
+    sent, _ = await _identify_listen_addrs(config, UNSPECIFIED, PUBLIC)
+    assert sent == [OTHER_PUBLIC]
+
+
+@pytest.mark.trio
+async def test_identify_skips_an_announce_item_that_does_not_parse(caplog):
+    config = _config()
+    config.announce_addrs = ["not-a-multiaddr", OTHER_PUBLIC]
+    sent, _ = await _identify_listen_addrs(config, UNSPECIFIED, PUBLIC)
+    assert sent == [OTHER_PUBLIC]
+    assert "not-a-multiaddr" in caplog.text
+
+
+@pytest.mark.trio
+async def test_identify_with_no_parsable_announce_item_sends_usable_bound_addrs():
+    config = _config()
+    config.announce_addrs = ["not-a-multiaddr"]
+    sent, _ = await _identify_listen_addrs(config, UNSPECIFIED, PUBLIC)
+    assert sent == [PUBLIC]
+
+
+@pytest.mark.trio
+async def test_identify_without_usable_addr_sends_transport_addrs_that_receiver_drops():
+    sent, message = await _identify_listen_addrs(_config(), UNSPECIFIED, LOOPBACK)
+    assert sent == [UNSPECIFIED, LOOPBACK]
+    sender = _new_pid()
+    receiver_store = _peerstore(_config(listen=(PUBLIC,)))
+    await update_peerstore_from_identify(receiver_store, sender, message)
+    assert _stored(receiver_store, sender) == []
+
+
+@pytest.mark.trio
+@pytest.mark.parametrize("listen,allow", [((PRIVATE,), None), ((UNSPECIFIED,), True)])
+async def test_identify_of_local_network_node_keeps_private_addrs(listen, allow):
+    sent, _ = await _identify_listen_addrs(_config(listen=listen, allow=allow), PRIVATE, LOOPBACK)
+    assert sent == [PRIVATE, LOOPBACK]

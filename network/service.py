@@ -17,8 +17,9 @@ from .dht_manager import DHTManager
 from .discovery import DiscoveryManager
 from .gossip import GossipManager
 from .peer_addrs import PeerAddrPolicy, self_advertised_addrs
-from .protocols import REQUEST_READ_TIMEOUT
+from .protocols import REQUEST_READ_TIMEOUT, TAU_MAX_TX_BYTES_BY_TYPE
 from commands import sendtx
+from consensus.approvals import RULE_CHANGE_TX_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -100,18 +101,7 @@ apply_quic_cleanup_shim()
 apply_auto_connector_backoff_shim()
 
 # Transaction types a mempool snapshot will replay to a newly connected peer.
-_SNAPSHOT_TX_TYPES = frozenset({
-    "user_tx",
-    "consensus_rule_update",
-    "consensus_rule_vote",
-    "rule_offer",
-    "rule_offer_accept",
-    "rule_offer_reject",
-    "approval_request",
-    "transfer_vote",
-    "retractable_transfer",
-    "retract_transfer",
-})
+_SNAPSHOT_TX_TYPES = sendtx.KNOWN_TX_TYPES
 
 
 class NetworkService:
@@ -645,16 +635,16 @@ class NetworkService:
                     retractable_txs_count += 1
                 topic = self.topic_for_tx_type(tx_type)
                     
-                # 4. Optional partial decode
                 try:
-                    payload = json.loads(tx)
+                    json.loads(tx)
                 except Exception:
                     continue
-                    
+
                 total_count += 1
-                
-                # Dispatch explicitly over correct topic path
-                await self.publish_gossip(topic, payload, target_peers=[peer_id])
+
+                # A peer measures the payload string as it comes. The stored
+                # canonical blob is the string that admission measured.
+                await self.publish_gossip(topic, tx, target_peers=[peer_id])
                 
         except Exception:
             logger.warning("Failed to send mempool snapshot to %s", peer_id, exc_info=True)
@@ -864,68 +854,38 @@ class NetworkService:
             logger.debug("Failed to connect to bootstrap peer", exc_info=True)
         
     async def _on_transaction_gossip(self, envelope: Dict[str, Any]) -> None:
-        from .protocols import TAU_MAX_USER_TX_BYTES
         await self._process_gossip_payload(
-            envelope, 
-            allowed_types={"user_tx"},
-            type_limits={
-                "user_tx": TAU_MAX_USER_TX_BYTES
-            }
+            envelope,
+            allowed_types={"user_tx"} | RULE_CHANGE_TX_TYPES,
+            type_limits=TAU_MAX_TX_BYTES_BY_TYPE,
         )
 
     async def _on_governance_gossip(self, envelope: Dict[str, Any]) -> None:
-        from .protocols import TAU_MAX_GOVERNANCE_UPDATE_BYTES, TAU_MAX_GOVERNANCE_VOTE_BYTES
         await self._process_gossip_payload(
-            envelope, 
+            envelope,
             allowed_types={"consensus_rule_update", "consensus_rule_vote"},
-            type_limits={
-                "consensus_rule_update": TAU_MAX_GOVERNANCE_UPDATE_BYTES,
-                "consensus_rule_vote": TAU_MAX_GOVERNANCE_VOTE_BYTES
-            }
+            type_limits=TAU_MAX_TX_BYTES_BY_TYPE,
         )
 
     async def _on_rule_gossip(self, envelope: Dict[str, Any]) -> None:
-        from .protocols import (
-            TAU_MAX_RULE_OFFER_ACCEPT_BYTES,
-            TAU_MAX_RULE_OFFER_BYTES,
-            TAU_MAX_RULE_OFFER_REJECT_BYTES,
-        )
         await self._process_gossip_payload(
             envelope,
             allowed_types={"rule_offer", "rule_offer_accept", "rule_offer_reject"},
-            type_limits={
-                "rule_offer": TAU_MAX_RULE_OFFER_BYTES,
-                "rule_offer_accept": TAU_MAX_RULE_OFFER_ACCEPT_BYTES,
-                "rule_offer_reject": TAU_MAX_RULE_OFFER_REJECT_BYTES,
-            },
+            type_limits=TAU_MAX_TX_BYTES_BY_TYPE,
         )
 
     async def _on_approval_gossip(self, envelope: Dict[str, Any]) -> None:
-        from .protocols import (
-            TAU_MAX_APPROVAL_REQUEST_BYTES,
-            TAU_MAX_TRANSFER_VOTE_BYTES,
-        )
         await self._process_gossip_payload(
             envelope,
             allowed_types={"approval_request", "transfer_vote"},
-            type_limits={
-                "approval_request": TAU_MAX_APPROVAL_REQUEST_BYTES,
-                "transfer_vote": TAU_MAX_TRANSFER_VOTE_BYTES,
-            },
+            type_limits=TAU_MAX_TX_BYTES_BY_TYPE,
         )
 
     async def _on_retractable_gossip(self, envelope: Dict[str, Any]) -> None:
-        from .protocols import (
-            TAU_MAX_RETRACT_TRANSFER_BYTES,
-            TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
-        )
         await self._process_gossip_payload(
             envelope,
             allowed_types={"retractable_transfer", "retract_transfer"},
-            type_limits={
-                "retractable_transfer": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
-                "retract_transfer": TAU_MAX_RETRACT_TRANSFER_BYTES,
-            },
+            type_limits=TAU_MAX_TX_BYTES_BY_TYPE,
         )
 
     async def _process_gossip_payload(self, envelope: Dict[str, Any], allowed_types: set, type_limits: dict) -> None:
