@@ -698,7 +698,9 @@ Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSoc
   wallet retrying a `consensus_rule_update` can tell "already landed" from a real
   rejection. `ADMISSION_TIMEOUT` / `ADMISSION_UNAVAILABLE` mean the isolated rule
   compile exceeded its bound or could not be run — the transaction was not admitted,
-  and a retry is reasonable.
+  and a retry is reasonable. `ADMISSION_UNAVAILABLE` also comes when the engine
+  refuses a step on the shrunk evaluator of this node and a full-width evaluator
+  does not refuse it. `TX_REJECTED` for a refused step means that both refuse it.
 - The `hello version=N` handshake stays plain text (versions 1 and 2).
 
 **`createblock`** takes one optional argument: `createblock allow-empty`. Block production is

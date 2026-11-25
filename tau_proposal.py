@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 
 MAX_REPRESENTATION_RETRIES = 3
 
-#: Deadline of one recheck, replay included. A recheck that runs out stops the
-#: block apply with no verdict, as each other node-local error does.
+#: Deadline of one recheck on the proposer, replay included. A recheck that
+#: runs out stops the block apply with no verdict, as a node-local error does.
 RECHECK_BUDGET_SECONDS = 60.0
 
 
@@ -272,6 +272,9 @@ class ProposalContext:
         #: a transaction branch is open: block-level work and replays never carry
         #: one. None means no deadline.
         self.budget = None
+        #: Deadline of a recheck in seconds. Only the proposer of a new block
+        #: sets it. None: the recheck runs to its end, so nodes agree.
+        self.recheck_budget = None
         #: The transaction whose branch is open, to name it if the worker is lost.
         self.open_tx = None
 
@@ -422,12 +425,13 @@ class ProposalContext:
 
     # --- recheck of a refused step --------------------------------------------
 
-    def recheck_step(self, inputs, *, branch=None, budget=RECHECK_BUDGET_SECONDS):
+    def recheck_step(self, inputs, *, branch=None):
         """Step `inputs` once on a fresh full-width evaluator at this point.
 
         The evaluator replays the committed journal, this proposal's journal and
         the journal of `branch`. Returns the outputs or raises StepRefused. The
-        proposal session, journal and allocator do not change.
+        proposal session, journal and allocator do not change. The deadline is
+        `recheck_budget`.
         """
         import threading
 
@@ -460,9 +464,12 @@ class ProposalContext:
             for session in victims:
                 session.dispose()
 
-        timer = threading.Timer(budget, expire)
-        timer.daemon = True
-        timer.start()
+        budget = self.recheck_budget
+        timer = None
+        if budget is not None:
+            timer = threading.Timer(budget, expire)
+            timer.daemon = True
+            timer.start()
         try:
             extra = branch.journal.entries() if branch is not None else ()
             try:
@@ -480,7 +487,8 @@ class ProposalContext:
                 raise TimeoutError(f"the recheck ran out of its {budget}s budget") from exc
             raise
         finally:
-            timer.cancel()
+            if timer is not None:
+                timer.cancel()
             for session in spawned:
                 try:
                     session.dispose()

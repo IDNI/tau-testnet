@@ -235,7 +235,8 @@ def test_a_recheck_that_runs_out_of_its_budget_is_a_timeout():
 
     proposal = _proposal(le.FakeSession(), rebuild)
     with pytest.raises(TimeoutError):
-        proposal.recheck_step({1: "5"}, budget=0.05)
+        proposal.recheck_budget = 0.05
+        proposal.recheck_step({1: "5"})
     assert hanging.disposed
 
 
@@ -250,8 +251,10 @@ def test_a_session_that_starts_after_the_deadline_is_disposed_at_once():
         assert late.disposed
         raise RuntimeError("worker lost")
 
+    proposal = _proposal(le.FakeSession(), rebuild)
+    proposal.recheck_budget = 0.01
     with pytest.raises(TimeoutError):
-        _proposal(le.FakeSession(), rebuild).recheck_step({1: "5"}, budget=0.01)
+        proposal.recheck_step({1: "5"})
 
 
 def test_a_failed_dispose_does_not_hide_the_answer():
@@ -310,6 +313,100 @@ def test_the_proposer_defers_a_transaction_that_only_the_shrunk_evaluator_refuse
     mined = db.get_canonical_head_block().get("tx_ids") or []
     assert good1 in mined and good2 in mined and bad not in mined
     assert le._pending(bad)
+
+
+# --- the deadline: only the proposer of a new block has one ---
+
+class SlowRebuild(Rebuild):
+    """A recheck that takes `seconds`, then answers like Rebuild."""
+
+    def __init__(self, seconds, step_exc=None):
+        super().__init__(step_exc=step_exc)
+        self.seconds = seconds
+        self.finished = 0
+
+    def __call__(self, journal, plan, *, allocation=None, on_spawn=None, extra=()):
+        import time
+
+        session = super().__call__(journal, plan, allocation=allocation,
+                                   on_spawn=on_spawn, extra=extra)
+        end = time.monotonic() + self.seconds
+        while time.monotonic() < end:
+            if session.disposed:
+                raise RuntimeError("worker lost")
+            time.sleep(0.01)
+        self.finished += 1
+        return session
+
+
+def test_a_proposal_has_no_recheck_deadline_unless_its_proposer_sets_one():
+    assert _proposal(le.FakeSession(), Rebuild()).recheck_budget is None
+
+
+def test_the_proposer_gives_up_on_a_slow_recheck_and_defers_the_transaction(
+        node_state, clean_deferrals, monkeypatch):
+    import db
+
+    monkeypatch.setattr(tp, "RECHECK_BUDGET_SECONDS", 0.05)
+    (_, good), (bad_pk, bad) = le._queued_transfers(["ta", "tb"])
+    rebuild = SlowRebuild(0.5, step_exc=_refused())
+
+    def factory(**kw):
+        plan = tr.plan_representation(candidate_rules=[])
+        return tp.ProposalContext(
+            session=le.SenderFailingSession(bad_pk, _refused()),
+            journal=tj.Journal(authoritative=False),
+            allocator=alloc.Allocator(alloc.DbMappingSnapshot(), width=plan.width,
+                                      label="proposal"),
+            plan=plan, rebuild=rebuild,
+        )
+
+    out = le._mine(factory)
+    assert "error" in out, out
+    assert rebuild.finished == 0
+    assert set(clean_deferrals) == {bad}
+    assert le._pending(bad)
+
+
+def test_the_receive_path_waits_for_a_slow_recheck_and_gives_its_verdict(
+        node_state, monkeypatch, caplog):
+    import chain_state
+    import db
+    import tau_authority as auth
+    import tau_commit
+
+    monkeypatch.setattr(tp, "RECHECK_BUDGET_SECONDS", 0.05)
+    owner = auth.AuthoritativeTauOwner(ready=threading.Event())
+    owner.enabled = True
+    auth.reset(owner)
+    tau_commit.registry().discard()
+    rebuilds = []
+
+    proposals = []
+
+    def build_proposal(**kw):
+        rebuilds.append(SlowRebuild(0.3, step_exc=_refused()))
+        proposals.append(_proposal(le.FakeSession(step_exc=_refused()), rebuilds[-1],
+                                   plan=tr.plan_representation(candidate_rules=[])))
+        return proposals[-1]
+
+    owner.build_proposal = build_proposal
+    try:
+        with patch.object(TauConsensusEngine, "verify_block_header",
+                          lambda *a, **k: True):
+            block = le._transfer_block()
+            head = db.get_canonical_head()["block_hash"]
+            accepted = chain_state.process_new_block(block)
+    finally:
+        tau_commit.registry().discard()
+        auth.reset(None)
+    assert proposals and all(p.recheck_budget is None for p in proposals)
+    assert rebuilds and rebuilds[0].finished == 1
+    assert "node-local" not in caplog.text.lower()
+    # The verdict: the block is accepted and its refused transfer moves nothing.
+    assert accepted is True
+    assert db.get_canonical_head()["block_hash"] == block.block_hash != head
+    assert chain_state.get_balance(le.RECIPIENT) == 0
 
 
 # --- the parked transfer measure ---
