@@ -2032,16 +2032,54 @@ def list_spec_snapshots() -> List[Dict]:
         return [_spec_snapshot_dict(r) for r in cur.fetchall()]
 
 
+# Why a listed rule outcome carries no revision interval, when it does
+# not (B02-7, issue #42): the same explicit codes the journal cut uses
+# (consensus.active_rules CUT_*), so a reader can tell a record that was
+# never written apart from one that exists but cannot speak, and from
+# one whose stored shape no longer parses -- instead of one silent None.
+REVISION_RECORDED = "RECORDED"        # both revision fields stored, as ints
+REVISION_UNAVAILABLE = "UNAVAILABLE"  # record parses; no interval stored
+REVISION_TAMPERED = "TAMPERED"        # record exists; its shape does not parse
+
+
+def _is_revision_int(value) -> bool:
+    """A stored revision is an int (JSON booleans are not revisions)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def list_rule_outcomes() -> List[Dict]:
     """Every recorded rule outcome, in apply order.
 
-    This line's `rule_outcomes` table stores the outcome text only --
-    the per-step revision interval the imported module's survival
-    ledger keys on is not recorded in this table here (revision
-    receipts live in the apply path), so `spec_revision_before` /
-    `spec_revision_after` come back None and the ledger derives no
-    units from them. The ledger is not served by any command on this
-    line; the rows are listed for completeness of the module's seam.
+    The `rule_outcomes` table stores the apply outcome dict verbatim as
+    JSON (see `record_rule_outcomes`): for a shared-spec rule step that
+    dict IS the engine's revision receipt, and it carries the step's
+    `spec_revision_before` / `spec_revision_after`. This accessor lifts
+    that recorded interval out of the stored JSON -- the values the
+    engine measured at apply, never reconstructed after the fact.
+
+    Each row carries:
+
+    * `outcome`: the recorded outcome NAME (the receipt's `outcome`
+      field, e.g. "ACCEPTED_CHANGED"), or None when the stored record
+      does not parse;
+    * `outcome_record`: the full parsed outcome dict (None when it does
+      not parse) -- `get_rule_outcome` remains the verbatim per-block
+      accessor behind gettxstatus;
+    * `spec_revision_before` / `spec_revision_after`: the recorded
+      interval, or None. They are NEVER fabricated: a record that
+      stored no interval (a clause-registry record, which by
+      construction has no spec revision; a receipt whose revision
+      counter was unreadable; a row written before the fields existed)
+      comes back with None here;
+    * `revision_status`: why the interval reads as it does --
+      REVISION_RECORDED (both fields stored as ints),
+      REVISION_UNAVAILABLE (the record parses but stored no complete
+      interval), or REVISION_TAMPERED (the stored payload is not a JSON
+      object, or a revision / outcome field is present with the wrong
+      type: the row exists, its content does not check out).
+
+    `consensus.active_rules.survival_ledger` derives its units from the
+    RECORDED rows only.
     """
     if _db_conn is None:
         init_db()
@@ -2053,17 +2091,53 @@ def list_rule_outcomes() -> List[Dict]:
             "ORDER BY block_number ASC, tx_hash ASC"
         )
         rows = cur.fetchall()
-    return [
-        {
-            "tx_hash": r[0],
-            "block_hash": r[1],
-            "block_number": r[2],
-            "outcome": r[3],
-            "spec_revision_before": None,
-            "spec_revision_after": None,
-        }
-        for r in rows
-    ]
+    listed = []
+    for tx_hash, block_hash, block_number, payload in rows:
+        record = None
+        try:
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict):
+                record = parsed
+        except Exception:
+            record = None
+        outcome = None
+        before = None
+        after = None
+        if record is None:
+            status = REVISION_TAMPERED
+        else:
+            raw_outcome = record.get("outcome")
+            raw_before = record.get("spec_revision_before")
+            raw_after = record.get("spec_revision_after")
+            if raw_outcome is not None and not isinstance(raw_outcome, str):
+                status = REVISION_TAMPERED
+            elif (raw_before is not None and not _is_revision_int(raw_before)) \
+                    or (raw_after is not None and not _is_revision_int(raw_after)):
+                status = REVISION_TAMPERED
+            elif _is_revision_int(raw_before) and _is_revision_int(raw_after):
+                status = REVISION_RECORDED
+                outcome = raw_outcome
+                before = raw_before
+                after = raw_after
+            else:
+                # Parses cleanly, but no complete interval was stored:
+                # registry evidence, an unreadable counter, or a
+                # pre-field record. The numbers stay None -- reporting
+                # a revision the apply step never recorded would be a
+                # fabrication, not a reading.
+                status = REVISION_UNAVAILABLE
+                outcome = raw_outcome
+        listed.append({
+            "tx_hash": tx_hash,
+            "block_hash": block_hash,
+            "block_number": block_number,
+            "outcome": outcome,
+            "outcome_record": record,
+            "spec_revision_before": before,
+            "spec_revision_after": after,
+            "revision_status": status,
+        })
+    return listed
 
 
 def get_canonical_confirmation(block_hash: str, block_number: int) -> tuple[bool, int]:

@@ -750,6 +750,52 @@ def spec_fragments(spec_text: str) -> List[str]:
 # two consecutive snapshots is attributed to the accepted units whose
 # apply step produced a revision inside that interval.
 
+# Why the survival ledger is empty, when it is (B02-7, issue #42):
+# the same explicit codes as the journal cut above. The ledger derives
+# its units from the revision interval each recorded rule outcome
+# carries (db.list_rule_outcomes lifts it out of the stored receipt).
+# A record written before the interval was stored -- or one that never
+# had a spec revision to report, like a clause-registry record -- has
+# no interval to derive from, and its numbers are never reconstructed
+# after the fact; the codes below say which case an empty ledger is.
+LEDGER_NOT_FOUND = "NOT_FOUND"      # no rule outcome recorded at all
+LEDGER_TAMPERED = "TAMPERED"        # records exist; a stored shape is broken
+LEDGER_UNAVAILABLE = "UNAVAILABLE"  # records exist; none carries an interval
+
+
+def survival_ledger_with_status(
+        target: Optional[Dict] = None) -> Tuple[List[Dict], Optional[str]]:
+    """`survival_ledger` with an empty result classified.
+
+    Returns (ledger, None) when the recorded outcomes can speak --
+    including a legitimately empty ledger (recorded intervals exist,
+    but no ACCEPTED unit is in force at the target). Otherwise returns
+    ([], code) with code one of LEDGER_NOT_FOUND (no rule outcome has
+    been recorded on this node), LEDGER_TAMPERED (records exist but at
+    least one stored payload no longer parses, and none carries a
+    usable interval), or LEDGER_UNAVAILABLE (records exist, none of
+    them carries a revision interval: pre-field records, receipts
+    whose counter was unreadable, registry evidence). The code
+    classifies the OUTCOME RECORDS only; the snapshot guards inside
+    the derivation are unchanged.
+    """
+    import db
+
+    rows = db.list_rule_outcomes()
+    if not rows:
+        return [], LEDGER_NOT_FOUND
+    recorded = [
+        row for row in rows
+        if row.get("revision_status") == db.REVISION_RECORDED
+    ]
+    if not recorded:
+        if any(row.get("revision_status") == db.REVISION_TAMPERED
+               for row in rows):
+            return [], LEDGER_TAMPERED
+        return [], LEDGER_UNAVAILABLE
+    return _derive_survival_ledger(recorded, target), None
+
+
 def survival_ledger(target: Optional[Dict] = None) -> List[Dict]:
     """Per-unit survival at `target` (default: the latest snapshot).
 
@@ -762,7 +808,19 @@ def survival_ledger(target: Optional[Dict] = None) -> List[Dict]:
     unit-level union of displacers. A unit that installed no new
     fragments (an ACCEPTED_NOOP receipt) is in_force with an empty
     footprint: it asserted nothing the spec did not already run.
+
+    Only outcomes whose stored record carries its revision interval
+    (db.REVISION_RECORDED) derive units; records without one are never
+    given invented numbers. `survival_ledger_with_status` classifies
+    an empty result.
     """
+    ledger, _code = survival_ledger_with_status(target)
+    return ledger
+
+
+def _derive_survival_ledger(rows: List[Dict],
+                            target: Optional[Dict]) -> List[Dict]:
+    """The ledger derivation over pre-listed RECORDED outcome rows."""
     import db
 
     if target is None:
@@ -787,7 +845,7 @@ def survival_ledger(target: Optional[Dict] = None) -> List[Dict]:
     target_frags = frag_sets.get(target_revision, set())
 
     units = [
-        row for row in db.list_rule_outcomes()
+        row for row in rows
         if row.get("spec_revision_after") is not None
         and row["spec_revision_after"] <= target_revision
         and (row.get("outcome") or "").startswith("ACCEPTED")

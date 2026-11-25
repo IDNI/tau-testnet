@@ -38,7 +38,10 @@ B02-6 additions (audit §6.6 / §6.7):
     and deleting a row inside the cut, both read TAMPERED, while a
     height whose cut does not reach the deletion still answers;
   * a bound-pinning measurement for `active_rules.survival_ledger()`
-    on this line (test_module_survival_ledger_reads_no_units_on_this_line).
+    on this line -- SUPERSEDED by B02-7: the accessor now lifts the
+    recorded revision interval, and the pin is replaced by
+    test_module_survival_ledger_reads_units_on_this_line (the bound
+    closed deliberately, in the open, exactly as the pin prescribed).
 """
 import json
 import re
@@ -421,25 +424,26 @@ def test_deleted_middle_journal_row_is_tampered(temp_database, fake_mirror):
     assert data["spec"] == {"status": "TAMPERED"}
 
 
-# --- B02-6 (§6.7): the module survival ledger on this line ----------------
+# --- B02-6 (§6.7) bound, SUPERSEDED by B02-7 ------------------------------
 
-def test_module_survival_ledger_reads_no_units_on_this_line(temp_database):
-    """BOUND-PINNING MEASUREMENT (audit §6.7), not a behaviour claim.
+def test_module_survival_ledger_reads_units_on_this_line(temp_database):
+    """SUPERSESSION of the B02-6 bound-pinning measurement (§6.7).
 
-    `consensus.active_rules.survival_ledger()` derives its units from
-    `db.list_rule_outcomes()`. On this line that accessor returns every
-    row with `spec_revision_before` / `spec_revision_after` = None (the
-    table stores the outcome JSON only, and the accessor does not lift
-    the revision interval out of it -- db.py documents this itself),
-    so the module ledger derives NO units even with snapshots and
-    revision-carrying outcomes recorded: it reads [] here. The ledger
-    `getactiverules` actually serves is the command's own
-    snapshot-derived derivation, asserted non-empty over the same
-    records in test_resend_a_b_a_served_unit_ledger above.
+    B02-6 pinned, as a measured bound, that the module ledger read []
+    on this line: `db.list_rule_outcomes()` returned every row with
+    `spec_revision_before` / `spec_revision_after` = None because the
+    accessor never lifted the interval out of the stored outcome JSON.
+    The pin itself said what would lift the bound: "If this test
+    starts failing because the accessor learned to parse the
+    intervals, the bound is lifted -- update the audit note, do not
+    just delete the pin."
 
-    If this test starts failing because the accessor learned to parse
-    the intervals, the bound is lifted -- update the audit note, do
-    not just delete the pin.
+    B02-7 is that lift, done deliberately: the accessor now projects
+    the recorded interval (and classifies records that carry none --
+    see tests/test_active_rules_revision_ledger.py), so over the SAME
+    records the B02-6 pin used, the module ledger now derives the two
+    units with their recorded pairs and survival statuses. This test
+    replaces the pin; the bound it measured is closed, not forgotten.
     """
     db.record_spec_snapshot(1, 1, TEXT_A, active_rules.spec_hash_of(TEXT_A))
     db.record_spec_snapshot(2, 2, TEXT_AB, active_rules.spec_hash_of(TEXT_AB))
@@ -450,4 +454,10 @@ def test_module_survival_ledger_reads_no_units_on_this_line(temp_database):
             "spec_revision_before": before,
             "spec_revision_after": after,
         })])
-    assert active_rules.survival_ledger() == []
+    ledger, code = active_rules.survival_ledger_with_status()
+    assert code is None
+    assert [(u["tx_hash"], u["spec_revision_before"], u["spec_revision_after"])
+            for u in ledger] == [("a1" * 16, 0, 1), ("b1" * 16, 1, 2)]
+    assert [u["status"] for u in ledger] == [
+        "partially_displaced", "in_force"]
+    assert ledger[0]["displaced_by"] == ["b1" * 16]
