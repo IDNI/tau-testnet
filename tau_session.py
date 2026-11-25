@@ -397,13 +397,14 @@ class WorkerSession(EvaluatorSession):
     def _encode(self, inputs):
         """Canonical values in, runtime values out, under THIS session's plan."""
         import tau_shrink
+        declared = self.plan.declared_widths()
         encoded = {}
         for key, value in (inputs or {}).items():
             index = key
             if isinstance(key, str):
                 index = int(key[1:]) if key.startswith("i") else int(key)
             encoded[key] = tau_shrink.shrink_stream_value(
-                value, index, self.plan.interned
+                value, index, self.plan.interned, declared
             )
         return encoded
 

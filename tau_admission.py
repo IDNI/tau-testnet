@@ -258,15 +258,17 @@ def _plan_for(anchor, entries, candidate_rules):
     import tau_journal
     import tau_reconstruction
 
+    history = [e.rule_text for e in entries
+               if e.kind == tau_journal.REVISION and e.rule_text]
     if anchor.get("plan_json"):
         committed = tau_reconstruction.RepresentationPlan.from_json(anchor["plan_json"])
         if anchor.get("plan_id") and committed.plan_id != anchor["plan_id"]:
             raise AdmissionUnavailable(
                 "the stored representation plan does not hash to its recorded id")
+        if committed.widths is None:
+            committed = committed.with_declared_widths(history)
         if not _conflicts(committed, candidate_rules):
             return committed
-    history = [e.rule_text for e in entries
-               if e.kind == tau_journal.REVISION and e.rule_text]
     import tau_manager
     with tau_manager.reexec_on_width_overflow():
         return tau_reconstruction.plan_representation(

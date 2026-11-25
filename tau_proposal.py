@@ -402,10 +402,14 @@ class ProposalContext:
                 f"representation still conflicting after {self._retries} attempts"
             )
         before = self.plan.plan_id
+        interned = frozenset(self.plan.interned) - frozenset(required_plain)
+        widths = self.plan.widths
         self.plan = tau_reconstruction.RepresentationPlan(
             width=self.plan.width,
-            interned=frozenset(self.plan.interned) - frozenset(required_plain),
+            interned=interned,
             plain=frozenset(self.plan.plain) | frozenset(required_plain),
+            widths=None if widths is None else tuple(
+                (s, w) for s, w in widths if s in interned),
         )
         if self.plan.plan_id == before:
             raise ProposalPoisoned("representation retry made no progress")

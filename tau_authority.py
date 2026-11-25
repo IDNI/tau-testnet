@@ -311,14 +311,13 @@ class AuthoritativeTauOwner:
         getter = getattr(store, "latest_block_commit", None)
         if getter is not None:
             latest = getter()
+        history = [e.rule_text for e in journal.entries()
+                   if e.kind == tau_journal.REVISION and e.rule_text]
         if latest is None or not latest.get("plan_json"):
             # Nothing committed yet: plan over the (empty or genesis) history.
             import tau_manager
             with tau_manager.reexec_on_width_overflow():
-                return tau_reconstruction.plan_representation(
-                    history_rules=[e.rule_text for e in journal.entries()
-                                   if e.kind == tau_journal.REVISION and e.rule_text],
-                )
+                return tau_reconstruction.plan_representation(history_rules=history)
         plan = tau_reconstruction.RepresentationPlan.from_json(latest["plan_json"])
         if latest.get("plan_id") and plan.plan_id != latest["plan_id"]:
             self.mark_unavailable(
@@ -326,6 +325,9 @@ class AuthoritativeTauOwner:
                 f"{plan.plan_id} != {latest['plan_id']}"
             )
             raise AuthorityMismatch("representation plan")
+        if plan.widths is None:
+            # An old stored plan keeps the streams it ran under.
+            plan = plan.with_declared_widths(history)
         return plan
 
     # --- proposals ------------------------------------------------------------
