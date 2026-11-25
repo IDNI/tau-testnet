@@ -48,7 +48,12 @@ import tau_manager
 from errors import TauEngineCrash
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 from commands import sendtx, createblock
-from consensus.payout_rules import LEG_BPS_OF_BASE, PayoutLeg, PayoutRuleEntry
+from consensus.payout_rules import (
+    BASE_RECORDED_RECEIPT,
+    LEG_BPS_OF_BASE,
+    PayoutLeg,
+    PayoutRuleEntry,
+)
 
 GENESIS_TAU = os.path.join(project_root, "genesis.tau")
 TRANSFER_RULE_PATH = os.path.join(project_root, "rules", "04_handle_valid_transfer.tau")
@@ -146,19 +151,35 @@ class TestPayoutRulesNativeE2E(unittest.TestCase):
         )
         self.assertNotIn("error", str(out).lower(), f"seeding {label} failed: {out}")
 
-    def _install_rule(self):
+    def _install_rule(self, base_source=0):
         now = int(time.time())
         entry = PayoutRuleEntry(
             owner_pubkey=OWNER, recipients=(ARTIST,),
             legs=(PayoutLeg(ARTIST, LEG_BPS_OF_BASE, 500),),
             max_per_execution=0, max_per_period=0,
             period_seconds=604800, period_anchor_ts=now - 100, version=1,
+            base_source=base_source,
         )
         chain_state._lifecycle_manager.payout_rules.install(entry, now)
         return entry
 
-    def _execute_tx(self, rule_id, settlement_id=SETTLEMENT_ID):
-        return json.dumps(sign_payload({
+    def _transfer(self, sk, sender, to, amount):
+        tx = json.dumps(sign_payload({
+            "sender_pubkey": sender,
+            "sequence_number": chain_state.get_sequence_number(sender),
+            "expiration_time": int(time.time()) + 3600,
+            "expire_at_height": 5000,
+            "operations": {"1": [[sender, to, str(amount)]]},
+            "fee_limit": "50",
+        }, sk))
+        res = sendtx.queue_transaction(tx, propagate=False)
+        self.assertTrue(res["ok"], f"transfer rejected: {res}")
+        block_res = createblock.create_block_from_mempool()
+        self.assertEqual(len(block_res.get("transactions", [])), 1, block_res)
+
+    def _execute_tx(self, rule_id, settlement_id=SETTLEMENT_ID, base=101,
+                    receipt_id=None):
+        payload = {
             "sender_pubkey": EXECUTOR,
             "tx_type": "execute_payout_rule",
             "sequence_number": chain_state.get_sequence_number(EXECUTOR),
@@ -166,9 +187,12 @@ class TestPayoutRulesNativeE2E(unittest.TestCase):
             "expire_at_height": 5000,
             "payout_rule_id": rule_id.hex(),
             "payout_settlement_id": settlement_id,
-            "payout_base_amount": 101,
+            "payout_base_amount": base,
             "fee_limit": "50",
-        }, SK_CAROL))
+        }
+        if receipt_id is not None:
+            payload["payout_receipt_id"] = receipt_id.hex()
+        return json.dumps(sign_payload(payload, SK_CAROL))
 
     def test_royalty_pays_5_once_on_the_native_engine(self):
         entry = self._install_rule()
@@ -201,6 +225,56 @@ class TestPayoutRulesNativeE2E(unittest.TestCase):
         # admission, before it can reach a block — it pays 5, once.
         res = sendtx.queue_transaction(self._execute_tx(entry.rule_id), propagate=False)
         self.assertFalse(res["ok"], f"repeat execution admitted: {res}")
+
+    def test_royalty_settles_from_recorded_receipt_on_the_native_engine(self):
+        """FIX 1-B on the real engine: a buyer pays 101 through the real
+        transfer path; the node records the sale as a receipt; an
+        execution naming that receipt with an inflated submitted base
+        still settles the royalty over the recorded 101 — exactly 5,
+        once."""
+        entry = self._install_rule(base_source=BASE_RECORDED_RECEIPT)
+
+        # The sale: EXECUTOR (the buyer) pays OWNER 101 via sendtx.
+        self._transfer(SK_CAROL, EXECUTOR, OWNER, 101)
+        book = chain_state._lifecycle_manager.payout_rules
+        receipts = book.receipts_for(OWNER)
+        self.assertEqual(len(receipts), 1, receipts)
+        receipt = receipts[0]
+        self.assertEqual(receipt.amount, 101)
+        self.assertEqual(receipt.sender_pubkey, EXECUTOR)
+        self.assertFalse(book.receipt_consumed(receipt.receipt_id))
+
+        before = {pk: chain_state._balances.get(pk, 0)
+                  for pk in (OWNER, ARTIST, EXECUTOR)}
+        res = sendtx.queue_transaction(
+            self._execute_tx(entry.rule_id, settlement_id="22" * 32,
+                             base=10_100, receipt_id=receipt.receipt_id),
+            propagate=False)
+        self.assertTrue(res["ok"], f"receipt execution rejected: {res}")
+        block_res = createblock.create_block_from_mempool()
+        self.assertEqual(len(block_res.get("transactions", [])), 1, block_res)
+        after = {pk: chain_state._balances.get(pk, 0)
+                 for pk in (OWNER, ARTIST, EXECUTOR)}
+
+        # The royalty is 5% of the RECORDED 101 — not of the submitted
+        # 10,100 (which would have paid 505).
+        self.assertEqual(after[ARTIST] - before[ARTIST], 5)
+        self.assertEqual(after[OWNER] - before[OWNER], -5)
+        book = chain_state._lifecycle_manager.payout_rules
+        record = book.settlement(entry.rule_id, bytes.fromhex("22" * 32))
+        self.assertEqual(record.total, 5)
+        self.assertEqual(record.base_amount, 101)
+        self.assertEqual(record.receipt_id, receipt.receipt_id)
+        self.assertTrue(book.receipt_consumed(receipt.receipt_id))
+
+        # A second execution naming the same receipt — a fresh
+        # settlement id, a correct-looking base — is refused at
+        # admission: the sale already funded its royalty.
+        res = sendtx.queue_transaction(
+            self._execute_tx(entry.rule_id, settlement_id="33" * 32,
+                             base=101, receipt_id=receipt.receipt_id),
+            propagate=False)
+        self.assertFalse(res["ok"], f"second receipt execution admitted: {res}")
 
 
 if __name__ == "__main__":

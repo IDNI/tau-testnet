@@ -12,13 +12,17 @@ import copy
 import pytest
 
 from consensus.payout_rules import (
+    BASE_RECORDED_RECEIPT,
+    BASE_SUBMITTED,
     LEG_BPS_OF_BASE,
     LEG_FIXED,
     PayoutLeg,
+    PayoutReceipt,
     PayoutRuleBook,
     PayoutRuleEntry,
     PayoutRuleShapeError,
     compute_legs,
+    parse_execute_payout_receipt_id,
     parse_execute_payout_rule,
     parse_install_payout_rule,
     payout_rule_capabilities,
@@ -320,3 +324,201 @@ def test_capabilities_match_the_module_constants():
     assert caps["supported"] is True
     assert caps["leg_modes"] == {"fixed": LEG_FIXED, "bps_of_base": LEG_BPS_OF_BASE}
     assert caps["credit_class"] == "payout_leg"
+
+
+# --- FIX 1-B: the royalty base is the recorded receipt, not the submission ---
+
+BUYER = "e" * 96
+RECEIPT_1 = bytes.fromhex("aa" * 32)
+RECEIPT_2 = bytes.fromhex("bb" * 32)
+
+
+def receipt_entry(version=1):
+    return PayoutRuleEntry(
+        owner_pubkey=OWNER,
+        recipients=(ARTIST,),
+        legs=(PayoutLeg(ARTIST, LEG_BPS_OF_BASE, 500),),
+        max_per_execution=0,
+        max_per_period=0,
+        period_seconds=WEEK,
+        period_anchor_ts=ANCHOR,
+        version=version,
+        base_source=BASE_RECORDED_RECEIPT,
+    )
+
+
+def record_sale(book, receipt_id=RECEIPT_1, amount=101, sender=BUYER,
+                recipient=OWNER):
+    receipt = PayoutReceipt(
+        receipt_id=receipt_id, recipient_pubkey=recipient,
+        sender_pubkey=sender, amount=amount, recorded_ts=ANCHOR,
+    )
+    assert book.record_receipt(receipt)
+    return receipt_id
+
+
+def test_receipt_base_ignores_inflated_submitted_base():
+    """Spec test (a): the royalty settles over the recorded 101, whatever
+    base the execution submits — inflated, exact, or absent (0)."""
+    book, entry = installed(receipt_entry())
+    rid = record_sale(book)
+    decision = book.execute(
+        entry.rule_id, SID_1, 1_010_000, ANCHOR, 10_000, receipt_id=rid)
+    assert decision.executed, decision.reason
+    assert decision.legs == ((ARTIST, 5),)
+    assert decision.total == 5
+    # The settlement record proves the base that was used: the recorded
+    # 101, never the submitted 1,010,000.
+    record = book.settlement(entry.rule_id, SID_1)
+    assert record is not None and record.base_amount == 101
+    assert record.receipt_id == rid
+    assert book.receipt_consumed(rid)
+
+    # A second sale settles the same way with NO base submitted at all:
+    # the submitted field is not merely capped, it is not read.
+    rid2 = record_sale(book, receipt_id=RECEIPT_2)
+    decision = book.execute(
+        entry.rule_id, SID_2, 0, ANCHOR, 10_000, receipt_id=rid2)
+    assert decision.executed, decision.reason
+    assert decision.total == 5
+    assert book.period_total(entry.rule_id, 0) == 10
+
+
+def test_second_execution_on_same_receipt_refused():
+    """Spec test (b): one receipt funds exactly one execution."""
+    book, entry = installed(receipt_entry())
+    rid = record_sale(book)
+    first = book.execute(entry.rule_id, SID_1, 101, ANCHOR, 10_000,
+                         receipt_id=rid)
+    assert first.executed
+    # A fresh settlement id does not help: the receipt is spent.
+    again = book.execute(entry.rule_id, SID_2, 101, ANCHOR, 10_000,
+                         receipt_id=rid)
+    assert not again.executed
+    assert "already funded an execution" in again.reason
+    assert not book.is_settled(entry.rule_id, SID_2)
+    assert book.period_total(entry.rule_id, 0) == 5
+    # Evaluation agrees with execution (admission reads the same state).
+    peek = book.evaluate_execution(entry.rule_id, SID_2, 101, ANCHOR,
+                                   10_000, receipt_id=rid)
+    assert not peek.executed
+
+
+def test_receipt_execution_refusals():
+    book, entry = installed(receipt_entry())
+    rid = record_sale(book)
+    # No receipt named.
+    noname = book.evaluate_execution(entry.rule_id, SID_1, 101, ANCHOR, 10_000)
+    assert not noname.executed and "must name" in noname.reason
+    # An id the node never recorded.
+    unknown = book.evaluate_execution(
+        entry.rule_id, SID_1, 101, ANCHOR, 10_000,
+        receipt_id=bytes.fromhex("ff" * 32))
+    assert not unknown.executed and "no recorded receipt" in unknown.reason
+    # A receipt of somebody else's sale.
+    other_rid = record_sale(book, receipt_id=RECEIPT_2, recipient=OTHER)
+    foreign = book.evaluate_execution(
+        entry.rule_id, SID_1, 101, ANCHOR, 10_000, receipt_id=other_rid)
+    assert not foreign.executed and "not received by" in foreign.reason
+    # A submitted-base rule gains nothing by naming a receipt.
+    legacy_book, legacy = installed()
+    named = legacy_book.evaluate_execution(
+        legacy.rule_id, SID_1, 101, ANCHOR, 10_000, receipt_id=rid)
+    assert not named.executed and "submitted amount" in named.reason
+
+
+def test_receipt_rule_shape_and_parse():
+    # A receipt-based rule with no basis-point leg has nothing for the
+    # recorded base to compute over: refused at install shape.
+    fixed_only = PayoutRuleEntry(
+        owner_pubkey=OWNER, recipients=(ARTIST,),
+        legs=(PayoutLeg(ARTIST, LEG_FIXED, 5),),
+        max_per_execution=0, max_per_period=0, period_seconds=WEEK,
+        period_anchor_ts=ANCHOR, version=1,
+        base_source=BASE_RECORDED_RECEIPT,
+    )
+    problem = validate_payout_rule_shape(fixed_only, ANCHOR)
+    assert problem is not None and "basis-point" in problem
+    assert validate_payout_rule_shape(receipt_entry(), ANCHOR) is None
+    bad_source = PayoutRuleEntry(
+        owner_pubkey=OWNER, recipients=(ARTIST,),
+        legs=(PayoutLeg(ARTIST, LEG_BPS_OF_BASE, 500),),
+        max_per_execution=0, max_per_period=0, period_seconds=WEEK,
+        period_anchor_ts=ANCHOR, version=1, base_source=7,
+    )
+    assert validate_payout_rule_shape(bad_source, ANCHOR) is not None
+    # Parsing: the signed root fields land on the entry / the execution.
+    tx = {
+        "sender_pubkey": OWNER,
+        "payout_recipients": [ARTIST],
+        "payout_legs": [[ARTIST, LEG_BPS_OF_BASE, 500]],
+        "payout_max_per_execution": 0,
+        "payout_max_per_period": 0,
+        "payout_period_seconds": WEEK,
+        "payout_period_anchor_ts": ANCHOR,
+        "payout_version": 1,
+        "payout_base_source": BASE_RECORDED_RECEIPT,
+    }
+    assert parse_install_payout_rule(tx).base_source == BASE_RECORDED_RECEIPT
+    del tx["payout_base_source"]
+    assert parse_install_payout_rule(tx).base_source == BASE_SUBMITTED
+    assert parse_execute_payout_receipt_id({}) is None
+    assert parse_execute_payout_receipt_id(
+        {"payout_receipt_id": "aa" * 32}) == RECEIPT_1
+    with pytest.raises(PayoutRuleShapeError):
+        parse_execute_payout_receipt_id({"payout_receipt_id": "not-hex"})
+
+
+def test_legacy_rule_ids_and_book_root_unchanged():
+    """The byte-for-byte pin: pre-1-B rules and books hash as before."""
+    from consensus.serialization import (
+        compute_payout_rule_book_root,
+        compute_payout_rule_id,
+    )
+
+    entry = rule()
+    legacy_id = compute_payout_rule_id(
+        entry.owner_pubkey, entry.recipients,
+        tuple((leg.recipient_pubkey, leg.mode, leg.value) for leg in entry.legs),
+        entry.max_per_execution, entry.max_per_period,
+        entry.period_seconds, entry.period_anchor_ts, entry.version,
+    )
+    assert entry.rule_id == legacy_id
+    book, entry = installed()
+    book.execute(entry.rule_id, SID_1, 101, ANCHOR, 10_000)
+    rows_legacy = [r[:10] for r in book.rows()]
+    settlements_legacy = [s[:5] for s in book.settlement_rows()]
+    assert book.root() == compute_payout_rule_book_root(
+        rows_legacy, settlements_legacy)
+    # And a receipt-based rule is a DIFFERENT rule from its submitted-base
+    # twin: the base source is inside its id.
+    assert receipt_entry().rule_id != rule().rule_id
+
+
+def test_receipt_restore_roundtrip_keeps_consumption():
+    book, entry = installed(receipt_entry())
+    rid = record_sale(book)
+    book.execute(entry.rule_id, SID_1, 101, ANCHOR, 10_000, receipt_id=rid)
+    clone = PayoutRuleBook.restore(
+        book.rows(), book.settlement_rows(), book.receipt_rows())
+    assert clone.root() == book.root()
+    assert clone.receipt_consumed(rid)
+    assert clone.get_receipt(rid).amount == 101
+    again = clone.execute(entry.rule_id, SID_2, 101, ANCHOR, 10_000,
+                          receipt_id=rid)
+    assert not again.executed
+
+
+def test_receipt_survives_removal_and_replacement():
+    book, entry = installed(receipt_entry())
+    rid = record_sale(book)
+    book.execute(entry.rule_id, SID_1, 101, ANCHOR, 10_000, receipt_id=rid)
+    book.remove(OWNER, ANCHOR)
+    # The receipt (and its consumption) outlives the rule, like a
+    # settlement: reinstalling can never make the same sale pay twice.
+    assert not book.is_empty()
+    assert book.receipts_for(OWNER)[0].receipt_id == rid
+    book.install(receipt_entry(version=1), ANCHOR)
+    again = book.evaluate_execution(
+        book.get(OWNER).rule_id, SID_2, 101, ANCHOR, 10_000, receipt_id=rid)
+    assert not again.executed and "already funded" in again.reason

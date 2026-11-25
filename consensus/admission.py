@@ -62,6 +62,7 @@ from consensus.grants import (
     parse_set_grant_shared_cap,
 )
 from consensus.payout_rules import (
+    BASE_RECORDED_RECEIPT,
     FORM_TAU_RULE,
     TX_TYPE_EXECUTE_PAYOUT_RULE,
     TX_TYPE_INSTALL_PAYOUT_RULE,
@@ -69,6 +70,7 @@ from consensus.payout_rules import (
     PayoutRuleBook,
     PayoutRuleShapeError,
     decode_clause_legs,
+    parse_execute_payout_receipt_id,
     parse_execute_payout_rule,
     parse_install_payout_rule,
     parse_remove_payout_rule,
@@ -2132,6 +2134,7 @@ def _tip_payout_book(row) -> PayoutRuleBook:
     rows = [row] if isinstance(row, dict) else list(row)
     entry_rows = []
     settlement_rows = []
+    receipt_rows = []
     for r in rows:
         entry_row = (
             bytes.fromhex(r["rule_id"]),
@@ -2156,8 +2159,12 @@ def _tip_payout_book(row) -> PayoutRuleBook:
             str(r.get("shared_cap_id", "")),
             int(r.get("shared_cap_amount", 0)),
         )
-        if int(r.get("periods_from_ts", 0)):
-            entry_row = entry_row + (int(r["periods_from_ts"]),)
+        if int(r.get("periods_from_ts", 0)) or int(r.get("base_source", 0)):
+            # Fixed positions (see PayoutRuleBook.rows): periods_from is
+            # field 16, base_source field 17.
+            entry_row = entry_row + (int(r.get("periods_from_ts", 0)),)
+            if int(r.get("base_source", 0)):
+                entry_row = entry_row + (int(r["base_source"]),)
         entry_rows.append(entry_row)
         settlement_rows.extend(
             (
@@ -2166,10 +2173,27 @@ def _tip_payout_book(row) -> PayoutRuleBook:
                 int(s["base_amount"]),
                 int(s["total"]),
                 int(s["execution_ts"]),
+                bytes.fromhex(s["receipt_id"]) if s.get("receipt_id") else b"",
             )
             for s in r.get("settlements", [])
         )
-    return PayoutRuleBook.restore(entry_rows, settlement_rows)
+        # The owner's receipts ride along (FIX 1-B), each with the consumed
+        # flag the full book reports: the settlement that consumed a receipt
+        # may belong to an earlier rule version this rebuilt book does not
+        # hold, so consumption cannot be re-derived from its settlements
+        # alone — restore takes the flag from the row's sixth element.
+        receipt_rows.extend(
+            (
+                bytes.fromhex(rr["receipt_id"]),
+                r["owner_pubkey"],
+                rr["sender_pubkey"],
+                int(rr["amount"]),
+                int(rr["recorded_ts"]),
+                bool(rr.get("consumed")),
+            )
+            for rr in r.get("receipts", [])
+        )
+    return PayoutRuleBook.restore(entry_rows, settlement_rows, receipt_rows)
 
 
 def validate_install_payout_rule_payload(
@@ -2285,6 +2309,7 @@ def validate_execute_payout_rule_payload(
     """
     try:
         rule_id, settlement_id, base_amount = parse_execute_payout_rule(tx)
+        receipt_id = parse_execute_payout_receipt_id(tx)
     except PayoutRuleShapeError as exc:
         return format_error(f"Malformed execute_payout_rule: {exc}.")
 
@@ -2312,13 +2337,33 @@ def validate_execute_payout_rule_payload(
     if entry is not None and entry.form == FORM_TAU_RULE:
         from consensus import sender_policy
 
+        # Fold (FIX 1-B clause-base pre-resolution): a receipt-based
+        # rule's clause must read the RESOLVED base — the receipt's
+        # recorded amount — not the submitted one. The clause's i1 is
+        # the base the engine hands the book, and _evaluate refuses on
+        # the submitted base only after the clause has already computed
+        # over it, so the resolution happens here, before the step.
+        # When the receipt cannot be resolved, fall back to the
+        # submitted base and let evaluate_execution refuse with the
+        # precise receipt reason.
+        clause_base = base_amount
+        if (
+            entry.base_source == BASE_RECORDED_RECEIPT
+            and receipt_id is not None
+        ):
+            receipt = book.get_receipt(receipt_id)
+            if (
+                receipt is not None
+                and receipt.recipient_pubkey == entry.owner_pubkey
+            ):
+                clause_base = receipt.amount
         sender = tx.get("sender_pubkey")
         outputs, detail = sender_policy.clause_outputs(
             entry.clause_text,
             payout_clause_inputs(
                 entry,
                 sender if isinstance(sender, str) else "",
-                base_amount, ts, balance,
+                clause_base, ts, balance,
                 book.period_paid_total(entry, ts),
             ),
             pool="admission",
@@ -2333,6 +2378,7 @@ def validate_execute_payout_rule_payload(
     decision = book.evaluate_execution(
         rule_id, settlement_id, base_amount, ts, balance,
         clause_legs=clause_legs,
+        receipt_id=receipt_id,
     )
     if not decision.executed:
         return format_error(
@@ -2341,6 +2387,7 @@ def validate_execute_payout_rule_payload(
     return success({
         "rule_id": rule_id.hex(),
         "settlement_id": settlement_id.hex(),
+        "receipt_id": receipt_id.hex() if receipt_id else "",
         "total": decision.total,
         "period_index": decision.period_index,
         "legs": [

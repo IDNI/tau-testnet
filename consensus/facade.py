@@ -626,13 +626,13 @@ class TipAdmissionView:
         shared_cap_id = str(row[13]) if len(row) > 13 else ""
         shared_cap_amount = int(row[14]) if len(row) > 14 else 0
         periods_from = int(row[15]) if len(row) > 15 else 0
+        base_source = int(row[16]) if len(row) > 16 else 0
         ts = self.next_block_timestamp
         return {
             "rule_id": entry.rule_id.hex(),
             "rule_index": rule_index,
             "shared_cap_id": shared_cap_id,
             "shared_cap_amount": shared_cap_amount,
-            "periods_from_ts": periods_from,
             "owner_pubkey": owner,
             "recipients": list(recipients),
             "legs": [
@@ -647,6 +647,7 @@ class TipAdmissionView:
             "period_anchor_ts": anchor,
             "periods_from_ts": periods_from,
             "version": version,
+            "base_source": base_source,
             "period_totals": [
                 {"period_index": i, "total": t} for i, t in period_totals
             ],
@@ -687,8 +688,23 @@ class TipAdmissionView:
                     "base_amount": s.base_amount,
                     "total": s.total,
                     "execution_ts": s.execution_ts,
+                    "receipt_id": s.receipt_id.hex() if s.receipt_id else "",
                 }
                 for s in book.settlements_for(entry.rule_id)
+            ],
+            # The owner's recorded receipts (FIX 1-B), with consumption
+            # read from the full book — a receipt consumed under an
+            # earlier rule version is consumed here too, so the rebuilt
+            # one-entry book admission uses answers identically.
+            "receipts": [
+                {
+                    "receipt_id": r.receipt_id.hex(),
+                    "sender_pubkey": r.sender_pubkey,
+                    "amount": r.amount,
+                    "recorded_ts": r.recorded_ts,
+                    "consumed": book.receipt_consumed(r.receipt_id),
+                }
+                for r in book.receipts_for(owner)
             ],
         }
 

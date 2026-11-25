@@ -1203,6 +1203,7 @@ DOMAIN_PAYOUT_RULE_V1 = b"tau.payout_rule.v1"
 DOMAIN_PAYOUT_RULE_TAU_V1 = b"tau.payout_rule.tau.v1"
 DOMAIN_PAYOUT_RULE_PERIODS_FROM_V1 = b"tau.payout_rule.periods_from.v1"
 DOMAIN_PAYOUT_RULE_BOOK_V1 = b"tau.payout_rule.book.v1"
+DOMAIN_PAYOUT_RECEIPT_V1 = b"tau.payout_receipt.v1"
 
 
 def _encode_pubkey_list(pubkeys) -> bytes:
@@ -1235,6 +1236,7 @@ def compute_payout_rule_id(
     rule_index: int = 0,
     shared_cap_id: str = "",
     shared_cap_amount: int = 0,
+    base_source: int = 0,
 ) -> bytes:
     """BLAKE3 of the canonical payout rule. Returns 32 bytes.
 
@@ -1258,6 +1260,11 @@ def compute_payout_rule_id(
     slot, by the same discipline: a rule that draws on a shared cap is a
     different rule from the same terms without one, and two rules naming
     different shared caps (or different amounts) never collide.
+
+    `base_source` (FIX 1-B) is encoded only when it is not the legacy
+    submitted-base source (0): a rule that predates the field keeps its
+    id byte-for-byte, and only a rule that declares the recorded-receipt
+    base pays for the wider preimage.
     """
     out = bytearray()
     out.extend(encode_string(DOMAIN_PAYOUT_RULE_V1.decode()))
@@ -1272,6 +1279,8 @@ def compute_payout_rule_id(
     out.extend(encode_uint64(int(rule_index)))
     out.extend(encode_string(str(shared_cap_id or "")))
     out.extend(encode_uint64(int(shared_cap_amount)))
+    if int(base_source) != 0:
+        out.extend(encode_uint64(int(base_source)))
     return blake3(bytes(out)).digest()
 
 
@@ -1287,6 +1296,7 @@ def compute_payout_rule_tau_id(
     rule_index: int = 0,
     shared_cap_id: str = "",
     shared_cap_amount: int = 0,
+    base_source: int = 0,
 ) -> bytes:
     """BLAKE3 of a Tau-form payout rule. Returns 32 bytes.
 
@@ -1297,6 +1307,11 @@ def compute_payout_rule_tau_id(
     ever collide with a declared-form id over the same terms. The FIX 7
     slot term is appended after `version`, exactly as in the declared
     form, and the FIX 8 shared-cap terms after the slot.
+
+    `base_source` (FIX 1-B) is encoded only when it is not the legacy
+    submitted-base source (0): a rule that predates the field keeps its
+    id byte-for-byte, and only a rule that declares the recorded-receipt
+    base pays for the wider preimage.
     """
     out = bytearray()
     out.extend(encode_string(DOMAIN_PAYOUT_RULE_TAU_V1.decode()))
@@ -1311,6 +1326,8 @@ def compute_payout_rule_tau_id(
     out.extend(encode_uint64(int(rule_index)))
     out.extend(encode_string(str(shared_cap_id or "")))
     out.extend(encode_uint64(int(shared_cap_amount)))
+    if int(base_source) != 0:
+        out.extend(encode_uint64(int(base_source)))
     return blake3(bytes(out)).digest()
 
 
@@ -1329,6 +1346,7 @@ def compute_payout_rule_periods_from_id(
     rule_index: int = 0,
     shared_cap_id: str = "",
     shared_cap_amount: int = 0,
+    base_source: int = 0,
 ) -> bytes:
     """BLAKE3 of a payout rule that carries a `periods_from` anchor.
 
@@ -1347,6 +1365,11 @@ def compute_payout_rule_periods_from_id(
     Tau ids on this line — the G4 line this function came from has
     neither, and without them two periods-from rules differing only in
     slot or shared cap would collide in this domain.
+
+    `base_source` (FIX 1-B) is encoded only when it is not the legacy
+    submitted-base source (0): a rule that predates the field keeps its
+    id byte-for-byte, and only a rule that declares the recorded-receipt
+    base pays for the wider preimage.
     """
     out = bytearray()
     out.extend(encode_string(DOMAIN_PAYOUT_RULE_PERIODS_FROM_V1.decode()))
@@ -1366,6 +1389,8 @@ def compute_payout_rule_periods_from_id(
     out.extend(encode_uint64(int(rule_index)))
     out.extend(encode_string(str(shared_cap_id or "")))
     out.extend(encode_uint64(int(shared_cap_amount)))
+    if int(base_source) != 0:
+        out.extend(encode_uint64(int(base_source)))
     return blake3(bytes(out)).digest()
 
 
@@ -1386,6 +1411,7 @@ def encode_payout_rule_record(
     shared_cap_id: str = "",
     shared_cap_amount: int = 0,
     periods_from_ts: int = 0,
+    base_source: int = 0,
 ) -> bytes:
     """One payout rule for the book root: signed fields + live period totals.
 
@@ -1400,6 +1426,10 @@ def encode_payout_rule_record(
     carries one, is appended after them, and ONLY then: a rule without
     the anchor encodes byte-identically to before the field existed, so
     existing book roots do not move.
+
+    `base_source` is encoded only when non-legacy (see
+    compute_payout_rule_id), so a book holding only pre-FIX-1-B rules
+    keeps its root byte-for-byte.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -1423,6 +1453,8 @@ def encode_payout_rule_record(
     out.extend(encode_uint64(int(shared_cap_amount)))
     if int(periods_from_ts):
         out.extend(encode_uint64(int(periods_from_ts)))
+    if int(base_source) != 0:
+        out.extend(encode_uint64(int(base_source)))
     return bytes(out)
 
 
@@ -1432,6 +1464,7 @@ def encode_payout_settlement(
     base_amount: int,
     total: int,
     execution_ts: int,
+    receipt_id: Any = b"",
 ) -> bytes:
     """One settled execution for the book root.
 
@@ -1439,6 +1472,10 @@ def encode_payout_settlement(
     standing book's paid-period facts: they outlive the rule version that
     produced them, so removing and reinstalling the same rule can never
     reset a settlement and pay the same execution twice.
+
+    `receipt_id` (FIX 1-B) names the recorded receipt the execution's
+    base came from; it is encoded only when present, so a settlement
+    that predates receipt-based rules keeps its bytes.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -1446,14 +1483,62 @@ def encode_payout_settlement(
     out.extend(encode_uint64(int(base_amount)))
     out.extend(encode_uint64(int(total)))
     out.extend(encode_uint64(int(execution_ts)))
+    if receipt_id:
+        out.extend(encode_hash32(receipt_id))
     return bytes(out)
 
 
-def compute_payout_rule_book_root(records: list, settlements: list) -> bytes:
+def compute_payout_receipt_id(tx_id: str, occurrence: int) -> bytes:
+    """The id of the receipt a credit records (FIX 1-B). Returns 32 bytes.
+
+    Derived from the containing transaction's id and the credit's
+    occurrence index among that transaction's recorded receipts, under
+    the receipt domain: any wallet or explorer that knows the
+    transaction can recompute the name an execution must carry, and the
+    block receipt surfaces it directly. The derivation is over consensus
+    data alone (the transaction as applied, in order), so every node
+    records the same receipt under the same id.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RECEIPT_V1.decode()))
+    out.extend(encode_string(str(tx_id)))
+    out.extend(encode_uint32(int(occurrence)))
+    return blake3(bytes(out)).digest()
+
+
+def encode_payout_receipt(
+    receipt_id: Any,
+    recipient_pubkey: Any,
+    sender_pubkey: Any,
+    amount: int,
+    recorded_ts: int,
+) -> bytes:
+    """One recorded incoming transfer for the book root (FIX 1-B).
+
+    A receipt is the node's own record of a transfer that actually
+    arrived: who sent it, who received it, the gross amount and when.
+    It is rooted with the book so two nodes that disagree about what
+    arrived disagree about every royalty base drawn from it.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(receipt_id))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_pubkey48(sender_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(recorded_ts)))
+    return bytes(out)
+
+
+def compute_payout_rule_book_root(
+    records: list, settlements: list, receipts: list = ()
+) -> bytes:
     """BLAKE3 of the payout-rule book: rule records + settlement records.
 
     `records` are tuples in encode_payout_rule_record argument order and
-    `settlements` in encode_payout_settlement argument order.
+    `settlements` in encode_payout_settlement argument order. `receipts`
+    (FIX 1-B) are tuples in encode_payout_receipt argument order; the
+    receipts section is appended only when the book holds any, so a book
+    with no recorded receipts keeps its root byte-for-byte.
     """
     encoded_records = sorted(encode_payout_rule_record(*r) for r in (records or []))
     encoded_settlements = sorted(
@@ -1467,6 +1552,13 @@ def compute_payout_rule_book_root(records: list, settlements: list) -> bytes:
     out.extend(encode_uint32(len(encoded_settlements)))
     for blob in encoded_settlements:
         out.extend(blob)
+    if receipts:
+        encoded_receipts = sorted(
+            encode_payout_receipt(*r) for r in receipts
+        )
+        out.extend(encode_uint32(len(encoded_receipts)))
+        for blob in encoded_receipts:
+            out.extend(blob)
     return blake3(bytes(out)).digest()
 
 

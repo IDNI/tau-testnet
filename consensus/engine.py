@@ -48,14 +48,18 @@ from .grants import (
     parse_set_grant_shared_cap,
 )
 from .payout_rules import (
+    BASE_RECORDED_RECEIPT,
     FORM_TAU_RULE,
     PAYOUT_RULE_TX_TYPES,
     TX_TYPE_EXECUTE_PAYOUT_RULE,
     TX_TYPE_INSTALL_PAYOUT_RULE,
     TX_TYPE_REMOVE_PAYOUT_RULE,
+    PayoutReceipt,
     PayoutRuleBook,
     PayoutRuleShapeError,
+    compute_payout_receipt_id,
     decode_clause_legs,
+    parse_execute_payout_receipt_id,
     parse_execute_payout_rule,
     parse_install_payout_rule,
     parse_remove_payout_rule,
@@ -1428,6 +1432,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 payout_events.append(event)
 
+        # Payout receipts (FIX 1-B): the recorded incoming transfers of
+        # this block, in transaction order — the names executions will
+        # cite, carried on the snapshot exactly as the routing events
+        # are, so a wallet can learn a receipt's id from the block that
+        # recorded it.
+        payout_receipt_events = []
+        for i, tx in enumerate(block.transactions):
+            entries = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "payout_receipts"
+            )
+            if entries and id(tx) in accepted_obj:
+                payout_receipt_events.extend(entries)
+
         # Grant events (stages 2-5): creations, draws and shared-cap
         # settings that stayed accepted, in transaction order, then this
         # block's sweep refunds — carried on the snapshot exactly as the
@@ -1599,6 +1616,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "routing_events": routing_events,
                 "standing_payment_events": standing_payment_events,
                 "payout_events": payout_events,
+                "payout_receipt_events": payout_receipt_events,
                 "grant_events": grant_events,
             }
         )
@@ -1616,6 +1634,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "routing_events": routing_events,
                 "standing_payment_events": standing_payment_events,
                 "payout_events": payout_events,
+                "payout_receipt_events": payout_receipt_events,
                 "grant_events": grant_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
@@ -2196,6 +2215,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_payout_install = None
             pending_payout_removal = None
             pending_payout_execution = None
+            # Payout receipts (FIX 1-B) defer to the same site: the seam
+            # stages a receipt for every ordinary credit that lands on a
+            # receipt-based rule's owner, but the book records it only
+            # once the transfer's tx is known to stay accepted — a
+            # fee-rejected transfer records no receipt, so no royalty
+            # base can ever name money that did not arrive.
+            pending_payout_receipts = []
             # Grant mutations defer to the same post-settlement site, for
             # the same reason: a creation whose fee is never paid custodies
             # nothing and records nothing, and a draw settles in the book
@@ -2656,6 +2682,47 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                         else:
                             staged_writes[to_addr] = _read_bal(to_addr) + amount
+                        # --- Payout receipts (FIX 1-B) ---
+                        # An ordinary or claimed-payment credit that lands
+                        # on the account of an owner whose payout rule is
+                        # receipt-based is a recorded sale for that rule:
+                        # stage its receipt now (the gross that arrived,
+                        # before any route split — the split divides the
+                        # proceeds, it does not change what was sold), and
+                        # the book records it at the post-settlement site
+                        # if this tx stays accepted. Node-made credits
+                        # (payout legs, standing executions, draws) carry
+                        # other classes and are never sales — the same
+                        # class gate that keeps routing single-hop.
+                        if credit_class in ROUTE_TRIGGER_CREDIT_CLASSES:
+                            payout_book = _payout_rule_book(lifecycle_mgr)
+                            # Fold (multi-rule line): an owner holds up to
+                            # 8 rules, so the receipt check looks at ALL
+                            # of them — get() alone would see only slot 0
+                            # and a receipt-based rule at another slot
+                            # would never record its sales. The receipt is
+                            # owner-level (FIX 1-B's own design: receipts
+                            # are keyed by recipient, _evaluate checks the
+                            # owner), so one receipt per credit, recorded
+                            # when ANY of the owner's rules is receipt-based.
+                            owner_entries = (
+                                payout_book.get_all(to_addr)
+                                if payout_book is not None else []
+                            )
+                            if any(
+                                e.base_source == BASE_RECORDED_RECEIPT
+                                for e in owner_entries
+                            ):
+                                receipt_id = compute_payout_receipt_id(
+                                    tx_id, len(pending_payout_receipts)
+                                )
+                                pending_payout_receipts.append(PayoutReceipt(
+                                    receipt_id=receipt_id,
+                                    recipient_pubkey=to_addr,
+                                    sender_pubkey=from_addr,
+                                    amount=amount,
+                                    recorded_ts=int(block_timestamp or 0),
+                                ))
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -3730,11 +3797,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     else:  # TX_TYPE_EXECUTE_PAYOUT_RULE
                         try:
                             pr_rule_id, pr_settlement_id, pr_base = parse_execute_payout_rule(tx)
+                            pr_receipt_id = parse_execute_payout_receipt_id(tx)
                         except PayoutRuleShapeError as exc:
                             pr_rule_id = None
                             pr_entry = None
                             pr_decision = None
                             pr_balance = 0
+                            pr_receipt_id = None
                             reason = f"invalid payout rule execution ({exc})"
                         else:
                             pr_entry = pr_book.get_by_id(pr_rule_id)
@@ -3754,11 +3823,41 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 # seam, so the owner's o5 is re-checked on
                                 # every real recipient and amount by the
                                 # same evaluation an ordinary transfer of
-                                # theirs would face.
+                                # theirs would face. For a receipt-based
+                                # rule (FIX 1-B) the book resolves the base
+                                # from the named receipt's recorded amount
+                                # and ignores the submitted base entirely.
                                 pr_balance = _read_bal(pr_entry.owner_pubkey)
                                 pr_decision = None
                                 reason = ""
                                 pr_clause_legs = None
+                                # Fold (FIX 1-B clause-base pre-resolution):
+                                # a receipt-based rule's clause must read
+                                # the RESOLVED base — the receipt's recorded
+                                # amount — not the submitted one. The
+                                # clause's i1 is the base the engine hands
+                                # the book, and _evaluate refuses on the
+                                # submitted base only after the clause has
+                                # already computed over it, so the
+                                # resolution happens here, before the step.
+                                # When the receipt cannot be resolved, fall
+                                # back to the submitted base and let
+                                # evaluate_execution refuse with the precise
+                                # receipt reason.
+                                pr_clause_base = pr_base
+                                if (
+                                    pr_entry.base_source
+                                    == BASE_RECORDED_RECEIPT
+                                    and pr_receipt_id is not None
+                                ):
+                                    pr_receipt = pr_book.get_receipt(
+                                        pr_receipt_id)
+                                    if (
+                                        pr_receipt is not None
+                                        and pr_receipt.recipient_pubkey
+                                        == pr_entry.owner_pubkey
+                                    ):
+                                        pr_clause_base = pr_receipt.amount
                                 if pr_entry.form == FORM_TAU_RULE:
                                     outputs, detail = (
                                         sender_policy.clause_outputs(
@@ -3767,7 +3866,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                                 pr_entry,
                                                 sender if isinstance(
                                                     sender, str) else "",
-                                                pr_base, pr_ts, pr_balance,
+                                                pr_clause_base, pr_ts, pr_balance,
                                                 pr_book.period_paid_total(
                                                     pr_entry, pr_ts),
                                             ),
@@ -3791,6 +3890,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         pr_rule_id, pr_settlement_id, pr_base,
                                         pr_ts, pr_balance,
                                         clause_legs=pr_clause_legs,
+                                        receipt_id=pr_receipt_id,
                                     )
                                     reason = (
                                         "" if pr_decision.executed
@@ -3832,7 +3932,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             if all_moved and accepted_in_block and not hard_reject:
                                 pending_payout_execution = (
                                     pr_entry, pr_decision, pr_balance,
-                                    pr_settlement_id, pr_base,
+                                    pr_settlement_id, pr_base, pr_receipt_id,
                                 )
                                 tx_receipt["logs"].append(
                                     "Payout rule execution staged: "
@@ -4542,6 +4642,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             stamp_retractable_park = False
             if accepted_in_block and not hard_reject:
+                if pending_payout_receipts:
+                    # FIX 1-B: record the receipts the seam staged. This
+                    # tx stayed accepted (its fee settled above), so the
+                    # credits it staged are the transfers that actually
+                    # arrived; a tx rejected anywhere above reaches this
+                    # site with the guard false and records nothing.
+                    receipt_book = _lifecycle_for_write().payout_rules
+                    for staged_receipt in pending_payout_receipts:
+                        receipt_book.record_receipt(staged_receipt)
+                        tx_receipt.setdefault("payout_receipts", []).append({
+                            "receipt_id": staged_receipt.receipt_id.hex(),
+                            "recipient_pubkey": staged_receipt.recipient_pubkey,
+                            "sender_pubkey": staged_receipt.sender_pubkey,
+                            "amount": staged_receipt.amount,
+                        })
+                        tx_receipt["logs"].append(
+                            "Payout receipt recorded: "
+                            + staged_receipt.receipt_id.hex()
+                            + f" ({staged_receipt.amount} to "
+                            f"{str(staged_receipt.recipient_pubkey)[:10]}...)"
+                        )
                 if pending_retractable_park is not None or pending_retract_id is not None:
                     book = _lifecycle_for_write().retractable_transfers
                 if pending_retractable_park is not None:
@@ -4728,7 +4849,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                 elif pending_payout_execution is not None:
                     (pr_entry, _pr_decision, pr_balance,
-                     pr_settlement_id, pr_base) = pending_payout_execution
+                     pr_settlement_id, pr_base,
+                     pr_receipt_id) = pending_payout_execution
                     # Same fork, same inputs as the branch's
                     # evaluate_execution: the settled decision is the staged
                     # one by construction. For a Tau-form rule the staged
@@ -4742,6 +4864,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             _pr_decision.legs
                             if pr_entry.form == FORM_TAU_RULE else None
                         ),
+                        receipt_id=pr_receipt_id,
+                    )
+                    # The event reports the settlement record's own base:
+                    # for a receipt-based execution that is the recorded
+                    # amount the node filled in, never the submitted one.
+                    settled_record = pr_book.settlement(
+                        pr_entry.rule_id, pr_settlement_id
                     )
                     tx_receipt["payout_event"] = {
                         "rule_id": pr_entry.rule_id.hex(),
@@ -4749,7 +4878,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         "owner_pubkey": pr_entry.owner_pubkey,
                         "form": pr_entry.form,
                         "settlement_id": pr_settlement_id.hex(),
-                        "base_amount": pr_base,
+                        "base_amount": (
+                            settled_record.base_amount
+                            if settled_record is not None else pr_base
+                        ),
+                        "receipt_id": (
+                            pr_receipt_id.hex() if pr_receipt_id else ""
+                        ),
                         "legs": [
                             {"recipient_pubkey": r, "amount": a}
                             for r, a in settled.legs

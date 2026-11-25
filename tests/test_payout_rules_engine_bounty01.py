@@ -28,9 +28,12 @@ from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.facade import TipAdmissionView
 from consensus.governance import ConsensusLifecycleManager
 from consensus.payout_rules import (
+    BASE_RECORDED_RECEIPT,
     LEG_BPS_OF_BASE,
     LEG_FIXED,
+    PayoutReceipt,
     PayoutRuleBook,
+    compute_payout_receipt_id,
     parse_install_payout_rule,
     payout_rule_capabilities,
 )
@@ -159,6 +162,7 @@ def _install_tx(owner, sk, seq, fee_limit="100", **kw):
         "payout_period_seconds": kw.get("period_seconds", WEEK),
         "payout_period_anchor_ts": kw.get("anchor_ts", TS - 100),
         "payout_version": kw.get("version", 1),
+        "payout_base_source": kw.get("base_source", 0),
     }, sk)
 
 
@@ -174,8 +178,9 @@ def _remove_tx(sender, sk, seq, fee_limit="100"):
     }, sk)
 
 
-def _execute_tx(sender, sk, rule_id, settlement_id, base, seq, fee_limit="100"):
-    return _sign({
+def _execute_tx(sender, sk, rule_id, settlement_id, base, seq, fee_limit="100",
+                receipt_id=None):
+    tx = {
         "tx_id": f"payout-exec-{next(_TX_SEQ)}",
         "tx_type": "execute_payout_rule",
         "sender_pubkey": sender,
@@ -186,6 +191,22 @@ def _execute_tx(sender, sk, rule_id, settlement_id, base, seq, fee_limit="100"):
         "payout_rule_id": rule_id.hex(),
         "payout_settlement_id": settlement_id,
         "payout_base_amount": base,
+    }
+    if receipt_id is not None:
+        tx["payout_receipt_id"] = receipt_id.hex()
+    return _sign(tx, sk)
+
+
+def _transfer(sender, sk, to, amount, seq, fee_limit="100"):
+    return _sign({
+        "tx_id": f"tr-{next(_TX_SEQ)}",
+        "tx_type": "user_tx",
+        "sender_pubkey": sender,
+        "sequence_number": seq,
+        "expiration_time": 9999999999,
+        "expire_at_height": 5000,
+        "fee_limit": fee_limit,
+        "operations": {"1": [[sender, to, str(amount)]]},
     }, sk)
 
 
@@ -606,3 +627,143 @@ def test_direct_replacement_carries_the_period_spend():
     assert rest["tx_id"] in result.accepted_tx_ids
     assert chain.balances[ARTIST] == 1000 + 250
     assert _book(chain).period_total(new_id, 0) == 250
+# --- FIX 1-B: the royalty base is the recorded receipt -------------------------
+
+
+def _receipt_installed_chain():
+    """A chain whose live rule takes its base from recorded receipts."""
+    return _installed_chain(base_source=BASE_RECORDED_RECEIPT)
+
+
+def _sale(chain, amount=101):
+    """An ordinary transfer of `amount` from EXECUTOR (the buyer) to OWNER."""
+    sale = _transfer(EXECUTOR, SK_EXECUTOR, OWNER, amount, seq=0)
+    result = chain.apply([sale])
+    assert sale["tx_id"] in result.accepted_tx_ids
+    return sale, result
+
+
+def test_sale_records_receipt_and_royalty_settles_from_it():
+    chain, rule_id = _receipt_installed_chain()
+    owner_after_install = chain.balances[OWNER]
+
+    sale, sale_result = _sale(chain)
+    # The credit that actually arrived is now consensus state: a receipt
+    # naming the gross, the sender, and an id anyone can recompute from
+    # the sale transaction — and it is carried on the block's snapshot.
+    book = _book(chain)
+    (receipt,) = book.receipts_for(OWNER)
+    assert receipt.amount == 101 and receipt.sender_pubkey == EXECUTOR
+    assert receipt.receipt_id == compute_payout_receipt_id(sale["tx_id"], 0)
+    (surfaced,) = sale_result.next_snapshot.metadata["payout_receipt_events"]
+    assert surfaced["receipt_id"] == receipt.receipt_id.hex()
+    assert surfaced["amount"] == 101
+    assert chain.balances[OWNER] == owner_after_install + 101
+
+    # Spec test (a) at the seam: the execution submits a base a hundred
+    # times the sale; the royalty still settles over the recorded 101.
+    execute = _execute_tx(EXECUTOR, SK_EXECUTOR, rule_id, SID_1, 10_100,
+                          seq=1, receipt_id=receipt.receipt_id)
+    result = chain.apply([execute])
+    assert execute["tx_id"] in result.accepted_tx_ids
+    assert chain.balances[ARTIST] == 1000 + 5
+    assert chain.balances[OWNER] == owner_after_install + 101 - 5
+    (event,) = result.next_snapshot.metadata["payout_events"]
+    assert event["total"] == 5 and event["base_amount"] == 101
+    assert event["receipt_id"] == receipt.receipt_id.hex()
+    book = _book(chain)  # re-read: apply forked the lifecycle manager
+    record = book.settlement(rule_id, bytes.fromhex(SID_1))
+    assert record.base_amount == 101 and record.receipt_id == receipt.receipt_id
+    assert book.receipt_consumed(receipt.receipt_id)
+
+    # Spec test (b) at the seam: a fresh settlement id naming the same
+    # receipt settles nothing — the sale funds one royalty, once.
+    again = _execute_tx(EXECUTOR, SK_EXECUTOR, rule_id, SID_2, 101,
+                        seq=2, receipt_id=receipt.receipt_id)
+    result = chain.apply([again])
+    assert again["tx_id"] in result.invalid_tx_ids
+    assert chain.balances[ARTIST] == 1000 + 5
+    assert chain.balances[OWNER] == owner_after_install + 101 - 5
+
+
+def test_no_receipt_without_a_receipt_based_rule():
+    chain, _rule_id = _installed_chain()  # the legacy submitted-base rule
+    _sale(chain)
+    assert _book(chain).receipts_for(OWNER) == []
+
+
+def test_fee_rejected_transfer_records_no_receipt():
+    chain, _rule_id = _receipt_installed_chain()
+    broke = _transfer(EXECUTOR, SK_EXECUTOR, OWNER, 101, seq=0, fee_limit="0")
+    result = chain.apply([broke])
+    assert broke["tx_id"] in result.invalid_tx_ids
+    # The money never arrived, so there is nothing to name: no receipt.
+    assert _book(chain).receipts_for(OWNER) == []
+
+
+def test_payout_leg_credit_is_not_a_sale():
+    """The credit-class gate: node-made credits never record receipts."""
+    chain = _funded_chain()
+    owner_install = _install_tx(OWNER, SK_OWNER, seq=0,
+                                base_source=BASE_RECORDED_RECEIPT)
+    artist_install = _install_tx(
+        ARTIST, SK_ARTIST, seq=0, recipients=[WORKER],
+        legs=[[WORKER, LEG_BPS_OF_BASE, 500]],
+        base_source=BASE_RECORDED_RECEIPT)
+    result = chain.apply([owner_install, artist_install])
+    assert owner_install["tx_id"] in result.accepted_tx_ids
+    assert artist_install["tx_id"] in result.accepted_tx_ids
+    owner_rule = _rule_id(owner_install)
+
+    _sale(chain)
+    (receipt,) = _book(chain).receipts_for(OWNER)
+    execute = _execute_tx(EXECUTOR, SK_EXECUTOR, owner_rule, SID_1, 101,
+                          seq=1, receipt_id=receipt.receipt_id)
+    result = chain.apply([execute])
+    assert execute["tx_id"] in result.accepted_tx_ids
+    assert chain.balances[ARTIST] == 1000 + 5 - FEE  # royalty in, install fee out
+    # The 5 that landed on ARTIST arrived as a payout leg: not a sale,
+    # so ARTIST's own receipt-based rule recorded nothing for it.
+    assert _book(chain).receipts_for(ARTIST) == []
+    # An ordinary transfer to ARTIST is a sale and does record.
+    sale2 = _transfer(EXECUTOR, SK_EXECUTOR, ARTIST, 50, seq=2)
+    result = chain.apply([sale2])
+    assert sale2["tx_id"] in result.accepted_tx_ids
+    (artist_receipt,) = _book(chain).receipts_for(ARTIST)
+    assert artist_receipt.amount == 50
+
+
+def test_admission_agrees_on_receipt_executions():
+    from consensus.admission import validate_execute_payout_rule_payload
+
+    book = PayoutRuleBook()
+    install = _install_tx(OWNER, SK_OWNER, seq=0,
+                          base_source=BASE_RECORDED_RECEIPT)
+    entry = parse_install_payout_rule(install)
+    book.install(entry, TS)
+    rid = bytes.fromhex("aa" * 32)
+    book.record_receipt(PayoutReceipt(
+        receipt_id=rid, recipient_pubkey=OWNER, sender_pubkey=EXECUTOR,
+        amount=101, recorded_ts=TS))
+    live = _TipView(book, {OWNER: 100000, EXECUTOR: 1000})
+
+    # The inflated submitted base is not read: admission sees the same
+    # total apply would settle, 5 over the recorded 101.
+    due = validate_execute_payout_rule_payload(
+        _execute_tx(EXECUTOR, SK_EXECUTOR, entry.rule_id, SID_1, 10_100,
+                    seq=0, receipt_id=rid), live)
+    assert due.is_valid and due.data["total"] == 5
+    assert due.data["receipt_id"] == rid.hex()
+    # An execution that names no receipt is refused at the same door.
+    assert not validate_execute_payout_rule_payload(
+        _execute_tx(EXECUTOR, SK_EXECUTOR, entry.rule_id, SID_1, 101,
+                    seq=0), live).is_valid
+
+    book.execute(entry.rule_id, bytes.fromhex(SID_1), 10_100, TS, 100000,
+                 receipt_id=rid)
+    # The rebuilt one-entry book (facade view -> restore) still knows
+    # the receipt is consumed, though the consuming settlement is the
+    # only one it holds: a second execution is refused at admission.
+    assert not validate_execute_payout_rule_payload(
+        _execute_tx(EXECUTOR, SK_EXECUTOR, entry.rule_id, SID_2, 101,
+                    seq=0, receipt_id=rid), live).is_valid
