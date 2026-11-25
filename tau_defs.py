@@ -142,6 +142,10 @@ RULE_CHANGE_KIND_REVOKE_GUARD = 5
 # the write applies consensus.payouts' update, preserving the
 # rule's lineage and accounting state.
 RULE_CHANGE_KIND_PAYOUT_UPDATE = 6
+# Installing or removing a payout rule decides whose hands a
+# registered clause's legs land in, so both travel the guard too.
+RULE_CHANGE_KIND_PAYOUT_INSTALL = 7
+RULE_CHANGE_KIND_PAYOUT_REMOVE = 8
 
 # Blocks after which a parked rule-change request may release without approvals.
 RULE_CHANGE_DELAY_BLOCKS = 1000

@@ -2885,9 +2885,25 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     and book.owner_rule_count(terms.owner) \
                                     >= MAX_RULES_PER_OWNER:
                                 reason = "the owner already holds the maximum number of rules"
+                        guard_blocked, guard_detail = False, ""
+                        if terms is not None and reason is None:
+                            guard_blocked, guard_detail = sender_policy.rule_change_blocked(
+                                lifecycle_mgr.rule_offers.clause_for,
+                                terms.owner,
+                                tau_defs.RULE_CHANGE_KIND_PAYOUT_INSTALL,
+                                int(block_timestamp or 0),
+                                pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
+                            )
                         if terms is None or reason:
                             tx_receipt["logs"].append(f"Payout install ignored: {reason}")
                             tx_receipt["reason"] = "payout_not_installed"
+                            accepted_in_block = False
+                        elif guard_blocked:
+                            tx_receipt["logs"].append(
+                                f"Payout install ignored (rule-change guard blocks: {guard_detail})"
+                            )
+                            tx_receipt["reason"] = RULE_CHANGE_NEEDS_APPROVAL_REASON
                             accepted_in_block = False
                         else:
                             pending_payout_install = terms
@@ -2913,9 +2929,25 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         elif state.terms.sealed and not rule_ended(
                                 state, int(block_timestamp or 0)):
                             reason = "the rule is sealed and has not ended"
+                        guard_blocked, guard_detail = False, ""
+                        if not reason:
+                            guard_blocked, guard_detail = sender_policy.rule_change_blocked(
+                                lifecycle_mgr.rule_offers.clause_for,
+                                owner,
+                                tau_defs.RULE_CHANGE_KIND_PAYOUT_REMOVE,
+                                int(block_timestamp or 0),
+                                pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
+                            )
                         if reason:
                             tx_receipt["logs"].append(f"Payout removal ignored: {reason}")
                             tx_receipt["reason"] = "payout_not_removed"
+                            accepted_in_block = False
+                        elif guard_blocked:
+                            tx_receipt["logs"].append(
+                                f"Payout removal ignored (rule-change guard blocks: {guard_detail})"
+                            )
+                            tx_receipt["reason"] = RULE_CHANGE_NEEDS_APPROVAL_REASON
                             accepted_in_block = False
                         else:
                             pending_payout_remove = (owner, rule_id)
@@ -2940,9 +2972,25 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             reason = book.update_problem(
                                 owner, rule_id, new_terms,
                                 ts=int(block_timestamp or 0))
+                        guard_blocked, guard_detail = False, ""
+                        if not reason:
+                            guard_blocked, guard_detail = sender_policy.rule_change_blocked(
+                                lifecycle_mgr.rule_offers.clause_for,
+                                owner,
+                                tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE,
+                                int(block_timestamp or 0),
+                                pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
+                            )
                         if reason:
                             tx_receipt["logs"].append(f"Payout update ignored: {reason}")
                             tx_receipt["reason"] = "payout_not_updated"
+                            accepted_in_block = False
+                        elif guard_blocked:
+                            tx_receipt["logs"].append(
+                                f"Payout update ignored (rule-change guard blocks: {guard_detail})"
+                            )
+                            tx_receipt["reason"] = RULE_CHANGE_NEEDS_APPROVAL_REASON
                             accepted_in_block = False
                         else:
                             pending_payout_update = (
