@@ -82,6 +82,24 @@ settlement history. On top of the stage-1 book:
   MAX_CLOCK_SETTLEMENTS_PER_BLOCK due rules per block,
   earliest-due-first, and every period that closes without a clock
   settlement is counted on the rule as a missed period.
+
+Per-sale rules (stage 3, Bounty 01 axis 10): a rule may declare
+`per_sale`, making it settle only against sales the chain recorded.
+Every ordinary credit to the owner's account -- the same credits
+the arrival trigger sees -- is recorded as an open sale of every
+per-sale rule of the account: the crediting transaction's id, its
+sender, the summed amount and the height. A submitted execution
+against a per-sale rule must name one open sale; the clause is
+stepped with the sale's recorded amount on i1 and its payer on
+i13, never with a gross the executor claims. Settling a sale
+records the canonical marker ``sale:<rule_id>:<sale_id>`` in the
+settlement history alongside the execution's own id and closes
+the sale, so "paid once per sale" is a ledger property like every
+other settlement's idempotency here. Open sales are bounded
+(MAX_OPEN_SALES per rule); the oldest gives way to a new arrival
+and is counted on the rule as a missed sale. A rule that is both
+`per_sale` and `on_arrival` has its sale closed by the node's
+arrival settlement in the same apply.
 """
 
 from __future__ import annotations
@@ -132,6 +150,12 @@ MAX_RULES_PER_OWNER = 8
 #: Stage 2: due settlements the block-end sweep performs per block;
 #: the rest stay due and are stepped by the next block.
 MAX_CLOCK_SETTLEMENTS_PER_BLOCK = 16
+#: Stage 3: open sales one per-sale rule may hold. A sale that
+#: arrives at a full list evicts the OLDEST open sale (counted on
+#: the rule as a missed sale); the incoming sale is always
+#: recorded. Eviction is by age only, never by amount, so the
+#: recording is a pure function of the credit sequence.
+MAX_OPEN_SALES = 32
 #: Stage 2: a clock rule's period may not be shorter than this, so
 #: due points of one rule are always spaced at least an hour apart
 #: (every current period kind is a day or longer; the bound is the
@@ -227,6 +251,10 @@ class PayoutTerms:
     # that sets neither keeps its pre-stage-2 rule id.
     sealed: bool = False
     max_fee_per_execution: Optional[int] = None
+    # Stage 3 terms: the rule settles only against recorded sales.
+    # Defaults off; a rule that does not declare it keeps its
+    # earlier rule id.
+    per_sale: bool = False
 
     @property
     def rule_id(self) -> str:
@@ -239,6 +267,10 @@ class PayoutTerms:
     @property
     def has_stage2_terms(self) -> bool:
         return bool(self.sealed or self.max_fee_per_execution is not None)
+
+    @property
+    def has_stage3_terms(self) -> bool:
+        return bool(self.per_sale)
 
 
 def compute_rule_id(terms: PayoutTerms) -> str:
@@ -268,6 +300,12 @@ def compute_rule_id(terms: PayoutTerms) -> str:
         payload.update({
             "sealed": bool(terms.sealed),
             "max_fee_per_execution": terms.max_fee_per_execution,
+        })
+    if terms.has_stage3_terms:
+        # Stage-3 terms likewise: `per_sale` joins the signed
+        # identity only when declared.
+        payload.update({
+            "per_sale": bool(terms.per_sale),
         })
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
@@ -318,6 +356,13 @@ def validate_payout_shape(terms: PayoutTerms, *, now_ts: int) -> None:
     if terms.max_fee_per_execution is not None \
             and terms.max_fee_per_execution < 0:
         raise PayoutShapeError("max_fee_per_execution must be non-negative")
+    if terms.per_sale and terms.due:
+        # A clock settlement carries a gross of 0 by construction:
+        # the node steps the clause against no sale at all. A rule
+        # that settles only against recorded sales has nothing for
+        # a due point to name, so the two never combine.
+        raise PayoutShapeError(
+            "a per-sale rule cannot carry the clock trigger")
     if terms.due:
         period_seconds = periods.period_end(
             terms.anchor_ts, terms.period_kind, 0) - terms.anchor_ts
@@ -327,12 +372,33 @@ def validate_payout_shape(terms: PayoutTerms, *, now_ts: int) -> None:
                 "due spacing")
 
 
+@dataclass(frozen=True)
+class Sale:
+    """One recorded credit a per-sale rule may settle against.
+
+    The id is the crediting transaction's id -- the same naming
+    currency as the ``arrival:<tx id>`` settlement ids -- the payer
+    is that transaction's sender, and the amount is the
+    transaction's summed ordinary credit to the rule's owner.
+    """
+    sale_id: str
+    payer: str
+    amount: int
+    height: int
+
+
 @dataclass
 class PayoutRuleState:
     terms: PayoutTerms
     period_index: int = -1
     spent_in_period: int = 0
     settlements: List[str] = field(default_factory=list)
+    # Stage-3 accounting for per-sale rules: the open sales, in
+    # recording order (oldest first), and how many sales the bound
+    # has evicted unpaid. Both are part of the rule's state: an
+    # update carries them over with the rest of the history.
+    sales: List[Sale] = field(default_factory=list)
+    sales_missed: int = 0
     # Clock-trigger accounting, across all periods: how much the
     # clock has paid in total and how many times it has fired. The
     # rule's end conditions read these, never the period counters.
@@ -361,6 +427,45 @@ class PayoutRuleState:
     def already_settled(self, settlement_id: str) -> bool:
         return settlement_id in self.settlements
 
+    # --- sales (stage 3) -------------------------------------------
+
+    def open_sale(self, sale_id: str) -> Optional[Sale]:
+        """The named open sale of this rule, or None."""
+        for sale in self.sales:
+            if sale.sale_id == sale_id:
+                return sale
+        return None
+
+    def note_sale(self, sale: Sale) -> Optional[Sale]:
+        """Record a sale; returns the sale the bound evicted, if any.
+
+        A sale id is a transaction id and a transaction applies
+        once, so an id already open is never recorded twice. At a
+        full list the OLDEST open sale gives way and is counted as
+        missed; the incoming sale is always recorded.
+        """
+        if self.open_sale(sale.sale_id) is not None:
+            return None
+        evicted = None
+        if len(self.sales) >= MAX_OPEN_SALES:
+            evicted = self.sales.pop(0)
+            self.sales_missed += 1
+        self.sales.append(sale)
+        return evicted
+
+    def close_sale(self, sale_id: str) -> bool:
+        """Drop a sale from the open list (it has been settled)."""
+        for i, sale in enumerate(self.sales):
+            if sale.sale_id == sale_id:
+                del self.sales[i]
+                return True
+        return False
+
+    def sale_already_settled(self, sale_id: str) -> bool:
+        """Whether the ledger carries this sale's paid marker."""
+        return sale_settlement_id(self.terms.rule_id, sale_id) \
+            in self.settlements
+
     def record_settlement(self, settlement_id: str, total: int) -> None:
         self.settlements.append(settlement_id)
         if len(self.settlements) > MAX_SETTLEMENTS_KEPT:
@@ -378,6 +483,17 @@ def clock_settlement_id(rule_id: str, period_index: int) -> str:
 def arrival_settlement_id(tx_id: str) -> str:
     """Settlement id of an arrival settlement: one per crediting tx."""
     return f"arrival:{tx_id}"
+
+
+def sale_settlement_id(rule_id: str, sale_id: str) -> str:
+    """Ledger marker of a settled sale: one per rule per sale.
+
+    Recorded alongside the settling execution's own settlement id
+    (carrying no spend counters), so a sale's paid-ness is proven
+    by the settlement history itself, not only by the sale's
+    absence from the open list.
+    """
+    return f"sale:{rule_id}:{sale_id}"
 
 
 def clock_due_period(state: PayoutRuleState, ts: int) -> Optional[int]:
@@ -655,6 +771,12 @@ class PayoutBook:
             lineage=list(old.lineage) + [rule_id],
             missed_periods=old.missed_periods,
             last_clock_period=old.last_clock_period,
+            # Stage 3: the open sales and the missed count are
+            # history the owner is owed; an update carries them
+            # over like every other counter, so replacing a rule's
+            # terms can never silently drop a payable sale.
+            sales=list(old.sales),
+            sales_missed=old.sales_missed,
         )
         rules = self._rules[owner]
         del rules[rule_id]
@@ -662,15 +784,31 @@ class PayoutBook:
         self._root_cache = None
         return state
 
+    # --- sales (stage 3) ---------------------------------------------
+
+    def note_sale(self, owner: str, sale: Sale, *,
+                  rule_id: Optional[str] = None) -> None:
+        """Record a credit as an open sale of a per-sale rule."""
+        state = self._resolve(owner, rule_id)
+        if state is None:
+            raise PayoutShapeError("no payout rule installed for the owner")
+        if not state.terms.per_sale:
+            raise PayoutShapeError("the rule does not record sales")
+        state.note_sale(sale)
+        self._root_cache = None
+
     # --- executions --------------------------------------------------
 
     def check_execution(
         self, owner: str, settlement_id: str, legs: Sequence[Tuple[str, int]],
         *, ts: int, rule_id: Optional[str] = None,
+        sale_id: Optional[str] = None,
     ) -> int:
         """Validate an execution against caps; returns the total.
 
         Pure check -- record via `settle` only when the legs apply.
+        With `sale_id`, the execution settles a named sale: the
+        sale must be open for the rule and not already settled.
         """
         state = self._resolve(owner, rule_id)
         if state is None:
@@ -683,6 +821,12 @@ class PayoutBook:
             raise PayoutShapeError("a settlement id is required")
         if state.already_settled(settlement_id):
             raise PayoutShapeError("settlement id already settled")
+        if sale_id is not None:
+            if state.open_sale(sale_id) is None:
+                raise PayoutShapeError(
+                    "the sale named is not an open sale of this rule")
+            if state.sale_already_settled(sale_id):
+                raise PayoutShapeError("the sale is already settled")
         if not legs:
             raise PayoutShapeError("the rule produced no legs")
         total = sum(amount for _r, amount in legs)
@@ -694,12 +838,25 @@ class PayoutBook:
         return total
 
     def settle(self, owner: str, settlement_id: str, total: int, *, ts: int,
-               rule_id: Optional[str] = None) -> None:
+               rule_id: Optional[str] = None,
+               sale_id: Optional[str] = None) -> None:
         state = self._resolve(owner, rule_id)
         if state is None:
             raise PayoutShapeError("no payout rule installed for the owner")
         state.roll_period(ts)
         state.record_settlement(settlement_id, total)
+        if sale_id is not None:
+            # The sale's paid marker joins the same history, with
+            # no spend counters of its own: it is the ledger's
+            # witness that this sale settled, next to the
+            # execution's own id.
+            marker = sale_settlement_id(state.terms.rule_id, sale_id)
+            if marker not in state.settlements:
+                state.settlements.append(marker)
+                if len(state.settlements) > MAX_SETTLEMENTS_KEPT:
+                    del state.settlements[
+                        : len(state.settlements) - MAX_SETTLEMENTS_KEPT]
+            state.close_sale(sale_id)
         self._root_cache = None
 
     def settle_clock(self, owner: str, settlement_id: str, total: int,
@@ -729,6 +886,8 @@ class PayoutBook:
                     "lineage": list(state.lineage),
                     "missed_periods": state.missed_periods,
                     "last_clock_period": state.last_clock_period,
+                    "sales": [_sale_payload(s) for s in state.sales],
+                    "sales_missed": state.sales_missed,
                 })
             self._root_cache = hashlib.sha256(
                 canonical_json_bytes(rows)).hexdigest()
@@ -750,6 +909,8 @@ class PayoutBook:
                 "lineage": list(state.lineage),
                 "missed_periods": state.missed_periods,
                 "last_clock_period": state.last_clock_period,
+                "sales": [_sale_payload(s) for s in state.sales],
+                "sales_missed": state.sales_missed,
             })
             rows.append(row)
         return rows
@@ -781,6 +942,7 @@ class PayoutBook:
                 max_fee_per_execution=(
                     None if row.get("max_fee_per_execution") is None
                     else int(row["max_fee_per_execution"])),
+                per_sale=bool(row.get("per_sale", False)),
             )
             if terms.rule_id != row["rule_id"]:
                 raise ValueError("payout row id does not recompute")
@@ -803,6 +965,14 @@ class PayoutBook:
             state.lineage = [str(s) for s in row.get("lineage", [])]
             state.missed_periods = int(row.get("missed_periods", 0))
             state.last_clock_period = int(row.get("last_clock_period", -1))
+            # Stage-3 sales: a row written before they existed
+            # restores with no open sales and nothing missed.
+            state.sales = [
+                Sale(sale_id=str(s["sale_id"]), payer=str(s["payer"]),
+                     amount=int(s["amount"]), height=int(s["height"]))
+                for s in row.get("sales", [])
+            ]
+            state.sales_missed = int(row.get("sales_missed", 0))
         book._root_cache = None
         return book
 
@@ -824,6 +994,16 @@ def _terms_payload(terms: PayoutTerms) -> dict:
         "max_total": terms.max_total,
         "sealed": bool(terms.sealed),
         "max_fee_per_execution": terms.max_fee_per_execution,
+        "per_sale": bool(terms.per_sale),
+    }
+
+
+def _sale_payload(sale: Sale) -> dict:
+    return {
+        "sale_id": sale.sale_id,
+        "payer": sale.payer,
+        "amount": sale.amount,
+        "height": sale.height,
     }
 
 
@@ -852,6 +1032,7 @@ def _terms_from_payload(data: dict, *, owner: str) -> PayoutTerms:
         max_total=_optional_int("max_total"),
         sealed=bool(data.get("sealed", False)),
         max_fee_per_execution=_optional_int("max_fee_per_execution"),
+        per_sale=bool(data.get("per_sale", False)),
     )
 
 
@@ -884,16 +1065,23 @@ def parse_payout_update(data: dict) -> Tuple[str, str, PayoutTerms]:
     return owner, rule_id, _terms_from_payload(data, owner=owner)
 
 
-def parse_payout_execute(data: dict) -> Tuple[str, str, int, Optional[str]]:
-    """(owner, settlement_id, gross input, rule_id or None)."""
+def parse_payout_execute(data: dict) -> Tuple[str, str, int, Optional[str],
+                                               Optional[str]]:
+    """(owner, settlement_id, gross input, rule_id or None,
+    sale_id or None)."""
     owner = str(data.get("owner", ""))
     settlement_id = str(data.get("settlement_id", ""))
     gross = int(data.get("gross", 0))
     rule_id = data.get("rule_id")
     rule_id = str(rule_id) if rule_id else None
+    sale_id = data.get("sale_id")
+    if sale_id is not None:
+        if not isinstance(sale_id, str) or not sale_id:
+            raise PayoutShapeError(
+                "a sale id must be a non-empty string")
     if not _well_formed_pubkey(owner):
         raise PayoutShapeError("execution owner pubkey is not well-formed")
-    return owner, settlement_id, gross, rule_id
+    return owner, settlement_id, gross, rule_id, sale_id
 
 
 def parse_payout_remove(data: dict) -> Tuple[str, str]:
@@ -901,15 +1089,22 @@ def parse_payout_remove(data: dict) -> Tuple[str, str]:
 
 
 def payout_values(base_values: Dict, terms: PayoutTerms, *,
-                  executor: str, gross: int) -> Dict:
+                  executor: str, gross: int,
+                  payer: Optional[str] = None) -> Dict:
     """The evaluation input map for a payout execution.
 
     The owner's rule is stepped with the policy owner set to the
     owner (i12), the executor on i3, the gross on i1 -- the same
-    discipline as the sender/recipient policy evaluations.
+    discipline as the sender/recipient policy evaluations. For a
+    settlement against a named sale, the sale's payer joins on
+    i13, beside the owner: the two parties of the sale. The gross
+    on i1 is then the sale's recorded amount, as it is the real
+    credit for an arrival settlement.
     """
     values = dict(base_values)
     values[1] = str(gross)
     values[3] = "{ #x" + str(executor) + " }:bv[384]"
     values[12] = "{ #x" + str(terms.owner) + " }:bv[384]"
+    if payer is not None:
+        values[13] = "{ #x" + str(payer) + " }:bv[384]"
     return values

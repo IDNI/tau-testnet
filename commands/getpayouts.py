@@ -4,7 +4,9 @@ Reports every rule in the owner's book (stage 2: up to eight
 concurrent rules per account): declared caps and recipient set,
 trigger and end condition, seal and fee cap, and the live
 accounting -- current period spend, clock totals, paid total,
-execution count, missed periods, version and lineage. The
+execution count, missed periods, version and lineage. A per-sale
+rule (stage 3) also reports its open sales and missed-sale count:
+the sales are the recorded credits an execution may name. The
 semantics tell a wallet what it needs to predict an execution:
 legs are chosen by the owner's rule by index into the declared
 set, both caps bind, a settlement id settles at most once.
@@ -54,6 +56,17 @@ def _rule_view(row):
         "version": int(row.get("version", 1)),
         "lineage": list(row.get("lineage") or []),
         "settled_count": len(row.get("settlements") or []),
+        "per_sale": bool(row.get("per_sale", False)),
+        "open_sales": [
+            {
+                "sale_id": s.get("sale_id"),
+                "payer": s.get("payer"),
+                "amount": int(s.get("amount", 0)),
+                "height": int(s.get("height", 0)),
+            }
+            for s in (row.get("sales") or [])
+        ],
+        "sales_missed": int(row.get("sales_missed", 0)),
     }
 
 

@@ -69,6 +69,55 @@ exactly and grows the book around it:
   disagreement between the two is treated as corruption, as
   before.
 
+## Stage 3 -- per-sale rules: settle against the chain's record
+
+A royalty rule's weakness in the shapes above is the gross: a
+submitted execution carries a gross of the executor's choosing, so
+"5% of what the sale brought in" is computed from a number the
+executor merely claims. Stage 3 closes that with one more terms
+flag, `per_sale`:
+
+- **The chain records the sale.** Every ordinary credit to the
+  owner's account -- the same credits the arrival trigger sees;
+  payout legs, grant draws and fee credits are not among them --
+  is recorded as an open sale of every per-sale rule of the
+  account: the crediting transaction's id, its sender, the summed
+  amount, the height. A credit from the account itself is not a
+  sale, and a transaction that does not stay accepted records
+  nothing.
+- **An execution names one sale** (`sale_id` on
+  `payout_execute`). The clause is stepped with the sale's
+  recorded amount on i1 -- the same input every settlement kind
+  uses -- and the sale's payer on i13, beside the owner on i12.
+  The transaction's own gross field is not consulted. An execution
+  without a sale, with a sale that is not open, or against a rule
+  without `per_sale` is refused, and a refused execution leaves
+  the sale open for a later attempt.
+- **Paid once, proven by the ledger.** Settling a sale records
+  the marker `sale:<rule_id>:<sale_id>` in the rule's settlement
+  history next to the execution's own id (no spend counters of
+  its own) and closes the sale. A second execution naming it is
+  refused: the open list is never the only witness.
+- **Bounded, by age.** At most 32 open sales per rule
+  (`MAX_OPEN_SALES`); a new arrival evicts the OLDEST open sale
+  and counts it on the rule as `sales_missed`. Eviction never
+  reads amounts, so recording is a pure function of the credit
+  sequence. An update carries the open sales and the missed
+  count over with the rest of the history; removal takes them
+  with the rule.
+- **Combined with arrival.** A rule that is both `per_sale` and
+  `on_arrival` has its sale recorded and closed by the node's
+  arrival settlement in the same apply, so the book holds the
+  complete sale record even for automatically settled sales.
+  `per_sale` never combines with `due`: a clock settlement
+  carries a gross of 0 and names no sale.
+- **No new consent surface.** A sale settlement is not the
+  owner's send; the owner's consent is the signed rule, exactly
+  as for an arrival settlement, and no policy clause is consulted
+  about it. `getpayouts` reports `per_sale`, the open sales and
+  `sales_missed` per rule; the sales ride the book's root and its
+  snapshot rows, so every node agrees which sales are payable.
+
 ## Proof pack (F7)
 
 Two reproducible measurements ship as scripts and tests:
@@ -102,6 +151,12 @@ Two reproducible measurements ship as scripts and tests:
 | Missed periods counted once, stop at end | `test_payout_stage2_book.py::test_missed_periods_are_counted_when_periods_close_unsettled`, `test_payout_stage2_apply.py::test_missed_periods_are_counted_by_the_sweep` |
 | Triggered rule and multi-rule book survive the DB round trip | `test_payout_stage2_book.py::test_triggered_rule_survives_the_db_round_trip`, `test_multi_rule_book_survives_the_db_round_trip` |
 | Interleave 25,000 / differential 121,800 | `test_payout_stage2_proofs.py` |
+| Credit records a sale (payer, amount, height); routed share and self-credit record none | `test_payout_per_sale.py::test_a_credit_records_a_sale_with_payer_amount_and_height`, `::test_a_routed_share_is_no_sale`, `::test_a_credit_from_the_account_itself_is_no_sale` |
+| Named execution pays from the recorded amount, payer on i13 | `test_payout_per_sale.py::test_a_named_execution_pays_from_the_recorded_amount_not_the_claim` |
+| Paid sale cannot be paid twice; misnamed executions refused; refused execution leaves the sale open | `test_payout_per_sale.py::test_a_paid_sale_cannot_be_paid_twice`, `::test_executions_that_misname_their_basis_are_refused`, `::test_a_refused_execution_leaves_the_sale_open` |
+| Open-sale bound evicts the oldest and counts it missed (book and apply) | `test_payout_per_sale.py::test_recording_bound_evicts_the_oldest_and_counts_it_missed`, `::test_apply_level_bound_evicts_the_oldest_sale` |
+| Arrival + per-sale closes its sale; sealed per-sale rule still settles | `test_payout_per_sale.py::test_an_arrival_rule_that_is_per_sale_closes_its_sale`, `::test_a_sealed_per_sale_rule_still_settles_its_sales` |
+| Sales survive snapshot/restore and update | `test_payout_per_sale.py::test_sales_survive_snapshot_restore_and_update` |
 
 The maintainer's five named cases from stage 1 are unchanged and
 still covered by the stage-1 suites (`test_payouts.py`,

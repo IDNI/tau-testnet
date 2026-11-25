@@ -512,7 +512,8 @@ class TipAdmissionView:
                     "max_total", "sealed", "max_fee_per_execution",
                     "total_spent", "fires", "paid_total", "executions",
                     "version", "lineage", "missed_periods",
-                    "last_clock_period"):
+                    "last_clock_period", "per_sale", "sales",
+                    "sales_missed"):
                 if key in ext:
                     out[key] = ext[key]
         return out

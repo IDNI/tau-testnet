@@ -47,6 +47,7 @@ from .payouts import (
     PAYOUT_TX_TYPES,
     PayoutShapeError,
     PayoutTerms,
+    Sale,
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_INSTALL,
     TX_TYPE_PAYOUT_REMOVE,
@@ -3011,18 +3012,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 + " -> " + new_terms.rule_id)
                     elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
                         try:
-                            owner, settlement_id, gross, want_rule_id = \
-                                parse_payout_execute(tx)
+                            owner, settlement_id, gross, want_rule_id, \
+                                want_sale_id = parse_payout_execute(tx)
                             reason = None
                         except (PayoutShapeError, ValueError, TypeError) as exc:
-                            owner, settlement_id, gross, want_rule_id = \
-                                "", "", 0, None
+                            owner, settlement_id, gross, want_rule_id, \
+                                want_sale_id = "", "", 0, None, None
                             reason = f"invalid payout execution ({exc})"
                         book = _payout_book(lifecycle_mgr)
                         state = book.get(owner, want_rule_id) \
                             if owner and book else None
                         legs = []
                         total = 0
+                        sale = None
                         if reason:
                             pass
                         elif state is None:
@@ -3034,18 +3036,36 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                           "the execution must name its rule")
                             else:
                                 reason = "no payout rule installed for the owner"
+                        elif state.terms.per_sale and want_sale_id is None:
+                            reason = ("the rule settles per sale; the "
+                                      "execution must name a sale")
+                        elif state.terms.per_sale:
+                            # The gross of a per-sale execution is the
+                            # chain's record of the named sale, never
+                            # the executor's claim: the transaction's
+                            # own gross field is not consulted.
+                            sale = state.open_sale(want_sale_id)
+                            if sale is None:
+                                reason = ("the sale named is not an open "
+                                          "sale of this rule")
+                            else:
+                                gross = sale.amount
+                        elif want_sale_id is not None:
+                            reason = ("the rule does not settle per sale; "
+                                      "the execution must not name a sale")
                         elif target_balances is None:
                             reason = "no balance overlay to execute from"
                         elif lifecycle_mgr.rule_offers.clause_for(
                                 owner, PAYOUT_STREAM_INDEX) is None:
                             reason = "the owner has published no payout clause"
-                        else:
+                        if reason is None:
                             values = payout_values(
                                 {2: str(_read_bal(owner)),
                                  5: str(int(block_timestamp or 0))},
                                 state.terms,
                                 executor=sender if isinstance(sender, str) else "",
                                 gross=gross,
+                                payer=sale.payer if sale is not None else None,
                             )
                             with tau_manager.tau_comm_lock:
                                 outputs = _session.evaluate(
@@ -3058,6 +3078,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     owner, settlement_id, legs,
                                     ts=int(block_timestamp or 0),
                                     rule_id=state.terms.rule_id,
+                                    sale_id=want_sale_id
+                                    if state.terms.per_sale else None,
                                 )
                             except PayoutShapeError as exc:
                                 reason = f"execution refused ({exc})"
@@ -3078,6 +3100,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 owner, settlement_id, total,
                                 int(block_timestamp or 0),
                                 state.terms.rule_id,
+                                want_sale_id if state.terms.per_sale else None,
                             )
                             tx_receipt["logs"].append(
                                 "Payout executed: " + settlement_id
@@ -3675,8 +3698,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # (clock, arrival) carry no transaction fee at all.
             if (charge_fee and accepted_in_block and not hard_reject
                     and pending_payout_settle is not None):
-                f_owner, _f_sid, _f_total, _f_ts, f_rule_id = \
-                    pending_payout_settle
+                f_owner, _f_sid, _f_total, _f_ts, f_rule_id, \
+                    _f_sale_id = pending_payout_settle
                 f_book = _payout_book(lifecycle_mgr)
                 f_state = f_book.get_rule(f_owner, f_rule_id) \
                     if f_book else None
@@ -3798,11 +3821,39 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     tx_receipt["payout_event"] = (
                         u_terms.rule_id, "updated")
                 elif pending_payout_settle is not None:
-                    s_owner, s_id, s_total, s_ts, s_rule_id = \
+                    s_owner, s_id, s_total, s_ts, s_rule_id, s_sale_id = \
                         pending_payout_settle
                     _lifecycle_for_write().payout_rules.settle(
-                        s_owner, s_id, s_total, ts=s_ts, rule_id=s_rule_id)
+                        s_owner, s_id, s_total, ts=s_ts, rule_id=s_rule_id,
+                        sale_id=s_sale_id)
                     tx_receipt["payout_event"] = (s_id, "executed")
+                if arrival_credits:
+                    # Per-sale recording (stage 3): every ordinary
+                    # credit of this transaction is a sale of every
+                    # per-sale rule of the credited account -- the
+                    # crediting transaction's id, its sender, the
+                    # summed amount, the height. A credit from the
+                    # account itself is not a sale. The recording
+                    # happens here, in the commit step, so a
+                    # transaction that does not stay accepted records
+                    # nothing, and a per-sale rule that is also
+                    # on_arrival has its sale on the book before the
+                    # arrival settlement below closes it.
+                    for a_owner in sorted(arrival_credits):
+                        if not isinstance(sender, str) or sender == a_owner:
+                            continue
+                        a_book = _payout_book(lifecycle_mgr)
+                        if a_book is None:
+                            continue
+                        for a_state in a_book.rules_of(a_owner):
+                            if not a_state.terms.per_sale:
+                                continue
+                            _lifecycle_for_write().payout_rules.note_sale(
+                                a_owner,
+                                Sale(sale_id=tx_id, payer=sender,
+                                     amount=arrival_credits[a_owner],
+                                     height=int(block_height or 0)),
+                                rule_id=a_state.terms.rule_id)
                 if arrival_credits:
                     # Arrival trigger (receive routes, #35): a credit
                     # to an on_arrival rule's owner steps the owner's
@@ -3848,7 +3899,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             _lifecycle_for_write().payout_rules.settle(
                                 a_owner, a_sid, a_total,
                                 ts=int(block_timestamp or 0),
-                                rule_id=a_state.terms.rule_id)
+                                rule_id=a_state.terms.rule_id,
+                                # A rule that is also per_sale has
+                                # this credit on its sale book (the
+                                # recording above): the arrival
+                                # settlement closes the sale.
+                                sale_id=tx_id if a_state.terms.per_sale
+                                else None)
                             tx_receipt["payout_event"] = (a_sid, "executed")
                             tx_receipt["logs"].append(
                                 "Payout arrival settled: " + a_sid)

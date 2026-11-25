@@ -1817,7 +1817,8 @@ def validate_payout_execute_payload(
     the settlement id's freshness against the tip book.
     """
     try:
-        owner, settlement_id, gross, rule_id = parse_payout_execute(tx)
+        owner, settlement_id, gross, rule_id, sale_id = \
+            parse_payout_execute(tx)
     except (PayoutShapeError, ValueError, TypeError) as exc:
         return format_error(f"Malformed payout_execute: {exc}.")
 
@@ -1851,6 +1852,25 @@ def validate_payout_execute_payload(
         return format_error(
             "That settlement id is already settled.",
             code="SETTLEMENT_ALREADY_SETTLED",
+        )
+    if row.get("per_sale", False):
+        if sale_id is None:
+            return format_error(
+                "The rule settles per sale; the execution must "
+                "name a sale_id.",
+                code="SALE_REQUIRED",
+            )
+        open_ids = [s.get("sale_id") for s in row.get("sales") or []]
+        if sale_id not in open_ids:
+            return format_error(
+                "The sale named is not an open sale of this rule.",
+                code="SALE_NOT_OPEN",
+            )
+    elif sale_id is not None:
+        return format_error(
+            "The rule does not settle per sale; the execution "
+            "must not name a sale_id.",
+            code="SALE_NOT_APPLICABLE",
         )
     if tip_view.clause_for(owner, PAYOUT_STREAM_INDEX) is None:
         return format_error(
