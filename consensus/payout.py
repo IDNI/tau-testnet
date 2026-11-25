@@ -84,8 +84,12 @@ transaction hash, its amount what that transaction paid the account (capped at
 bv[24]). An execution must name one open sale; the rule reads the sale's amount
 and payer (i27, i28), and a paid execution closes the sale, so a second
 execution naming it is refused. A refused execution leaves it open. At most
-MAX_OPEN_SALES are open at once; a sale that arrives while that many are open is
-not recorded and is counted as missed. Replacing, revoking or expiring the rule
+MAX_OPEN_SALES are open at once. When that many are open, a larger sale takes
+the place of the smallest open one and the smaller is counted as missed; a sale
+no larger than every open one is not recorded and is counted as missed. So
+sales too small to pay anything (a 5% royalty pays nothing on 19 or less)
+cannot hold every place and keep later sales out. Replacing, revoking or
+expiring the rule
 drops its open sales.
 """
 from __future__ import annotations
@@ -832,6 +836,21 @@ def _restore_more(more: Any, rid: bytes) -> Tuple[Optional[int], Optional[int], 
     return periods_from, due_at, int(last_clock), bool(due_done)
 
 
+def _with_sale(open_sales: Tuple[Tuple[bytes, str, int, int], ...],
+               entry: Tuple[bytes, str, int, int]):
+    """`open_sales` with `entry` recorded, and the sale left out (None if none).
+
+    Below MAX_OPEN_SALES the sale is added. At the bound it takes the place of
+    the smallest open sale if it is larger (of equally small ones, the one
+    recorded last gives way), else it is the one left out."""
+    if len(open_sales) < MAX_OPEN_SALES:
+        return open_sales + (entry,), None
+    low = min(range(len(open_sales)), key=lambda i: (open_sales[i][2], -i))
+    if entry[2] <= open_sales[low][2]:
+        return open_sales, entry
+    return open_sales[:low] + open_sales[low + 1:] + (entry,), open_sales[low]
+
+
 def _restore_sales(sales: Any, rid: bytes) -> Tuple[Tuple[Tuple[bytes, str, int, int], ...], int]:
     """A stored (missed, open sales) pair, checked; ((), 0) for a rule without it."""
     if sales is None:
@@ -1123,9 +1142,10 @@ class PayoutBook:
                   height: int) -> Optional[str]:
         """A signed transaction paid `account` `amount` in total: record it as an
         open sale of the account's per-sale rule, its id the transaction hash.
-        Returns "recorded", "missed" (MAX_OPEN_SALES already open), or None when
-        the account has no per-sale rule, the payer is the account itself, or the
-        sale is already recorded."""
+        Returns "recorded", "missed" (MAX_OPEN_SALES already open, none of them
+        smaller), or None when the account has no per-sale rule, the payer is the
+        account itself, or the sale is already recorded. A recorded sale may have
+        taken the place of a smaller open one, which is then counted as missed."""
         terms = self.terms.get(account)
         if terms is None or not terms.per_sale or payer == account or amount <= 0:
             return None
@@ -1133,14 +1153,14 @@ class PayoutBook:
         sale_id = bytes(sale_id)
         if state.sale(sale_id) is not None:
             return None
-        if len(state.open_sales) >= MAX_OPEN_SALES:
-            self.state[account] = replace(state, sales_missed=state.sales_missed + 1)
-            self._root = None
-            return "missed"
+        # At most MAX_OPEN_SALES are open, and a larger sale takes the place of
+        # the smallest: sales that pay nothing cannot hold every place.
         entry = (sale_id, payer, min(int(amount), tau_defs.MAX_TRANSFER_VALUE), int(height))
-        self.state[account] = replace(state, open_sales=state.open_sales + (entry,))
+        open_sales, left_out = _with_sale(state.open_sales, entry)
+        missed = state.sales_missed + (0 if left_out is None else 1)
+        self.state[account] = replace(state, open_sales=open_sales, sales_missed=missed)
         self._root = None
-        return "recorded"
+        return "missed" if left_out is entry else "recorded"
 
     def expire(self, height: int, ts: int) -> List[PayoutTerms]:
         """Remove every rule whose end this block reached, earliest first. A rule
