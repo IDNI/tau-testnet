@@ -2814,10 +2814,25 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["reason"] = "payout_not_installed"
                             accepted_in_block = False
                         else:
-                            pending_payout_install = terms
-                            tx_receipt["logs"].append(
-                                "Payout rule installed: " + terms.rule_id
+                            guard_blocked, guard_detail = sender_policy.rule_change_blocked(
+                                lifecycle_mgr.rule_offers.clause_for,
+                                terms.owner,
+                                tau_defs.RULE_CHANGE_KIND_PAYOUT_INSTALL,
+                                int(block_timestamp or 0),
+                                pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
                             )
+                            if guard_blocked:
+                                tx_receipt["logs"].append(
+                                    f"Payout install ignored (rule-change guard blocks: {guard_detail})"
+                                )
+                                tx_receipt["reason"] = RULE_CHANGE_NEEDS_APPROVAL_REASON
+                                accepted_in_block = False
+                            else:
+                                pending_payout_install = terms
+                                tx_receipt["logs"].append(
+                                    "Payout rule installed: " + terms.rule_id
+                                )
                     elif tx_type == TX_TYPE_PAYOUT_REMOVE:
                         try:
                             owner, rule_id = parse_payout_remove(tx)
@@ -2839,8 +2854,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["reason"] = "payout_not_removed"
                             accepted_in_block = False
                         else:
-                            pending_payout_remove_owner = owner
-                            tx_receipt["logs"].append("Payout rule removed: " + rule_id)
+                            guard_blocked, guard_detail = sender_policy.rule_change_blocked(
+                                lifecycle_mgr.rule_offers.clause_for,
+                                owner,
+                                tau_defs.RULE_CHANGE_KIND_PAYOUT_REMOVE,
+                                int(block_timestamp or 0),
+                                pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
+                            )
+                            if guard_blocked:
+                                tx_receipt["logs"].append(
+                                    f"Payout removal ignored (rule-change guard blocks: {guard_detail})"
+                                )
+                                tx_receipt["reason"] = RULE_CHANGE_NEEDS_APPROVAL_REASON
+                                accepted_in_block = False
+                            else:
+                                pending_payout_remove_owner = owner
+                                tx_receipt["logs"].append("Payout rule removed: " + rule_id)
                     elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
                         try:
                             owner, settlement_id, gross = parse_payout_execute(tx)

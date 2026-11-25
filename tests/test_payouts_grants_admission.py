@@ -92,6 +92,9 @@ def _payout_install_tx(**kw):
 
 
 def test_payout_install_admission():
+    # The validator now also reads the owner's rule-change guard
+    # through the view, so the db backing it must exist.
+    db.init_db()
     view = _View(JAN1)
     ok = validate_payout_install_payload(_payout_install_tx(), view)
     assert ok.is_valid, ok

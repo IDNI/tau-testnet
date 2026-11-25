@@ -1607,6 +1607,12 @@ def validate_payout_install_payload(
             tip_view.payout_rule_count() >= MAX_PAYOUT_RULES:
         return format_error("The payout rule book is full.", code="PAYOUT_BOOK_FULL")
 
+    refusal = _rule_change_refusal(
+        tip_view, terms.owner, tau_defs.RULE_CHANGE_KIND_PAYOUT_INSTALL
+    )
+    if refusal is not None:
+        return refusal
+
     return success({
         "payout_rule_id": terms.rule_id,
         "max_per_execution": terms.max_per_execution,
@@ -1681,6 +1687,12 @@ def validate_payout_remove_payload(
             "rule_id does not match the installed rule.",
             code="PAYOUT_RULE_MISMATCH",
         )
+
+    refusal = _rule_change_refusal(
+        tip_view, owner, tau_defs.RULE_CHANGE_KIND_PAYOUT_REMOVE
+    )
+    if refusal is not None:
+        return refusal
 
     return success({"payout_rule_id": rule_id})
 

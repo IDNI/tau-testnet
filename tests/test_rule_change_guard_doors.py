@@ -201,3 +201,192 @@ def test_a_guard_that_does_not_build_blocks(evaluators, tip_view, door):
 def test_the_timestamp_input_is_derived_from_its_stream_name():
     from consensus.admission import GUARD_READABLE_INPUTS
     assert int(tau_defs.TAU_INPUT_STREAM_TIMESTAMP[1:]) in GUARD_READABLE_INPUTS
+
+
+# --- the payout doors ---------------------------------------------------------
+# Installing or removing a payout rule decides whose hands a registered
+# clause's legs land in, so both travel the guard like the doors above.
+
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_tx  # noqa: E402
+from consensus.payouts import PayoutTerms  # noqa: E402
+
+BOB = pubkey_hex(SK_BOB)
+CAROL = pubkey_hex(SK_CAROL)
+
+PAYOUT_DOORS = ["install", "remove"]
+PAYOUT_KIND = {"install": "7", "remove": "8"}
+PAYOUT_TS = 1767225600  # 2026-01-01: the anchor's own timestamp
+
+PAYOUT_MODES = {
+    "none": lambda inputs: "1",
+    "all": lambda inputs: "0",
+    "kind7": lambda inputs: "0" if inputs.get("i1") == "7" else "1",
+    "kind8": lambda inputs: "0" if inputs.get("i1") == "8" else "1",
+}
+
+
+def _payout_blocks(mode, door):
+    return PAYOUT_MODES[mode]({"i1": PAYOUT_KIND[door]}) == "0"
+
+
+def _install_payout_mode(evs, mode):
+    for ev in evs.values():
+        ev.set_verdict(GUARD, PAYOUT_MODES[mode])
+
+
+def _payout_terms(recipients=(MALLORY,)):
+    return PayoutTerms(
+        owner=ALICE, max_per_execution=1000, max_per_period=1500,
+        recipients=recipients, period_kind=2, anchor_ts=PAYOUT_TS,
+        sequence_number=0,
+    )
+
+
+def _payout_install_payload(recipients=(MALLORY,)):
+    return {
+        "tx_type": "payout_rule_install", "expire_at_height": 5000,
+        "sender_pubkey": ALICE, "max_per_execution": 1000,
+        "max_per_period": 1500, "recipients": list(recipients),
+        "period_kind": 2, "anchor_ts": PAYOUT_TS, "sequence_number": 0,
+    }
+
+
+def _payout_install_tx(recipients=(MALLORY,)):
+    tx = h._base("payout-install", "payout_rule_install", ALICE, 0)
+    tx.update(
+        max_per_execution=1000, max_per_period=1500,
+        recipients=list(recipients), period_kind=2,
+        anchor_ts=PAYOUT_TS, sequence_number=0,
+    )
+    return sign_tx(tx, SK_ALICE)
+
+
+def _payout_remove_tx():
+    tx = h._base("payout-remove", "payout_rule_remove", ALICE, 0)
+    tx.update(rule_id=_payout_terms().rule_id)
+    return sign_tx(tx, SK_ALICE)
+
+
+def _lm_payout(door, guard=True):
+    lm = h._lifecycle(slots=True)
+    if door == "remove":
+        lm.payout_rules.install(_payout_terms())
+    if guard:
+        lm.rule_offers.accepted_clauses[GUARD_KEY] = GUARD
+    return lm
+
+
+def _apply_payout_door(door, lm):
+    if door == "install":
+        return ("payout-install", *h._apply(_payout_install_tx(), lm))
+    return ("payout-remove", *h._apply(_payout_remove_tx(), lm))
+
+
+def _admit_payout_door(door, tip_view, guard=True):
+    tip_view.clause_for.side_effect = (
+        lambda who, idx: GUARD if guard and idx == tau_defs.RULE_CHANGE_GUARD_INDEX
+        else None
+    )
+    tip_view.next_block_timestamp = PAYOUT_TS
+    if door == "install":
+        tip_view.get_payout_rule.return_value = None
+        tip_view.payout_rule_count.return_value = 0
+        return validate_mempool_admission(_payout_install_payload(), tip_view)
+    tip_view.get_payout_rule.return_value = {"rule_id": _payout_terms().rule_id}
+    payload = {
+        "tx_type": "payout_rule_remove", "expire_at_height": 5000,
+        "sender_pubkey": ALICE, "rule_id": _payout_terms().rule_id,
+    }
+    return validate_mempool_admission(payload, tip_view)
+
+
+def _payout_landed(door, post):
+    state = post.payout_rules.get(ALICE)
+    if door == "install":
+        return state is not None
+    return state is None
+
+
+@pytest.mark.parametrize("door", PAYOUT_DOORS)
+def test_payout_doors_without_a_guard_nothing_changes(evaluators, tip_view, door):
+    admitted = _admit_payout_door(door, tip_view, guard=False)
+    tx_id, result, post, _ = _apply_payout_door(door, _lm_payout(door, guard=False))
+    assert admitted.is_valid
+    assert tx_id in result.accepted_tx_ids
+    assert _payout_landed(door, post)
+    assert not evaluators["apply"].verdict_calls
+    assert not evaluators["admission"].verdict_calls
+
+
+@pytest.mark.parametrize("mode", list(PAYOUT_MODES))
+@pytest.mark.parametrize("door", PAYOUT_DOORS)
+def test_payout_doors_admission_and_apply_agree(evaluators, tip_view, door, mode):
+    _install_payout_mode(evaluators, mode)
+    admitted = _admit_payout_door(door, tip_view)
+    tx_id, result, post, _ = _apply_payout_door(door, _lm_payout(door))
+
+    blocked = _payout_blocks(mode, door)
+    assert admitted.is_valid is (not blocked)
+    assert (tx_id in result.invalid_tx_ids) is blocked
+    assert _payout_landed(door, post) is (not blocked)
+    if blocked:
+        assert admitted.code == "RULE_CHANGE_NEEDS_APPROVAL"
+        assert h._outcome(result, tx_id).reason == NEEDS_APPROVAL
+        assert result.accepted_tx_ids == []
+
+
+@pytest.mark.parametrize("door", PAYOUT_DOORS)
+def test_payout_doors_guard_is_fed_the_kind_and_timestamp(evaluators, tip_view, door):
+    _install_payout_mode(evaluators, "none")
+    _admit_payout_door(door, tip_view)
+    _apply_payout_door(door, _lm_payout(door))
+    body, inputs = evaluators["admission"].verdict_calls[0]
+    assert body == GUARD
+    assert inputs == sender_policy.change_inputs(int(PAYOUT_KIND[door]), PAYOUT_TS)
+    body, inputs = evaluators["apply"].verdict_calls[0]
+    assert body == GUARD
+    assert inputs == sender_policy.change_inputs(int(PAYOUT_KIND[door]), 1234567890)
+
+
+def test_a_blocked_payout_install_leaves_the_installed_rule_alone(evaluators):
+    _install_payout_mode(evaluators, "all")
+    lm = h._lifecycle(slots=True)
+    lm.payout_rules.install(_payout_terms(recipients=(BOB,)))
+    lm.rule_offers.accepted_clauses[GUARD_KEY] = GUARD
+    tx_id, result, post, _ = (
+        "payout-install", *h._apply(_payout_install_tx(recipients=(MALLORY,)), lm))
+    assert tx_id in result.invalid_tx_ids
+    assert h._outcome(result, tx_id).reason == NEEDS_APPROVAL
+    assert post.payout_rules.get(ALICE).terms.recipients == (BOB,)
+
+
+def test_errnex_shape_a_blocked_install_cannot_divert_a_route(evaluators):
+    """errnex's #128 shape, adapted: BOB's route clause already pays
+    90% to recipient index 0 and his guard blocks every rule change.
+    A stolen BOB key swapping the rule's recipients to MALLORY must
+    be refused, so a 1,000 credit still lands 900 on CAROL."""
+    import test_payout_triggers as t
+
+    evaluators["apply"].set_verdict(GUARD, PAYOUT_MODES["all"])
+    ch = t.Chain({t.ALICE: 10_000, t.BOB: 0, t.CAROL: 0, t.MALLORY: 0,
+                  t.PROPOSER: 0})
+    ch.install_rule(t.BOB, t.SK_BOB, height=20, recipients=[t.CAROL],
+                    extra={"on_arrival": True})
+    ch.lm.rule_offers.accepted_clauses[
+        (t.BOB, tau_defs.RULE_CHANGE_GUARD_INDEX)] = GUARD
+
+    attack = t.install_tx(owner=t.BOB, sk=t.SK_BOB, seq=1,
+                          recipients=[t.MALLORY], extra={"on_arrival": True})
+    ch.block([attack], height=21, ts=t.NOW)
+    assert not ch.accepted(attack)
+    assert ch.receipt(attack)["reason"] == NEEDS_APPROVAL
+    assert ch.book.get(t.BOB).terms.recipients == (t.CAROL,)
+    assert any(body == GUARD for body, _ in evaluators["apply"].verdict_calls)
+
+    ch.legs_fn = t._pct(90)
+    pay = t.transfer_tx(t.BOB, 1000, t.SK_ALICE, sender=t.ALICE, seq=0)
+    ch.block([pay], height=22, ts=t.NOW)
+    assert ch.accepted(pay)
+    assert ch.bal[t.MALLORY] == 0
+    assert ch.bal[t.CAROL] == 900
+    assert ch.bal[t.BOB] == 100
