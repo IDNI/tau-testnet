@@ -141,7 +141,11 @@ class SpeculationSession:
             raise WorkerLost(f"result channel unreadable: {exc}") from exc
         if body is None or len(body) < size:
             raise WorkerLost("truncated result frame")
-        return json.loads(body.decode("utf-8"))
+        try:
+            return json.loads(body.decode("utf-8"))
+        except ValueError as exc:
+            # A ValueError would read as a fault of the transaction at apply.
+            raise SpeculationProtocolError(f"undecodable result frame: {exc}") from exc
 
     def _request(self, payload: dict, *, timeout=_SESSION_DEFAULT) -> dict:
         limit = self._timeout if timeout is _SESSION_DEFAULT else timeout

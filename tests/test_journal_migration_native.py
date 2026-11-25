@@ -388,7 +388,8 @@ def test_migration_refuses_at_once_when_nothing_can_verify(chain, interpreter_do
     with patch.object(TauConsensusEngine, "verify_block_header", REAL_VERIFY), \
          patch.object(tau_advisory.AdvisoryEvaluator, "evaluate_consensus",
                       lambda *a, **k: None):
-        with pytest.raises(auth.AuthorityMismatch, match="header verification"):
+        with pytest.raises(auth.AuthorityMismatch,
+                           match="header check stopped by a node-local error: TauUnavailable"):
             owner.initialize(cwd=REPO, env=_env(), rebuild=auth.REBUILD_MISSING)
     assert time.monotonic() - started < 30, "migration waited for an interpreter"
     assert not owner.active

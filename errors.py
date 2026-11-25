@@ -89,6 +89,10 @@ class TauCommunicationError(TauTestnetError):
         self.last_state = last_state
 
 
+class TauUnavailable(TauCommunicationError):
+    """No Tau evaluator can answer now. Node-local, never a verdict about a block."""
+
+
 class CommandError(TauTestnetError):
     """Raised when a client command cannot be processed correctly."""
 

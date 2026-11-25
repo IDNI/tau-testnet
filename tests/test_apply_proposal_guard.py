@@ -18,6 +18,7 @@ import tau_reconstruction as tr
 import tau_session as ts
 from bls_keys import SK_ALICE, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine
+from consensus.fees import FeeRuleError
 from consensus.state import TauStateSnapshot
 
 SENDER = pubkey_hex(SK_ALICE)
@@ -104,7 +105,7 @@ def test_the_leak_survives_a_broad_except_clause():
                 pytest.fail("a broad catch absorbed the isolation breach")
 
 
-def test_the_guard_is_gone_once_apply_returns(temp_database):
+def test_the_guard_is_gone_once_apply_exits(temp_database):
     """A guard that leaked out of apply would trap the node's own committed
     writes for the rest of the process."""
     import chain_state
@@ -113,7 +114,8 @@ def test_the_guard_is_gone_once_apply_returns(temp_database):
     session.ready.return_value = False
     session.is_speculative = True
     proposal = _proposal(session)
-    _apply(session, proposal)
+    with pytest.raises(FeeRuleError):
+        _apply(session, proposal)
     assert chain_state.save_application_rules_state is original
 
 

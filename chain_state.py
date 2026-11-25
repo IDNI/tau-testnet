@@ -16,6 +16,7 @@ from consensus.lanes import TAU_EVALUATING_TX_TYPES
 from consensus.clause_registry import ClauseRegistry
 from consensus import faucet
 from consensus.fees import FeeRuleError
+from consensus.local_errors import is_local_apply_error
 from errors import DatabaseError
 from block import Block
 import hashlib
@@ -753,12 +754,22 @@ def _process_new_block_locked(block: Block) -> bool:
 
             proof_ok = getattr(block, "verify_consensus_proof", lambda: True)()
             try:
-                if active_view is not None:
-                    verify_ok = engine.verify_block_header(active_view, block, {"proof_ok": proof_ok})
-                else:
+                try:
+                    if active_view is not None:
+                        verify_ok = engine.verify_block_header(active_view, block, {"proof_ok": proof_ok})
+                    else:
+                        verify_ok = engine.verify_block_header(block)
+                except TypeError:
                     verify_ok = engine.verify_block_header(block)
-            except TypeError:
-                verify_ok = engine.verify_block_header(block)
+            except Exception as exc:
+                if not is_local_apply_error(exc):
+                    raise
+                logger.error(
+                    "[BLOCKCHAIN] Block #%s: the header check stopped on a node-local "
+                    "error (%s: %s); not accepted now",
+                    block.header.block_number, type(exc).__name__, exc,
+                )
+                return False
 
             if not verify_ok:
                 logger.error(f"[BLOCKCHAIN] Block #{block.header.block_number} failed network verification.")
@@ -882,7 +893,8 @@ def _process_new_block_locked(block: Block) -> bool:
                     )
                     return False
                 try:
-                    with tau_proposal.boundary(_proposal, label="process_new_block"):
+                    with tau_proposal.boundary(_proposal, label="process_new_block"), \
+                            tau_manager.reexec_on_width_overflow():
                         apply_result = engine.apply_block(
                             active_view, block, parent_snapshot,
                             session=_proposal.session, proposal=_proposal,
@@ -951,6 +963,15 @@ def _process_new_block_locked(block: Block) -> bool:
                         logger.error(
                             "[BLOCKCHAIN] Governance activation failed for block #%s: %s",
                             block.header.block_number, exc,
+                        )
+                        return False
+                    except Exception as exc:
+                        if not is_local_apply_error(exc):
+                            raise
+                        logger.error(
+                            "[BLOCKCHAIN] could not evaluate block #%s: node-local "
+                            "error (%s: %s); not accepted now",
+                            block.header.block_number, type(exc).__name__, exc,
                         )
                         return False
                     next_snapshot = apply_result.next_snapshot
@@ -1292,24 +1313,32 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             # proof_ok skips the signature re-check: ingest and process_new_block verified it before the row was stored.
             # o6/o7 still run.
             # Under worker-backed authority they run on the advisory evaluator, so a down interpreter is no reason to skip.
-            if _enabled:
-                if block_number == 0:
-                    # Genesis carries no consensus proof; it is anchored by identity.
-                    if block.block_hash != db.get_genesis_hash():
-                        print("[ERROR][chain_state] Block #0 is not the genesis block. Aborting rebuild!")
-                        return RebuildResult(ok=False, stopped_at_block=0,
-                                             reason="block 0 does not match the genesis hash")
-                elif not engine.verify_block_header(active_view, block, {"proof_ok": True}):
-                    print(f"[ERROR][chain_state] Block #{block_number} verification failed. Aborting rebuild!")
-                    return RebuildResult(ok=False, stopped_at_block=block_number,
-                                         reason="header verification failed")
-            elif tau_manager.tau_ready.is_set():
-                if not engine.verify_block_header(active_view, block, {"proof_ok": True}):
-                    print(f"[ERROR][chain_state] Block #{block_number} verification failed. Aborting rebuild!")
-                    return RebuildResult(ok=False, stopped_at_block=block_number,
-                                         reason="header verification failed")
-            else:
-                print(f"[WARN][chain_state] Tau unavailable during rebuild; skipping header verification for block #{block_number}.")
+            try:
+                if _enabled:
+                    if block_number == 0:
+                        # Genesis has no proof. Its identity anchors it.
+                        if block.block_hash != db.get_genesis_hash():
+                            print("[ERROR][chain_state] Block #0 is not the genesis block. Aborting rebuild!")
+                            return RebuildResult(ok=False, stopped_at_block=0,
+                                                 reason="block 0 does not match the genesis hash")
+                    elif not engine.verify_block_header(active_view, block, {"proof_ok": True}):
+                        print(f"[ERROR][chain_state] Block #{block_number} verification failed. Aborting rebuild!")
+                        return RebuildResult(ok=False, stopped_at_block=block_number,
+                                             reason="header verification failed")
+                elif tau_manager.tau_ready.is_set():
+                    if not engine.verify_block_header(active_view, block, {"proof_ok": True}):
+                        print(f"[ERROR][chain_state] Block #{block_number} verification failed. Aborting rebuild!")
+                        return RebuildResult(ok=False, stopped_at_block=block_number,
+                                             reason="header verification failed")
+                else:
+                    print(f"[WARN][chain_state] Tau unavailable during rebuild; skipping header verification for block #{block_number}.")
+            except Exception as exc:
+                if not is_local_apply_error(exc):
+                    raise
+                reason = (f"header check stopped by a node-local error: "
+                          f"{type(exc).__name__}: {exc}")
+                print(f"[ERROR][chain_state] Block #{block_number}: {reason}. Aborting rebuild!")
+                return RebuildResult(ok=False, stopped_at_block=block_number, reason=reason)
             
             # 4. Execute Core Block Application Natively
             _proposal = None
@@ -1325,7 +1354,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                     with tau_proposal.boundary(label=_label):
                         _proposal = _owner.build_proposal(
                             candidate_rules=_candidates, label=_label)
-                    with tau_proposal.boundary(_proposal, label="rebuild"):
+                    with tau_proposal.boundary(_proposal, label="rebuild"), \
+                            tau_manager.reexec_on_width_overflow():
                         apply_result = engine.apply_block(
                             active_view, block, parent_snapshot, replay_mode=True,
                             session=_proposal.session, proposal=_proposal,
@@ -2683,7 +2713,19 @@ def ingest_block(block: Block) -> IngestResult:
     # the parent-state stake input do NOT run here. This pre-filter only checks
     # the Tau o6 verdict; canonical acceptance re-verifies with full parent
     # state via process_new_block / the rebuild path.
-    if not engine.verify_block_header(block):
+    try:
+        header_ok = engine.verify_block_header(block)
+    except Exception as exc:
+        if not is_local_apply_error(exc):
+            raise
+        # No verdict: process_new_block checks the header again later.
+        logger.error(
+            "[chain_state] Block #%s %s...: the header pre-check stopped on a "
+            "node-local error (%s: %s); the block is kept for a later check.",
+            block.header.block_number, block.block_hash[:16], type(exc).__name__, exc,
+        )
+        header_ok = True
+    if not header_ok:
         return IngestResult('invalid', "Block verification failed")
     
     existing = db.get_block_by_hash(block.block_hash)
