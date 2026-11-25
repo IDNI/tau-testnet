@@ -552,10 +552,21 @@ def init_db():
                     spec_revision INTEGER PRIMARY KEY,
                     height        INTEGER NOT NULL,
                     canonical_text TEXT NOT NULL,
-                    sha256        TEXT NOT NULL
+                    sha256        TEXT NOT NULL,
+                    journal_verified INTEGER NOT NULL DEFAULT 0,
+                    journal_sha256 TEXT
                 );
             ''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_spec_snapshots_height ON spec_snapshots(height);')
+            # Journal cross-check verdicts (Bounty 02 gap-closer): additive
+            # columns on databases created before they existed, the same
+            # idiom as the mempool fee columns below. Existing rows default
+            # to unverified with no journal hash -- never silently trusted.
+            snap_cols = {row[1] for row in conn.execute("PRAGMA table_info(spec_snapshots);").fetchall()}
+            if "journal_verified" not in snap_cols:
+                conn.execute("ALTER TABLE spec_snapshots ADD COLUMN journal_verified INTEGER NOT NULL DEFAULT 0;")
+            if "journal_sha256" not in snap_cols:
+                conn.execute("ALTER TABLE spec_snapshots ADD COLUMN journal_sha256 TEXT;")
 
             # Backfill tx_index for databases created before it existed: if the
             # index is empty but blocks exist, populate it once from stored block
@@ -956,6 +967,28 @@ def canonical_tip_height() -> Optional[int]:
         return len(get_chain_path(tip, genesis))
     except Exception:
         return None
+
+
+def earliest_block_commit_height() -> Optional[int]:
+    """The lowest height a block-commit record pins to a journal head.
+
+    The journal cross-check's coverage starts here: commit records are
+    what pin heights to journal heads, so no snapshot below the first
+    record's height can be journal-checked. None when no commit record
+    exists.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT MIN(b.block_number) FROM block_commits_v1 c "
+            "JOIN blocks b ON b.block_hash = c.tip"
+        )
+        row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
 
 
 def block_commit_at_height(height: int) -> Optional[Dict]:
@@ -1825,6 +1858,27 @@ def get_rule_tx_by_revision() -> Dict[int, str]:
     return by_revision
 
 
+def _spec_snapshot_verdicts(height: int, pairs) -> dict:
+    """Journal cross-check verdicts for (spec_revision, text) pairs.
+
+    Keyed by spec_revision: {journal_verified, journal_sha256}. Best
+    effort, like the record path itself -- a verification failure (no
+    journal coverage for the height, a broken chain, a step the segment
+    does not reproduce) yields unverified rows, never an exception and
+    never a blocked record.
+    """
+    try:
+        from consensus import spec_verify
+
+        return {
+            verdict["spec_revision"]: verdict
+            for verdict in spec_verify.verify_block_snapshots(height, pairs)
+        }
+    except Exception:
+        logger.exception("spec snapshot journal cross-check failed")
+        return {}
+
+
 def record_spec_snapshots(height: int, snapshots) -> None:
     """Persist canonical spec snapshots for the revisions a block advanced.
 
@@ -1833,18 +1887,29 @@ def record_spec_snapshots(height: int, snapshots) -> None:
     revision more than once, and each stays addressable by its revision. The
     sha256 is computed here, over the exact text stored, so a stored row can
     always be verified against its own hash. Replaced on re-record.
+
+    Each row also carries the journal cross-check verdict computed at
+    record time (see consensus.spec_verify): journal_verified is set
+    only when replaying the committed journal segment for this block
+    reproduces the captured text for that revision's step, and
+    journal_sha256 is that step's journal-derived hash (recorded on a
+    mismatch too, so the read path can serve the reconstruction).
     """
+    pairs = [(int(revision), text) for revision, text in (snapshots or [])]
+    if not pairs:
+        return
+    verdicts = _spec_snapshot_verdicts(int(height), pairs)
     rows = [
         (
-            int(revision),
+            revision,
             int(height),
             text,
             hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            1 if verdicts.get(revision, {}).get("journal_verified") else 0,
+            verdicts.get(revision, {}).get("journal_sha256"),
         )
-        for revision, text in (snapshots or [])
+        for revision, text in pairs
     ]
-    if not rows:
-        return
     try:
         if _db_conn is None:
             init_db()
@@ -1852,7 +1917,9 @@ def record_spec_snapshots(height: int, snapshots) -> None:
             with _db_conn:
                 _db_conn.executemany(
                     "INSERT OR REPLACE INTO spec_snapshots "
-                    "(spec_revision, height, canonical_text, sha256) VALUES (?, ?, ?, ?)",
+                    "(spec_revision, height, canonical_text, sha256, "
+                    "journal_verified, journal_sha256) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     rows,
                 )
     except Exception:
@@ -1867,6 +1934,8 @@ def _spec_snapshot_row(row) -> Optional[Dict]:
         "height": row[1],
         "canonical_text": row[2],
         "sha256": row[3],
+        "journal_verified": bool(row[4]),
+        "journal_sha256": row[5],
     }
 
 
@@ -1877,7 +1946,7 @@ def get_spec_snapshot(spec_revision: int) -> Optional[Dict]:
     with _db_lock:
         cur = _db_conn.cursor()
         cur.execute(
-            "SELECT spec_revision, height, canonical_text, sha256 "
+            "SELECT spec_revision, height, canonical_text, sha256, journal_verified, journal_sha256 "
             "FROM spec_snapshots WHERE spec_revision = ? LIMIT 1",
             (int(spec_revision),),
         )
@@ -1897,7 +1966,7 @@ def get_spec_snapshot_at_height(height: int) -> Optional[Dict]:
     with _db_lock:
         cur = _db_conn.cursor()
         cur.execute(
-            "SELECT spec_revision, height, canonical_text, sha256 "
+            "SELECT spec_revision, height, canonical_text, sha256, journal_verified, journal_sha256 "
             "FROM spec_snapshots WHERE height <= ? "
             "ORDER BY height DESC, spec_revision DESC LIMIT 1",
             (int(height),),
@@ -1912,7 +1981,7 @@ def get_latest_spec_snapshot() -> Optional[Dict]:
     with _db_lock:
         cur = _db_conn.cursor()
         cur.execute(
-            "SELECT spec_revision, height, canonical_text, sha256 "
+            "SELECT spec_revision, height, canonical_text, sha256, journal_verified, journal_sha256 "
             "FROM spec_snapshots ORDER BY spec_revision DESC LIMIT 1"
         )
         return _spec_snapshot_row(cur.fetchone())
@@ -1934,12 +2003,12 @@ def get_all_spec_snapshots(upto_revision: Optional[int] = None) -> list:
         cur = _db_conn.cursor()
         if upto_revision is None:
             cur.execute(
-                "SELECT spec_revision, height, canonical_text, sha256 "
+                "SELECT spec_revision, height, canonical_text, sha256, journal_verified, journal_sha256 "
                 "FROM spec_snapshots ORDER BY spec_revision ASC"
             )
         else:
             cur.execute(
-                "SELECT spec_revision, height, canonical_text, sha256 "
+                "SELECT spec_revision, height, canonical_text, sha256, journal_verified, journal_sha256 "
                 "FROM spec_snapshots WHERE spec_revision <= ? "
                 "ORDER BY spec_revision ASC",
                 (int(upto_revision),),
@@ -1965,6 +2034,8 @@ def _spec_snapshot_dict(row) -> Optional[Dict]:
         "height": row[1],
         "spec_hash": row[2],
         "spec_text": row[3],
+        "journal_verified": bool(row[4]),
+        "journal_sha256": row[5],
     }
 
 
@@ -1974,16 +2045,24 @@ def record_spec_snapshot(spec_revision: int, height: int, spec_text: str,
 
     Singular counterpart of record_spec_snapshots for the imported
     module's record path; the sha256 is the caller's, stored as given.
+    The journal cross-check verdict is computed the same way as on the
+    plural path (see record_spec_snapshots).
     """
+    verdict = _spec_snapshot_verdicts(
+        int(height), [(int(spec_revision), spec_text)]
+    ).get(int(spec_revision), {})
     if _db_conn is None:
         init_db()
     with _db_lock:
         with _db_conn:
             _db_conn.execute(
                 "INSERT OR REPLACE INTO spec_snapshots "
-                "(spec_revision, height, canonical_text, sha256) "
-                "VALUES (?, ?, ?, ?)",
-                (int(spec_revision), int(height), spec_text, spec_hash),
+                "(spec_revision, height, canonical_text, sha256, "
+                "journal_verified, journal_sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (int(spec_revision), int(height), spec_text, spec_hash,
+                 1 if verdict.get("journal_verified") else 0,
+                 verdict.get("journal_sha256")),
             )
 
 
@@ -1998,7 +2077,7 @@ def get_spec_snapshot_at_or_before(height: int) -> Optional[Dict]:
     with _db_lock:
         cur = _db_conn.cursor()
         cur.execute(
-            "SELECT spec_revision, height, sha256, canonical_text "
+            "SELECT spec_revision, height, sha256, canonical_text, journal_verified, journal_sha256 "
             "FROM spec_snapshots WHERE height <= ? "
             "ORDER BY spec_revision DESC LIMIT 1",
             (int(height),),
@@ -2013,7 +2092,7 @@ def get_earliest_spec_snapshot() -> Optional[Dict]:
     with _db_lock:
         cur = _db_conn.cursor()
         cur.execute(
-            "SELECT spec_revision, height, sha256, canonical_text "
+            "SELECT spec_revision, height, sha256, canonical_text, journal_verified, journal_sha256 "
             "FROM spec_snapshots ORDER BY spec_revision ASC LIMIT 1"
         )
         return _spec_snapshot_dict(cur.fetchone())
@@ -2026,7 +2105,7 @@ def list_spec_snapshots() -> List[Dict]:
     with _db_lock:
         cur = _db_conn.cursor()
         cur.execute(
-            "SELECT spec_revision, height, sha256, canonical_text "
+            "SELECT spec_revision, height, sha256, canonical_text, journal_verified, journal_sha256 "
             "FROM spec_snapshots ORDER BY spec_revision ASC"
         )
         return [_spec_snapshot_dict(r) for r in cur.fetchall()]

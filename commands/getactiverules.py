@@ -23,6 +23,16 @@ height, the newest snapshot is served. A height before the first snapshot
 answers with an explicit not-available result -- the view never guesses
 from later state and never falls back to the accumulation.
 
+Provenance: every answer names its `source`. Under journal coverage
+(the committed journal pins the snapshot's height through its block
+commit record) the captured text is served only when replaying the
+committed journal reproduces it for that revision's step
+(`captured+journal-verified`); an unverified step is answered from the
+journal reconstruction (`journal-reconstructed`), or not-available when
+the journal cannot produce one -- a capture the journal contradicts is
+never served. Snapshots below journal coverage serve their captured
+text labelled `captured`. See consensus/spec_verify.py.
+
 With `account` (a 96-hex-char public key), the response also splits the
 effective text's top-level conjuncts by attribution: `rules` holds the
 conjuncts whose guard binds i12 to exactly that account, and every other
@@ -322,19 +332,78 @@ def execute(raw_command: str, container):
         )
         return api_response.success_response("getactiverules", data)
 
+    # Journal cross-check (Bounty 02 gap-closer): the captured text is
+    # served as verified only when the committed journal still confirms
+    # it at serve time -- the verdict is recomputed against the journal
+    # as it stands now, so a journal tampered with after the snapshot
+    # was recorded cannot keep the captured text's verified label. An
+    # unverified snapshot under journal coverage is answered from the
+    # journal reconstruction instead, and when the journal cannot
+    # produce one, the step answers not-available: the stale capture is
+    # never served. A snapshot below journal coverage (no commit record
+    # pins its height -- e.g. recorded before the journal existed) keeps
+    # serving its captured text, labelled "captured", never "verified".
+    import hashlib
+
+    from consensus import spec_verify
+
+    served_text = snapshot["canonical_text"]
+    served_sha = snapshot["sha256"]
+    source = "captured"
+    if spec_verify.journal_engaged(snapshot["height"]):
+        journal_text = spec_verify.reconstruct_snapshot(
+            snapshot["height"], snapshot["spec_revision"]
+        )
+        if journal_text is not None and journal_text == snapshot["canonical_text"]:
+            source = "captured+journal-verified"
+        elif journal_text is not None:
+            served_text = journal_text
+            served_sha = hashlib.sha256(
+                journal_text.encode("utf-8")
+            ).hexdigest()
+            source = "journal-reconstructed"
+        else:
+            data = {
+                "available": False,
+                "spec_revision": snapshot["spec_revision"],
+                "height": snapshot["height"],
+                "message": (
+                    "spec snapshot is not journal-verified and the "
+                    "journal reconstruction is unavailable"
+                ),
+            }
+            if height is not None:
+                data["requested_height"] = height
+            return api_response.success_response("getactiverules", data)
+
     data = {
         "available": True,
         "spec_revision": snapshot["spec_revision"],
         "height": snapshot["height"],
-        "canonical_text": snapshot["canonical_text"],
-        "sha256": snapshot["sha256"],
+        "canonical_text": served_text,
+        "sha256": served_sha,
+        "source": source,
     }
     try:
         sequence = db.get_all_spec_snapshots(
             upto_revision=snapshot["spec_revision"]
         )
+        # The ledger derives from the same effective texts the view
+        # serves: a step under journal coverage contributes its
+        # journal-reconstructed text when one exists, never a capture
+        # the journal contradicts.
+        effective = []
+        for step in sequence:
+            text = step["canonical_text"]
+            if spec_verify.journal_engaged(step["height"]):
+                journal_text = spec_verify.reconstruct_snapshot(
+                    step["height"], step["spec_revision"]
+                )
+                if journal_text is not None:
+                    text = journal_text
+            effective.append({**step, "canonical_text": text})
         data["units"] = derive_unit_ledger(
-            sequence, db.get_rule_tx_by_revision()
+            effective, db.get_rule_tx_by_revision()
         )
     except Exception as exc:
         return api_response.error_response(
@@ -345,7 +414,7 @@ def execute(raw_command: str, container):
         data["requested_height"] = height
     if account is not None:
         rules, unattributed = split_conjuncts_by_account(
-            snapshot["canonical_text"], account
+            served_text, account
         )
         data["account"] = account
         data["rules"] = rules
