@@ -41,6 +41,11 @@ execution path in the node.
   settlement id ``arrival:<crediting tx id>``. Legs paid by any
   payout settlement are payout-class: they never trigger a route,
   so a routed share can never cascade into another route.
+  A route settles at most the gross credit -- across all of the
+  owner's on-arrival rules, one credit's shares sum to at most the
+  credit -- so the legs stay a division of what arrived and never
+  a draw on the balance that was already there; a route whose legs
+  exceed what is left of the credit settles nothing on it.
 
 Both triggers settle through `check_execution`/`settle` exactly
 like a submitted execution: same caps, same period accounting, same

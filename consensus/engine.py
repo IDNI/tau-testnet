@@ -1686,7 +1686,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             return lifecycle_mgr
 
         def _step_triggered_payout(book, offers, state, settlement_id, gross,
-                                   *, ts, balance):
+                                   *, ts, balance, limit=None):
             """Step a triggered rule's clause and check its legs.
 
             Shared by the clock and arrival triggers (Bounty 01 stage 1
@@ -1698,6 +1698,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             or refused execution, or a balance that cannot cover the
             legs. A trigger never fails the block or the crediting
             transaction: it settles what it can, or nothing.
+
+            `limit`, when given, bounds the settlement's total: a
+            route settles at most what is left of the credit that
+            triggered it, so the legs stay a division of the gross
+            credit (issue #35) and never become a draw on the
+            balance that was already there. The clock trigger
+            passes no limit: a standing payment settles from the
+            balance by design.
             """
             if book is None or state is None:
                 return None
@@ -1736,6 +1744,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             except PayoutShapeError:
                 return None
             if balance < total:
+                return None
+            if limit is not None and total > limit:
                 return None
             return legs, total
 
@@ -3807,6 +3817,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         if a_book is None:
                             continue
                         a_sid = arrival_settlement_id(tx_id)
+                        # One credit is divided, never multiplied:
+                        # the owner's routes share a single budget
+                        # of the gross credit, spent in rule order.
+                        a_remaining = arrival_credits[a_owner]
                         # Stage 2: every on_arrival rule of the owner
                         # settles on the credit, each under the same
                         # settlement id in its OWN history -- the id
@@ -3819,10 +3833,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 a_state, a_sid, arrival_credits[a_owner],
                                 ts=int(block_timestamp or 0),
                                 balance=_read_bal(a_owner),
+                                limit=a_remaining,
                             )
                             if stepped is None:
                                 continue
                             a_legs, a_total = stepped
+                            a_remaining -= a_total
                             staged_writes[a_owner] = \
                                 _read_bal(a_owner) - a_total
                             for a_recipient, a_amount in a_legs:
