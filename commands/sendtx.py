@@ -1412,37 +1412,6 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                             if refusal is not None:
                                 return refusal
 
-                            # Guarded mode: a second step with i12 set to the
-                            # recipient, stepped only when their key appears
-                            # as a literal in the running spec. Only o5 is
-                            # read from it; the step's other outputs are
-                            # discarded, so it can never move a fee.
-                            if sender_policy.spec_mentions_account(
-                                    chain_state.get_application_rules_state(),
-                                    tau_input_dict['to_addr']):
-                                guarded_values = sender_policy.guarded_pass_inputs(
-                                    tau_input_stream_values,
-                                    tau_input_dict['to_addr'],
-                                    hold=recip_hold, context=recip_context,
-                                )
-                                guarded_outputs = admission_tau.step_multi(
-                                    guarded_values, source=sender_pubkey,
-                                )
-                                guarded_o5 = guarded_outputs.get(
-                                    tau_defs.USER_POLICY_STREAM_INDEX
-                                )
-                                if guarded_o5 is not None and \
-                                        tau_manager.parse_tau_output(guarded_o5) == tau_defs.USER_POLICY_BLOCK_VALUE:
-                                    return _qt_err(
-                                        "TX_REJECTED",
-                                        (
-                                            f"Transaction rejected: the recipient's policy "
-                                            f"refused transfer #{i+1} ({transfer_details}). "
-                                            f"Policy output: {guarded_o5}"
-                                        ),
-                                        transfer_index=i + 1,
-                                    )
-
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.
                         try:

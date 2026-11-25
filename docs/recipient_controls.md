@@ -88,14 +88,6 @@ Only parks are gated. A retract is never gated by the recipient's cap, and
 a release is not re-checked: once a park is admitted, the recipient is paid
 at maturity even if their rule changed afterwards.
 
-## Guarded mode
-
-If the recipient's key appears as a literal in the running spec, a second
-step runs with `i12` set to the recipient, so an existing guarded unit of
-theirs can veto. The step runs after the transfer's fee outputs have been
-parsed, reads only `o5` from its own step, and applies no rules update — its
-outputs never reach fee components or any accounting.
-
 ## Pre-flight
 
 `getrecipientpolicy <address> [sender amount hold unit]` is a read-only

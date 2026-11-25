@@ -2381,7 +2381,6 @@ def cmd_policy_receive_status(args: argparse.Namespace) -> int:
         "2 time park (seconds), 3 height park (blocks)"
         % (caps.get("context_stream", 16),
            caps.get("context_stream_width", 64)),
-        "  guarded mode:   %s" % caps.get("guarded_mode", "unknown"),
         "  preflight:      tau-testnet policy receive show <address>",
     ]
     if not active:

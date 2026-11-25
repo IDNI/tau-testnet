@@ -209,7 +209,6 @@ def execute(raw_command: str, container):
                         "incoming_time_park": tau_defs.CONTEXT_INCOMING_TIME_PARK,
                         "incoming_height_park": tau_defs.CONTEXT_INCOMING_HEIGHT_PARK,
                     },
-                    "guarded_mode": True,
                     "preflight_command": "getrecipientpolicy",
                 },
             },

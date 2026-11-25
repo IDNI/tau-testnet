@@ -2111,56 +2111,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 tx_receipt["logs"].append(log_line)
                                 return False
 
-                            # Guarded mode: a second spec step with i12 set
-                            # to the recipient, so an existing guarded unit
-                            # of theirs can veto. Stepped only when their key
-                            # appears as a literal in the current spec (a
-                            # guarded unit scopes on its owner's key). The
-                            # step runs AFTER this transfer's fee outputs
-                            # were parsed above, reads ONLY o5 from its own
-                            # step, and applies no rules update — its outputs
-                            # never reach fee components or any accounting.
-                            spec_text = (
-                                current_tau_bytes.decode("utf-8", errors="ignore")
-                                if isinstance(current_tau_bytes, (bytes, bytearray))
-                                else str(current_tau_bytes or "")
-                            )
-                            if sender_policy.spec_mentions_account(spec_text, to_addr):
-                                guarded_values = sender_policy.guarded_pass_inputs(
-                                    tau_input_stream_values, to_addr,
-                                    hold=hold, context=context,
-                                )
-                                with tau_manager.tau_comm_lock:
-                                    guarded_outputs = _session.evaluate(
-                                        guarded_values, multi=True,
-                                        apply_rules_update=False,
-                                    )
-                                guarded_o5 = guarded_outputs.get(
-                                    tau_defs.USER_POLICY_STREAM_INDEX
-                                )
-                                if guarded_o5 is not None and \
-                                        tau_manager.parse_tau_output(guarded_o5) == tau_defs.USER_POLICY_BLOCK_VALUE:
-                                    logger.info(
-                                        "Transfer rejected by the recipient's guarded policy unit for %s->%s (o5=%s)",
-                                        str(from_addr)[:10], str(to_addr)[:10],
-                                        guarded_o5,
-                                    )
-                                    if not replay_mode:
-                                        accepted_in_block = False
-                                        hard_reject = True
-                                    execution_success = False
-                                    tx_receipt["reason"] = "recipient_policy_block"
-                                    tx_receipt["recipient_policy"] = {
-                                        "recipient": to_addr,
-                                        "reason": "recipient_policy_block",
-                                        "mode": "guarded",
-                                    }
-                                    tx_receipt["logs"].append(
-                                        "Transfer rejected by recipient policy "
-                                        f"(guarded unit, o5={guarded_o5})"
-                                    )
-                                    return False
-
                     current_from = _read_bal(from_addr)
                     if current_from < amount:
                         logger.error(

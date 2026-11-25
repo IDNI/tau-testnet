@@ -6,7 +6,7 @@ neutral default, #47.3 batch atomicity, #47.4 one unit both directions,
 #47.5 capability reporting + deploy refusal, #76.1 cap zero, #76.2 cap 600
 seconds, #76.3 no rule no restriction, #76.4 retract never gated, #76.5
 refusal carries the verified cap, #76.6 in force before the payment — plus
-the design's parity, determinism, guarded-mode and sabotage checks.
+the design's parity, determinism, and sabotage checks.
 
 Mock evaluator throughout (the native engine bindings are unavailable in
 this environment, so — exactly like the neighbouring suites — clause
@@ -963,112 +963,6 @@ def test_admission_apply_parity_for_a_capped_park(park_node):
     admitted = sendtx_mod.queue_transaction(
         json.dumps(_park_payload(PARK_TIP_TS + 600)), propagate=False)
     assert admitted["ok"] is True, admitted
-
-
-# --- guarded mode ------------------------------------------------------------
-
-GUARDED_SPEC = (
-    "always ( (i12[t]:bv[384] = { #x" + ap.BOB + " }:bv[384]) "
-    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
-    ": (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
-)
-
-
-def _apply_with_spec(txs, *, spec_text, multi, lm, balances=None, height=20):
-    from block import Block
-    from consensus.engine import ActiveConsensusView, TauConsensusEngine
-    from consensus.state import TauStateSnapshot
-
-    bal = balances if balances is not None else {
-        ap.ALICE: 100000, ap.AUTH: 10, ap.SCAN: 10, ap.BOB: 0}
-    parent_snapshot = TauStateSnapshot(
-        state_hash="0" * 64,
-        tau_bytes=spec_text.encode(),
-        metadata={
-            "balances": dict(bal),
-            "sequence_numbers": {},
-            "last_transfer_ts": {},
-            "lifecycle_manager": lm,
-            "consensus_rules_state": "always (o6[t]:bv[16] = i10[t]:bv[16]).",
-            "active_consensus_id": "",
-        },
-    )
-    active_view = ActiveConsensusView(
-        target_height=height,
-        consensus_rules=parent_snapshot.metadata["consensus_rules_state"],
-        active_validators=[bytes.fromhex(ap.ALICE)],
-        mechanism_specific_metadata={"poa": True, "approval_slots_active": True},
-    )
-    block_obj = Block.create(
-        block_number=height, previous_hash="00" * 32, transactions=txs,
-        proposer_pubkey=ap.ALICE, timestamp=1234567890,
-    )
-    calls = []
-
-    def _multi(**kwargs):
-        calls.append(kwargs)
-        return multi(kwargs.get("input_stream_values") or {})
-
-    engine = TauConsensusEngine()
-    with patch("tau_manager.communicate_with_tau", return_value="T"), \
-            patch("tau_manager.communicate_with_tau_multi", side_effect=_multi), \
-            patch("chain_state.get_application_rules_state", return_value=""), \
-            patch("tau_manager.tau_ready") as ready:
-        ready.is_set.return_value = True
-        result = engine.apply_block(active_view, block_obj, parent_snapshot)
-    return result, calls
-
-
-def _guarded_multi(guarded_o5, guarded_fee="999"):
-    def _multi(vals):
-        amount = int(str(vals.get(1, "0")) or 0)
-        out = {1: str(amount), 8: "0", 9: "7", 5: "1"}
-        if ap.BOB in str(vals.get(12, "")):
-            # The recipient pass: i12 carries the recipient's key.
-            out[5] = guarded_o5
-            out[9] = guarded_fee
-        return out
-    return _multi
-
-
-def test_guarded_mode_recipient_pass():
-    """An existing guarded unit of the recipient's vetoes the payment in a
-    second pass — no clause registration needed."""
-    tx = _transfer_tx(ap.ALICE, ap.BOB, 500)
-    result, calls = _apply_with_spec(
-        [tx], spec_text=GUARDED_SPEC, multi=_guarded_multi("0"),
-        lm=_lm_ap())
-    assert tx["tx_id"] in result.invalid_tx_ids
-    assert _reason(result, tx) == "recipient_policy_block"
-    assert ap._balances(result)[ap.BOB] == 0
-    assert any(ap.BOB in str((c.get("input_stream_values") or {}).get(12, ""))
-               for c in calls), "the recipient pass must have run"
-
-
-def test_guarded_pass_fee_isolation():
-    """The recipient pass's outputs never reach fee accounting: it reports
-    a fee of 999, the transfer is still charged exactly the sender pass's
-    7 — the regression shape that hit the competitor's guarded mode."""
-    tx = _transfer_tx(ap.ALICE, ap.BOB, 500)
-    result, calls = _apply_with_spec(
-        [tx], spec_text=GUARDED_SPEC, multi=_guarded_multi("1"),
-        lm=_lm_ap())
-    assert tx["tx_id"] in result.accepted_tx_ids
-    logs = ap._logs(result)
-    assert "Fee charged: 7" in logs and "999" not in logs
-    balances = ap._balances(result)
-    assert balances[ap.BOB] == 500
-    assert balances[ap.ALICE] == 100000 - 500, "fee 7 nets out via the proposer"
-
-
-def test_guarded_pass_skipped_when_spec_never_mentions_recipient():
-    tx = _transfer_tx(ap.ALICE, ap.BOB, 500)
-    result, calls = _apply_with_spec(
-        [tx], spec_text="always (o0[t]=1).", multi=_guarded_multi("0"),
-        lm=_lm_ap())
-    assert tx["tx_id"] in result.accepted_tx_ids
-    assert not any(ap.BOB in str((c.get("input_stream_values") or {}).get(12, ""))
-                   for c in calls)
 
 
 # --- sabotage check ----------------------------------------------------------
