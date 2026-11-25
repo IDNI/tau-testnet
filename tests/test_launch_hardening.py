@@ -30,6 +30,38 @@ def temp_db(tmp_path):
     db._db_conn = prev_conn
 
 
+def _getgovernance_payload():
+    """`getgovernance`'s payload, from a stub container: no chain, no rules."""
+    from commands.getgovernance import execute as getgov_execute
+    from consensus.governance import ConsensusLifecycleManager
+
+    class _Lock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Chain:
+        _balance_lock = _Lock()
+        _sequence_lock = _Lock()
+        _rules_lock = _Lock()
+        _active_consensus_id = None
+        _consensus_rules_state = "rules"
+        _application_rules_state = "apps"
+        _lifecycle_manager = ConsensusLifecycleManager(active_validators=["aa" * 48])
+
+    class _DB:
+        def get_canonical_head_block(self):
+            return {"block_hash": "abc", "header": {"block_number": 1}}
+
+    class _Container:
+        chain_state = _Chain()
+        db = _DB()
+
+    return json.loads(getgov_execute("getgovernance", _Container()))["data"]
+
+
 class TestSchemaVersion:
     def test_fresh_db_stamped_with_schema_version(self, temp_db):
         row = db._db_conn.execute("SELECT version FROM schema_version").fetchone()
@@ -753,37 +785,9 @@ class TestPolicyWidthScreen:
             assert result.code == "CLAUSE_SHAPE"
 
     def test_getgovernance_exposes_constant_stream_widths(self):
-        import json
-        from commands.getgovernance import execute as getgov_execute
-        from consensus.governance import ConsensusLifecycleManager
         import tau_defs
 
-        class _Lock:
-            def __enter__(self):
-                return self
-            def __exit__(self, *a):
-                return False
-
-        class _Chain:
-            _balance_lock = _Lock()
-            _sequence_lock = _Lock()
-            _rules_lock = _Lock()
-            _active_consensus_id = None
-            _consensus_rules_state = "rules"
-            _application_rules_state = "apps"
-            _lifecycle_manager = ConsensusLifecycleManager(
-                active_validators=["aa" * 48]
-            )
-
-        class _DB:
-            def get_canonical_head_block(self):
-                return {"block_hash": "abc", "header": {"block_number": 1}}
-
-        class _Container:
-            chain_state = _Chain()
-            db = _DB()
-
-        payload = json.loads(getgov_execute("getgovernance", _Container()))["data"]
+        payload = _getgovernance_payload()
         assert payload["stream_widths"] == dict(tau_defs.HOST_STREAM_WIDTHS)
         assert payload["stream_widths"] == {
             "i1": 24, "i2": 24, "o5": 24, "o8": 24, "o9": 24,
@@ -791,6 +795,15 @@ class TestPolicyWidthScreen:
             # its width is frozen here too and a wallet learns it from the host.
             "i17": 64,
         }
+
+    def test_getgovernance_reports_the_recipient_feature(self):
+        """A wallet must be able to learn that this node judges inbound payments."""
+        import tau_defs
+
+        features = _getgovernance_payload()["features"]
+        assert features["recipient_policy"] is True
+        assert features["receive_stream"] == f"i{tau_defs.RECEIVE_STREAM_INDEX}" == "i17"
+        assert features["receive_stream_width"] == tau_defs.RECEIVE_STREAM_BV_WIDTH == 64
 
 
 class TestApplyRuleHonesty:

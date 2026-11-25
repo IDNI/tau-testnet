@@ -113,6 +113,48 @@ past (a proposer may choose one up to 120 s behind), which can make a time-based
 hold marginally longer than admission measured. A park that close to its own
 release point is refused by the park screens anyway.
 
+## Order of checks
+
+An incoming payment passes the same gates in the same order everywhere, and the order is
+the reason a refusal is explainable rather than mysterious.
+
+**Gate 1 — does the recipient have a clause?** No clause on `o5` means no evaluator call
+at all, on either path. This is the common case and it costs nothing.
+
+**Gate 2 — does that clause read `i17`?** If it never mentions the receive stream, it is
+not judged on the receiving side, even when it exists. A policy written for outbound
+rules (it reads `i3` or `i1`) keeps meaning exactly what it meant before the upgrade.
+Reading `i17` is the opt-in, and it is the only thing that can tell the two passes apart.
+
+**Gate 3 — one evaluation, every condition at once.** The same clause is evaluated once
+with `i12 = the recipient`, `i17` carrying the hold, and `i18`–`i25` zeroed. All of the
+account's conditions live inside that one unit, so they are not checked one after
+another: `o5` is a single value, and a clause that leaves it `0` for any reason refuses
+the payment as a whole. There is no partial acceptance and no "the first failed check
+wins" — the clause decides, once.
+
+**Then the reason is chosen.** A refusal caused by a payment that is not final
+(`i17 > 1`) is reported as `RECIPIENT_MAX_HOLD`, and the message names the hold; when the
+clause uses the shipped template, the message also states the cap it enforces
+("the recipient accepts payments at most 600 seconds"). Every other refusal is reported as
+`recipient_policy_block` with the clause's own policy output. The distinction exists so a
+payer's wallet can say "send it now instead" rather than "refused by policy".
+
+**At what stage.** Admission and block apply run the same call for the same reason
+(`consensus/sender_policy.py` and `consensus/recipient_policy.py` exist so the two paths
+cannot drift): at admission the refusal rejects the transaction before it enters the
+mempool and nothing is charged; at apply it is a hard reject, so no staged write commits,
+a batch fails whole, and no fee is settled. An evaluator that cannot answer is
+operational, not a verdict: admission maps it to `ADMISSION_UNAVAILABLE`.
+
+In `consensus/engine.py` the order is: the sender's `o5`, then the sender's own clause,
+then the recipient's clause, then the balance check and the staged writes. A recipient
+refusal sets `accepted_in_block = False` and `hard_reject = True`, and both later steps are
+gated on the same expression — balance writes commit only under
+`accepted_in_block and not hard_reject`, and fee settlement is charged only under
+`charge_fee and accepted_in_block and not hard_reject`. That is why a refused payment
+moves nothing and costs the payer nothing.
+
 ## The payer's approval slots are not visible to the recipient
 
 The receiving pass zeroes `i18`–`i25`. Those slots carry the approvers who

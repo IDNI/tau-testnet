@@ -21,7 +21,7 @@ from consensus import approvals, recipient_policy, sender_policy
 from consensus import admission as admission_mod
 from consensus.approvals import screen_receive_widths
 from consensus.policy_mock import MockPolicyEvaluator
-from consensus.retractable import KIND_HEIGHT, KIND_TIME
+from consensus.retractable import KIND_HEIGHT, KIND_TIME, parse_retractable_transfer
 
 import test_approval_apply as ap
 
@@ -83,6 +83,21 @@ def _transfer_tx(amount, to=ap.BOB, seq=0):
         "expire_at_height": 5000,
         "fee_limit": "100",
         "operations": {"1": [[ap.ALICE, to, str(amount)]]},
+    }, ap.SK_ALICE)
+
+
+def _park_tx(amount=100, to=ap.BOB, seq=0, release_at_height=200):
+    return ap._sign({
+        "tx_id": f"park-{next(ap._TX_SEQ)}",
+        "tx_type": "retractable_transfer",
+        "sender_pubkey": ap.ALICE,
+        "recipient_pubkey": to,
+        "amount": amount,
+        "sequence_number": seq,
+        "expiration_time": 9999999999,
+        "expire_at_height": 5000,
+        "fee_limit": "100",
+        "release_at_height": release_at_height,
     }, ap.SK_ALICE)
 
 
@@ -434,3 +449,69 @@ def test_a_comment_about_a_hold_stream_does_not_count_as_bounding_it():
             "(i17[t]:bv[64] > { #x0259 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24])"
             " : (o5[t]:bv[24] = { #x000001 }:bv[24])")
     assert approvals.screen_hold_mentions(body, group=(17, 27))
+
+
+# --- the bounty's own acceptance cases ---------------------------------------
+
+# "Instant and final only" (bounty 03, part 2): the shipped cap-0 template
+# refuses any hold above a plain transfer, so the account only takes money it
+# can spend the moment it lands.
+INSTANT_ONLY = (
+    "always ( (i17[t]:bv[64] > { #x0001 }:bv[64])"
+    " ? (o5[t]:bv[24] = { #x000000 }:bv[24])"
+    " : (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
+)
+
+
+def _cap_zero(inputs):
+    """The cap-0 template's verdict: only the plain, final value is accepted."""
+    return "0" if int(inputs.get("i17", 1)) > recipient_policy.plain_transfer_value() else "1"
+
+
+def test_a_cap_of_zero_admits_a_plain_transfer_and_refuses_every_park():
+    sender_policy.set_evaluator("apply", _judgeable(body=INSTANT_ONLY, decide=_cap_zero))
+
+    plain = _transfer_tx(500)
+    result, _lm, _calls = ap._apply([plain], lm=_registered(INSTANT_ONLY))
+    assert plain["tx_id"] in result.accepted_tx_ids
+
+    park = _park_tx()
+    result, _lm, _calls = ap._apply([park], lm=_registered(INSTANT_ONLY))
+    assert park["tx_id"] in result.invalid_tx_ids
+    assert _reason(result, park) == recipient_policy.REASON_MAX_HOLD
+
+
+def test_the_retract_path_never_consults_the_recipient_clause():
+    """A retract never reaches the recipient, so the recipient has no say in it.
+
+    A park and the retract of that same park are applied in one block, with a
+    clause registered for the recipient and an evaluator that records every
+    call. One call for two transactions means the retract was never judged.
+    """
+    calls = []
+
+    def decide(inputs):
+        calls.append(inputs.get("i17"))
+        return "1"
+
+    ev = MockPolicyEvaluator(pool="apply")
+    ev.set_verdict(INBOUND_BODY, decide)
+    sender_policy.set_evaluator("apply", ev)
+
+    park = _park_tx(seq=0)
+    rid = parse_retractable_transfer(park).retractable_id.hex()
+    retract = ap._sign({
+        "tx_id": f"retract-{next(ap._TX_SEQ)}",
+        "tx_type": "retract_transfer",
+        "sender_pubkey": ap.ALICE,
+        "sequence_number": 1,
+        "expiration_time": 9999999999,
+        "expire_at_height": 5000,
+        "fee_limit": "0",
+        "retractable_id": rid,
+    }, ap.SK_ALICE)
+
+    result, _lm, _calls = ap._apply([park, retract], lm=_registered(INBOUND_BODY))
+    assert park["tx_id"] in result.accepted_tx_ids
+    assert retract["tx_id"] in result.accepted_tx_ids
+    assert len(calls) == 1, f"the recipient clause was consulted {len(calls)} times for 2 transactions"
