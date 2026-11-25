@@ -220,8 +220,13 @@ itself:
   is refused (`the sale named is not an open sale of this rule`). A refused
   execution, for example over a cap, leaves the sale open for a later attempt.
 - **Bounded.** At most 64 sales are open per rule. A sale that arrives while 64
-  are open is not recorded, and `sales_missed` counts it. Replacing, revoking or
-  expiring the rule drops its open sales.
+  are open takes the place of the smallest open sale if it is larger (of equally
+  small ones, the one recorded last gives way), and `sales_missed` counts the
+  sale that gave way; a sale no larger than every open one is not recorded, and
+  `sales_missed` counts it. So sales too small to pay anything (a 5% royalty
+  pays nothing on 19 or less) cannot hold every place and keep later sales out:
+  to keep a sale out, all 64 places must hold larger sales, each paid to the
+  account. Replacing, revoking or expiring the rule drops its open sales.
 
 `getpayoutrule` lists the open sales (`open_sales`: id, payer, amount, height)
 and `sales_missed`; the `executed` event names the `sale_id` it paid. The open
