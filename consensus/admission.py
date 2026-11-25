@@ -276,6 +276,244 @@ class UserRuleRejection(NamedTuple):
     details: Optional[Dict] = None
 
 
+class _O8ParseError(Exception):
+    """Raised when an o8 rule is outside the shape the scope proof supports."""
+
+
+class _O8Node:
+    __slots__ = ("kind", "data")
+
+    def __init__(self, kind: str, **data):
+        self.kind = kind
+        self.data = data
+
+
+# Arithmetic / bitwise operators fold into an opaque operand (they cannot be
+# identity guards, and an o8 charged from one is a potential non-zero).
+_O8_ARITH = {"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"}
+_O8_CMP = ("=", "!=", "<", ">", "<=", ">=")
+_O8_IMP = {"->", "<-"}
+
+
+def _o8_bvlit_is_zero(text: str) -> bool:
+    m = re.match(r"\{\s*(#x[0-9a-fA-F]+|#b[01]+|\d+)\s*\}\s*:\s*bv\[\s*\d+\s*\]", text)
+    if not m:
+        return False
+    body = m.group(1)
+    if body.startswith("#x"):
+        return all(c == "0" for c in body[2:])
+    if body.startswith("#b"):
+        return all(c == "0" for c in body[2:])
+    return body == "0"
+
+
+def _o8_cur(toks, pos):
+    return toks[pos[0]] if pos[0] < len(toks) else None
+
+
+def _o8_eat(toks, pos, kind, text=None):
+    t = _o8_cur(toks, pos)
+    if t is None or t.kind != kind or (text is not None and t.text != text):
+        raise _O8ParseError(f"expected {kind} {text!r}")
+    pos[0] += 1
+    return t
+
+
+def _o8_parse_formula(toks, pos):
+    return _o8_parse_ternary(toks, pos)
+
+
+def _o8_parse_ternary(toks, pos):
+    cond = _o8_parse_imp(toks, pos)
+    t = _o8_cur(toks, pos)
+    if t is not None and t.kind == "other" and t.text == "?":
+        pos[0] += 1
+        then = _o8_parse_ternary(toks, pos)
+        _o8_eat(toks, pos, "colon", ":")
+        els = _o8_parse_ternary(toks, pos)
+        return _O8Node("ite", cond=cond, then=then, els=els)
+    return cond
+
+
+def _o8_parse_imp(toks, pos):
+    ant = _o8_parse_or(toks, pos)
+    t = _o8_cur(toks, pos)
+    if t is not None and t.kind == "op" and t.text in _O8_IMP:
+        pos[0] += 1
+        cons = _o8_parse_ternary(toks, pos)
+        return _O8Node("imp", ant=ant, cons=cons, rev=(t.text == "<-"))
+    return ant
+
+
+def _o8_parse_or(toks, pos):
+    lhs = _o8_parse_and(toks, pos)
+    while True:
+        t = _o8_cur(toks, pos)
+        if t is not None and t.kind == "op" and t.text == "||":
+            pos[0] += 1
+            lhs = _O8Node("or", a=lhs, b=_o8_parse_and(toks, pos))
+        else:
+            return lhs
+
+
+def _o8_parse_and(toks, pos):
+    lhs = _o8_parse_cmp(toks, pos)
+    while True:
+        t = _o8_cur(toks, pos)
+        if t is not None and t.kind == "op" and t.text == "&&":
+            pos[0] += 1
+            lhs = _O8Node("and", a=lhs, b=_o8_parse_cmp(toks, pos))
+        else:
+            return lhs
+
+
+def _o8_parse_cmp(toks, pos):
+    lhs = _o8_parse_arith(toks, pos)
+    t = _o8_cur(toks, pos)
+    if t is not None and t.kind == "op" and t.text in _O8_CMP:
+        pos[0] += 1
+        return _O8Node("cmp", lhs=lhs, op=t.text, rhs=_o8_parse_arith(toks, pos))
+    return lhs
+
+
+def _o8_parse_arith(toks, pos):
+    lhs = _o8_parse_atom(toks, pos)
+    while True:
+        t = _o8_cur(toks, pos)
+        if t is not None and t.kind == "op" and t.text in _O8_ARITH:
+            pos[0] += 1
+            lhs = _O8Node("expr", a=lhs, b=_o8_parse_atom(toks, pos))
+        else:
+            return lhs
+
+
+def _o8_parse_atom(toks, pos):
+    t = _o8_cur(toks, pos)
+    if t is None:
+        raise _O8ParseError("eof")
+    if t.kind == "group" and t.text == "(":
+        pos[0] += 1
+        node = _o8_parse_formula(toks, pos)
+        _o8_eat(toks, pos, "group", ")")
+        return node
+    if t.kind == "streamref":
+        pos[0] += 1
+        import tau_shrink
+        ref = tau_shrink._ref_of(t, 0)
+        if ref is None:
+            raise _O8ParseError("untyped streamref")
+        return _O8Node("ref", io=ref.io, idx=ref.index)
+    if t.kind == "bvlit":
+        pos[0] += 1
+        return _O8Node("lit", zero=_o8_bvlit_is_zero(t.text))
+    if t.kind in ("num", "hexnum"):
+        pos[0] += 1
+        return _O8Node("lit", zero=(t.text in ("0", "#x0", "#b0")))
+    if t.kind == "ident":
+        pos[0] += 1
+        return _O8Node("ident", text=t.text)
+    raise _O8ParseError(f"unexpected atom {t.kind} {t.text!r}")
+
+
+def _o8_is_identity_guard(node) -> bool:
+    """True iff node is exactly `i12 = <lit>` or `i3 = <lit>`."""
+    if node.kind != "cmp" or node.data["op"] != "=":
+        return False
+    lhs, rhs = node.data["lhs"], node.data["rhs"]
+    if lhs.kind != "ref" or lhs.data["io"] != "i" or lhs.data["idx"] not in (12, 3):
+        return False
+    return rhs.kind == "lit"
+
+
+def _o8_imposes_identity(node) -> bool:
+    """True iff node, when true, pins a specific sender (i12/i3 = literal)."""
+    if node is None:
+        return False
+    if _o8_is_identity_guard(node):
+        return True
+    if node.kind == "and":
+        return _o8_imposes_identity(node.data["a"]) or _o8_imposes_identity(node.data["b"])
+    return False
+
+
+def _o8_charged_write(node) -> bool:
+    """A leaf `o8[...] = RHS` whose RHS is not a provable zero."""
+    if node.kind != "cmp" or node.data["op"] != "=":
+        return False
+    lhs = node.data["lhs"]
+    if lhs.kind != "ref" or lhs.data["io"] != "o" or lhs.data["idx"] != 8:
+        return False
+    rhs = node.data["rhs"]
+    if rhs.kind == "lit":
+        return not rhs.data["zero"]
+    return True  # stream or expression RHS: potentially non-zero
+
+
+def _o8_safe(node, parent_guard) -> bool:
+    """True iff no charged o8 write in `node` is reachable without a genuine guard."""
+    if node is None:
+        return True
+    if _o8_charged_write(node):
+        return parent_guard
+    if node.kind in ("ref", "lit", "ident", "cmp", "expr"):
+        return True
+    d = node.data
+    if node.kind == "and":
+        return (_o8_safe(d["a"], parent_guard or _o8_imposes_identity(d["b"]))
+                and _o8_safe(d["b"], parent_guard or _o8_imposes_identity(d["a"])))
+    if node.kind == "or":
+        return _o8_safe(d["a"], parent_guard) and _o8_safe(d["b"], parent_guard)
+    if node.kind == "ite":
+        return (_o8_safe(d["then"], parent_guard or _o8_imposes_identity(d["cond"]))
+                and _o8_safe(d["els"], parent_guard))
+    if node.kind == "imp":
+        if not d["rev"]:
+            return (_o8_safe(d["ant"], parent_guard)
+                    and _o8_safe(d["cons"], parent_guard or _o8_imposes_identity(d["ant"])))
+        return (_o8_safe(d["cons"], parent_guard)
+                and _o8_safe(d["ant"], parent_guard or _o8_imposes_identity(d["cons"])))
+    return False  # unknown node kind: fail closed
+
+
+def screen_o8_sender_scope(rule_text: str) -> bool:
+    """Structural proof that every charged `o8` write is conjoined to an
+    `i12 = <key>` / `i3 = <key>` identity guard (issue #183).
+
+    Replaces the textual 'rule mentions i12' heuristic, which let a rule that
+    merely *referenced* i12 (a tautology, a disjunct bypass, or a dead branch)
+    charge fees for every sender. Reuses the repo tokenizer. Fail-closed: any
+    rule outside the supported shape -- or any the proof cannot certify -- is
+    refused, since a wrong fee is worse than a rejected fee rule.
+    """
+    import tau_shrink  # lazy: matches the existing pattern at the temporal screen
+
+    scrubbed = _strip_tau_comments(rule_text)
+    try:
+        toks = tau_shrink._tokenize(scrubbed)
+    except Exception:
+        return False
+    n = len(toks)
+    if n == 0:
+        return False
+    # Only the universal quantifier keeps a textual guard as proof of gating;
+    # a different quantifier changes the charge semantics, so the proof is
+    # inconclusive and the rule is refused.
+    if not (toks[0].kind == "ident" and toks[0].text == "always"):
+        return False
+    pos = [1]
+    try:
+        node = _o8_parse_formula(toks, pos)
+    except _O8ParseError:
+        return False
+    # Fail closed on anything the parser did not consume: function calls, a
+    # second formula, or syntax outside the supported shape must refuse.
+    while pos[0] < n and toks[pos[0]].kind == "dot":
+        pos[0] += 1
+    if pos[0] < n:
+        return False
+    return _o8_safe(node, False)
+
+
 def screen_user_rule_text(
     rule_text: str, eligibility_mode: str, slots_active: bool
 ) -> Optional[UserRuleRejection]:
@@ -331,14 +569,19 @@ def screen_user_rule_text(
         )
 
     # o8 is shared across senders, so an unscoped write taxes fees for all.
-    # A reference is not proof of gating; this catches the accidental global rule only.
+    # "The text mentions i12" is not proof the rule is gated by it: a tautology
+    # (i12 = i12), a disjunct bypass, or i12 parked in a dead branch all charge
+    # every sender while the text still references i12. So the screen proves
+    # structurally that every charged o8 write is conjoined to an
+    # i12/i3 = <key> identity (issue #183), failing closed on any rule it
+    # cannot certify.
     policy_out = _streams_referenced(rule_text, ("o8",))
-    if policy_out and not _streams_referenced(rule_text, ("i12", "i3")):
+    if policy_out and not screen_o8_sender_scope(rule_text):
         return UserRuleRejection(
-            f"user_tx rule text writes shared policy stream '{policy_out[0]}' "
-            f"without a sender scope: it would apply to every account on the "
-            f"network. Guard the rule on your own identity — reference i12 "
-            f"(sender pubkey) or i3 (from address), e.g. "
+            f"rule text writes shared policy stream '{policy_out[0]}' "
+            f"without a sender scope that charges only its author: every charged "
+            f"write must be guarded by i12 (sender pubkey) or i3 (from address) "
+            f"equal to a literal, e.g. "
             f"always ((i12[t]:bv[384] = {{ #x<your pubkey> }}:bv[384]) -> "
             f"{policy_out[0]}[t]:bv[24] = {{ #x000000 }}:bv[24]).",
             "unscoped_user_rule",

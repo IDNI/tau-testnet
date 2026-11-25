@@ -343,9 +343,13 @@ class TestAdmissionLimits:
 
     def test_user_rule_scoping_on_i12_still_accepted_under_tau_validator_set(self):
         # Reading i12 is how a fee rule scopes itself to its own sender; the
-        # reserved-set reuse for rule TEXT must keep excluding it.
+        # reserved-set reuse for rule TEXT must keep excluding it. Guarded on
+        # the sender's own key so the structural o8 scope proof (issue #183)
+        # also holds -- the point here is that i12 stays a readable stream
+        # under tau_validator_set, not that any mention of it suffices.
         from consensus.admission import validate_user_tx_reserved_domains
-        rule = "always ( o8[t]:bv[24] = { 1 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384] )."
+        rule = ("always ((i12[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]) -> "
+                "o8[t]:bv[24] = { #x000000 }:bv[24]).")
         assert validate_user_tx_reserved_domains(
             {"operations": {"0": rule}}, self._tau_validator_set_tip_view()).is_valid
 
@@ -557,17 +561,18 @@ class TestUserRuleSenderScope:
         result = self._screen("always (o13[t]:bv[16] = { #x0001 }:bv[16]).")
         assert result.is_valid, result.error
 
-    def test_known_gap_reference_is_not_proof_of_gating(self):
-        """Documented limitation, asserted so it is a known state rather than a
-        surprise: the screen is textual, so a rule that merely mentions i12
-        without gating on it passes. Catching this needs formula analysis."""
+    def test_reference_alone_is_no_longer_proof_of_gating(self):
+        """Issue #183 (now fixed): a rule that merely *mentions* i12 without
+        gating the charged write on it is refused. `i12 != i12` is false for
+        every sender, so `o8 = 3 || i12 != i12` charges every sender while the
+        text still references i12. The structural screen catches this; before
+        the fix the same rule was admitted and the gap was asserted as a known
+        limitation."""
         result = self._screen(
             "always (o8[t]:bv[24] = { #x000003 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384])."
         )
-        assert result.is_valid, (
-            "if this now fails, the screen gained real scope analysis — good, "
-            "update the docs in tau_defs.py and README that call it textual"
-        )
+        assert not result.is_valid
+        assert result.code == "UNSCOPED_USER_RULE"
 
 
 class TestBalanceReadingPolicyRules:

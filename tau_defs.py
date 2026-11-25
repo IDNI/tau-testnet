@@ -101,8 +101,10 @@ TAU_OUTPUT_STREAM_VALIDATION_RESULT = "o1"
 # block apply for both o5 and o8: rule text writing either without referencing
 # i12 or i3 is rejected with UNSCOPED_USER_RULE (consensus/admission.py),
 # because a single unscoped `always (o5[t] = 0)` would block every account on
-# the network. The screen is textual — it cannot prove the scope actually
-# gates the assignment. Rules may also read i4 (recipient) and i5
+# block every account on the network. The screen is structural: it parses the
+# rule and proves that every charged assignment is conjoined to an i12/i3
+# identity guard (a mere mention of i12 is not enough — issue #183), failing
+# closed on any rule it cannot certify. Rules may also read i4 (recipient) and i5
 # (block timestamp) — both real at admission and apply — for recipient
 # whitelists and time-locks.
 #
