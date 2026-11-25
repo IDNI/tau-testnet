@@ -2,7 +2,8 @@
 
 A rule installed with `per_sale` settles only against sales the
 chain recorded. The book-level halves pin the sale bookkeeping --
-recording, the age bound, the ledger marker, update carry-over --
+recording, the displacement bound, the ledger marker, update
+carry-over --
 and the apply-level halves run the engine with the stage-1
 harness's scripted evaluator: a credit records a sale, an
 execution names it and pays from the RECORDED amount (never the
@@ -137,10 +138,12 @@ def test_parse_install_and_execute_carry_the_sale_fields():
 # --- book level: recording, bound, settling ------------------------------------
 
 
-def test_recording_bound_evicts_the_oldest_and_counts_it_missed():
+def test_recording_bound_displaces_the_smallest_and_counts_it_missed():
     book = PayoutBook()
     terms = _terms(per_sale=True)
     state = book.install(terms)
+    # Amounts rise, so the smallest open sale is also the oldest:
+    # the 33rd arrival displaces tx-0 and is counted missed.
     for n in range(MAX_OPEN_SALES + 1):
         book.note_sale(
             ALICE, Sale(f"tx-{n}", BOB, 10 + n, 20 + n),
@@ -153,6 +156,72 @@ def test_recording_bound_evicts_the_oldest_and_counts_it_missed():
     book.note_sale(ALICE, Sale("tx-1", BOB, 11, 21), rule_id=terms.rule_id)
     assert len(state.sales) == MAX_OPEN_SALES
     assert state.sales_missed == 1
+
+
+def test_recording_bound_displaces_the_smallest_not_the_oldest():
+    # The dust scenario: a 5% royalty pays nothing on 19 or less,
+    # so dust sales are worthless slots. One large early sale
+    # plus 31 dust sales fill the list; a larger arrival must
+    # displace the smallest (a dust sale), never the large old one.
+    book = PayoutBook()
+    terms = _terms(per_sale=True)
+    state = book.install(terms)
+    book.note_sale(ALICE, Sale("tx-big", BOB, 500, 20),
+                   rule_id=terms.rule_id)
+    for n in range(MAX_OPEN_SALES - 1):
+        book.note_sale(
+            ALICE, Sale(f"tx-dust-{n}", BOB, 19, 21 + n),
+            rule_id=terms.rule_id)
+    assert len(state.sales) == MAX_OPEN_SALES
+    displaced = state.note_sale(Sale("tx-real", BOB, 101, 60))
+    assert displaced is not None
+    assert displaced.sale_id == "tx-dust-0"
+    assert state.sales_missed == 1
+    assert state.open_sale("tx-big") is not None
+    assert state.open_sale("tx-real") is not None
+    assert len(state.sales) == MAX_OPEN_SALES
+
+
+def test_displacement_tie_break_takes_the_oldest_of_the_smallest():
+    book = PayoutBook()
+    terms = _terms(per_sale=True)
+    state = book.install(terms)
+    book.note_sale(ALICE, Sale("tx-a", BOB, 100, 20),
+                   rule_id=terms.rule_id)
+    book.note_sale(ALICE, Sale("tx-small-1", BOB, 5, 21),
+                   rule_id=terms.rule_id)
+    book.note_sale(ALICE, Sale("tx-small-2", BOB, 5, 22),
+                   rule_id=terms.rule_id)
+    for n in range(MAX_OPEN_SALES - 3):
+        book.note_sale(
+            ALICE, Sale(f"tx-{n}", BOB, 50 + n, 23 + n),
+            rule_id=terms.rule_id)
+    assert len(state.sales) == MAX_OPEN_SALES
+    displaced = state.note_sale(Sale("tx-new", BOB, 60, 60))
+    assert displaced is not None
+    assert displaced.sale_id == "tx-small-1"
+    assert state.open_sale("tx-small-2") is not None
+    assert state.sales_missed == 1
+
+
+def test_a_small_arrival_at_a_full_list_is_itself_missed():
+    book = PayoutBook()
+    terms = _terms(per_sale=True)
+    state = book.install(terms)
+    for n in range(MAX_OPEN_SALES):
+        book.note_sale(
+            ALICE, Sale(f"tx-{n}", BOB, 100 + n, 20 + n),
+            rule_id=terms.rule_id)
+    # Equal to the smallest open sale (100) is no larger: missed,
+    # not recorded. Smaller still: missed as well.
+    state.note_sale(Sale("tx-equal", BOB, 100, 60))
+    assert state.open_sale("tx-equal") is None
+    assert state.sales_missed == 1
+    state.note_sale(Sale("tx-smaller", BOB, 50, 61))
+    assert state.open_sale("tx-smaller") is None
+    assert state.sales_missed == 2
+    assert len(state.sales) == MAX_OPEN_SALES
+    assert state.sales[0].sale_id == "tx-0"
 
 
 def test_settling_a_sale_marks_the_ledger_and_closes_it():
@@ -287,7 +356,7 @@ def test_every_per_sale_rule_of_the_account_records_the_sale():
         assert [s.sale_id for s in sales] == [tx["tx_id"]]
 
 
-def test_apply_level_bound_evicts_the_oldest_sale():
+def test_apply_level_bound_refuses_an_equal_arrival():
     ch = Chain(_balances())
     terms = _install(ch, BOB, SK_BOB, height=20, recipients=[CAROL],
                      extra={"per_sale": True})
@@ -300,8 +369,67 @@ def test_apply_level_bound_evicts_the_oldest_sale():
         assert ch.accepted(tx), ch.receipt(tx)
     state = ch.book.get_rule(BOB, terms.rule_id)
     assert len(state.sales) == MAX_OPEN_SALES
+    # Every arrival is 10, no larger than the smallest open sale,
+    # so the 33rd is itself missed -- and the oldest sale stays.
     assert state.sales_missed == 1
-    assert state.open_sale(first) is None
+    assert state.open_sale(first) is not None
+
+
+def test_dust_flood_cannot_block_a_later_real_sale():
+    # 32 dust credits (19 each: a 5% royalty pays nothing on
+    # them) fill the list; a real sale of 101 then displaces the
+    # oldest dust sale, and a further dust credit is refused a
+    # slot of its own. The displaced dust sale can no longer be
+    # executed; the real sale can, and pays 5% of its recorded
+    # 101.
+    ch = Chain(_balances())
+    terms = _install(ch, BOB, SK_BOB, height=20, recipients=[CAROL],
+                     extra={"per_sale": True})
+    first_dust = None
+    for n in range(MAX_OPEN_SALES):
+        tx = transfer_tx(BOB, 19, SK_CAROL, sender=CAROL, seq=n)
+        if first_dust is None:
+            first_dust = tx["tx_id"]
+        ch.block([tx], height=21 + n, ts=NOW)
+        assert ch.accepted(tx), ch.receipt(tx)
+    state = ch.book.get_rule(BOB, terms.rule_id)
+    assert len(state.sales) == MAX_OPEN_SALES
+    assert state.sales_missed == 0
+
+    real = transfer_tx(BOB, 101, SK_ALICE, sender=ALICE, seq=0)
+    ch.block([real], height=21 + MAX_OPEN_SALES, ts=NOW)
+    assert ch.accepted(real), ch.receipt(real)
+    # Re-fetch: the engine replaces the rule-state object per
+    # block, so a handle taken before this block is stale.
+    state = ch.book.get_rule(BOB, terms.rule_id)
+    assert state.open_sale(first_dust) is None
+    assert state.open_sale(real["tx_id"]) is not None
+    assert state.sales_missed == 1
+
+    more_dust = transfer_tx(BOB, 19, SK_CAROL, sender=CAROL,
+                            seq=MAX_OPEN_SALES)
+    ch.block([more_dust], height=22 + MAX_OPEN_SALES, ts=NOW)
+    assert ch.accepted(more_dust), ch.receipt(more_dust)
+    state = ch.book.get_rule(BOB, terms.rule_id)
+    assert state.open_sale(more_dust["tx_id"]) is None
+    assert state.sales_missed == 2
+
+    ch.legs_fn = _pct(5)
+    # CAROL sent 33 transfers (seq 0..32), so her executions
+    # continue at seq 33.
+    gone = execute_tx(settlement_id="dust-gone", seq=33,
+                      rule_id=terms.rule_id, sale_id=first_dust)
+    ch.block([gone], height=23 + MAX_OPEN_SALES, ts=NOW)
+    assert not ch.accepted(gone)
+    assert "not an open sale" in " ".join(ch.receipt(gone)["logs"])
+    before = ch.bal[CAROL]
+    # The refused execution above consumed no sequence number:
+    # the next expected sequence for CAROL is still 33.
+    ex = execute_tx(settlement_id="royalty-real", seq=33,
+                    rule_id=terms.rule_id, sale_id=real["tx_id"])
+    ch.block([ex], height=24 + MAX_OPEN_SALES, ts=NOW)
+    assert ch.accepted(ex), ch.receipt(ex)
+    assert ch.bal[CAROL] == before + 5
 
 
 # --- apply level: named executions ------------------------------------------------

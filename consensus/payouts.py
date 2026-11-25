@@ -96,10 +96,13 @@ records the canonical marker ``sale:<rule_id>:<sale_id>`` in the
 settlement history alongside the execution's own id and closes
 the sale, so "paid once per sale" is a ledger property like every
 other settlement's idempotency here. Open sales are bounded
-(MAX_OPEN_SALES per rule); the oldest gives way to a new arrival
-and is counted on the rule as a missed sale. A rule that is both
-`per_sale` and `on_arrival` has its sale closed by the node's
-arrival settlement in the same apply.
+(MAX_OPEN_SALES per rule); at a full list a larger arrival
+displaces the SMALLEST open sale (the oldest among ties) and is
+counted as missed, while an arrival no larger than the smallest
+open sale is itself missed and not recorded -- so a flood of
+dust sales can never fill the list and block a later real sale.
+A rule that is both `per_sale` and `on_arrival` has its sale
+closed by the node's arrival settlement in the same apply.
 """
 
 from __future__ import annotations
@@ -151,10 +154,14 @@ MAX_RULES_PER_OWNER = 8
 #: the rest stay due and are stepped by the next block.
 MAX_CLOCK_SETTLEMENTS_PER_BLOCK = 16
 #: Stage 3: open sales one per-sale rule may hold. A sale that
-#: arrives at a full list evicts the OLDEST open sale (counted on
-#: the rule as a missed sale); the incoming sale is always
-#: recorded. Eviction is by age only, never by amount, so the
-#: recording is a pure function of the credit sequence.
+#: arrives at a full list displaces the SMALLEST open sale (the
+#: oldest among ties, counted on the rule as a missed sale) --
+#: but only when it is larger than that smallest sale; an
+#: incoming sale no larger than the smallest open sale is itself
+#: missed and is not recorded. Displacement is by amount, never
+#: by age alone, so a burst of dust sales can never fill the
+#: list and block a later real sale, and no payer can choose an
+#: amount that protects their own sale from a larger one.
 MAX_OPEN_SALES = 32
 #: Stage 2: a clock rule's period may not be shorter than this, so
 #: due points of one rule are always spaced at least an hour apart
@@ -437,18 +444,27 @@ class PayoutRuleState:
         return None
 
     def note_sale(self, sale: Sale) -> Optional[Sale]:
-        """Record a sale; returns the sale the bound evicted, if any.
+        """Record a sale; returns the sale the bound displaced, if any.
 
         A sale id is a transaction id and a transaction applies
         once, so an id already open is never recorded twice. At a
-        full list the OLDEST open sale gives way and is counted as
-        missed; the incoming sale is always recorded.
+        full list the SMALLEST open sale gives way -- the oldest
+        among ties -- and is counted as missed, but only when the
+        incoming sale is larger than it; an incoming sale no
+        larger than the smallest open sale is itself missed and
+        is not recorded. The list stays in recording order.
         """
         if self.open_sale(sale.sale_id) is not None:
             return None
         evicted = None
         if len(self.sales) >= MAX_OPEN_SALES:
-            evicted = self.sales.pop(0)
+            smallest = min(
+                range(len(self.sales)),
+                key=lambda i: (self.sales[i].amount, i))
+            if sale.amount <= self.sales[smallest].amount:
+                self.sales_missed += 1
+                return None
+            evicted = self.sales.pop(smallest)
             self.sales_missed += 1
         self.sales.append(sale)
         return evicted
