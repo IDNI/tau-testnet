@@ -408,6 +408,8 @@ When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker)
 
 Per-account `o5` policy clauses are evaluated in separate policy worker processes, one pool for block apply and one for admission. A worker is replaced after 500 builds or 20 000 steps, or once its memory passes 1 GiB, and a worker lost during a call is replaced and the call retried once.
 
+The node pins the engine configuration at startup (`tau_engine_profile.py`): engine option variables (`TAU_<option>`) are ignored, and the node refuses to start when the engine does not match the tested profile.
+
 ---
 
 ## Consensus boundary
