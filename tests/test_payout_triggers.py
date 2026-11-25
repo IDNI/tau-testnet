@@ -301,25 +301,55 @@ def test_arrivals_take_each_accounts_oldest_sale_first_and_sixteen_a_block():
         book.drop_sale(A, b"\x01" * 32)
 
 
-def test_no_sale_of_a_rule_the_node_runs_is_turned_away():
+def test_a_rule_the_node_runs_keeps_at_most_64_sales_waiting():
+    """A flood of small payments into an account whose rule the node runs on
+    arrival does not grow its queue without end: at most MAX_OPEN_SALES wait,
+    as for a rule someone executes, and a larger sale takes the place of the
+    smallest waiting one."""
     from consensus.payout import MAX_OPEN_SALES
 
     book = PayoutBook()
     book.install(route(), NOW)
-    book.install(terms(sender_pubkey=C, rule_text=ROUTE, per_sale=True), NOW)
     for k in range(MAX_OPEN_SALES + 6):
-        sid = k.to_bytes(32, "big")
-        assert book.note_sale(A, sid, B, 5, NOW + 1, NOW_TS) == "recorded"
-        assert book.note_sale(C, sid, B, 5, NOW + 1, NOW_TS) == (
+        assert book.note_sale(A, k.to_bytes(32, "big"), B, 1, NOW + 1, NOW_TS) == (
             "recorded" if k < MAX_OPEN_SALES else "missed")
-    assert len(book.state_of(A).open_sales) == MAX_OPEN_SALES + 6
-    assert (book.state_of(A).sales_missed, book.state_of(C).sales_missed) == (0, 6)
+    state = book.state_of(A)
+    assert len(state.open_sales) == MAX_OPEN_SALES and state.sales_missed == 6
+    real = b"\xee" * 32
+    assert book.note_sale(A, real, C, 400, NOW + 2, NOW_TS) == "recorded"
+    state = book.state_of(A)
+    assert len(state.open_sales) == MAX_OPEN_SALES and state.sales_missed == 7
+    assert state.sale(real) is not None
+    # the small sale recorded last gave way; the first one waits as before
+    assert state.sale((MAX_OPEN_SALES - 1).to_bytes(32, "big")) is None
+    assert state.sale((0).to_bytes(32, "big")) is not None
+    # the real sale runs within MAX_OPEN_SALES / 16 blocks of runs
+    blocks = 0
+    while state.sale(real) is not None:
+        for key, sid in book.arrivals():
+            if sid == real:
+                book.record(key, 80, NOW + 3, NOW_TS, sid)
+            else:
+                book.drop_sale(key, sid)          # pays nothing: closed
+        blocks += 1
+        state = book.state_of(A)
+    assert blocks <= MAX_OPEN_SALES // 16
     again = PayoutBook.restore(book.store_rows(), *book.resolved_state())
-    assert again.root() == book.root() and again._arrivals == {A}
-    rows = [row if row[1] != C else row[:16] + ((0, book.state_of(A).open_sales),)
-            for row in book.store_rows()]
+    assert again.root() == book.root()
+
+
+def test_a_stored_queue_longer_than_the_bound_is_refused():
+    from consensus.payout import MAX_OPEN_SALES
+
+    book = PayoutBook()
+    book.install(route(), NOW)
+    for k in range(MAX_OPEN_SALES):
+        book.note_sale(A, k.to_bytes(32, "big"), B, 5, NOW + 1, NOW_TS)
+    (row,) = book.store_rows()
+    missed, waiting = row[16]
+    longer = (missed, tuple(waiting) + ((b"\xab" * 32, B, 5, NOW + 1),))
     with pytest.raises(ValueError, match="impossible sales"):
-        PayoutBook.restore(rows, *book.resolved_state())
+        PayoutBook.restore([row[:16] + (longer,) + row[17:]], *book.resolved_state())
 
 
 def test_a_rule_someone_must_execute_has_no_arrivals():

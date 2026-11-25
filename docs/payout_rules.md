@@ -250,8 +250,13 @@ itself:
   is refused (`the sale named is not an open sale of this rule`). A refused
   execution, for example over a cap, leaves the sale open for a later attempt.
 - **Bounded.** At most 64 sales are open per rule. A sale that arrives while 64
-  are open is not recorded, and `sales_missed` counts it. Replacing, revoking or
-  expiring the rule drops its open sales.
+  are open takes the place of the smallest open sale if it is larger (of equally
+  small ones, the one recorded last gives way), and `sales_missed` counts the
+  sale that gave way; a sale no larger than every open one is not recorded, and
+  `sales_missed` counts it. So sales too small to pay anything (a 5% royalty
+  pays nothing on 19 or less) cannot hold every place and keep later sales out:
+  to keep a sale out, all 64 places must hold larger sales, each paid to the
+  account. Replacing, revoking or expiring the rule drops its open sales.
 
 `getpayoutrule` lists the open sales (`open_sales`: id, payer, amount, height)
 and `sales_missed`; the `executed` event names the `sale_id` it paid. The open
@@ -649,12 +654,12 @@ paid 101 and the fee of its own transaction. The shop need not be online.
 - Money the node moves is never a sale: a payout leg, a released transfer. So a share one rule pays out is not shared again by the
   rule of the account that receives it. Only a payment someone signs is.
 - At most 16 runs a block. More than that wait in the rule's open sales for the
-  next blocks, and an idle chain seals a block for them. No sale is turned
-  away: the limit of 64 open sales is for rules someone has to execute. What
-  waits is bounded by what was paid for: every waiting sale is a signed
-  transaction that paid its fee. Each account's longest-waiting sale comes
-  first, so an account with many sales waiting does not hold up the one sale
-  of another.
+  next blocks, and an idle chain seals a block for them. At most 64 wait per
+  rule, as for every rule that pays per sale, and a larger sale takes the place
+  of the smallest waiting one. So a flood of small payments cannot make the
+  queue grow without end, and a sale waits at most a few blocks behind it.
+  Each account's longest-waiting sale comes first, so an account with many
+  sales waiting does not hold up the one sale of another.
 - A payment in the block that reaches `expires_at` is not a sale of the rule
   any more. A rule with a sale still waiting is kept until that sale has run.
 - The condition is the rule's: a floor (`i27 >= 50`), a payer that is exempt

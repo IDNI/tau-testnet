@@ -84,9 +84,12 @@ transaction hash, its amount what that transaction paid the account (capped at
 bv[24]). An execution must name one open sale; the rule reads the sale's amount
 and payer (i27, i28), and a paid execution closes the sale, so a second
 execution naming it is refused. A refused execution leaves it open. At most
-MAX_OPEN_SALES are open at once; a sale that arrives while that many are open is
-not recorded and is counted as missed. Replacing, revoking or expiring the rule
-drops its open sales.
+MAX_OPEN_SALES are open at once, for a rule the node runs on arrival as well.
+When that many are open, a larger sale takes the place of the smallest open one
+and the smaller is counted as missed; a sale no larger than every open one is
+not recorded and is counted as missed. So sales too small to pay anything (a 5%
+royalty pays nothing on 19 or less) cannot hold every place and keep later
+sales out. Replacing, revoking or expiring the rule drops its open sales.
 """
 from __future__ import annotations
 
@@ -1138,8 +1141,22 @@ def _restore_more(more: Any, rid: bytes) -> Dict[str, Any]:
     return out
 
 
-def _restore_sales(sales: Any, rid: bytes,
-                   bounded: bool = True) -> Tuple[Tuple[Tuple[bytes, str, int, int], ...], int]:
+def _with_sale(open_sales: Tuple[Tuple[bytes, str, int, int], ...],
+               entry: Tuple[bytes, str, int, int]):
+    """`open_sales` with `entry` recorded, and the sale left out (None if none).
+
+    Below MAX_OPEN_SALES the sale is added. At the bound it takes the place of
+    the smallest open sale if it is larger (of equally small ones, the one
+    recorded last gives way), else it is the one left out."""
+    if len(open_sales) < MAX_OPEN_SALES:
+        return open_sales + (entry,), None
+    low = min(range(len(open_sales)), key=lambda i: (open_sales[i][2], -i))
+    if entry[2] <= open_sales[low][2]:
+        return open_sales, entry
+    return open_sales[:low] + open_sales[low + 1:] + (entry,), open_sales[low]
+
+
+def _restore_sales(sales: Any, rid: bytes) -> Tuple[Tuple[Tuple[bytes, str, int, int], ...], int]:
     """A stored (missed, open sales) pair, checked; ((), 0) for a rule without it."""
     if sales is None:
         return (), 0
@@ -1156,7 +1173,7 @@ def _restore_sales(sales: Any, rid: bytes,
             out.append((sale_id, str(payer), int(amount), int(height)))
     except (TypeError, ValueError):
         raise ValueError(f"stored payout rule has malformed sales: {rid.hex()}") from None
-    if not _is_int(missed) or missed < 0 or (bounded and len(out) > MAX_OPEN_SALES) \
+    if not _is_int(missed) or missed < 0 or len(out) > MAX_OPEN_SALES \
             or len({e[0] for e in out}) != len(out):
         raise ValueError(f"stored payout rule has impossible sales: {rid.hex()}")
     return tuple(out), int(missed)
@@ -1235,7 +1252,7 @@ class PayoutBook:
                 raise ValueError(f"two stored payout rules for one place: {str(key)[:18]}")
             if (more is not None) != terms.extended:
                 raise ValueError(f"stored payout rule and its optional terms disagree: {rid.hex()}")
-            open_sales, missed = _restore_sales(sales, rid, bounded=not terms.on_arrival)
+            open_sales, missed = _restore_sales(sales, rid)
             state = PayoutState(anchor, period_index, spent, executions, paid_total,
                                 last_height, open_sales, missed, kept["last_clock"],
                                 kept["due_done"], kept["due_index"], kept["retry_at"],
@@ -1646,8 +1663,10 @@ class PayoutBook:
         open sale of each per-sale rule the account holds, its id the
         transaction hash; each rule pays its own share of it under its own caps.
         Returns "recorded" (by at least one rule), "missed" (MAX_OPEN_SALES
-        already open), or None when the account has no per-sale rule that takes
-        it, the payer is the account itself, or the sale is already recorded."""
+        already open, none of them smaller), or None when the account has no
+        per-sale rule that takes it, the payer is the account itself, or the
+        sale is already recorded. A recorded sale may have taken the place of a
+        smaller open one, which is then counted as missed."""
         noted = [self._note_sale_on(k, sale_id, payer, amount, height, ts)
                  for k in self.keys_of(account)]
         if "recorded" in noted:
@@ -1668,18 +1687,18 @@ class PayoutBook:
         sale_id = bytes(sale_id)
         if state.sale(sale_id) is not None:
             return None
-        if len(state.open_sales) >= MAX_OPEN_SALES and not terms.on_arrival:
-            # Sales someone has to execute wait at most this many at once. Sales
-            # the node runs itself are never turned away: each was paid for by a
-            # transaction, and the node takes them off again block by block.
-            self.state[key] = replace(state, sales_missed=state.sales_missed + 1)
-            self._root = None
-            return "missed"
+        # At most MAX_OPEN_SALES wait, also for a rule the node runs on arrival,
+        # and a larger sale takes the place of the smallest: sales that pay
+        # nothing cannot hold every place, and what waits for a run stays small.
         entry = (sale_id, payer, min(int(amount), tau_defs.MAX_TRANSFER_VALUE), int(height))
-        self.state[key] = replace(state, open_sales=state.open_sales + (entry,))
+        open_sales, left_out = _with_sale(state.open_sales, entry)
+        self.state[key] = replace(state, open_sales=open_sales,
+                                  sales_missed=state.sales_missed + (0 if left_out is None else 1))
+        self._root = None
+        if left_out is entry:
+            return "missed"
         if terms.on_arrival:
             self._arrivals.add(key)
-        self._root = None
         return "recorded"
 
     def expire(self, height: int, ts: int) -> List[PayoutTerms]:
