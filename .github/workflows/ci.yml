@@ -92,6 +92,8 @@ jobs:
           tests/test_web_wallet_examples.py
           tests/test_state_reconstruction.py
           tests/test_custom_inputs.py
+          tests/test_admission_isolation_native.py
+          tests/test_clause_registration_native.py
           tests/test_fee_model_native.py
           tests/test_rule_scoping_native.py
           tests/test_shrink_bare_ref_native.py

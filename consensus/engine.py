@@ -16,7 +16,7 @@ from .governance import (
     is_tau_authoritative_eligibility_mode,
 )
 from . import faucet, fees
-from . import sender_policy
+from . import recipient_policy, sender_policy
 from .fees import FeeRuleError
 from .approvals import (
     APPROVAL_TX_TYPES,
@@ -1812,6 +1812,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     4: "{ #x" + str(to_addr) + " }:bv[384]",
                 }
                 values[12] = "{ #x" + str(from_addr) + " }:bv[384]"
+                # i17: the receive stream. 0 = this clause is judging a payment
+                # its owner SENDS (recipient-side policy, #47/#76); the second
+                # pass overrides it with the hold a payment to the recipient
+                # would carry.
+                values[tau_defs.RECEIVE_STREAM_INDEX] = str(tau_defs.RECEIVE_OUTBOUND)
                 for k, v in (overrides or {}).items():
                     values[k] = v
                 # Approval slots, fed after the custom merge and before i5,
@@ -1882,7 +1887,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
-                                          escrow=False):
+                                          escrow=False, receive=None):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -2002,6 +2007,35 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["logs"].append(
                                 f"Transfer rejected by the sender's own policy clause (o5={own_o5})"
                             )
+                            return False
+
+                        # --- Recipient-side policy (#47, #76) ---
+                        # The same single o5 unit per account, judged a second
+                        # time with i12 = the RECIPIENT, so an account can
+                        # refuse senders it has not approved and cap how long a
+                        # payment to it may be held. Skipped entirely when the
+                        # recipient has no clause, which is the common case, so
+                        # an ordinary transfer to a plain account costs no
+                        # extra evaluator step.
+                        r_blocked, r_reason, r_message = recipient_policy.judge(
+                            lifecycle_mgr.rule_offers.clause_for,
+                            to_addr, tau_input_stream_values,
+                            tau_defs.RECEIVE_FINAL if receive is None else receive,
+                            pool="apply",
+                            timeout=getattr(_session, "request_budget", None),
+                        )
+                        if r_blocked:
+                            logger.info(
+                                "Transfer rejected by the recipient's own policy "
+                                "for %s->%s (%s)",
+                                str(from_addr)[:10], str(to_addr)[:10], r_message,
+                            )
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = r_reason
+                            tx_receipt["logs"].append(r_message)
                             return False
 
                     current_from = _read_bal(from_addr)
@@ -2593,6 +2627,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 slot_values=_approval_slot_values(),
                                 overrides={},
                                 escrow=True,
+                                # #76: the recipient judges the park on its hold,
+                                # measured in the park's own unit against the
+                                # same block height/timestamp the release uses.
+                                receive=recipient_policy.park_value(
+                                    park.kind, park.release_at,
+                                    int(block_height or 0), int(block_timestamp or 0),
+                                ),
                             )
                             fee_already_measured = True
                             if escrowed and accepted_in_block and not hard_reject:
@@ -2959,6 +3000,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     # mirrors the submit path so any rule that
                                     # references i12[t] replays deterministically.
                                     tau_input_stream_values[12] = "{ #x" + str(from_addr) + " }:bv[384]"
+                                    tau_input_stream_values[tau_defs.RECEIVE_STREAM_INDEX] = str(
+                                        tau_defs.RECEIVE_OUTBOUND
+                                    )
                                     # NOTE: o5 user policy is consensus-enforced in the
                                     # fee-era loop above (the live path when fees are on,
                                     # which is the release config). This feeless legacy
@@ -3048,6 +3092,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # since insertion order is what the shrink layer sees.
                         5: str(block_timestamp),
                         12: "{ #x" + str(sender) + " }:bv[384]",
+                        17: str(tau_defs.RECEIVE_OUTBOUND),
                     }
                     for k, v in custom_tau_inputs.items():
                         fee_query_inputs[k] = v

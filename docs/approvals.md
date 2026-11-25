@@ -424,6 +424,7 @@ only to stop accidental or lone revocations.
 | `i1` | `bv[24]` | transfer amount |
 | `i3` / `i4` | `bv[384]` | sender / recipient pubkey |
 | `i12` | `bv[384]` | sender pubkey — set by the node; a clause body must not reference it |
+| `i17` | `bv[64]` | receive stream: `0` the owner sends, `1` the payment to the owner is final, `1 + N` held `N` seconds, `2^63 + N` held `N` blocks — set by the node; write-forbidden, clause-readable (see [recipient_controls.md](recipient_controls.md)) |
 | `i18`–`i25` | `bv[384]` | approval slots: node-written, clause-readable, `0` = no vote |
 | `i26`+ | — | sender custom inputs |
 | `o5` | `bv[24]` | user policy: `0` blocks, `1` or absent allows |
