@@ -52,6 +52,11 @@ def execute(raw_command: str, container):
             "tx_type": result.get("tx_type"),
             "tau_evaluated": tau_evaluated,
             "checks_skipped": checks_skipped,
+            # Capability surface (#63): this node enforces payout-rule
+            # caps and grant conditions in block apply, and screens
+            # both families in admission.
+            "payout_rules": "enforced",
+            "conditional_grants": "enforced",
         }
         if estimate and "estimated_fee" in result:
             data["estimated_fee"] = result["estimated_fee"]

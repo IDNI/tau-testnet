@@ -538,6 +538,10 @@ class RuleChangeRequest:
             return ""
         if self.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
             return self.rule_text
+        if self.kind == tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE:
+            # The body is a payout update payload (canonical JSON),
+            # not a clause: it is carried verbatim.
+            return self.rule_text
         from consensus.rule_offers import clause_body_v1
 
         return clause_body_v1(self.rule_text)
@@ -581,9 +585,11 @@ _RULE_CHANGE_BODY_KINDS = frozenset({
     tau_defs.RULE_CHANGE_KIND_SET_POLICY,
     tau_defs.RULE_CHANGE_KIND_SET_GUARD,
     tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
+    tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE,
 })
 _RULE_CHANGE_KINDS = frozenset(range(
-    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD + 1
+    tau_defs.RULE_CHANGE_KIND_SET_POLICY,
+    tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE + 1
 ))
 
 
@@ -609,7 +615,7 @@ def parse_rule_change_request_checked(
         if isinstance(val, bool) or not isinstance(val, int):
             return None, "kind, sequence_number and expire_at_height must be integers"
     if kind not in _RULE_CHANGE_KINDS:
-        return None, "kind must be 1..5"
+        return None, "kind must be 1..6"
 
     rule_text = tx.get("rule_text", "")
     if rule_text is None:
@@ -647,7 +653,23 @@ def parse_rule_change_request_checked(
     except ApprovalShapeError as exc:
         return None, str(exc)
 
-    if has_body:
+    if has_body and kind == tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE:
+        # The body is data, not a clause: it must at least parse as
+        # a payout update addressed to the sender. The history
+        # screens run at admission and again at the write.
+        try:
+            data = json.loads(rule_text)
+        except ValueError:
+            return None, "the payout update body is not valid JSON"
+        if not isinstance(data, dict):
+            return None, "the payout update body is not a JSON object"
+        from consensus.payouts import PayoutShapeError, parse_payout_update
+
+        try:
+            parse_payout_update({**data, "sender_pubkey": sender_n})
+        except (PayoutShapeError, ValueError, TypeError) as exc:
+            return None, f"the payout update body does not parse: {exc}"
+    elif has_body:
         try:
             body = clause_body_v1(rule_text)
         except RuleOfferShapeError as exc:

@@ -95,6 +95,13 @@ def node(temp_database, mock_policy_evaluators, monkeypatch):
         patch.object(TipAdmissionView, "approval_slots_active",
                      new_callable=PropertyMock, return_value=True),
         patch.object(TipAdmissionView, "get_offer", return_value=_offer_row()),
+        patch.object(TipAdmissionView, "get_payout_rule",
+                     return_value=_payout_row()),
+        patch.object(TipAdmissionView, "clause_for",
+                     return_value="always (o20[t] = 1)."),
+        patch.object(TipAdmissionView, "get_grant",
+                     side_effect=lambda gid: _grant_row()
+                     if gid == _grant_row()["grant_id"] else None),
     ]
     mocks = [p.start() for p in patches]
     mocks[3].is_set.return_value = True
@@ -115,6 +122,31 @@ def _offer_row():
     return {"offer_id": offer.offer_id_hex, "offerer_pubkey": SENDER,
             "recipient_pubkey": RECIPIENT, "rule_text": OFFER_RULE,
             "expire_at_height": offer.expire_at_height, "status": "offered"}
+
+
+def _payout_row():
+    from consensus.payouts import PayoutTerms
+    terms = PayoutTerms(
+        owner=SENDER, max_per_execution=1000, max_per_period=1500,
+        recipients=(RECIPIENT,), anchor_ts=1_800_000_000, sequence_number=1)
+    return {"rule_id": terms.rule_id, "owner_pubkey": SENDER,
+            "max_per_execution": 1000, "max_per_period": 1500,
+            "recipients": [RECIPIENT], "period_kind": 2,
+            "anchor_ts": 1_800_000_000, "sequence_number": 1,
+            "period_index": 0, "spent_in_period": 0, "settlements": []}
+
+
+def _grant_row():
+    from consensus.grants import GrantTerms
+    terms = GrantTerms(
+        sender=SENDER, recipient=RECIPIENT, total=5000, cap_per_period=500,
+        opens_at=1_700_000_000, deadline=1_900_000_000, sequence_number=7)
+    return {"grant_id": terms.grant_id, "sender_pubkey": SENDER,
+            "recipient_pubkey": RECIPIENT, "total": 5000,
+            "cap_per_period": 500, "opens_at": 1_700_000_000,
+            "deadline": 1_900_000_000, "sequence_number": 1,
+            "remaining": 5000, "period_index": 0, "drawn_in_period": 0,
+            "last_draw_ts": 0, "refunded": False}
 
 
 def _envelope(tx_type, sender, fee_limit, **fields):
@@ -144,6 +176,26 @@ def _payload(kind, fee_limit="0"):
     if kind == "approval_request":
         return _envelope(kind, SENDER, fee_limit, recipient_pubkey=RECIPIENT,
                          amount=500, approvers={"18": APPROVER}, custom_inputs={})
+    if kind == "payout_rule_install":
+        return _envelope(kind, SENDER, fee_limit, max_per_execution=1000,
+                         max_per_period=1500, recipients=[RECIPIENT],
+                         period_kind=2, anchor_ts=1_800_000_000)
+    if kind == "payout_execute":
+        return _envelope(kind, SENDER, fee_limit, owner=SENDER,
+                         settlement_id="estimate-1", gross=100)
+    if kind == "payout_rule_update":
+        return _envelope(kind, SENDER, fee_limit,
+                         rule_id=_payout_row()["rule_id"],
+                         max_per_execution=1000, max_per_period=1500,
+                         recipients=[RECIPIENT], period_kind=2,
+                         anchor_ts=1_800_000_000, terms_sequence_number=2)
+    if kind == "grant_create":
+        return _envelope(kind, SENDER, fee_limit, recipient_pubkey=RECIPIENT,
+                         total=5000, cap_per_period=500,
+                         opens_at=1_700_000_000, deadline=1_900_000_000)
+    if kind == "grant_draw":
+        return _envelope(kind, RECIPIENT, fee_limit,
+                         grant_id=_grant_row()["grant_id"], amount=100)
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
@@ -158,7 +210,8 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request", "payout_rule_install", "payout_execute",
+               "payout_rule_update", "grant_create", "grant_draw"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

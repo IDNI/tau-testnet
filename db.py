@@ -476,6 +476,86 @@ def init_db():
                     PRIMARY KEY (retractable_id, block_hash, outcome)
                 );
             ''')
+            # Payout rules + conditional grants (Bounty 01, issue #63):
+            # both books are bound into consensus_meta_hash, so their
+            # rows are written in the canonical transaction, like the
+            # retractable book.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS payout_rules_v1 (
+                    rule_id           TEXT PRIMARY KEY,
+                    owner_pubkey      TEXT NOT NULL UNIQUE,
+                    max_per_execution INTEGER NOT NULL,
+                    max_per_period    INTEGER NOT NULL,
+                    recipients_json   TEXT NOT NULL,
+                    period_kind       INTEGER NOT NULL,
+                    anchor_ts         INTEGER NOT NULL,
+                    sequence_number   INTEGER NOT NULL,
+                    period_index      INTEGER NOT NULL,
+                    spent_in_period   INTEGER NOT NULL,
+                    settlements_json  TEXT NOT NULL
+                );
+            ''')
+            # Bounty 01 stage 2: the multi-rule book's complete
+            # rows. v1's owner column is UNIQUE and its column set
+            # predates triggers and stage-2 terms, so v1 keeps the
+            # FIRST rule of each owner in the stage-1 shape (stage-1
+            # readers read exactly that row), and this table carries
+            # every rule's full row as JSON, keyed by rule id.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS payout_rules_v2 (
+                    rule_id           TEXT PRIMARY KEY,
+                    owner_pubkey      TEXT NOT NULL,
+                    row_json          TEXT NOT NULL
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS grants_v1 (
+                    grant_id        TEXT PRIMARY KEY,
+                    sender_pubkey   TEXT NOT NULL,
+                    recipient_pubkey TEXT NOT NULL,
+                    total           INTEGER NOT NULL,
+                    cap_per_period  INTEGER NOT NULL,
+                    opens_at        INTEGER NOT NULL,
+                    deadline        INTEGER NOT NULL,
+                    sequence_number INTEGER NOT NULL,
+                    remaining       INTEGER NOT NULL,
+                    period_index    INTEGER NOT NULL,
+                    drawn_in_period INTEGER NOT NULL,
+                    last_draw_ts    INTEGER NOT NULL,
+                    refunded        INTEGER NOT NULL,
+                    cap_group       TEXT NOT NULL DEFAULT '',
+                    cap_group_cap   INTEGER NOT NULL DEFAULT 0
+                );
+            ''')
+            cur = conn.execute("PRAGMA table_info(grants_v1);")
+            grant_cols = {row[1] for row in cur.fetchall()}
+            if grant_cols and "cap_group" not in grant_cols:
+                # Additive: existing rows default to no cap group,
+                # which reads as an ungrouped grant.
+                conn.execute(
+                    "ALTER TABLE grants_v1 ADD COLUMN cap_group TEXT NOT NULL DEFAULT '';"
+                )
+                conn.execute(
+                    "ALTER TABLE grants_v1 ADD COLUMN cap_group_cap INTEGER NOT NULL DEFAULT 0;"
+                )
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS payout_events (
+                    entry_id     TEXT NOT NULL,
+                    block_hash   TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    outcome      TEXT NOT NULL,
+                    PRIMARY KEY (entry_id, block_hash, outcome)
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS grant_events (
+                    grant_id     TEXT NOT NULL,
+                    block_hash   TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    outcome      TEXT NOT NULL,
+                    PRIMARY KEY (grant_id, block_hash, outcome)
+                );
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -2243,7 +2323,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, payout_rules: Dict | None = None, grants: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2281,6 +2361,8 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 approval_requests=approval_requests,
                 approval_slots_active=approval_slots_active,
                 retractable_transfers=retractable_transfers,
+                payout_rules=payout_rules,
+                grants=grants,
                 rule_change_requests=rule_change_requests,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
@@ -2346,7 +2428,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, payout_rules: Dict | None = None, grants: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2554,6 +2636,10 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
 
     if retractable_transfers is not None:
         _write_retractable_rows(retractable_transfers)
+    if payout_rules is not None:
+        _write_payout_rows(payout_rules)
+    if grants is not None:
+        _write_grant_rows(grants)
 
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
@@ -2620,6 +2706,229 @@ def load_retractable_state() -> tuple[List[tuple], int, bytes]:
         count,
         acc,
     )
+
+
+def _write_payout_rows(state: Dict) -> None:
+    """Full replace of the installed payout-rule rows.
+
+    Every rule's complete row goes to payout_rules_v2 as JSON; the
+    first rule of each owner (by rule id) ALSO goes to
+    payout_rules_v1 in the stage-1 column shape, whose owner column
+    is UNIQUE and whose readers predate the multi-rule book.
+    """
+    rows = sorted(
+        state['rows'], key=lambda r: (r['owner'], r['rule_id']))
+    _db_conn.execute('DELETE FROM payout_rules_v1')
+    _db_conn.execute('DELETE FROM payout_rules_v2')
+    seen_owners = set()
+    for row in rows:
+        _db_conn.execute(
+            'INSERT INTO payout_rules_v2 '
+            '(rule_id, owner_pubkey, row_json) VALUES (?, ?, ?)',
+            (row['rule_id'], row['owner'], json.dumps(row)),
+        )
+        if row['owner'] in seen_owners:
+            continue
+        seen_owners.add(row['owner'])
+        _db_conn.execute(
+            'INSERT INTO payout_rules_v1 '
+            '(rule_id, owner_pubkey, max_per_execution, max_per_period, '
+            'recipients_json, period_kind, anchor_ts, sequence_number, '
+            'period_index, spent_in_period, settlements_json) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                row['rule_id'],
+                row['owner'],
+                int(row['max_per_execution']),
+                int(row['max_per_period']),
+                json.dumps(list(row['recipients'])),
+                int(row['period_kind']),
+                int(row['anchor_ts']),
+                int(row['sequence_number']),
+                int(row['period_index']),
+                int(row['spent_in_period']),
+                json.dumps(list(row['settlements'])),
+            )
+        )
+
+
+def _load_payout_v2_rows() -> Dict[str, Dict]:
+    """rule_id -> complete row, from payout_rules_v2 ({} if absent)."""
+    try:
+        rows = _db_conn.execute(
+            'SELECT rule_id, row_json FROM payout_rules_v2'
+        ).fetchall()
+    except Exception:
+        return {}
+    return {r[0]: json.loads(r[1]) for r in rows}
+
+
+def load_payout_state() -> List[Dict]:
+    """The installed payout-rule rows as dicts, exactly as stored.
+
+    Merges the two tables _write_payout_rows maintains: a v1 row
+    and its v2 extension must agree on every field v1 carries --
+    a disagreement is corruption and raises ValueError, which the
+    restore path turns into a loud refusal. A v1 row with no v2
+    extension is a stage-1 row and restores as one.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT rule_id, owner_pubkey, max_per_execution, max_per_period, '
+            'recipients_json, period_kind, anchor_ts, sequence_number, '
+            'period_index, spent_in_period, settlements_json '
+            'FROM payout_rules_v1 ORDER BY owner_pubkey'
+        ).fetchall()
+        extensions = _load_payout_v2_rows()
+    out = []
+    for r in rows:
+        base = {
+            'rule_id': r[0], 'owner': r[1],
+            'max_per_execution': int(r[2]), 'max_per_period': int(r[3]),
+            'recipients': json.loads(r[4]),
+            'period_kind': int(r[5]), 'anchor_ts': int(r[6]),
+            'sequence_number': int(r[7]), 'period_index': int(r[8]),
+            'spent_in_period': int(r[9]), 'settlements': json.loads(r[10]),
+        }
+        ext = extensions.pop(base['rule_id'], None)
+        if ext is None:
+            out.append(base)
+            continue
+        for key, value in base.items():
+            if key == 'rule_id':
+                continue
+            if ext.get(key) != value:
+                raise ValueError(
+                    "payout row does not agree with its extension row")
+        out.append(ext)
+    out.extend(extensions.values())
+    out.sort(key=lambda row: (row['owner'], row['rule_id']))
+    return out
+
+
+def payout_extension_row(rule_id: str):
+    """The complete stored row for one rule (v2), or None."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        return _load_payout_v2_rows().get(rule_id)
+
+
+def payout_rows_for_owner(owner: str) -> List[Dict]:
+    """Every complete stored row of one owner (v2), by rule id."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        extensions = _load_payout_v2_rows()
+    rows = [r for r in extensions.values() if r.get('owner') == owner]
+    rows.sort(key=lambda row: row['rule_id'])
+    return rows
+
+
+def _write_grant_rows(state: Dict) -> None:
+    """Full replace of the grant rows."""
+    _db_conn.execute('DELETE FROM grants_v1')
+    for row in state['rows']:
+        _db_conn.execute(
+            'INSERT INTO grants_v1 '
+            '(grant_id, sender_pubkey, recipient_pubkey, total, '
+            'cap_per_period, opens_at, deadline, sequence_number, '
+            'remaining, period_index, drawn_in_period, last_draw_ts, '
+            'refunded, cap_group, cap_group_cap) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                row['grant_id'],
+                row['sender'],
+                row['recipient'],
+                int(row['total']),
+                int(row['cap_per_period']),
+                int(row['opens_at']),
+                int(row['deadline']),
+                int(row['sequence_number']),
+                int(row['remaining']),
+                int(row['period_index']),
+                int(row['drawn_in_period']),
+                int(row['last_draw_ts']),
+                int(row['refunded']),
+                str(row.get('cap_group', '') or ''),
+                int(row.get('cap_group_cap', 0)),
+            )
+        )
+
+
+def load_grant_state() -> List[Dict]:
+    """The grant rows as dicts, exactly as stored."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT grant_id, sender_pubkey, recipient_pubkey, total, '
+            'cap_per_period, opens_at, deadline, sequence_number, '
+            'remaining, period_index, drawn_in_period, last_draw_ts, '
+            'refunded, cap_group, cap_group_cap '
+            'FROM grants_v1 ORDER BY grant_id'
+        ).fetchall()
+    keys = (
+        'grant_id', 'sender', 'recipient', 'total', 'cap_per_period',
+        'opens_at', 'deadline', 'sequence_number', 'remaining',
+        'period_index', 'drawn_in_period', 'last_draw_ts', 'refunded',
+        'cap_group', 'cap_group_cap',
+    )
+    out = []
+    for r in rows:
+        d = dict(zip(keys, r))
+        for k in keys[3:]:
+            if k == 'cap_group':
+                d[k] = str(d[k] or '')
+            else:
+                d[k] = int(d[k])
+        d['refunded'] = bool(d['refunded'])
+        out.append(d)
+    return out
+
+
+def record_payout_events(block_hash: str, block_number: int, events) -> None:
+    """Node-local history of what a block did to payout rules.
+
+    Diagnostic only: a failure is logged and never reaches block commit.
+    """
+    if not events:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        with _db_lock:
+            with _db_conn:
+                _db_conn.executemany(
+                    'INSERT OR IGNORE INTO payout_events '
+                    '(entry_id, block_hash, block_number, outcome) VALUES (?, ?, ?, ?)',
+                    [(eid, block_hash, int(block_number), outcome) for eid, outcome in events],
+                )
+    except Exception:
+        logger.exception("could not record payout events")
+
+
+def record_grant_events(block_hash: str, block_number: int, events) -> None:
+    """Node-local history of what a block did to grants.
+
+    Diagnostic only: a failure is logged and never reaches block commit.
+    """
+    if not events:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        with _db_lock:
+            with _db_conn:
+                _db_conn.executemany(
+                    'INSERT OR IGNORE INTO grant_events '
+                    '(grant_id, block_hash, block_number, outcome) VALUES (?, ?, ?, ?)',
+                    [(gid, block_hash, int(block_number), outcome) for gid, outcome in events],
+                )
+    except Exception:
+        logger.exception("could not record grant events")
 
 
 def get_open_retractables(address: str, role: str = "all") -> List[Dict]:

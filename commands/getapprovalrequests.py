@@ -73,6 +73,7 @@ KIND_NAMES = {
     tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER: "accept_offer",
     tau_defs.RULE_CHANGE_KIND_SET_GUARD: "set_guard",
     tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD: "revoke_guard",
+    tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE: "payout_update",
 }
 
 

@@ -136,6 +136,16 @@ RULE_CHANGE_KIND_REVOKE_POLICY = 2
 RULE_CHANGE_KIND_ACCEPT_OFFER = 3
 RULE_CHANGE_KIND_SET_GUARD = 4
 RULE_CHANGE_KIND_REVOKE_GUARD = 5
+# Bounty 01 stage 2: a guarded account's payout-rule update travels
+# the same request-and-release path as its policy changes. The body
+# is the payout update payload as canonical JSON (not a clause);
+# the write applies consensus.payouts' update, preserving the
+# rule's lineage and accounting state.
+RULE_CHANGE_KIND_PAYOUT_UPDATE = 6
+# Installing or removing a payout rule decides whose hands a
+# registered clause's legs land in, so both travel the guard too.
+RULE_CHANGE_KIND_PAYOUT_INSTALL = 7
+RULE_CHANGE_KIND_PAYOUT_REMOVE = 8
 
 # Blocks after which a parked rule-change request may release without approvals.
 RULE_CHANGE_DELAY_BLOCKS = 1000
