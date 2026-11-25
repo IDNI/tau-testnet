@@ -12,6 +12,13 @@ _ENTRY = re.compile(r'^    "(?P<name>[^"]+)": `(?P<rest>.*)$')
 
 
 def _block_lines(block="ruleTemplates"):
+    if not os.path.exists(APP_JS):
+        # Native decision (b): the Docker build context excludes web-wallet
+        # (.dockerignore), so the shipped templates are genuinely absent
+        # there. Treat the source as absent — an empty block — not an
+        # error; callers that need a template see an empty mapping and
+        # skip. When app.js exists this changes nothing.
+        return []
     with open(APP_JS, encoding="utf-8") as fh:
         lines = fh.read().splitlines()
     start = next((i for i, l in enumerate(lines) if f"const {block} =" in l), None)

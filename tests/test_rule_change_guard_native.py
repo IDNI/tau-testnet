@@ -59,6 +59,17 @@ def _key(label):
 
 X, Y, Z, OTHER, SENDER = (_key(n) for n in ("x", "y", "z", "other", "sender"))
 GUARDS = shipped_guard_templates()
+if not GUARDS:
+    # Native decision (b): the shipped templates live in web-wallet/app.js,
+    # which the Docker build context excludes (.dockerignore). With the
+    # source absent the template tests have nothing to verify: skip the
+    # whole module explicitly (reported as SKIPPED, never silently
+    # dropped) instead of erroring at collection. When app.js is present
+    # this changes nothing — the file stays on the native list.
+    pytest.skip(
+        "shipped guard templates absent: web-wallet/app.js is not in this context",
+        allow_module_level=True,
+    )
 ANY = "Guard: Any policy change needs co-signer X"
 TWO_OF_THREE = "Guard: 2 of 3 co-signers for any policy change"
 REVOKE_ONLY = "Guard: Revoking needs a co-signer (weaker)"
