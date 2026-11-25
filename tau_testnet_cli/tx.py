@@ -823,7 +823,7 @@ def build_payout_rule_set_tx(
 
     ``due_every`` (on the period's clock) or ``due_months`` (calendar months,
     time clock only) repeat that run from ``due_at`` on. ``on_arrival`` (with
-    ``per_sale``): the node runs the rule itself for each sale. ``sealed``: the
+    ``per_sale``): the node runs the rule itself inside each payment. ``sealed``: the
     account signs nothing until the rule ends.
 
     ``rule_index`` (1..7): the rule's place on the account; left out, the

@@ -45,6 +45,7 @@ from .payout import (
     MAX_PAYOUT_EXECUTIONS_PER_BLOCK,
     PAYOUT_TX_TYPES,
     POOL_APPLY as PAYOUT_POOL_APPLY,
+    PAYS_NOTHING,
     PayoutBook,
     PayoutRefused,
     PayoutShapeError,
@@ -384,14 +385,17 @@ def _node_payout_pay(lm, book, balances, sequences, last_ts, rule, legs, have, h
 
 def _run_arrival_payouts(lm, balances, sequences, last_ts, height, timestamp, *, timeout=None,
                          replay_mode=False, policy=None) -> List[Dict[str, Any]]:
-    """Run every rule that pays on arrival for the sales waiting on it; their events.
+    """Run, after the block's transactions, the sales still waiting for a rule
+    the node runs on arrival; their events.
 
-    A sale is a signed payment the chain recorded for the account. The node
-    steps the rule once for each, oldest first, at most
-    MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK a block, with no executor and no named
-    recipient, under the rule's own caps. A run happens once for a sale: paid
-    or not, the sale is closed. Money the node moves is never a sale, so what a
-    rule pays out is not paid out again by the rule of the account that gets it.
+    A payment is run inside itself (_run_arrivals_of_payment) wherever its
+    transfers are staged. A sale waits only when an apply wrote the transfers
+    at once (one without a proposer). The node steps the rule once for each,
+    oldest first, at most MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK a block, with no
+    executor and no named recipient, under the rule's own caps. A run happens
+    once for a sale: paid or not, the sale is closed. Money the node moves is
+    never a sale, so what a rule pays out is not paid out again by the rule of
+    the account that gets it.
     """
     book = _payout_book(lm)
     if book is None or not book.has_arrivals():
@@ -416,6 +420,79 @@ def _run_arrival_payouts(lm, balances, sequences, last_ts, height, timestamp, *,
             lm, book, balances, sequences, last_ts, rule, legs, have, height, timestamp,
             sale_id)))
     return events
+
+
+class _StagedBalances:
+    """A transaction's view of the balances: its staged writes over the block's.
+
+    A write goes to the staged ones, so it commits with the transaction or not
+    at all."""
+
+    __slots__ = ("staged", "base")
+
+    def __init__(self, staged: Dict[str, int], base: Dict[str, int]) -> None:
+        self.staged, self.base = staged, base
+
+    def __contains__(self, address: Any) -> bool:
+        return address in self.staged or address in self.base
+
+    def get(self, address: Any, default: Any = None) -> Any:
+        if address in self.staged:
+            return self.staged[address]
+        return self.base.get(address, default)
+
+    def __getitem__(self, address: Any) -> int:
+        if address in self.staged:
+            return self.staged[address]
+        return self.base[address]
+
+    def __setitem__(self, address: Any, value: int) -> None:
+        self.staged[address] = value
+
+
+def _run_arrivals_of_payment(lm, book, balances, sequences, sale_id, sales, height,
+                             timestamp, *, timeout=None,
+                             replay_mode=False) -> Tuple[List[Dict[str, Any]], str]:
+    """Run, inside a payment, the rule each account it paid runs on arrival:
+    (events, refusal).
+
+    `sales` maps (recipient, payer) to what the transaction paid the recipient,
+    `balances` is the transaction's own view. An account has at most one such
+    rule, so a payment makes at most one run for each account it pays, and at
+    most MAX_TRANSFERS_PER_TX in all. The run reads the balance with the
+    payment in it and may pay at most the payment; its legs are written with
+    the payment's own, so no later transaction sees the share the rule sends
+    on. A run that pays nothing leaves the payment whole. Any other refusal is
+    returned, and the payment is refused with it: nothing moves, nobody pays a
+    fee. A run is the account receiving, not sending: its o5 clause is not
+    asked and its cooldown clock is not stamped. A replay keeps the payment
+    the chain carries and marks the run not paid.
+    """
+    events: List[Dict[str, Any]] = []
+    for (to, payer), _amount in sorted(sales.items()):
+        key = book.arrival_key(to, sale_id)
+        if not isinstance(key, str):        # no such rule (or a stand-in book)
+            continue
+        rule, state, exe = book.arrival_execution(key, sale_id)
+        _, _, amount, _ = state.sale(sale_id)
+        reason, legs, have, _short = _node_payout_step(
+            lm, balances, sequences, rule, state, exe, height, timestamp,
+            timeout=timeout, replay_mode=replay_mode, what="arrival", policy=None)
+        total = sum(a for _, _, a in legs)
+        if not reason and total > amount:
+            reason = f"the rule pays {total}, more than the payment of {amount}"
+        event = dict(_payout_rule_event(rule), sale_id=sale_id.hex(), sale_amount=amount,
+                     payer_pubkey=payer)
+        if reason and (reason == PAYS_NOTHING or replay_mode):
+            book.drop_sale(key, sale_id)
+            events.append(dict(event, outcome="arrival_not_paid", reason=reason))
+            continue
+        if reason:
+            return events, f"the payout rule of {str(to)[:10]}... refuses the payment: {reason}"
+        events.append(dict(event, **_node_payout_pay(
+            lm, book, balances, sequences, None, rule, legs, have, height, timestamp,
+            sale_id)))
+    return events, ""
 
 
 def _run_due_payouts(lm, balances, sequences, last_ts, height, timestamp, *, timeout=None,
@@ -1319,9 +1396,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # points, expiries, then the rules a guarded release installed or revoked.
         payout_events = []
         for i, tx in enumerate(block.transactions):
-            event = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get("payout_event")
-            if event and tx in exec_result.accepted_transactions:
-                payout_events.append(event)
+            receipt = exec_result.receipts.get(tx.get('tx_id', str(i))) or {}
+            if tx in exec_result.accepted_transactions:
+                if receipt.get("payout_event"):
+                    payout_events.append(receipt["payout_event"])
+                payout_events.extend(receipt.get("arrival_events") or ())
         payout_events.extend(payout_arrivals)
         payout_events.extend(payout_due)
         payout_events.extend(payout_expired)
@@ -3764,6 +3843,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["logs"].append(
                                 f"Sale {noted} for the payout rule of {to[:10]}...: "
                                 f"{sale_id.hex()[:16]} ({amount})")
+                    # Only where the transfers are staged: an apply that writes
+                    # them at once leaves the sale to the block's end.
+                    if charge_fee and target_balances is not None:
+                        arrivals, refusal = _run_arrivals_of_payment(
+                            lifecycle_mgr, book,
+                            _StagedBalances(staged_writes, target_balances),
+                            target_sequences, sale_id, pending_sales,
+                            int(block_height or 0), int(block_timestamp or 0),
+                            timeout=getattr(_session, "request_budget", None),
+                            replay_mode=replay_mode)
+                        if refusal:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = "payment_refused_by_payout_rule"
+                            tx_receipt["logs"].append(refusal)
+                        elif arrivals:
+                            tx_receipt["arrival_events"] = arrivals
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

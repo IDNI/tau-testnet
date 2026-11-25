@@ -491,19 +491,16 @@ def test_a_retry_the_clause_blocks_is_done(evs):
     assert _events(ch) == [] and (ch.bal[ALICE], ch.bal[BOB]) == (260, 0)
 
 
-def test_a_blocked_run_on_arrival_closes_the_sale_unpaid(evs):
+def test_a_run_on_arrival_is_not_asked_the_accounts_o5_clause(evs):
+    # The share is routed as the payment lands, so it was never the account's
+    # to spend: a frozen account still has its payments split, and is still paid.
     ch, tx = _routed()
     _clause(ch, FREEZE)
     buy = spend_tx(CAROL, ALICE, 101, 0)       # Carol's own transfer is not Alice's to judge
     ch.block([buy], height=HEIGHT + 1, ts=TS + 1)
-    event, = _events(ch)
-    assert event["outcome"] == "arrival_not_paid" and event["reason"] == BLOCKED + " 0"
-    assert (ch.bal[ALICE], ch.bal[BOB], ch.bal[CAROL]) == (1_101, 0, 399)
+    assert [(e["outcome"], e["total"]) for e in _events(ch)] == [("executed", 20)]
+    assert (ch.bal[ALICE], ch.bal[BOB], ch.bal[CAROL]) == (1_081, 20, 399)
     assert ch.lm.payout_rules.state_of(ALICE).open_sales == ()
-    _clause(ch, None)
-    ch.block([spend_tx(CAROL, ALICE, 50, 1)], height=HEIGHT + 2, ts=TS + 2)
-    assert [(e["outcome"], e["total"]) for e in _events(ch)] == [("executed", 10)]
-    assert ch.bal[BOB] == 10                   # the next payment is routed; the closed one is not
 
 
 @pytest.mark.parametrize("install, run", [

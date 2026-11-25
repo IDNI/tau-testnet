@@ -129,7 +129,7 @@ def test_a_time_lock_holds_a_rent_until_it_ends(real):
     assert [e["outcome"] for e in _events(ch)] == ["executed"] and ch.bal[BOB] == 100
 
 
-def test_block_all_stops_an_execution_a_due_point_and_a_routed_share(real):
+def test_block_all_stops_an_execution_and_a_due_point_not_a_routed_share(real):
     ch, tx = _chain(BLOCK_ALL)
     outcome, log = _execute(ch, tx, 1, data={"0": 30})
     assert outcome == "refused" and BLOCKED + " 0" in log
@@ -140,11 +140,12 @@ def test_block_all_stops_an_execution_a_due_point_and_a_routed_share(real):
     assert [(e["outcome"], e["reason"]) for e in _events(ch)] == [
         ("due_not_paid", BLOCKED + " 0")]
 
+    # a share routed as the payment lands was never the account's to spend:
+    # its clause is not asked, and a frozen account is still paid, and split
     ch, tx = _chain(BLOCK_ALL, rule=ROUTE, per_sale=True, on_arrival=True)
     ch.block([spend_tx(CAROL, ALICE, 101, 0)], height=HEIGHT + 1, ts=TS + 1)
-    assert [(e["outcome"], e["reason"]) for e in _events(ch)] == [
-        ("arrival_not_paid", BLOCKED + " 0")]
-    assert (ch.bal[ALICE], ch.bal[BOB]) == (20_101, 0)   # the payment arrived; no share left
+    assert [(e["outcome"], e["total"]) for e in _events(ch)] == [("executed", 20)]
+    assert (ch.bal[ALICE], ch.bal[BOB]) == (20_081, 20)
 
 
 def test_lifting_the_clause_lets_the_rule_pay_again(real):

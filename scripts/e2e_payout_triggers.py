@@ -10,8 +10,8 @@ rules like any other, and a sealed account holds money its own key cannot move.
     due_at + due_every   Alice's account pays Bob 100 at a block she signed and
                          again every 256 blocks; nobody sends a transaction
     on_arrival           a fifth of every payment the shop receives goes to the
-                         creator, in the block that carries the payment; the
-                         payer pays its own fee and nothing more
+                         creator, inside the payment itself; the payer pays its
+                         own fee and nothing more
     sealed               a vault holds Carol's money for Bob: until the rule
                          ends the vault's own key can neither spend nor change
                          the rule; what Bob has not taken goes back to Carol at
@@ -27,9 +27,9 @@ SCENARIOS (balances through an accounting oracle, fees to the miner included)
     2. The shop installs the route. Carol pays 101: the creator has 20, the
        shop 81, Carol paid 101 and her one fee. 4 is too small to share. Two
        payments in one block are each split on their own. Then the shop
-       installs an o5 clause that blocks its transfers: the next payment
-       arrives whole and no share leaves. It lifts the clause and the payment
-       after that is shared again.
+       installs an o5 clause that blocks its transfers: the next payment is
+       split all the same, because the share is the shop receiving, not
+       sending. It lifts the clause and the payment after that is shared too.
     3. The creator shares what it is paid with Alice the same way. A share that
        came from the shop's rule stays whole; a payment someone signs to the
        creator is shared.
@@ -214,7 +214,8 @@ def scenario_route(rig, st):
     orc.move("shop", "creator", 11 + 2)
     orc.verify("two payments in one block, each split on its own (11 and 2)")
 
-    # The shop's own o5 clause judges the share the node routes, in the block.
+    # The share leaves inside the payment, so it is never the shop's to spend:
+    # the shop's own o5 clause, which judges what the shop sends, is not asked.
     res = set_clause(rig, "shop", BLOCK_ALL)
     check("the shop's o5 clause that blocks its transfers is admitted",
           res.get("status") == "ok", res)
@@ -222,11 +223,11 @@ def scenario_route(rig, st):
     orc.fee("shop")
     pay(rig, orc, "carol", "shop", 50, "Carol pays 50 while the clause is in force")
     rig.mine(empty=False)
-    orc.verify("the clause blocks the routed share (all 50 stay with the shop)")
+    orc.move("shop", "creator", 10)
+    orc.verify("the payment is split with the clause in force (10 of 50)")
     event = newest(rig, "shop")
-    check("the history names the clause and the sale is closed",
-          event.get("outcome") == "arrival_not_paid"
-          and "o5 clause blocks the payment" in (event.get("reason") or "")
+    check("the history shows the run and the sale is closed",
+          event.get("outcome") == "executed" and event.get("total") == 10
           and not (rule(rig, "shop").get("open_sales") or []), event)
     res = set_clause(rig, "shop", NEUTRAL)
     check("the shop lifts its clause", res.get("status") == "ok", res)
@@ -235,7 +236,7 @@ def scenario_route(rig, st):
     pay(rig, orc, "carol", "shop", 50, "Carol pays 50 again")
     rig.mine(empty=False)
     orc.move("shop", "creator", 10)
-    orc.verify("without the clause the share is routed again (10 of 50)")
+    orc.verify("without the clause the share is routed as before (10 of 50)")
 
 
 def scenario_no_second_hop(rig, st):

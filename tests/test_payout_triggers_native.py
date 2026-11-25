@@ -19,12 +19,15 @@ The runs go through the engine's own end-of-block functions.
 
 Skipped where the native module is not built.
 """
+import copy
 import random
 import types
 
 import pytest
 
-from consensus.engine import _run_arrival_payouts, _run_due_payouts
+from consensus.engine import (
+    _StagedBalances, _run_arrival_payouts, _run_arrivals_of_payment, _run_due_payouts,
+)
 from consensus.payout import (
     MIN_DUE_EVERY_BLOCKS,
     PayoutBook,
@@ -96,13 +99,24 @@ class Account:
 
     def pays_in(self, amount, at=0, payer=STRANGER):
         """A block in which `payer` sends `amount`: the chain records the sale,
-        credits the account, and the node makes its runs."""
+        credits the account and runs the rule inside the payment, as the block
+        apply does. A payment the run refuses is not taken: the account and the
+        book stay as they were, and the one event says why."""
         self.height += 1
         self.sales += 1
-        noted = self.book.note_sale(ALICE, bytes([self.sales]) * 32, payer, amount,
-                                    self.height, at)
-        self.balances[ALICE] += amount
-        events = self._run(_run_arrival_payouts, at)
+        sale_id = bytes([self.sales]) * 32
+        book = copy.deepcopy(self.book)
+        noted = book.note_sale(ALICE, sale_id, payer, amount, self.height, at)
+        staged = {ALICE: self.balances[ALICE] + amount}
+        lm = types.SimpleNamespace(payout_rules=book, faucet_amount=0)
+        events, refusal = _run_arrivals_of_payment(
+            lm, book, _StagedBalances(staged, self.balances),
+            {key: 0 for key in self.balances}, sale_id, {(ALICE, payer): amount},
+            self.height, at)
+        if refusal:
+            return noted, [{"outcome": "payment_refused", "reason": refusal}]
+        self.book = book
+        self.balances.update(staged)
         return noted, events
 
     def held(self, who=ALICE):
@@ -255,12 +269,13 @@ def test_a_share_that_stops_at_a_date(real):
 
 def test_the_cap_of_the_rule_holds_for_a_run_on_arrival(real):
     account = _routed(balance=0, cap_per_execution=30, cap_per_period=30)
+    # a payment whose share the caps refuse is refused itself: no payer gets past the rule
     _, (event,) = account.pays_in(500, _utc(2026, 2, 1))                  # a fifth is 100
-    assert event["outcome"] == "arrival_not_paid" and "cap per execution" in event["reason"]
+    assert event["outcome"] == "payment_refused" and "cap per execution" in event["reason"]
     assert _paid(account.pays_in(150, _utc(2026, 2, 1) + 1)[1]) == [("executed", 30)]
     _, (event,) = account.pays_in(5, _utc(2026, 2, 1) + 2)
-    assert event["outcome"] == "arrival_not_paid" and "cap per period" in event["reason"]
-    assert (account.held(), account.held(BOB)) == (625, 30)
+    assert event["outcome"] == "payment_refused" and "cap per period" in event["reason"]
+    assert (account.held(), account.held(BOB)) == (120, 30)        # 150 in, 30 on
 
 
 # --- the sealed grant ------------------------------------------------------------------------

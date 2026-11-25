@@ -61,7 +61,7 @@ tau-testnet payout set --key treasury --file payout.tau \
 | `due_at` | Optional, a number or left out. At this point on the period's clock the node runs the rule itself, once ([Optional terms](#optional-terms)). |
 | `due_every` | Optional, a number or left out, with `due_at`. The node runs the rule again every so many blocks or seconds ([Three ways a rule is started](#three-ways-a-rule-is-started)). |
 | `due_months` | Optional, 1 to 12, with `due_at` and `period_seconds`. The node runs the rule again every so many calendar months, UTC. |
-| `on_arrival` | Optional, `true` or left out, with `per_sale`. The node runs the rule itself for each payment that arrives. |
+| `on_arrival` | Optional, `true` or left out, with `per_sale`. The node runs the rule itself inside each payment that arrives. At most one such rule per account. |
 | `sealed` | Optional, `true` or left out. Until the rule ends the account signs nothing and the rule cannot be changed. |
 | `rule_index` | Optional, 1 to 7 or left out. The rule's place on the account; left out, the first ([Several rules per account](#several-rules-per-account)). |
 | `due_retry` | Optional, a number or left out, with `due_at`. A due point that found the account short is run again until this much later ([A due point tried again](#a-due-point-tried-again)). |
@@ -270,8 +270,9 @@ period than the account signed, whatever the sale.
 
 Every payment of a run is asked of the account's **current** `o5` clause, the
 one registered when the run happens, not the one the account had when it
-installed the rule. This holds for every way a rule is started: an execution
-someone sends, a due point, a retry and a run on arrival.
+installed the rule. This holds for an execution someone sends, a due point and
+a retry. A run on arrival is the account receiving, not sending, and is not
+asked (see "A payment that arrives").
 
 - **Asked like a transfer.** Each payment is one question with the inputs a
   transfer of that amount from the account to that recipient gets: `i1` the
@@ -286,9 +287,8 @@ someone sends, a due point, a retry and a run on arrival.
   whole run: all slots are paid or none.
 - **A refused run moves nothing.** An execution is refused at admission
   (`PAYOUT_REFUSED`) and is not included in a block, so nobody pays a fee for
-  it. A due point is recorded as `due_not_paid` and a run on arrival as
-  `arrival_not_paid`, each with the reason `the account's o5 clause blocks the
-  payment of slot k`. A due point the clause blocked is not tried again, also
+  it. A due point is recorded as `due_not_paid` with the reason `the account's
+  o5 clause blocks the payment of slot k`. A due point the clause blocked is not tried again, also
   with `due_retry`: a retry is owed only to an account that was short.
 - **Once.** The clause is asked once per payment, after the rule and the caps
   have passed. A paid run counts once for the account's cooldown clock, like one
@@ -623,7 +623,9 @@ leaves one owed with `retry_at`.
 
 A rule with `per_sale` pays against sales the chain recorded: signed transfers
 into the account. With `on_arrival` nobody has to execute it. The node runs the
-rule for each sale at the end of the block that recorded it.
+rule inside the payment itself: right after its transfers and before the next
+transaction of the block, with the shares written together with the payment.
+The gross, the shares and the net commit together or not at all.
 
 ```bash
 # a fifth of every payment the shop receives goes to the creator
@@ -638,30 +640,40 @@ tau-testnet payout set --key shop --file route.tau --slot <creator_pubkey> \
 always ( o30[t]:bv[24] = i27[t]:bv[24] / { 5 }:bv[24] ).
 ```
 
-A payment of 101 leaves 81 with the shop and 20 with the creator. The payer
-paid 101 and the fee of its own transaction. The shop need not be online.
+A payment of 101 leaves 81 with the shop and 20 with the creator, in the same
+transaction: a transaction after it in the block, one the shop signs included,
+sees 81, never 101. The payer paid 101 and the fee of its own transaction. The
+shop need not be online.
 
 - The run has no executor (`i13` is 0), so only fixed slots are paid. `i27` is
-  the amount of the sale, `i28` who paid it. Everything else is an execution
-  like any other: all slots or none, both caps, the balance.
-- Each sale is run once and then closed, paid or not. A sale the rule pays
-  nothing for is recorded as `arrival_not_paid` with the reason. The history
-  in `getpayoutrule` shows each run with the sale, its amount, who paid it and
+  the amount of the payment, `i28` who paid it. Everything else is an execution
+  like any other: all slots or none, both caps. The run pays at most the
+  payment it runs for.
+- A run that pays nothing (a share of 4 at a fifth, a floor not reached) leaves
+  the payment whole and is recorded as `arrival_not_paid` with the reason.
+- A run the rule refuses for any other reason, a cap or more than the payment,
+  refuses the payment: it is not included, nothing moves, and the payer pays no
+  fee (`payment_refused_by_payout_rule`). So a payer cannot get past the rule
+  with a payment it refuses, and the caps of such a rule bound what the account
+  can be paid while it is installed.
+- The share is the account receiving, not sending: it never was the account's
+  to spend. The account's `o5` clause is not asked, and the run does not stamp
+  the account's cooldown clock. A frozen account is still paid, and its
+  payments are still split.
+- An account has at most one rule the node runs on arrival; a second one in
+  another place is refused. So a payment makes at most one run for each
+  account it pays, and a transaction at most one per transfer (64).
+- Each payment is run once and its sale closed. The history in
+  `getpayoutrule` shows each run with the sale, its amount, who paid it and
   what went to which slot: the gross, the shares and so the net.
 - A sale is a transfer someone signs to the account, as for every rule that
   pays per sale. A retractable transfer released to the account, a transfer
   released by approvers and a payment the node makes by a rule are not sales.
-- Money the node moves is never a sale: a payout leg, a released transfer. So a share one rule pays out is not shared again by the
-  rule of the account that receives it. Only a payment someone signs is.
-- At most 16 runs a block. More than that wait in the rule's open sales for the
-  next blocks, and an idle chain seals a block for them. At most 64 wait per
-  rule, as for every rule that pays per sale, and a larger sale takes the place
-  of the smallest waiting one. So a flood of small payments cannot make the
-  queue grow without end, and a sale waits at most a few blocks behind it.
-  Each account's longest-waiting sale comes first, so an account with many
-  sales waiting does not hold up the one sale of another.
+- Money the node moves is never a sale: a payout leg, a released transfer. So a
+  share one rule pays out is not shared again by the rule of the account that
+  receives it. Only a payment someone signs is.
 - A payment in the block that reaches `expires_at` is not a sale of the rule
-  any more. A rule with a sale still waiting is kept until that sale has run.
+  any more, and is not split.
 - The condition is the rule's: a floor (`i27 >= 50`), a payer that is exempt
   (`i28`), a date after which the share stops (`i5`), two shares to two slots.
   `tests/test_payout_triggers_native.py` runs each of these on the real engine;
@@ -732,7 +744,8 @@ tau-testnet payout revoke --key alice --rule-index 1
   `--rule-index`.
 - Each rule has its own period count, due points, open sales and runs. A
   payment that arrives is a sale of every per-sale rule of the account, and each
-  pays its own share of it under its own caps.
+  pays its own share of it under its own caps. At most one of them is run by
+  the node on arrival.
 - A set that replaces the rule in its place keeps what that place has paid this
   period (see "Installing"); the other places are not touched.
 - A sealed rule in any place seals the account: until it ends, the account
@@ -777,7 +790,7 @@ account's).
 | Executor data inputs | 8 |
 | Executions per block | 16 |
 | Due points run per block | 16 |
-| Runs on arrival per block | 16 |
+| Rules run on arrival per account | 1 |
 | Retries of a short due point per block | 4 |
 | Shortest repeat (`due_every`) | 256 blocks, or 3,600 seconds |
 | Rule text | 4,096 bytes |
@@ -845,16 +858,16 @@ execution signed for another network is refused here.
   nothing, and the state hash shows it.
 - Expiry runs after the block's transactions, before rule-change releases; an
   execution in the expiry block is refused by its clock check.
-- Due points run after the block's transactions and the runs on arrival,
-  before expiries, in the order (due point, account) with rules on the block
+- Due points run after the block's transactions, before expiries, in the order (due point, account) with rules on the block
   clock first. Such a run reads the balance the block has reached, which every
   node has computed the same way by then.
 - A rule with an optional term, or one that reads `i48` or `i49`, carries a
   second part in its book entry (the terms, the last paid clock, whether the
   due point has run). Every other rule hashes exactly as before.
-- Runs on arrival come after the block's transactions and before the due
-  points, in the order (position among the account's waiting sales, block that
-  recorded the sale, account). A rule with `due_every`, `due_months`, `on_arrival` or
+- A run on arrival is part of its payment: after the payment's transfers and
+  fee, in the order of the accounts it paid. An apply that writes transfers at
+  once instead of staging them (one without a proposer) leaves the sale for a
+  run after the block's transactions instead, at most 16 a block. A rule with `due_every`, `due_months`, `on_arrival` or
   `sealed` adds those terms and the number of its next due point to the second
   part of its entry; a rule without them hashes exactly as before.
 - A rule in another place than the first, or one with `due_retry`, adds its
@@ -931,9 +944,9 @@ replay could not run the rule; nothing moves, and the state hash says so.
   custom input reads 0 for it in a run, as for a transfer sent without it.
 - Executions are bounded per block (16), and refused ones cost the executor
   nothing but are not included either, so they cannot fill blocks.
-- Runs the node makes are bounded per block too (16 at due points, 16 on
-  arrival, 4 retries), and each run on arrival was paid for by the fee of the
-  payment that caused it.
+- Runs the node makes are bounded too: per block 16 at due points and 4
+  retries; on arrival at most one per account a payment pays, inside that
+  payment, which was paid for by its fee.
 - A seal binds the key holder for the life of the rule and nobody can lift it,
   the key holder included. Check the rule text and `expires_at` before signing.
 

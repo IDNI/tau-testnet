@@ -76,10 +76,13 @@ def semantics() -> dict:
         },
         "on_arrival": {
             "term": "on_arrival: true, with per_sale and a fixed slot",
-            "run": "the node steps the rule once for each sale, at the end of the "
-                   "block that recorded it, with no executor (i13 = 0); paid or "
-                   "not, the sale is closed; money the node moves is never a sale",
-            "runs_per_block": payout.MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK,
+            "run": "the node steps the rule once for each payment, inside that "
+                   "payment, with no executor (i13 = 0): the gross, the shares and "
+                   "the net commit together; money the node moves is never a sale",
+            "pays": "at most the payment; a run that pays nothing leaves the payment "
+                    "whole, any other refusal refuses the payment (no fee)",
+            "per_account": "at most one such rule",
+            "o5": "not asked: the share is the account receiving, not sending",
             "fee": "none: the payer pays the fee of its own payment and nothing more",
         },
         "policy_exempt": {

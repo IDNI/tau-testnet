@@ -52,6 +52,7 @@ from consensus.tx_signing import signing_message_bytes
 
 from tests.test_payout_apply import _events, _reason, exec_tx, rid, set_tx
 from tests.test_payout_options import NOW, NOW_TS, fields, seconds, terms
+from tests.test_payout_sales import _sale_id
 from tests.chain_harness import (
     ALICE, BOB, CAROL, FAR, HEIGHT, PROPOSER, SKS, TS, Chain, _logs, _sign, spend_tx,
 )
@@ -534,10 +535,15 @@ def test_due_points_of_two_places_run_in_one_block_first_place_first(evs):
 def test_a_payment_that_arrives_is_a_sale_of_each_per_sale_rule(evs):
     ch = Chain(_bal())
     ch.block([set_tx(rule=ROUTE, per_sale=True, on_arrival=True),
-              set_tx(seq=1, rule=HALF, per_sale=True, on_arrival=True, rule_index=1)])
-    ch.block([spend_tx(CAROL, ALICE, 100, 0)], height=HEIGHT + 1, ts=TS + 1)
-    assert [(e.get("rule_index"), e["total"]) for e in _events(ch)] == [(None, 20), (1, 50)]
-    assert (ch.bal[ALICE], ch.bal[BOB], ch.bal[CAROL]) == (1_030, 70, 400)
+              set_tx(seq=1, rule=HALF, per_sale=True, rule_index=1)])
+    buy = spend_tx(CAROL, ALICE, 100, 0)
+    ch.block([buy], height=HEIGHT + 1, ts=TS + 1)
+    # the rule the node runs on arrival pays inside the payment; the other
+    # holds the sale open for an execution someone sends
+    assert [(e.get("rule_index"), e["total"]) for e in _events(ch)] == [(None, 20)]
+    assert (ch.bal[ALICE], ch.bal[BOB], ch.bal[CAROL]) == (1_080, 20, 400)
+    waiting = ch.lm.payout_rules.state_of(payout_key(ALICE, 1)).open_sales
+    assert [entry[0].hex() for entry in waiting] == [_sale_id(buy)]
 
 
 # --- block apply: a due point tried again --------------------------------------------------

@@ -31,6 +31,7 @@ from consensus.payout import (
     PayoutShapeError,
     parse_payout_rule_set,
     parse_payout_spec,
+    payout_key,
     payout_rule_body,
     payout_spec_text,
     validate_terms_shape,
@@ -60,6 +61,9 @@ ROUTE_BODY = payout_rule_body(ROUTE)
 # The other half of a routed payment, for the account that gets the share.
 HALF = "always ( o30[t]:bv[24] = i27[t]:bv[24] / { 2 }:bv[24] )."
 HALF_BODY = payout_rule_body(HALF)
+
+DOUBLE = "always ( o30[t]:bv[24] = i27[t]:bv[24] + i27[t]:bv[24] )."
+DOUBLE_BODY = payout_rule_body(DOUBLE)
 
 
 def repeating(**over):
@@ -713,18 +717,80 @@ def test_a_payment_too_small_to_share_is_closed_unpaid(evs):
     assert ch.lm.payout_rules.state_of(ALICE).open_sales == ()
 
 
-def test_seventeen_payments_in_one_block_take_two_blocks(evs):
+def test_every_payment_of_a_block_is_routed_inside_it(evs):
     ch, tx = _routed()
     buys = [spend_tx(CAROL, ALICE, 10, k) for k in range(MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK + 1)]
     ch.block(buys, height=HEIGHT + 1, ts=TS + 1)
-    assert [e["sale_id"] for e in _events(ch)] == [
-        _sale_id(b) for b in buys[:MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK]]
-    assert ch.bal[BOB] == 2 * MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK
-    assert len(ch.lm.payout_rules.state_of(ALICE).open_sales) == 1
-    ch.block([], height=HEIGHT + 2, ts=TS + 2)
-    assert [e["sale_id"] for e in _events(ch)] == [_sale_id(buys[-1])]
+    assert [e["sale_id"] for e in _events(ch)] == [_sale_id(b) for b in buys]
     assert ch.bal[BOB] == 2 * (MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK + 1)
+    assert ch.lm.payout_rules.state_of(ALICE).open_sales == ()
     assert not ch.lm.payout_rules.has_arrivals()
+
+
+@pytest.mark.parametrize("spend, kept", [(1_081, True), (1_082, False)])
+def test_the_share_leaves_inside_the_payment_so_a_later_spend_sees_81(evs, spend, kept):
+    ch, tx = _routed()
+    buy, out = spend_tx(CAROL, ALICE, 101, 0), spend_tx(ALICE, CAROL, spend, 1)
+    ch.block([buy, out], height=HEIGHT + 1, ts=TS + 1)
+    assert [e["total"] for e in _events(ch)] == [20] and ch.bal[BOB] == 20
+    if kept:
+        assert ch.bal[ALICE] == 0
+    else:
+        assert next(o for o in ch.last.outcomes if o.tx_id == out["tx_id"]).status == "invalid"
+        assert ch.bal[ALICE] == 1_081                  # the 20 were never Alice's to spend
+
+
+def _capped_route(rule=ROUTE, **kw):
+    ch = Chain(_bal())
+    tx = set_tx(rule=rule, per_sale=True, on_arrival=True, **kw)
+    ch.block([tx])
+    assert ch.lm.payout_rules.get(ALICE) is not None, _reason(ch.last, tx)
+    return ch, tx
+
+
+def test_a_run_the_rule_refuses_refuses_the_payment_and_nobody_pays_a_fee(evs):
+    ch, tx = _capped_route(cap_exec=10, cap_period=10_000)
+    before = dict(ch.bal)
+    ch.fee = 3
+    buy = spend_tx(CAROL, ALICE, 101, 0)                   # 20 to route, over the cap of 10
+    ch.block([buy], height=HEIGHT + 1, ts=TS + 1)
+    assert _reason(ch.last, buy) == "payment_refused_by_payout_rule"
+    assert _events(ch) == [] and ch.bal == before and CAROL not in ch.seq
+    ch.block([spend_tx(CAROL, ALICE, 50, 0)], height=HEIGHT + 2, ts=TS + 2)
+    assert [e["total"] for e in _events(ch)] == [10] and ch.bal[BOB] == 10
+
+
+def test_a_rule_that_pays_more_than_the_payment_refuses_it(evs):
+    evs["payout_apply"].set_outputs(DOUBLE_BODY, lambda i: {"o30": str(2 * int(i.get("i27", "0")))})
+    ch, tx = _capped_route(rule=DOUBLE, cap_exec=1_000, cap_period=10_000)
+    before = dict(ch.bal)
+    buy = spend_tx(CAROL, ALICE, 50, 0)
+    ch.block([buy], height=HEIGHT + 1, ts=TS + 1)
+    assert _reason(ch.last, buy) == "payment_refused_by_payout_rule"
+    assert ch.bal == before and ch.lm.payout_rules.state_of(ALICE).open_sales == ()
+
+
+def test_a_run_on_arrival_is_not_a_send_of_the_account(evs):
+    ch, tx = _routed()
+    stamped = ch.lts.get(ALICE)
+    ch.block([spend_tx(CAROL, ALICE, 101, 0)], height=HEIGHT + 1, ts=TS + 1)
+    assert [e["total"] for e in _events(ch)] == [20]
+    assert ch.lts.get(ALICE) == stamped and ch.lts[CAROL] == TS + 1
+    assert ch.seq == {ALICE: 1, CAROL: 1}
+
+
+def test_an_account_has_one_rule_the_node_runs_on_arrival(evs):
+    ch, tx = _routed()
+    second = set_tx(seq=1, rule=HALF, per_sale=True, on_arrival=True, rule_index=1,
+                    cap_exec=1_000, cap_period=10_000)
+    ch.block([second], height=HEIGHT + 1, ts=TS + 1)
+    assert _reason(ch.last, second) == "payout_rule_not_set"
+    assert ch.lm.payout_rules.get(payout_key(ALICE, 1)) is None
+    # a new rule in the same place replaces it
+    again = set_tx(seq=1, rule=HALF, per_sale=True, on_arrival=True,
+                   cap_exec=1_000, cap_period=10_000)
+    ch.block([again], height=HEIGHT + 2, ts=TS + 2)
+    assert ch.lm.payout_rules.get(ALICE).rule_id.hex() == rid(again)
 
 
 def test_a_payment_in_the_block_that_reaches_the_end_is_not_routed(evs):

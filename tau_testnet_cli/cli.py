@@ -2680,8 +2680,9 @@ def _add_payout_subparsers(sub) -> None:
                        help="With --due-at and --period-seconds: the node runs the rule "
                             "again every N calendar months (UTC)")
     p_set.add_argument("--on-arrival", action="store_true",
-                       help="With --per-sale: the node runs the rule itself for each "
-                            "payment that arrives, once; only fixed slots are paid")
+                       help="With --per-sale: the node runs the rule itself inside each "
+                            "payment that arrives, once; only fixed slots are paid, at "
+                            "most the payment; one such rule per account")
     p_set.add_argument("--sealed", action="store_true",
                        help="Until the rule ends the account signs nothing and the rule "
                             "cannot be changed: money leaves by the rule only")

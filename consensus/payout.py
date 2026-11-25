@@ -84,12 +84,16 @@ transaction hash, its amount what that transaction paid the account (capped at
 bv[24]). An execution must name one open sale; the rule reads the sale's amount
 and payer (i27, i28), and a paid execution closes the sale, so a second
 execution naming it is refused. A refused execution leaves it open. At most
-MAX_OPEN_SALES are open at once, for a rule the node runs on arrival as well.
+MAX_OPEN_SALES are open at once.
 When that many are open, a larger sale takes the place of the smallest open one
 and the smaller is counted as missed; a sale no larger than every open one is
 not recorded and is counted as missed. So sales too small to pay anything (a 5%
 royalty pays nothing on 19 or less) cannot hold every place and keep later
 sales out. Replacing, revoking or expiring the rule drops its open sales.
+
+With `on_arrival: true` the node runs the rule inside the payment itself (see
+consensus/engine.py, _run_arrivals_of_payment), so its sale is closed in the
+same transaction. An account holds at most one such rule.
 """
 from __future__ import annotations
 
@@ -157,6 +161,9 @@ MAX_RULE_BYTES = 4096
 MAX_PAYOUT_RULES_TOTAL = 4096
 MAX_PAYOUT_EXECUTIONS_PER_BLOCK = 16
 MAX_PAYOUT_DUE_RUNS_PER_BLOCK = 16
+# A sale recorded by an apply that writes transfers at once (one without a
+# proposer) waits for a run after the block's transactions; an apply that stages
+# them runs it inside the payment.
 MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK = 16
 # Runs the node makes again for due points that found the account short, after
 # the due points of the block and on their own budget, so a retry never delays
@@ -1000,6 +1007,11 @@ def parse_amount(value: Any) -> int:
     return 0 if parsed is None else int(parsed)
 
 
+# The refusal of a run whose rule pays nothing. A run on arrival that pays
+# nothing leaves the payment whole; every other refusal refuses the payment.
+PAYS_NOTHING = "the rule pays nothing for these inputs"
+
+
 def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
            outputs: Dict[str, Any], *, height: int, ts: int,
            balance: int) -> List[Tuple[int, str, int]]:
@@ -1019,7 +1031,7 @@ def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
         legs.append((k, who, amount))
     total = sum(a for _, _, a in legs)
     if total <= 0:
-        raise PayoutRefused("the rule pays nothing for these inputs")
+        raise PayoutRefused(PAYS_NOTHING)
     if total > terms.cap_per_execution:
         raise PayoutRefused(
             f"the rule pays {total}, over the cap per execution {terms.cap_per_execution}")
@@ -1506,6 +1518,14 @@ class PayoutBook:
         return terms, state, PayoutExecution("", terms.account_pubkey, terms.rule_id,
                                              (), (), bytes(sale_id))
 
+    def arrival_key(self, account: Any, sale_id: bytes) -> Optional[str]:
+        """The key of the account's rule the node runs on arrival when it holds
+        this sale open, else None. An account has at most one such rule."""
+        for key in self.keys_of(account):
+            if self.terms[key].on_arrival and self.state[key].sale(bytes(sale_id)) is not None:
+                return key
+        return None
+
     def drop_sale(self, key: str, sale_id: bytes) -> None:
         """The node ran the rule for this sale and the rule paid nothing: the
         sale is closed, a run on arrival happens once."""
@@ -1545,6 +1565,11 @@ class PayoutBook:
             return False, "this payout rule is already installed"
         if self.sealed(terms.account_pubkey):
             return False, "the account's payout rule is sealed until it ends"
+        if terms.on_arrival and any(self.terms[k].on_arrival
+                                    for k in self.keys_of(terms.account_pubkey)
+                                    if k != terms.key):
+            return False, ("the account already has a rule the node runs on arrival; "
+                           "it may have one")
         if current is None and len(self.terms) >= MAX_PAYOUT_RULES_TOTAL:
             return False, "the payout rule book is full"
         return True, ""
