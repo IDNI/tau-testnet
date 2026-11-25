@@ -14,7 +14,11 @@ pin the fix: an optional signed `periods_from` anchor on the entry.
   existed: same rule id, same stored row, same book root. The ids and
   the root pinned below were computed on the pristine base of this
   branch (the dupfix head) with the pins script, before the field was
-  added — they are the pre-change values, not re-computed ones.
+  added — they are the pre-change values, not re-computed ones. On the
+  FIX 9 fold line the pins were recomputed (see the PIN_ constants):
+  the values differ because this line's id and record domains carry
+  the FIX 7 slot and FIX 8 shared cap, while the property pinned is
+  the same — byte-identical without the anchor, on this line.
 - The anchor is signed (tx_signing) and inside the rule id under its
   own domain, and install validation refuses anchors absurdly far from
   the install moment in either direction.
@@ -57,10 +61,15 @@ SID_1 = bytes.fromhex("11" * 32)
 SID_2 = bytes.fromhex("22" * 32)
 SID_3 = bytes.fromhex("33" * 32)
 
-# Pre-change pins, computed on the pristine base (see module docstring).
-PIN_DECLARED_ID = "8eee67a75aa58006fc1c14d1860075bd34441c81e2c0a10d2337e12eed2f9f2b"
-PIN_TAU_ID = "d08f7aa1238ec2cf6fbdb78dea3594948a5abf612133b4bb18b4616008ca83ba"
-PIN_ROOT = "0d878e1e2e0eec802de071b24c66dd78f456261f810a9777faea6ed7a03b3979"
+# Fold pins, computed on this line (FIX 9 + FIX 1A + FIX 1B): the id and
+# record domains here carry the FIX 7 slot and the FIX 8 shared cap,
+# which the FIX 1A base the original pins were computed on did not
+# have — so the values differ from the FIX 1A branch's pins, while the
+# property they pin is the same: an entry without periods_from is
+# byte-identical to before the field existed ON THIS LINE.
+PIN_DECLARED_ID = "817e6188d40a233a984e691f83fdfe13b78b00f70a1fd7c72d5ec4318c619a00"
+PIN_TAU_ID = "478cf790851adac0fb5bbf8cff24894b44dac93924482917b026c9c61b3ef19c"
+PIN_ROOT = "3a29722cbff3d81ebf526692308bb6cf48da123179965916420299401be5dcab"
 
 
 def rule(
@@ -149,9 +158,10 @@ def test_absent_periods_from_is_byte_identical():
     # Same rule ids as before the field existed.
     assert declared.rule_id.hex() == PIN_DECLARED_ID
     assert tau.rule_id.hex() == PIN_TAU_ID
-    # Same stored rows: twelve fields, the pre-change shape.
+    # Same stored rows: fifteen fields, the pre-change shape on this line
+    # (twelve on the FIX 1A base, plus slot + shared cap from FIX 7/8).
     for row in book.rows():
-        assert len(row) == 12
+        assert len(row) == 15
     # Same book root.
     assert book.root().hex() == PIN_ROOT
     # And a restore of those rows reproduces the same root.
