@@ -318,8 +318,9 @@ def _standing_payment_book(lm) -> Optional[StandingPaymentBook]:
 
 def _guard_blocks_change(lm, sender, kind, timestamp, timeout):
     """(blocked, detail) from the sender's rule-change guard for one of the
-    payment-book changes (kinds 7..12, FIX 5B): the guard judges a payout
-    or standing change exactly as it judges a policy change."""
+    payment-book changes (kinds 7..12, FIX 5B) or a receive-route change
+    (kinds 13..15, FIX 11): the guard judges a payout, standing or route
+    change exactly as it judges a policy change."""
     offers = lm.rule_offers
     return sender_policy.rule_change_blocked(
         lambda who, idx: offers.accepted_clauses.get((who, idx)),
@@ -3434,6 +3435,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 operations = {}
                 if accepted_in_block and not hard_reject:
                     route_book = _lifecycle_for_write().receive_routes
+                    route_guard_refused = False
                     if tx_type == TX_TYPE_INSTALL_RECEIVE_ROUTE:
                         try:
                             route = parse_install_receive_route(tx)
@@ -3447,9 +3449,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 _, reason = route_book.can_install(
                                     route, int(block_timestamp or 0)
                                 )
+                                if not reason:
+                                    # Installing a route is a rule change
+                                    # (kind 13 for the first route, kind 14
+                                    # for its next version): the owner's
+                                    # guard judges it (FIX 11).
+                                    route_kind = (
+                                        tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE
+                                        if route_book.get(route.owner_pubkey) is None
+                                        else tau_defs.RULE_CHANGE_KIND_UPDATE_RECEIVE_ROUTE)
+                                    guard_blocked, guard_detail = _guard_blocks_change(
+                                        _lifecycle_for_write(), route.owner_pubkey,
+                                        route_kind, int(block_timestamp or 0),
+                                        getattr(_session, "request_budget", None))
+                                    if guard_blocked:
+                                        reason = f"rule-change guard blocks: {guard_detail}"
+                                        route_guard_refused = True
                         if route is None or reason:
                             tx_receipt["logs"].append(f"Receive route install ignored: {reason}")
-                            tx_receipt["reason"] = "receive_route_not_installed"
+                            tx_receipt["reason"] = (
+                                RULE_CHANGE_NEEDS_APPROVAL_REASON if route_guard_refused
+                                else "receive_route_not_installed")
                             accepted_in_block = False
                         else:
                             pending_route_install = route
@@ -3473,9 +3493,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     route_owner, int(block_timestamp or 0),
                                     destination_authorized=authorized,
                                 )
+                                if not reason:
+                                    # Removing a route is a rule change
+                                    # (kind 15): the owner's guard judges
+                                    # it (FIX 11).
+                                    guard_blocked, guard_detail = _guard_blocks_change(
+                                        _lifecycle_for_write(), route_owner,
+                                        tau_defs.RULE_CHANGE_KIND_REMOVE_RECEIVE_ROUTE,
+                                        int(block_timestamp or 0),
+                                        getattr(_session, "request_budget", None))
+                                    if guard_blocked:
+                                        reason = f"rule-change guard blocks: {guard_detail}"
+                                        route_guard_refused = True
                         if route_owner is None or reason:
                             tx_receipt["logs"].append(f"Receive route removal ignored: {reason}")
-                            tx_receipt["reason"] = "receive_route_not_removed"
+                            tx_receipt["reason"] = (
+                                RULE_CHANGE_NEEDS_APPROVAL_REASON if route_guard_refused
+                                else "receive_route_not_removed")
                             accepted_in_block = False
                         else:
                             pending_route_removal = (route_owner, authorized)

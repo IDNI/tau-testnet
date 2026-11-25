@@ -393,6 +393,11 @@ class _TipView:
     def get_receive_route(self, owner):
         return self._row
 
+    def clause_for(self, who, idx):
+        # FIX 11: route admission also asks for the owner's rule-change
+        # guard; this fixture's accounts have none registered.
+        return None
+
 
 def test_admission_agrees_with_apply_on_install_and_remove():
     from consensus.admission import (

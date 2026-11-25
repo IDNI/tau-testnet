@@ -1858,6 +1858,18 @@ def validate_install_receive_route_payload(
     if not ok:
         return format_error(f"install_receive_route rejected: {reason}")
 
+    # Installing a route is a rule change (kind 13 for the first
+    # route, kind 14 for the next version of an existing one): the
+    # owner's guard judges it (FIX 11, the FIX 5B parity pattern).
+    refusal = _rule_change_refusal(
+        tip_view, route.owner_pubkey,
+        tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE
+        if book.get(route.owner_pubkey) is None
+        else tau_defs.RULE_CHANGE_KIND_UPDATE_RECEIVE_ROUTE,
+    )
+    if refusal is not None:
+        return refusal
+
     return success({"route_id": route.route_id.hex()})
 
 
@@ -1892,6 +1904,14 @@ def validate_remove_receive_route_payload(
     )
     if not ok:
         return format_error(f"remove_receive_route rejected: {reason}")
+
+    # Removing a route is a rule change (kind 15): the owner's guard
+    # judges it (FIX 11, the FIX 5B parity pattern).
+    refusal = _rule_change_refusal(
+        tip_view, owner, tau_defs.RULE_CHANGE_KIND_REMOVE_RECEIVE_ROUTE,
+    )
+    if refusal is not None:
+        return refusal
 
     return success({"route_id": entry.route_id.hex()})
 

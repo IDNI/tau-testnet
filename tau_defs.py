@@ -166,6 +166,22 @@ RULE_CHANGE_KIND_REVOKE_PAYOUT = 9
 RULE_CHANGE_KIND_SET_STANDING = 10
 RULE_CHANGE_KIND_UPDATE_STANDING = 11
 RULE_CHANGE_KIND_CANCEL_STANDING = 12
+# Kinds 13..15 (Bounty 01, FIX 11): the receive route's lifecycle as rule
+# changes. Installing, replacing and removing a receive route (#35)
+# decides where an account's incoming payments go, so the account's
+# rule-change guard judges them (i1 = kind) exactly as it judges the
+# payment books' changes: kind 13 writes version 1 (no route may
+# exist), kind 14 carries the next version of an existing route, and
+# kind 15 removes the sender's route. FIX 5B's parity sweep covered
+# kinds 7..12 and left routes out of scope; the defensive audit of
+# 2026-11-25 proved the gap (a block-all guard refused a standing
+# create while one signature installed a 90% route past it). Stated
+# bound: kinds 13..15 are judged on the direct transactions (admission
+# + apply); filing a route change as a rule-change request is not
+# wired — the approvals book's kind range stays 1..12.
+RULE_CHANGE_KIND_SET_RECEIVE_ROUTE = 13
+RULE_CHANGE_KIND_UPDATE_RECEIVE_ROUTE = 14
+RULE_CHANGE_KIND_REMOVE_RECEIVE_ROUTE = 15
 
 # Blocks after which a parked rule-change request may release without approvals.
 RULE_CHANGE_DELAY_BLOCKS = 1000
