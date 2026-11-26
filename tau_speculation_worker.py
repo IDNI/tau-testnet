@@ -153,9 +153,33 @@ class _Session:
 
     def observe(self):
         if self.itp is None:
-            return {"time_point": None, "spec_revision": None}
+            return {"time_point": None, "spec_revision": None,
+                    "current_spec": None}
         return {"time_point": self.itp.time_point,
-                "spec_revision": self.itp.spec_revision}
+                "spec_revision": self.itp.spec_revision,
+                "current_spec": self._current_spec_or_none()}
+
+    def _current_spec_or_none(self):
+        """The interpreter's current spec, or None when it cannot speak.
+
+        Guarded: observe() feeds every receipt, and a failure here must
+        never wedge the worker (main() marks the session unhealthy on
+        any op exception). The raw interpreter spec is the normalized
+        form the journal-cut mirror reports; the trailing period is
+        ensured so the text is a well-formed single statement.
+        """
+        try:
+            text = self.itp.current_spec()
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", "replace")
+            if not isinstance(text, str):
+                return None
+            text = text.strip()
+            if text and not text.endswith("."):
+                text += "."
+            return text or None
+        except Exception:
+            return None
 
     def init(self, spec_text: str) -> dict:
         with _Capture() as cap:
