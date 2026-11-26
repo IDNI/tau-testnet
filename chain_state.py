@@ -1171,7 +1171,12 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             # Re-seed genesis rule text (the reorg path replays only the new
             # suffix, not the genesis block, so these would otherwise be lost
             # and the replayed state hash would diverge from the mined chain).
-            _application_rules_state = _genesis_application_rules
+            # B02 §3 (F4, OQ#1): same preprocessed seed as load_genesis --
+            # the raw genesis application text has no trailing '.', which
+            # merged its statement with the first builtin unit in the
+            # accumulation (see load_genesis).
+            _application_rules_state = _preprocess_tau_spec_text(
+                _genesis_application_rules)
             _consensus_rules_state = _genesis_consensus_rules
             _active_consensus_id = "tau_poa_v1"
             # Re-seed the genesis validator set + quorum policy so a rebuilt
@@ -1578,7 +1583,21 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
                 _sequence_numbers[addr] = 0
                 
             global _application_rules_state, _consensus_rules_state, _active_consensus_id, _tau_engine_state_hash, _canonical_head_hash
-            _application_rules_state = genesis_data["application_rules"]
+            # B02 §3 (F4, OQ#1): the genesis application text is seeded
+            # preprocessed -- like the consensus unit and the builtins
+            # already are in restore_plan_for -- so its first statement
+            # ends with '.'. The raw genesis.json text has none, so the
+            # accumulation's first statement ran into the first builtin
+            # unit and top_level_conjuncts merged them into one conjunct
+            # (the application conditional + builtin 01 read as a single
+            # ledger instance). NOTE: this changes the accumulation bytes
+            # (one '.' added, trailing newline dropped), so the BLAKE3
+            # state hash of every block from height 1 on differs from
+            # pre-F4 chains for the same heights -- deterministic within
+            # fixed code, same class of accepted impact as the F2
+            # move-to-end; fresh chains only, no backfill for persisted DBs.
+            _application_rules_state = _preprocess_tau_spec_text(
+                genesis_data["application_rules"])
             _consensus_rules_state = genesis_data["consensus_rules"]
             _active_consensus_id = ""
             _canonical_head_hash = genesis_block.block_hash
