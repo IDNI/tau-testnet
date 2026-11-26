@@ -1522,8 +1522,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             handler has already appended the step's unit by the time its
             receipt is read; on a speculative session it has not (the unit
             is staged further down instead), so append it here under the
-            same dedup rule `save_effective_tau_spec` and that staging
-            both use.
+            same move-to-end rule `save_effective_tau_spec` and that
+            staging both use (B02 §1: a resend is a new revision, so
+            the unit moves to the end instead of being dropped).
             """
             base = _rules_state()
             units = [u for u in (base or "").split("\n") if u.strip()]
@@ -1534,7 +1535,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 ).strip()
             except Exception:
                 unit = (applied_rule_text or "").strip()
-            if unit and unit not in units:
+            if unit:
+                # B02 §1: a verbatim re-submission is a NEW revision,
+                # not an accumulation replay -- move the unit to the
+                # end so the composed snapshot reads the resend's
+                # terms (o26=7 after A-B-A). Set-membership dedup
+                # dropped the resend and left the snapshot showing
+                # the displaced terms. Replay stays deterministic:
+                # the move is a pure function of the unit sequence,
+                # so replaying the same journal yields the same
+                # accumulation. Hash impact accepted by the
+                # coordinator (decision 2026-11-26); noted in the
+                # PR body.
+                units = [u for u in units if u != unit]
                 units.append(unit)
             return "\n".join(units)
 
@@ -3082,8 +3095,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     unit = (chain_state._preprocess_tau_spec_text(rule_text)
                                             or rule_text).strip()
                                     units = [u for u in staged.split("\n") if u.strip()]
-                                    if unit not in units:
-                                        units.append(unit)
+                                    # B02 §1 (same move-to-end rule as
+                                    # _step_accumulation_text): a verbatim
+                                    # re-submission is a new revision --
+                                    # move the unit to the end instead of
+                                    # dropping it, so the staged
+                                    # accumulation (and therefore the
+                                    # persisted full_tau_spec) reflects
+                                    # the resend.
+                                    units = [u for u in units if u != unit]
+                                    units.append(unit)
                                     _set_rules_state("\n".join(units))
                                     current_tau_bytes = "\n".join(units).encode("utf-8")
                                     _rule_touched_canonical = True
