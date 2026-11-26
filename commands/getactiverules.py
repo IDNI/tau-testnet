@@ -44,6 +44,7 @@ survival known at that height, never from later state.
 import re
 
 import api_response
+from consensus import active_rules
 
 # An i12 equality binding to a bit-vector literal, in either operand order:
 # the guard form rules use to scope themselves to one sender,
@@ -322,13 +323,27 @@ def execute(raw_command: str, container):
         )
         return api_response.success_response("getactiverules", data)
 
+    # Step 7 stopgap (B02 §2): serve the journal cut's text + sha256
+    # when the stored snapshot diverges from the replayed journal at
+    # the snapshot's own height. The snapshot is the fast path and is
+    # served unchanged when it agrees; the check only replaces a
+    # divergent snapshot. When NO snapshot exists the answer stays
+    # not-available (the wipe contract: a wiped node answers
+    # available:false) -- the cut is never substituted for a missing
+    # snapshot here. The unit ledger below is still derived from the
+    # stored snapshot sequence (see derive_unit_ledger); the permanent
+    # fix unifies the two canonicalizations so the served text and
+    # the ledger agree again.
+    view = active_rules.checked_snapshot_answer(snapshot)
     data = {
         "available": True,
-        "spec_revision": snapshot["spec_revision"],
-        "height": snapshot["height"],
-        "canonical_text": snapshot["canonical_text"],
-        "sha256": snapshot["sha256"],
+        "spec_revision": view["spec_revision"],
+        "height": view["height"],
+        "canonical_text": view["spec_text"],
+        "sha256": view["spec_hash"],
     }
+    if view.get("derived") is not None:
+        data["derived"] = view["derived"]
     try:
         sequence = db.get_all_spec_snapshots(
             upto_revision=snapshot["spec_revision"]
@@ -345,7 +360,7 @@ def execute(raw_command: str, container):
         data["requested_height"] = height
     if account is not None:
         rules, unattributed = split_conjuncts_by_account(
-            snapshot["canonical_text"], account
+            view["spec_text"], account
         )
         data["account"] = account
         data["rules"] = rules
