@@ -539,9 +539,51 @@ def journal_cut_status(height: int) -> Optional[str]:
     return None if cut is not None else code
 
 
+def checked_snapshot_answer(snap: Optional[Dict]) -> Optional[Dict]:
+    """Step 7 stopgap (B02 §2): a stored snapshot is only served when it
+    agrees with the journal cut at the snapshot's own height.
+
+    The snapshot and the cut are two canonicalizations of the same
+    committed record; they diverged systematically (the snapshot is
+    composed from the append-only accumulation, the cut is the
+    interpreter's normalized spec over the full genesis baseline), so
+    a snapshot that disagrees with the cut is answered with the cut
+    instead -- the cut's text and its sha256, with ``derived`` marking
+    the source. When the snapshot and the cut agree, the snapshot is
+    served unchanged. When the cut cannot be derived at all (no commit
+    record, a journal that no longer verifies, a mirror that cannot
+    speak), the snapshot is served as today: the cut is a check that
+    runs when it can speak, not a gate that withholds the view (O-2,
+    recorded openly; the coordinator may tighten this to "hold when
+    TAMPERED"). A snapshot with no height cannot be checked and is
+    served unchanged. The comparison covers the served text, its
+    sha256, and the spec revision: all three must agree, or the cut
+    answers.
+    """
+    view = _view_shape(snap)
+    if view is None:
+        return None
+    height = view.get("height")
+    if height is None:
+        return view
+    cut, _code = _journal_cut_at_height(int(height))
+    if cut is None:
+        return view
+    if (view.get("spec_text") != cut.get("spec_text")
+            or view.get("spec_hash") != cut.get("spec_hash")
+            or view.get("spec_revision") != cut.get("spec_revision")):
+        return cut
+    return view
+
+
 def resolve_answer_with_status(
         height: Optional[int] = None) -> Tuple[Optional[Dict], Optional[str]]:
     """`resolve_answer` with the no-answer case classified.
+
+    A stored snapshot is served only after the Step 7 check against
+    the journal cut at its own height (see
+    `checked_snapshot_answer`); a divergent snapshot is answered
+    with the cut instead.
 
     Returns (answer, None) whenever an answer exists, else
     (None, code) with the journal cut's failure code for the height
@@ -555,7 +597,7 @@ def resolve_answer_with_status(
     if height is None:
         snap = db.get_latest_spec_snapshot()
         if snap is not None:
-            return _view_shape(snap), None
+            return checked_snapshot_answer(snap), None
         tip = db.canonical_tip_height()
         if tip is None:
             return None, CUT_NOT_FOUND
@@ -563,7 +605,7 @@ def resolve_answer_with_status(
         return cut, (None if cut is not None else code)
     snap = db.get_spec_snapshot_at_or_before(int(height))
     if snap is not None:
-        return _view_shape(snap), None
+        return checked_snapshot_answer(snap), None
     cut, code = _journal_cut_at_height(int(height))
     if cut is not None:
         return cut, None
