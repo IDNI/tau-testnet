@@ -98,7 +98,11 @@ def _key(label):
 OWNER = _key("owner")
 OTHER_OWNER = _key("other-owner")
 EXECUTOR = _key("executor")
-RECIPIENTS = [_key(f"recipient-{i}") for i in range(8)]
+# Nine recipients: slots are 0..7, but the ninth-rule test builds an entry
+# for slot 8 to prove it is refused — the entry needs a ninth recipient
+# purely as a construction artefact (the slot check does not care which
+# recipient the entry names).
+RECIPIENTS = [_key(f"recipient-{i}") for i in range(9)]
 
 
 def _env():
@@ -121,17 +125,30 @@ def real():
     ev.close()
 
 
-def _pay_clause(amount):
-    """A Tau clause paying candidate 0 exactly `amount`, unconditionally."""
+def _pay_clause():
+    """A Tau clause paying candidate 0 the submitted base amount (i1).
+
+    The clause MUST read an input stream: the real policy worker refuses
+    to step a clause that reads no input stream ("clause cannot be
+    evaluated: it reads no input stream"), so a constant clause — however
+    correct its arithmetic — can never settle on the native engine. (The
+    same rule is documented by the grant clause in
+    test_payout_tau_rule_native.py.) The amount paid is the base the
+    caller submits; _execute passes the rule's amount as base.
+    """
     return (
         "((o30[t]:bv[64] = { 1 }:bv[64]) "
         "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
-        f"&& (o32[t]:bv[64] = {{ {amount} }}:bv[64]))"
+        "&& (o32[t]:bv[64] = i1[t]:bv[64]))"
     )
 
 
 def _rule(index, amount, *, owner=OWNER, max_period=0, max_exec=0,
           version=1, anchor=ANCHOR):
+    # `amount` is the rule's intended payment. It is NOT baked into the
+    # clause text anymore: a constant clause cannot step on the real
+    # worker, so the clause pays i1 and the caller passes `amount` as
+    # the execution's base to _execute.
     return PayoutRuleEntry(
         owner_pubkey=owner,
         recipients=(RECIPIENTS[index],),
@@ -142,7 +159,7 @@ def _rule(index, amount, *, owner=OWNER, max_period=0, max_exec=0,
         period_anchor_ts=anchor,
         version=version,
         form=FORM_TAU_RULE,
-        clause_text=_pay_clause(amount),
+        clause_text=_pay_clause(),
         rule_index=index,
     )
 
@@ -151,14 +168,20 @@ def _sid(n):
     return bytes([n]) * 32
 
 
-def _execute(book, entry, sid, balance, ts=TS):
+def _execute(book, entry, sid, balance, base, ts=TS):
     """Step the rule's REAL clause and settle through the book — the
     admission/apply construction: node-built inputs, decoded legs, the
-    book's own checks."""
+    book's own checks.
+
+    `base` is the execution's submitted base amount. The clause pays
+    i1, so the base IS the amount that settles — it must be the rule's
+    own amount (passing 1 would settle 1, not the rule's terms). The
+    same base goes to the book, whose settlement records it.
+    """
     outputs, detail = sender_policy.clause_outputs(
         entry.clause_text,
         payout_clause_inputs(
-            entry, EXECUTOR, 1, ts, balance,
+            entry, EXECUTOR, base, ts, balance,
             book.period_paid_total(entry, ts)),
         pool="apply",
     )
@@ -166,7 +189,7 @@ def _execute(book, entry, sid, balance, ts=TS):
     legs, why = decode_clause_legs(entry, outputs)
     assert legs is not None, why
     return book.execute(
-        entry.rule_id, sid, 1, ts, balance, clause_legs=legs)
+        entry.rule_id, sid, base, ts, balance, clause_legs=legs)
 
 
 # --- (a) eight rules install and pay independently ------------------------------
@@ -185,7 +208,7 @@ def test_eight_rules_install_and_pay_independently(real):
     assert len({e.rule_id for e in entries}) == MAX_RULES_PER_OWNER
 
     for i, entry in enumerate(entries):
-        decision = _execute(book, entry, _sid(10 + i), balance=10_000)
+        decision = _execute(book, entry, _sid(10 + i), balance=10_000, base=100 + i)
         assert decision.executed, decision.reason
         assert decision.legs == ((RECIPIENTS[i], 100 + i),)
         assert book.period_total(entry.rule_id, 0) == 100 + i
@@ -222,15 +245,15 @@ def test_per_rule_caps_bind_separately(real):
     book.install(rule_a, TS)
     book.install(rule_b, TS)
 
-    first = _execute(book, rule_a, _sid(21), balance=10_000)
+    first = _execute(book, rule_a, _sid(21), balance=10_000, base=400)
     assert first.executed
     # Rule A's next execution would push ITS period total to 800 > 500.
-    refused = _execute(book, rule_a, _sid(22), balance=10_000)
+    refused = _execute(book, rule_a, _sid(22), balance=10_000, base=400)
     assert not refused.executed
     assert "max per period" in refused.reason
     assert book.period_total(rule_a.rule_id, 0) == 400
     # Rule B's allowance is its own: the same amount pays in full.
-    other = _execute(book, rule_b, _sid(23), balance=10_000)
+    other = _execute(book, rule_b, _sid(23), balance=10_000, base=400)
     assert other.executed, other.reason
     assert book.period_total(rule_b.rule_id, 0) == 400
 
@@ -244,8 +267,8 @@ def test_replacement_carry_is_per_rule(real):
     rule_1 = _rule(1, 300, max_period=1000)
     book.install(rule_0, TS)
     book.install(rule_1, TS)
-    assert _execute(book, rule_0, _sid(31), balance=10_000).executed
-    assert _execute(book, rule_1, _sid(32), balance=10_000).executed
+    assert _execute(book, rule_0, _sid(31), balance=10_000, base=100).executed
+    assert _execute(book, rule_1, _sid(32), balance=10_000, base=300).executed
 
     # Replace slot 1: its replacement's first period starts at 300 —
     # rule 1's own paid total carried (FIX 5C), nothing of rule 0's.
@@ -361,7 +384,7 @@ def test_retry_is_per_rule(real):
     # settles, no settlement is recorded, no period total advances —
     # for either rule.
     for entry, sid in ((rule_a, _sid(41)), (rule_b, _sid(42))):
-        decision = _execute(book, entry, sid, balance=100)
+        decision = _execute(book, entry, sid, balance=100, base=400)
         assert not decision.executed
         assert "insufficient funds" in decision.reason
         assert not book.is_settled(entry.rule_id, sid)
@@ -370,13 +393,13 @@ def test_retry_is_per_rule(real):
     # Fund the owner and resubmit rule A alone (the same settlement id —
     # the refusal recorded nothing, so the retry is the same execution):
     # A settles; B remains exactly as refused.
-    retried = _execute(book, rule_a, _sid(41), balance=10_000)
+    retried = _execute(book, rule_a, _sid(41), balance=10_000, base=400)
     assert retried.executed, retried.reason
     assert book.period_total(rule_a.rule_id, 0) == 400
     assert not book.is_settled(rule_b.rule_id, _sid(42))
     assert book.period_total(rule_b.rule_id, 0) == 0
 
     # Rule B's own resubmission settles it, on its own terms.
-    retried_b = _execute(book, rule_b, _sid(42), balance=10_000)
+    retried_b = _execute(book, rule_b, _sid(42), balance=10_000, base=400)
     assert retried_b.executed, retried_b.reason
     assert book.period_total(rule_b.rule_id, 0) == 400
