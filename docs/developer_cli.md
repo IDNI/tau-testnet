@@ -162,7 +162,7 @@ The full registry (28 names, `app/container.py`):
 | `getsequence` | `getsequence <address>` |
 | `history` | `history <address>` — mempool only, not chain history |
 | `gettxstatus` | `gettxstatus <tx_hash>` — 64 hex chars |
-| `getblocks` | `getblocks [limit]` — bare form returns the whole chain |
+| `getblocks` | `getblocks [limit] [start]` — bare form returns the whole chain; with `start`, one page of `limit` heights and `next_start` |
 | `getallaccounts` | `getallaccounts` |
 | `gettaustate` | `gettaustate` |
 | `getgovernance` | `getgovernance` |
@@ -352,11 +352,29 @@ tau-testnet blocks --limit 10   # the 10 most recent blocks
 tau-testnet tau-state
 ```
 
-`--limit N` sends `getblocks N` and returns the N highest-numbered blocks,
-still ordered oldest → newest. Prefer it on a long chain: the unlimited form
-can exceed the CLI's 4 MiB read ceiling and fail with exit code `3`. The
-response also carries `total` (the full chain length) and `truncated`, so a
-short window is distinguishable from a short chain.
+`--limit N` returns the N highest-numbered blocks, still ordered oldest →
+newest. The response also carries `total` (the full chain length) and
+`truncated`, so a short window is distinguishable from a short chain.
+
+Each node answer has a 4 MiB read cap, so the CLI reads a long chain in pages.
+`blocks` with no limit sends `getblocks 100 <start>` from height 0 and
+follows `next_start` until it is `null`. A page that exceeds the cap is read
+again with half the heights.
+
+`blocks --limit N` with N of 100 or less sends one `getblocks N`. With N
+above 100, the CLI asks `getblocks 1` for the tip, and reads the pages from
+height `tip - N + 1` to the tip. The tip can be an orphan block above a gap.
+When these pages hold fewer than N rows, the CLI reads the pages below them,
+until it has N rows or reaches height 0. The result is the same N rows as one
+`getblocks N`.
+
+`getblocks <limit> <start>` returns every row with
+`start <= block_number < start + limit`, forks included, so a page never
+splits a height. The answer adds `start` and `next_start`: the first block
+number above the page, or `null` when the page holds the tip. When the node
+does not know this form, the CLI sends one `getblocks` or `getblocks N`
+instead. That gives the full answer, or exit code `3` when the answer exceeds
+the cap.
 
 ### Governance introspection
 

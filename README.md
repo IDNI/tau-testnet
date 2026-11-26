@@ -257,6 +257,7 @@ tau-testnet balance <pubkey>
 tau-testnet sequence <pubkey>
 tau-testnet history <pubkey>
 tau-testnet blocks --limit 10
+tau-testnet blocks                # the whole chain, read in pages
 tau-testnet mempool
 tau-testnet governance
 

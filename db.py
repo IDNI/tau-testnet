@@ -4,7 +4,7 @@ import logging
 import os
 import sqlite3
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from contextlib import contextmanager
 
 import config
@@ -2097,6 +2097,30 @@ def get_recent_blocks(limit: int) -> List[Dict]:
     blocks = _parse_block_data_rows(rows)
     blocks.reverse()
     return blocks
+
+
+def get_blocks_in_height_range(start: int, count: int) -> Tuple[List[Dict], Optional[int]]:
+    """Rows with `start <= block_number < start + count`, ascending, forks included.
+
+    Also returns the lowest block number above the range, or None when no row
+    is above it, so a pager can continue across gaps without a second guess.
+    """
+    if _db_conn is None:
+        init_db()
+    # Clamp to the SQLite INTEGER range: start and count may each be at its top.
+    end = min(int(start) + max(int(count), 0), 2**63 - 1)
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT block_data FROM blocks WHERE block_number >= ? AND block_number < ? '
+            'ORDER BY block_number ASC',
+            (int(start), end),
+        )
+        rows = cur.fetchall()
+        cur.execute('SELECT MIN(block_number) FROM blocks WHERE block_number >= ?', (end,))
+        row = cur.fetchone()
+    next_start = int(row[0]) if row and row[0] is not None else None
+    return _parse_block_data_rows(rows), next_start
 
 def get_canonical_blocks_at_or_after_height(block_number: int) -> List[Dict]:
     """
