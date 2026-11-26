@@ -145,6 +145,27 @@ GENESIS_SURVIVING_STORED = [
     "o1[t]:bv[24] = i1[t]:bv[24]",
 ]
 
+# GENESIS_SURVIVING_CHECKED: the genesis unit's 9 surviving
+# conjuncts as the CHECKED (served) text renders them (O-4 (a)).
+# The ledger now reads the checked text, so the genesis unit is the
+# CUT form on builtin 02: bv[384] with the operands i4=i3, vs the
+# stored form's bv[8] i3=i4. The other 8 conjuncts are identical
+# between the stored and the cut renderings (pinned from mirror run
+# 45787977564: the cut renders the 8 non-b02 conjuncts identically,
+# and the ledger union's single diff gives the cut b02). The stored
+# form above is kept as documentation of what the snapshots record.
+GENESIS_SURVIVING_CHECKED = [
+    "(i0[t]:tau = 0 || o0[t]:tau = 0 && u[t]:tau = i0[t]:tau)",
+    "(o0[t]:tau' = 0 || i0[t]:tau != 0)",
+    "o7[t]:bv[16] = { 1 }:bv[16]",
+    "o9[t]:bv[24] = { 10 }:bv[24]",
+    "o6[t]:bv[16] = i10[t]:bv[16]",
+    "(o2[t]:bv[24] = 0 && i2[t]:bv[24] < i1[t]:bv[24] || o2[t]:bv[24] = { 1 }:bv[24] && i2[t]:bv[24] !< i1[t]:bv[24])",
+    "(o3[t]:bv[16] = 0 && i4[t]:bv[384] = i3[t]:bv[384] || o3[t]:bv[16] = { 1 }:bv[16] && i4[t]:bv[384] != i3[t]:bv[384])",
+    "(o4[t]:bv[24] = 0 && i1[t]:bv[24] = 0 || i1[t]:bv[24] != 0 && o4[t]:bv[24] = { 1 }:bv[24])",
+    "o1[t]:bv[24] = i1[t]:bv[24]",
+]
+
 
 def _env():
     env = dict(os.environ)
@@ -546,15 +567,17 @@ def test_unit_ledger_served_under_authority(authority, _mining_allowed):
     assert genesis["introduced_at_height"] == 0
     assert genesis["introduced_at_revision"] == first["introduced_at_revision"] - 1
     assert genesis["status"] == "in_force"
-    # NOTE (F5d): the exact genesis conjuncts ARE now asserted (the
-    # coordinator correction asked for them to be pinned once CI
-    # revealed the rendering -- mirror run 45779972374 did: the cut
-    # renders the 8 non-b02 conjuncts, the union diff gives the
-    # stored b02). The genesis unit is the STORED form (bv[8],
-    # i3=i4), not the cut form (bv[384], i4=i3) -- the ledger reads
-    # stored snapshots, and the two differ on b02 alone (O-4).
+    # NOTE (F5d, updated by O-4 (a)): the exact genesis conjuncts ARE
+    # asserted (the coordinator correction asked for them to be pinned
+    # once CI revealed the rendering -- mirror run 45779972374 did:
+    # the cut renders the 8 non-b02 conjuncts, the union diff gives
+    # the stored b02). The genesis unit is now the CHECKED form
+    # (bv[384], i4=i3), not the stored form (bv[8], i3=i4) -- the
+    # ledger reads the checked (served) text since O-4 (a), and the
+    # two differ on b02 alone. The stored form is kept as
+    # GENESIS_SURVIVING_STORED for documentation.
     assert sorted(genesis["surviving_conjuncts"]) == sorted(
-        GENESIS_SURVIVING_STORED)
+        GENESIS_SURVIVING_CHECKED)
     assert genesis["displaced_conjuncts"] == []
     assert first["introduced_by_tx"] == install["tx_hash"]
     assert first["status"] == "partially_displaced"
@@ -569,16 +592,18 @@ def test_unit_ledger_served_under_authority(authority, _mining_allowed):
     assert second["introduced_by_tx"] == displace["tx_hash"]
     assert second["status"] == "in_force"
 
-    # NOTE (F4, known residual -- not an F4 defect): the union below is
-    # the check that the served text and the ledger agree, and it is
-    # currently predicted to fail on builtin 02 ALONE. The stored
-    # snapshots carry b02 shrunk (bv[8], the worker's fed form) while
-    # the served view text is the journal cut, which the mirror renders
-    # full-width (bv[384]); the two canonicalizations are not yet
-    # unified, so sorted(surviving) and the served conjuncts differ by
-    # exactly the b02 pair. The ledger is complete against the stored
-    # canonical text (verified in the F4 simulation); unifying the two
-    # canonicalizations is the follow-up that makes this union green.
+    # NOTE (F4, resolved by O-4 (a)): the union below is the check
+    # that the served text and the ledger agree. It used to fail on
+    # builtin 02 ALONE (the stored snapshots carry b02 shrunk to
+    # bv[8], the worker's fed form, while the served view text is the
+    # journal cut, which the mirror renders full-width bv[384]).
+    # Since O-4 (a) the ledger is derived from the checked (served)
+    # text, so the union holds by construction -- the ledger and the
+    # view read the same text. The two canonicalizations are still
+    # not unified (the stored snapshots still carry the shrunk b02);
+    # unifying them is the permanent fix. The union no longer
+    # detects stored-vs-cut divergence -- that divergence is visible
+    # only through the derived="journal_cut" marker.
     surviving = []
     for unit in units:
         surviving.extend(unit["surviving_conjuncts"])

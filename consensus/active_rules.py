@@ -576,6 +576,35 @@ def checked_snapshot_answer(snap: Optional[Dict]) -> Optional[Dict]:
     return view
 
 
+def checked_snapshot_sequence(
+        snapshots: List[Dict]) -> Tuple[Optional[List[Dict]], Optional[str]]:
+    """Map stored snapshots to the text the view actually serves.
+
+    O-4 (a): the per-unit ledger describes the SERVED state, so it is
+    derived from the checked text of every snapshot in the served
+    history, not from the stored text. Each snapshot is run through
+    `checked_snapshot_answer` (the Step 7 check); the returned rows
+    keep the stored snapshot's revision and height and carry the
+    checked text + sha256. Returns (sequence, None) on success. When
+    any snapshot's check HOLDs (its journal cut is TAMPERED -- see
+    O-2), the whole history's integrity is broken: return
+    (None, CUT_TAMPERED) and serve nothing rather than a ledger over
+    a history that cannot be verified.
+    """
+    checked = []
+    for snap in snapshots:
+        view = checked_snapshot_answer(snap)
+        if view is None:
+            return None, CUT_TAMPERED
+        checked.append({
+            "spec_revision": snap["spec_revision"],
+            "height": snap.get("height"),
+            "canonical_text": view["spec_text"],
+            "sha256": view["spec_hash"],
+        })
+    return checked, None
+
+
 def resolve_answer_with_status(
         height: Optional[int] = None) -> Tuple[Optional[Dict], Optional[str]]:
     """`resolve_answer` with the no-answer case classified.

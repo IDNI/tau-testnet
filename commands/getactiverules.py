@@ -330,10 +330,17 @@ def execute(raw_command: str, container):
     # divergent snapshot. When NO snapshot exists the answer stays
     # not-available (the wipe contract: a wiped node answers
     # available:false) -- the cut is never substituted for a missing
-    # snapshot here. The unit ledger below is still derived from the
-    # stored snapshot sequence (see derive_unit_ledger); the permanent
-    # fix unifies the two canonicalizations so the served text and
-    # the ledger agree again.
+    # snapshot here. The unit ledger below is derived from the CHECKED
+    # snapshot sequence (O-4 (a)): the ledger describes the served
+    # state, so each snapshot is mapped through the Step 7 check
+    # before the ledger reads it -- the stored text and the served
+    # text diverge on builtin 02 (the worker's fed form is shrunk to
+    # bv[8]; the journal cut renders full-width bv[384]), so a ledger
+    # read from the stored text attributes units to a state the view
+    # does not serve. The permanent fix unifies the two
+    # canonicalizations; until then the ledger reads the checked text
+    # by construction, and the stored-vs-cut divergence is visible
+    # only through the derived="journal_cut" marker.
     view = active_rules.checked_snapshot_answer(snapshot)
     data = {
         "available": True,
@@ -345,9 +352,32 @@ def execute(raw_command: str, container):
     if view.get("derived") is not None:
         data["derived"] = view["derived"]
     try:
-        sequence = db.get_all_spec_snapshots(
-            upto_revision=snapshot["spec_revision"]
+        sequence, sequence_code = active_rules.checked_snapshot_sequence(
+            db.get_all_spec_snapshots(
+                upto_revision=snapshot["spec_revision"]))
+    except Exception as exc:
+        return api_response.error_response(
+            "getactiverules",
+            f"Failed to check the snapshot sequence: {exc}",
+            "INTERNAL_ERROR",
         )
+    if sequence is None:
+        # O-2: a snapshot in the served history fails its journal-cut
+        # check (TAMPERED) -- hold, do not serve a ledger over a
+        # history whose integrity is broken. (Defense in depth: the
+        # journal is append-only, so a tampered entry in an earlier
+        # cut is in every later cut too -- the served snapshot's own
+        # check would hold first; this branch catches the same failure
+        # if the sequence is ever checked on its own.)
+        data = {"available": False}
+        if height is not None:
+            data["requested_height"] = height
+        data["message"] = (
+            "the journal cut for a snapshot in the served history is "
+            "TAMPERED; the active rules are not available")
+        data["cut_status"] = sequence_code
+        return api_response.success_response("getactiverules", data)
+    try:
         data["units"] = derive_unit_ledger(
             sequence, db.get_rule_tx_by_revision()
         )
