@@ -86,6 +86,44 @@ PROBE_A = ("always ( o26[t]:bv[24] = { 7 }:bv[24] && "
            "o27[t]:bv[24] = { 9 }:bv[24] ).")
 PROBE_B = "always ( o26[t]:bv[24] = { 3 }:bv[24] )."
 
+# Genesis baseline conjuncts (B02 §3 / F4, new world after F3-permanent):
+# every snapshot is now the executing session's own spec, carried in the
+# receipt (receipt.get("current_spec")), so S0/S1/S2 all carry the same
+# eight genesis conjuncts -- consensus o6/o7/o9, application, builtins
+# 01-04 -- and the genesis unit reads in_force. Builtin 02 is the
+# worker's shrunk form (i3/i4 bv[384] -> bv[8]; tau_shrink
+# MIN_SHRINK_WIDTH=128, fresh-chain width 8; prepare_rule verified
+# empirically on the real b02 text). GENESIS_B02_FULL is the form the
+# journal-cut mirror renders (it is fed full-width journal text): the
+# served view text carries it while the stored ledger carries the shrunk
+# form -- the two differ on b02 only (see the union note below). The
+# exact strings below assume the interpreter renders its spec
+# '.'-separated at the fed spacing (O-1); CI answers that empirically.
+# COORDINATOR CORRECTION: the baseline CI cut already contradicts the
+# as-fed assumption (it normalizes APP/o1/o9/B01), so only GENESIS_O6
+# and GENESIS_O7 -- the two plain assignments the cut verifies
+# verbatim -- are asserted on; the rest of these constants are the
+# as-fed model kept as documentation until CI reveals the rendering.
+GENESIS_APP = ("((!(i0[t] = 0)) ? ( u[t] = i0[t] && o0[t] = 0 ) : o0[t] = 1)")
+GENESIS_B01 = (
+    "((i1[t]:bv[24] > i2[t]:bv[24]) && o2[t] = { #x000000 }:bv[24]) || "
+    "((i1[t]:bv[24] <= i2[t]:bv[24]) && o2[t] = { #x000001 }:bv[24])")
+GENESIS_B02_FULL = (
+    "((i3[t]:bv[384] = i4[t]:bv[384]) && o3[t] = { #x0000 }:bv[16]) || "
+    "((i3[t]:bv[384] != i4[t]:bv[384]) && o3[t] = { #x0001 }:bv[16])")
+GENESIS_B02_SHRUNK = (
+    "((i3[t]:bv[8] = i4[t]:bv[8]) && o3[t] = { #x0000 }:bv[16]) || "
+    "((i3[t]:bv[8] != i4[t]:bv[8]) && o3[t] = { #x0001 }:bv[16])")
+GENESIS_B03 = (
+    "((i1[t]:bv[24] = { #x000000 }:bv[24]) && o4[t] = { #x000000 }:bv[24]) || "
+    "((i1[t]:bv[24] != { #x000000 }:bv[24]) && o4[t] = { #x000001 }:bv[24])")
+GENESIS_B04 = (
+    "o1[t]:bv[24] = ((i1[t]:bv[24] + { #x000000 }:bv[24]) & "
+    "((i1[t]:bv[24] + { #x000000 }:bv[24]) | { #x000000 }:bv[24]))")
+GENESIS_O6 = "o6[t]:bv[16] = i10[t]:bv[16]"
+GENESIS_O7 = "o7[t]:bv[16] = { 1 }:bv[16]"
+GENESIS_O9 = "o9[t]:bv[24] = { #x00000a }:bv[24]"
+
 
 def _env():
     env = dict(os.environ)
@@ -425,21 +463,69 @@ def test_snapshot_text_equals_journal_cut_replay_at_each_height(
 def test_unit_ledger_served_under_authority(authority, _mining_allowed):
     """After install + displace under the authoritative worker, the
     served view's per-unit ledger is NOT empty (the #134-line harness
-    observation does not carry): the install unit reads
-    partially_displaced with its loss attributed to the displacing
-    transaction, the displacing unit reads in_force, the units are
-    attributed to the transactions that were actually mined, and the
-    ledger's surviving conjuncts are exactly the conjuncts of the text
-    the view serves."""
+    observation does not carry): the genesis unit -- recorded as the
+    baseline snapshot at height 0 (B02 §3) from the receipt-carried
+    session spec -- reads in_force (all eight genesis conjuncts survive
+    every later snapshot), the install unit reads partially_displaced
+    with its loss attributed to the displacing transaction, the
+    displacing unit reads in_force, the units are attributed to the
+    transactions that were actually mined, and the ledger's surviving
+    conjuncts are exactly the conjuncts of the text the view serves.
+
+    Revisions are asserted relatively (genesis == install - 1): no
+    assert pins the absolute genesis revision, which is 6 when the
+    application unit counts and 5 when it lands ACCEPTED_NOOP."""
     sk, pk = _sender("authority-ledger")
     install = _submit_and_mine(sk, pk, PROBE_A, seq=0)
     displace = _submit_and_mine(sk, pk, PROBE_B, seq=1)
 
+    # The genesis snapshot is the ledger's baseline: recorded at height 0
+    # (B02 §3) with the executing session's spec (consensus + application
+    # + builtins). Verified against the stored sequence, not the served
+    # height-0 view: the Step 7 checked-snapshot answer serves the
+    # journal cut at height 0, and the cut at height 0 is the pre-genesis
+    # baseline by construction (cut_len=0, revision 0 --
+    # active_rules._journal_cut_at_height), so the served height-0 text
+    # carries no o6 and reports revision 0. That is a known stopgap
+    # divergence (fix: include the genesis journal entries in the
+    # height-0 cut, or exempt the genesis snapshot from the check), not
+    # a defect of the recorded snapshot checked here.
+    stored0 = db.get_spec_snapshot_at_height(0)
+    assert stored0 is not None, "no snapshot recorded at height 0"
+    assert stored0["height"] == 0, stored0
+    assert GENESIS_O6 in getactiverules.top_level_conjuncts(
+        stored0["canonical_text"]), stored0
+    at0 = _answer_at(0)
+    assert at0["available"] is True, at0
+    assert at0["height"] == 0, at0
+
     view = _answer_at()
     assert view["available"] is True
     units = view["units"]
-    assert len(units) == 2, units
-    first, second = units
+    assert len(units) == 3, units
+    genesis, first, second = units
+    assert stored0["spec_revision"] == genesis["introduced_at_revision"]
+    assert genesis["introduced_by_tx"] is None
+    assert genesis["introduced_at_height"] == 0
+    assert genesis["introduced_at_revision"] == first["introduced_at_revision"] - 1
+    assert genesis["status"] == "in_force"
+    # NOTE (coordinator correction of the F4 test): the exact genesis
+    # conjunct strings are NOT asserted here. They depend on the
+    # interpreter's rendering (O-1, unverified): the baseline CI cut
+    # already shows the interpreter normalizes the as-fed forms (APP
+    # ternary -> disjunction, o1 simplified to i1, o9 rendered
+    # '{ 10 }' not '{ #x00000a }', B01 reordered) -- so the as-fed
+    # constants above cannot be asserted verbatim (the baseline log
+    # truncates the cut, so the full normalized strings are not
+    # recoverable from it). What IS asserted (rendering-robust): the
+    # genesis unit is in_force, and the two plain-assignment conjuncts
+    # the cut verifies verbatim (O6, O7) survive in it. The exact
+    # normalized strings will be pinned from CI output once the mirror
+    # reveals the rendering.
+    assert GENESIS_O6 in genesis["surviving_conjuncts"]
+    assert GENESIS_O7 in genesis["surviving_conjuncts"]
+    assert len(genesis["surviving_conjuncts"]) >= 2
+    assert genesis["displaced_conjuncts"] == []
     assert first["introduced_by_tx"] == install["tx_hash"]
     assert first["status"] == "partially_displaced"
     assert first["surviving_conjuncts"] == [
@@ -453,6 +539,16 @@ def test_unit_ledger_served_under_authority(authority, _mining_allowed):
     assert second["introduced_by_tx"] == displace["tx_hash"]
     assert second["status"] == "in_force"
 
+    # NOTE (F4, known residual -- not an F4 defect): the union below is
+    # the check that the served text and the ledger agree, and it is
+    # currently predicted to fail on builtin 02 ALONE. The stored
+    # snapshots carry b02 shrunk (bv[8], the worker's fed form) while
+    # the served view text is the journal cut, which the mirror renders
+    # full-width (bv[384]); the two canonicalizations are not yet
+    # unified, so sorted(surviving) and the served conjuncts differ by
+    # exactly the b02 pair. The ledger is complete against the stored
+    # canonical text (verified in the F4 simulation); unifying the two
+    # canonicalizations is the follow-up that makes this union green.
     surviving = []
     for unit in units:
         surviving.extend(unit["surviving_conjuncts"])
