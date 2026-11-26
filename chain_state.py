@@ -2281,8 +2281,16 @@ def save_effective_tau_spec(canonical_rule_text: str):
         return
     with _rules_lock:
         units = [u for u in (_application_rules_state or "").split("\n") if u.strip()]
-        if unit not in units:  # idempotent: dedup exact units (re-apply / replay)
-            units.append(unit)
+        # B02 §1: a verbatim re-submission is a NEW revision, not an
+        # accumulation replay -- move the unit to the end (instead of
+        # dropping it) so the composed snapshot reads the resend's
+        # terms (o26=7 after A-B-A). Replay stays deterministic: the
+        # move is a pure function of the unit sequence. The
+        # accumulation is hashed consensus state; the hash impact is
+        # accepted by the coordinator (decision 2026-11-26) and noted
+        # in the PR body.
+        units = [u for u in units if u != unit]
+        units.append(unit)
         _application_rules_state = "\n".join(units)
         snapshot = _application_rules_state
     try:
