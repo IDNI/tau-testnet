@@ -348,7 +348,8 @@ def _interpreter_spec_revision(interpreter):
         return None
 
 
-def _build_revision_receipt(*, delivered, outputs, before, after, has_error):
+def _build_revision_receipt(*, delivered, outputs, before, after, has_error,
+                           current_spec=None):
     """Classify what the engine did with a revision.
 
     Measured on the real engine, on the router the node boots:
@@ -386,6 +387,12 @@ def _build_revision_receipt(*, delivered, outputs, before, after, has_error):
         "outputs": named or None,
         "spec_revision_before": before,
         "spec_revision_after": after,
+        # B02 §2 (permanent): the interpreter's spec as of this step,
+        # carried so the snapshot capture reads the spec at the
+        # revision the step advanced to -- the same normalized form
+        # the journal-cut mirror serves. None when the spec could
+        # not be read; the caller then falls back (and records it).
+        "current_spec": current_spec,
     }
 
 class TauInterface:
@@ -431,6 +438,21 @@ class TauInterface:
             logger.debug("Appending missing '.' to spec for native interpreter compatibility.")
             text += "."
         return text
+
+    def _current_spec_or_none(self):
+        """The interpreter's current spec (trailing period ensured), or None.
+
+        Guarded: a receipt must never fail to build because the spec
+        could not be read. This is the same text get_current_spec()
+        reports (the interpreter's normalized spec, the form the
+        journal-cut mirror serves) -- the B02 §2 permanent snapshot
+        source, carried in the receipt so the snapshot capture reads
+        the spec as of this step.
+        """
+        try:
+            return self._ensure_trailing_period(self.interpreter.current_spec())
+        except Exception:
+            return None
 
     @staticmethod
     def _strip_nonliteral_hash_comments(line: str) -> str:
@@ -661,6 +683,7 @@ class TauInterface:
                     before=revision_before,
                     after=_interpreter_spec_revision(self.interpreter),
                     has_error=has_error,
+                    current_spec=self._current_spec_or_none(),
                 )
             raise exc
 
@@ -770,6 +793,7 @@ class TauInterface:
                 before=revision_before,
                 after=_interpreter_spec_revision(self.interpreter),
                 has_error=report.has_error,
+                current_spec=self._current_spec_or_none(),
             )
 
         revision_after = _interpreter_spec_revision(self.interpreter)
