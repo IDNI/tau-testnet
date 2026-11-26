@@ -997,6 +997,49 @@ def block_commit_at_height(height: int) -> Optional[Dict]:
     return out
 
 
+def genesis_block_commit() -> Optional[Dict]:
+    """The commit record of the genesis block, or None.
+
+    Genesis (height 0) has no commit record in `block_commit_at_height`
+    by design, but `_commit_genesis` DOES record a genesis commit in
+    `block_commits_v1` (tip = the genesis hash, journal_head = the link
+    of the last genesis journal entry). O-5 needs that record: the
+    journal cut at height 0 resolves its cut length from the genesis
+    commit's journal head, so the cut carries the genesis journal
+    entries instead of the empty pre-genesis baseline. Returns None
+    when no genesis commit exists (a database predating the genesis
+    commit) -- the height-0 cut then falls back to the pre-genesis
+    baseline, as before. Same dict shape as `block_commit_at_height`.
+    """
+    genesis_hash = get_genesis_hash()
+    if not genesis_hash:
+        return None
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT execution_id, tip, parent, journal_head, allocator_digest, '
+            'plan_id, plan_json, spec_revision, time_point, committed_at '
+            'FROM block_commits_v1 WHERE tip = ? '
+            'ORDER BY committed_at DESC, rowid DESC LIMIT 1',
+            (genesis_hash,),
+        )
+        row = cur.fetchone()
+        cur.execute('SELECT timestamp FROM blocks WHERE block_hash = ?',
+                    (genesis_hash,))
+        ts = cur.fetchone()
+    if row is None:
+        return None
+    keys = ("execution_id", "tip", "parent", "journal_head",
+            "allocator_digest", "plan_id", "plan_json", "spec_revision",
+            "time_point", "committed_at")
+    out = dict(zip(keys, row))
+    out["block_hash"] = genesis_hash
+    out["block_timestamp"] = int(ts[0]) if ts else None
+    return out
+
+
 def current_tip():
     """The canonical head hash, or None. Named for the commit protocol."""
     return get_chain_state_value("canonical_head_hash", "") or None

@@ -539,15 +539,13 @@ def test_unit_ledger_served_under_authority(authority, _mining_allowed):
 
     # The genesis snapshot is the ledger's baseline: recorded at height 0
     # (B02 §3) with the executing session's spec (consensus + application
-    # + builtins). Verified against the stored sequence, not the served
-    # height-0 view: the Step 7 checked-snapshot answer serves the
-    # journal cut at height 0, and the cut at height 0 is the pre-genesis
-    # baseline by construction (cut_len=0, revision 0 --
-    # active_rules._journal_cut_at_height), so the served height-0 text
-    # carries no o6 and reports revision 0. That is a known stopgap
-    # divergence (fix: include the genesis journal entries in the
-    # height-0 cut, or exempt the genesis snapshot from the check), not
-    # a defect of the recorded snapshot checked here.
+    # + builtins). Since O-5 the served height-0 view IS the genesis
+    # snapshot: the journal cut at height 0 now carries the genesis
+    # journal entries (resolved from the genesis commit's journal head),
+    # so the served height-0 text carries o6 and reports the genesis
+    # spec revision -- no longer the pre-genesis baseline (cut_len=0,
+    # revision 0). The stored snapshot is still checked directly here
+    # (it is the recorded baseline the ledger reads from).
     stored0 = db.get_spec_snapshot_at_height(0)
     assert stored0 is not None, "no snapshot recorded at height 0"
     assert stored0["height"] == 0, stored0
@@ -556,6 +554,12 @@ def test_unit_ledger_served_under_authority(authority, _mining_allowed):
     at0 = _answer_at(0)
     assert at0["available"] is True, at0
     assert at0["height"] == 0, at0
+    # O-5: the served height-0 view carries the genesis rules (o6)
+    # and reports the genesis spec revision, matching the stored
+    # genesis snapshot -- not the pre-genesis baseline.
+    assert GENESIS_O6 in getactiverules.top_level_conjuncts(
+        at0["canonical_text"]), at0
+    assert at0["spec_revision"] == stored0["spec_revision"], at0
 
     view = _answer_at()
     assert view["available"] is True

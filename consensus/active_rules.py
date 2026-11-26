@@ -445,9 +445,25 @@ def _journal_cut_at_height(
             block_hash = db.get_genesis_hash() or None
             if not block_hash:
                 return None, CUT_NOT_FOUND
-            revision: Optional[int] = 0
-            cut_len = 0
-            commit = None
+            # O-5: the genesis journal entries belong in the height-0
+            # cut. _commit_genesis records a genesis commit in
+            # block_commits_v1 (tip = the genesis hash); its journal
+            # head is the link of the last genesis entry, so the cut
+            # carries the genesis rules instead of the empty
+            # pre-genesis baseline. When no genesis commit exists (a
+            # database predating the genesis commit), fall back to the
+            # pre-genesis baseline (cut_len=0, revision 0).
+            commit = db.genesis_block_commit()
+            if commit is None:
+                revision: Optional[int] = 0
+                cut_len = 0
+            else:
+                revision = commit.get("spec_revision")
+                if revision is None:
+                    # A commit that names a journal head but no
+                    # revision cannot pin the cut to a spec_revision.
+                    return None, CUT_NOT_FOUND
+                cut_len = -1  # resolved against the journal head below
         else:
             commit = db.block_commit_at_height(height)
             if commit is None:
@@ -462,7 +478,7 @@ def _journal_cut_at_height(
         journal = tau_journal.journal_from_rows(
             db.committed_journal_entries())
         entries = journal.entries()
-        if height > 0:
+        if commit is not None:
             head_link = commit.get("journal_head")
             if head_link is None:
                 return None, CUT_NOT_FOUND
@@ -517,9 +533,10 @@ def journal_cut_at_height(height: int) -> Optional[Dict]:
     block hash it answers for), or None when the cut cannot be derived:
     no commit record for the height, a commit that names no journal
     head, a journal head the journal no longer holds, a journal that
-    does not verify, or a mirror that cannot speak. Height 0 is the
-    empty cut: the program baseline before any committed entry.
-    `journal_cut_status` classifies the None.
+    does not verify, or a mirror that cannot speak. Height 0 carries
+    the genesis journal entries when a genesis commit exists (O-5);
+    it is the empty pre-genesis baseline only when no genesis commit
+    is recorded. `journal_cut_status` classifies the None.
     """
     cut, _code = _journal_cut_at_height(height)
     return cut
