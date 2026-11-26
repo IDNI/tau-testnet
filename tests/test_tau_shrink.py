@@ -34,7 +34,59 @@ def test_zero_is_reserved_id_zero(temp_database):
 
 
 def test_width_for_count_boundaries():
-    assert [ts.width_for_count(n) for n in (0, 254, 255, 65534, 65535)] == [8, 8, 16, 16, 24]
+    # The width always has room for the next id: 254 ids fill bv[8].
+    assert [ts.width_for_count(n) for n in (0, 253, 254, 65533, 65534)] == [8, 8, 16, 16, 24]
+
+
+def test_a_reexec_minimum_widens_the_process_width(monkeypatch):
+    monkeypatch.setattr(ts, "_width_pinned", False)
+    monkeypatch.setattr(ts, "_current_shrink_width", ts.DEFAULT_SHRINK_WIDTH)
+    monkeypatch.setattr(db, "get_max_shrink_id", lambda: 10)
+    monkeypatch.setenv(ts.MIN_WIDTH_ENV, "16")
+    assert ts.set_shrink_width_from_db() == 16
+
+
+@pytest.mark.parametrize("value", ["wide", "12", "0", "-16"])
+def test_a_malformed_reexec_minimum_is_ignored(monkeypatch, caplog, value):
+    monkeypatch.setattr(ts, "_width_pinned", False)
+    monkeypatch.setattr(ts, "_current_shrink_width", ts.DEFAULT_SHRINK_WIDTH)
+    monkeypatch.setattr(db, "get_max_shrink_id", lambda: 10)
+    monkeypatch.setenv(ts.MIN_WIDTH_ENV, value)
+    assert ts.set_shrink_width_from_db() == 8
+    assert "not a positive multiple of 8" in caplog.text
+
+
+def test_the_allocator_width_is_the_wider_of_plan_and_process(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ts, "_current_shrink_width", 16)
+    assert ts.allocator_width(SimpleNamespace(width=8)) == 16
+    assert ts.allocator_width(SimpleNamespace(width=24)) == 24
+
+
+def test_a_full_allocator_is_a_width_overflow(temp_database):
+    # A capacity error must reach the re-exec, never a full-width fallback.
+    import tau_allocator as alloc
+
+    snapshot = alloc.MappingSnapshot(
+        epoch="e0", committed={f"bv384:{i:096x}": i for i in range(1, 255)})
+    with ts.speculative_allocation(allocator=alloc.Allocator(snapshot, width=8)):
+        with pytest.raises(ts.ShrinkWidthOverflow) as info:
+            ts.intern_value(HEX96, 384)
+    assert info.value.required_id == 255
+    assert isinstance(info.value.__cause__, alloc.AllocatorCapacityExceeded)
+
+
+def test_another_allocator_error_stays_unavailable(temp_database):
+    import tau_allocator as alloc
+
+    parent = alloc.Allocator(alloc.MappingSnapshot(epoch="e0", committed={}), width=8)
+    child = parent.child()
+    parent.discard(child)
+    with ts.speculative_allocation(allocator=child):
+        with pytest.raises(ts.ShrinkUnavailable) as info:
+            ts.intern_value(HEX96, 384)
+    assert not isinstance(info.value.__cause__, alloc.AllocatorCapacityExceeded)
 
 
 # --- the shrink id space is dense (block churn must not touch it) -------------
@@ -108,8 +160,9 @@ def test_overflow_raises_widthoverflow(temp_database, monkeypatch):
     # An interned id beyond the current process width (default bv[8], usable<=254)
     # raises ShrinkWidthOverflow -> the node must re-exec to widen (not fail-closed).
     monkeypatch.setattr(db, "get_shrink_id", lambda key: 9999)
-    with pytest.raises(ts.ShrinkWidthOverflow):
+    with pytest.raises(ts.ShrinkWidthOverflow) as info:
         ts.intern_value(HEX96, 384)
+    assert info.value.required_id == 9999
 
 
 def test_the_planner_lets_a_width_overflow_reach_its_caller(temp_database, monkeypatch):

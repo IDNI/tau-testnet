@@ -318,8 +318,8 @@ def _speculative_proposal(candidate_rules=()):
     def _spawn(replay_trace, current_plan):
         session = tau_session.WorkerSession.spawn(
             baseline, trace=replay_trace, plan=current_plan,
-            allocation=tau_allocator.Allocator(snapshot, width=current_plan.width,
-                                               label="proposal"),
+            allocation=tau_allocator.Allocator(
+                snapshot, width=tau_shrink.allocator_width(current_plan), label="proposal"),
         )
         return session
 
@@ -348,7 +348,7 @@ def _speculative_proposal(candidate_rules=()):
     return tau_proposal.ProposalContext(
         session=session,
         journal=tau_journal.Journal(authoritative=False),
-        allocator=tau_allocator.Allocator(snapshot, width=plan.width,
+        allocator=tau_allocator.Allocator(snapshot, width=tau_shrink.allocator_width(plan),
                                           label="proposal"),
         plan=plan, rebuild=rebuild, label="miner",
         respawn=lambda current_plan: _spawn([], current_plan),

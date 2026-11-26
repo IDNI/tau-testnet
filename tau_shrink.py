@@ -31,6 +31,7 @@ CRITICAL INVARIANTS (see plan: the-problem-in-replicated-taco.md):
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 from dataclasses import dataclass, replace
@@ -48,17 +49,8 @@ RESERVED_EMPTY_ID = 0
 # operands (amounts, balances, heights) are decimals well under this and never match.
 MIN_SHRINK_WIDTH = 128
 
-# --- Dynamic shrink width -----------------------------------------------------
-# The OUTPUT width used for shrunk literals/streams is the SMALLEST byte-multiple
-# bv that holds the current interned-address count, chosen ONCE per process (the
-# native engine's per-stream bv typing is process-global and sticky -- it cannot
-# change within a running process). Usable id range at width W is [1, 2^W - 2]
-# (0 reserved for empty; the top value reserved as the grow boundary), so:
-#   count <= 254      -> bv[8]
-#   count <= 65534    -> bv[16]
-#   count <= 2^24 - 2 -> bv[24] ...
-# When an interned id would exceed the current width, the node must re-exec (a
-# fresh process re-types at the next width); see ShrinkWidthOverflow.
+# The engine types each stream once per process, so the width is chosen once
+# (width_for_count) and grows only by a re-exec (ShrinkWidthOverflow).
 DEFAULT_SHRINK_WIDTH = 8
 _current_shrink_width: int = DEFAULT_SHRINK_WIDTH
 # True once the width has been chosen for this process. A later recompute is
@@ -75,19 +67,54 @@ _VERDICT_OUTPUT_STREAMS = frozenset({0, 1, 5, 6, 7})
 
 
 def _max_usable_id(width: int) -> int:
+    # 0 is the empty value, and the top value is the grow boundary.
     return (1 << width) - 2
 
 
 def width_for_count(count: int) -> int:
-    """Smallest byte-multiple bv width whose usable range [1, 2^W-2] holds `count`."""
+    """Smallest byte-multiple bv width whose usable range [1, 2^W-2] holds `count`
+    ids and the next one.
+
+    A speculative allocation never persists its ids, so a process that re-execs
+    on the next id sees the same count: a full width here would never grow.
+    """
     w = DEFAULT_SHRINK_WIDTH
-    while count > _max_usable_id(w):
+    while count + 1 > _max_usable_id(w):
         w += 8
     return w
 
 
 def current_shrink_width() -> int:
     return _current_shrink_width
+
+
+def allocator_width(plan) -> int:
+    """The id ceiling of an allocator that runs under `plan`.
+
+    prepare_rule types the runtime text at the process width, so the plan width
+    alone would refuse ids that the process can type.
+    """
+    return max(int(plan.width), _current_shrink_width)
+
+
+# A width re-exec passes the width that holds the overflowing id. The intern
+# table alone cannot give it, because a speculative id is never stored.
+MIN_WIDTH_ENV = "TAU_SHRINK_MIN_WIDTH"
+
+
+def min_width_from_env() -> int:
+    raw = os.environ.get(MIN_WIDTH_ENV)
+    if not raw:
+        return 0
+    try:
+        width = int(raw)
+    except ValueError:
+        width = 0
+    if width <= 0 or width % 8:
+        logger.warning("tau_shrink: ignoring %s=%r, not a positive multiple of 8",
+                       MIN_WIDTH_ENV, raw)
+        return 0
+    return width
 
 
 def set_shrink_width(width: int, *, pin: bool = False) -> None:
@@ -122,7 +149,7 @@ def set_shrink_width_from_db() -> int:
         max_id = db.get_max_shrink_id()
     except Exception:
         max_id = 0
-    width = width_for_count(max_id or 0)
+    width = max(width_for_count(max_id or 0), min_width_from_env())
     if _width_pinned:
         if width != _current_shrink_width:
             logger.warning(
@@ -149,11 +176,16 @@ class ShrinkUnavailable(Exception):
 class ShrinkWidthOverflow(Exception):
     """Raised when an interned id no longer fits the current process shrink width.
 
-    The id is already persisted in tau_shrink_ids, so a FRESH process will pick a
-    wider width. The node must re-exec (NOT rebuild the interpreter in-process --
-    the engine's per-stream bv typing is sticky). Distinct from ShrinkUnavailable
-    so it is NOT swallowed by fail-closed disable paths.
+    `required_id` is the id that did not fit. A speculative allocation never
+    persists it, so the re-exec carries the width that holds it. The node must
+    re-exec (NOT rebuild the interpreter in-process -- the engine's per-stream bv
+    typing is sticky). Distinct from ShrinkUnavailable so it is NOT swallowed by
+    fail-closed disable paths.
     """
+
+    def __init__(self, message: str, *, required_id: int | None = None):
+        super().__init__(message)
+        self.required_id = required_id
 
 
 class ShrinkTypeConflict(Exception):
@@ -269,7 +301,8 @@ def intern_value(hex_digits: str, width: int) -> int:
 
     `width` is the ORIGINAL value width (e.g. 384) used for the canonical key.
     Raises ShrinkUnavailable on DB error; ShrinkWidthOverflow if the id no longer
-    fits the current process OUTPUT shrink width (-> node must re-exec wider).
+    fits the allocator or the current process OUTPUT shrink width (-> node must
+    re-exec wider).
     """
     if _hex_is_zero(hex_digits):
         return RESERVED_EMPTY_ID
@@ -290,13 +323,21 @@ def intern_value(hex_digits: str, width: int) -> int:
         # hides the mismatch.
         if type(exc).__name__ == "ReconstructionMismatch":
             raise
+        import tau_allocator
+        if isinstance(exc, tau_allocator.AllocatorCapacityExceeded):
+            raise ShrinkWidthOverflow(
+                f"interned id {exc.required_id} exceeds bv[{exc.width}] usable range; "
+                f"process must re-exec to widen",
+                required_id=exc.required_id,
+            ) from exc
         raise ShrinkUnavailable(f"intern failed: {exc}") from exc
     if id_num < 0:
         raise ShrinkUnavailable(f"interned id {id_num} is negative")
     if id_num > _max_usable_id(_current_shrink_width):
         raise ShrinkWidthOverflow(
             f"interned id {id_num} exceeds bv[{_current_shrink_width}] usable range; "
-            f"process must re-exec to widen"
+            f"process must re-exec to widen",
+            required_id=id_num,
         )
     return id_num
 
