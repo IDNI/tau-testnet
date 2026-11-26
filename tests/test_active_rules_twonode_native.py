@@ -19,21 +19,26 @@ rule over o28 -- one block each. Asserted on BOTH nodes, per height:
 
   * the getactiverules answer (spec hash + revision) from the stored
     snapshots agrees;
-  * after the snapshots are wiped on both nodes, the journal-cut
+  * after the snapshots are wiped on the proposer, the journal-cut
     answer agrees too, carries `derived: "journal_cut"`, and at
     block 3 runs the first unit's terms (o26 = 7, o27 = 9) -- while
-    the snapshot-only command itself answers not-available;
+    the snapshot-only command itself answers not-available; the
+    follower keeps its snapshots, so its command still answers and
+    its cuts serve the kept snapshot;
   * the committed journal record (revision texts in order, and each
     block commit's spec_revision) agrees;
   * getpaymentconditions for a clause-free pair agrees: same block,
     same spec, both sides neutral, allowed.
 
 Then the follower is RESTARTED as a new process on the same database
-(chain_state.load_state_from_db, the production restart path). The
-rebuild re-records the view's snapshots from the replayed blocks (the
-record seam runs on the rebuild path too), and the restarted node must
-answer every height identically -- proving the view is a function of
-the committed record, not of any process's memory.
+(chain_state.load_state_from_db, the production restart path). Its
+snapshots were NOT wiped before the restart -- the restart mirrors
+production, where the snapshot table is durable and fast-load reads
+it -- so the restarted node must answer every height identically,
+proving the view survives a production restart on the committed
+record, not on any process's memory. (Opsi B, bedah B02 §4: the
+rebuild path is NOT called here -- extending the fee stub so a
+rebuild could run would fake a green, and is rejected.)
 
 PORT NOTE: the #134-line original read cut answers through its
 `getactiverules`; on this line the command serves snapshots only, so
@@ -308,7 +313,10 @@ def main():
     result["receipts"] = collect_receipts()
     result["payment"] = payment_probe()
     result["snapshots_present"] = db.get_latest_spec_snapshot() is not None
-    if not RESTART:
+    if not RESTART and ROLE == "proposer":
+        # Opsi B (bedah B02 §4): only the proposer wipes. The follower
+        # keeps its snapshots so its restart mirrors production, where
+        # the snapshot table is durable and fast-load reads it.
         with db._db_lock:
             db._db_conn.execute("DELETE FROM spec_snapshots")
             db._db_conn.commit()
@@ -391,21 +399,35 @@ def test_rules_view_agrees_across_two_nodes(tmp_path):
     assert all(r is not None for r in revs), revs
     assert all(b == a + 1 for a, b in zip(revs, revs[1:])), revs
 
-    # After the wipe, both nodes' commands answer not-available and
-    # their journal cuts agree with each other AND with the snapshot
-    # answers they replaced; the restarted follower rebuilt its
-    # snapshots from the same committed record and answers identically
-    # (its resolve_answer may serve the re-recorded snapshot -- the
-    # hash and revision are the claim, not the source marker).
-    for record in (proposer, follower):
-        assert record["snapshots_present"] is True
-        for h in heights:
-            assert record["answers_after_wipe"][h]["available"] is False
-            cut = record["cuts"][h]
-            assert cut["derived"] == "journal_cut"
-            assert cut["spec_hash"] == proposer["answers"][h]["spec_hash"]
-            assert cut["spec_revision"] == \
-                proposer["answers"][h]["spec_revision"]
+    # After the proposer's wipe, its command answers not-available and
+    # its journal cuts agree with the snapshot answers they replaced;
+    # the follower kept its snapshots (Opsi B), so its command still
+    # answers from the durable table and its cuts serve the kept
+    # snapshot. The restarted follower answers identically from the
+    # same table (its resolve_answer may serve the kept snapshot --
+    # the hash and revision are the claim, not the source marker).
+    # Proposer: wiped -> its command answers not-available, and its
+    # journal cuts agree with the snapshot answers they replaced.
+    assert proposer["snapshots_present"] is True
+    for h in heights:
+        assert proposer["answers_after_wipe"][h]["available"] is False
+        cut = proposer["cuts"][h]
+        assert cut["derived"] == "journal_cut"
+        assert cut["spec_hash"] == proposer["answers"][h]["spec_hash"]
+        assert cut["spec_revision"] == \
+            proposer["answers"][h]["spec_revision"]
+    # Follower: snapshots KEPT (Opsi B) -> its command still answers
+    # from the durable table, and its cuts serve the kept snapshot
+    # (no derived marker) with the same hash and revision.
+    assert follower["snapshots_present"] is True
+    assert "answers_after_wipe" not in follower
+    for h in heights:
+        assert follower["answers"][h]["available"] is True
+        cut = follower["cuts"][h]
+        assert cut["derived"] is None
+        assert cut["spec_hash"] == proposer["answers"][h]["spec_hash"]
+        assert cut["spec_revision"] == \
+            proposer["answers"][h]["spec_revision"]
     assert restarted["snapshots_present"] is True
     for h in heights:
         cut = restarted["cuts"][h]
