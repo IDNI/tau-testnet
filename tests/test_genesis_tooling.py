@@ -225,11 +225,20 @@ class TestGenesisReplay(unittest.TestCase):
             self.assertEqual(chain_state.get_sequence_number(addr), 0)
 
     def test_genesis_rules_seeded(self):
-        """After genesis load, application and consensus rules match genesis.json."""
+        """After genesis load, application rules are the preprocessed
+        genesis.json text and consensus rules match genesis.json."""
         genesis = _load_genesis()
         chain_state.load_genesis(GENESIS_PATH)
 
-        self.assertEqual(chain_state.get_application_rules_state(), genesis["application_rules"])
+        # B02 §3 (OQ#1): the genesis application seed is stored
+        # preprocessed -- its first statement ends with '.', unlike
+        # the raw genesis.json text (no trailing period, trailing
+        # newline), which merged its statement with the first builtin
+        # unit in the accumulation (top_level_conjuncts read them as
+        # one conjunct). The consensus rules are unaffected.
+        self.assertEqual(
+            chain_state.get_application_rules_state(),
+            "((!(i0[t] = 0)) ? ( u[t] = i0[t] && o0[t] = 0 ) : o0[t] = 1).")
         self.assertEqual(chain_state.get_consensus_rules_state(), genesis["consensus_rules"])
 
     def test_canonical_head_is_genesis(self):
