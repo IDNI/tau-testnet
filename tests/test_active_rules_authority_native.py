@@ -267,11 +267,24 @@ def test_a_confirmed_rule_tx_shows_its_apply_outcome_under_authority(authority):
     assert second["spec_revision_after"] > second["spec_revision_before"]
 
     # The revision the displacement took is the revision the view
-    # serves: the snapshot recorded for that revision is the view's
-    # head state, not a parallel reconstruction.
+    # serves: the view's head state is the state at that revision,
+    # not a parallel reconstruction.
     view = _view()
     assert view["available"] is True
     assert view["spec_revision"] == second["spec_revision_after"]
     snapshot = db.get_spec_snapshot(second["spec_revision_after"])
     assert snapshot is not None
-    assert view["sha256"] == snapshot["sha256"]
+    # NOTE (F3b): under the Step 7 stopgap the served sha256 is the
+    # journal cut's, not the snapshot's, when the stored snapshot
+    # diverges from the cut -- here the genesis b02 is shrunk to
+    # bv[8] in the worker's fed form (bv[384] in the mirror cut),
+    # so the stopgap fires (O-4) and the view carries
+    # derived="journal_cut". The claim is the head state (revision
+    # + the served text hashing to the served sha256), not that the
+    # view serves the snapshot verbatim.
+    assert view["sha256"] == hashlib.sha256(
+        view["canonical_text"].encode("utf-8")).hexdigest()
+    if view.get("derived") == "journal_cut":
+        assert view["sha256"] != snapshot["sha256"]
+    else:
+        assert view["sha256"] == snapshot["sha256"]
