@@ -58,7 +58,13 @@ def _build_chain_with_snapshot():
             'journal_head, allocator_digest, plan_id, plan_json, '
             'spec_revision, time_point, committed_at) '
             'VALUES (?,?,?,?,?,?,?,?,?,?)',
-            ("exec-1", block_hash, GENESIS_HASH, "headlink", "digest",
+            # No journal_head: this fixture models no journal at all
+            # (no tau_journal_v1 rows), so it must not claim one. A
+            # placeholder head would read CUT_TAMPERED under O-2's
+            # hold (the commit names a head the journal does not
+            # hold); with no head the cut is CUT_NOT_FOUND and the
+            # snapshot is served, which is what this fixture needs.
+            ("exec-1", block_hash, GENESIS_HASH, None, "digest",
              None, None, 1, ts, ts))
         cur.execute(
             'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
