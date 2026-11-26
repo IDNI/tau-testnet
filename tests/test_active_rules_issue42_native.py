@@ -436,11 +436,22 @@ def test_snapshot_text_equals_journal_cut_replay_at_each_height(
     assert out.get("ok"), out
     _mine()                                           # height 4
 
+    # NOTE (F3b): under the Step 7 stopgap this loop is vacuous when
+    # the stopgap fires -- the served text IS the cut by
+    # construction. It fires at every height here: the genesis b02
+    # is shrunk to bv[8] in the worker's fed form (bv[384] in the
+    # mirror cut), so the stored snapshot still diverges (O-4) and
+    # the view is served from the cut. The firing is asserted, not
+    # hidden: when O-4 is fixed and the stored snapshot agrees with
+    # the cut, this assert must be updated (the stopgap stops
+    # firing). The snapshot-vs-cut agreement itself is pinned by
+    # the ledger union (which fails on O-4 alone).
     for height in (1, 2, 3, 4):
         served = _answer_at(height)
         assert served["available"] is True, served
         cut = active_rules.journal_cut_at_height(height)
         assert cut is not None, f"no journal cut at height {height}"
+        assert served.get("derived") == "journal_cut"
         assert cut["spec_text"] == served["canonical_text"], (
             f"height {height}: replay text != snapshot text\n"
             f"--- snapshot ---\n{served['canonical_text']}\n"
@@ -454,8 +465,13 @@ def test_snapshot_text_equals_journal_cut_replay_at_each_height(
     at3 = _answer_at(3)
     assert "i12[t]" in at3["canonical_text"]
     at4 = _answer_at(4)
-    assert "o29[t]:bv[24] = { #x000002 }:bv[24]" in at4["canonical_text"]
-    assert "o29[t]:bv[24] = { #x000001 }:bv[24]" not in at4["canonical_text"]
+    # NOTE (F3b): the interpreter renders bv literals DECIMAL
+    # ({ 2 }, not { #x000002 }) in its canonical spec -- the as-fed
+    # hex form cannot be asserted against the served text (mirror
+    # run 45779972374: the served text carries o29[t]:bv[24] =
+    # { 2 }:bv[24]).
+    assert "o29[t]:bv[24] = { 2 }:bv[24]" in at4["canonical_text"]
+    assert "o29[t]:bv[24] = { 1 }:bv[24]" not in at4["canonical_text"]
 
 
 # --- B02-6 (§6.7): the served unit ledger under authority ------------------
