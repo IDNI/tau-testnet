@@ -496,6 +496,7 @@ _genesis_eligibility_mode: str = ""
 _genesis_fee_beneficiary: str = ""
 _genesis_faucet_amount: int = 0
 _genesis_approval_slots_active: bool = False
+_genesis_recipient_controls_active: bool = False
 # Genesis rule text, re-seeded on full rebuild so the replayed state hash
 # matches the mined chain (the reorg path replays only the new suffix, not
 # the genesis block, so its rules would otherwise be lost).
@@ -607,6 +608,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         approval_requests=lm.approval_requests.snapshot_requests(),
         rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
         approval_slots_active=lm.approval_slots_active,
+        recipient_controls_active=lm.recipient_controls_active,
         retractable_transfers=_retractable_state(lm),
         eligibility_mode=lm.eligibility_mode,
         fee_beneficiary=lm.fee_beneficiary,
@@ -1161,6 +1163,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _lifecycle_manager.faucet_amount = _genesis_faucet_amount
             if _genesis_approval_slots_active:
                 _lifecycle_manager.activate_approval_slots()
+            if _genesis_recipient_controls_active:
+                _lifecycle_manager.activate_recipient_controls()
             _lifecycle_manager.recompute_approval_threshold()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
@@ -1504,7 +1508,7 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     # regardless of whether the DB is fresh or already provisioned.
     global _genesis_accounts_state, _genesis_active_validators, _genesis_vote_quorum
     global _genesis_eligibility_mode, _genesis_fee_beneficiary, _genesis_faucet_amount
-    global _genesis_approval_slots_active
+    global _genesis_approval_slots_active, _genesis_recipient_controls_active
     global _genesis_application_rules, _genesis_consensus_rules
     _genesis_accounts_state = {
         k: int(v) for k, v in genesis_data.get("accounts_state", {}).items()
@@ -1523,6 +1527,9 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     _genesis_faucet_amount = _faucet
     _genesis_approval_slots_active = (
         (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("approval_slots_active") is True
+    )
+    _genesis_recipient_controls_active = (
+        (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("recipient_controls_active") is True
     )
     _genesis_application_rules = genesis_data.get("application_rules", "")
     _genesis_consensus_rules = genesis_data.get("consensus_rules", "")
@@ -1585,6 +1592,14 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
                 except Exception:
                     logger.warning(
                         "could not persist approval_slots_active from genesis",
+                        exc_info=True)
+            if _genesis_recipient_controls_active:
+                _lifecycle_manager.activate_recipient_controls()
+                try:
+                    db.set_chain_state_value("recipient_controls_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist recipient_controls_active from genesis",
                         exc_info=True)
             _lifecycle_manager.recompute_approval_threshold()
 
@@ -2388,6 +2403,18 @@ def load_state_from_db() -> bool:
                     logger.warning(
                         "could not persist approval_slots_active from genesis",
                         exc_info=True)
+        persisted_controls = db.get_chain_state_value("recipient_controls_active", _MISSING)
+        if _genesis_recipient_controls_active or (
+            persisted_controls is not _MISSING and str(persisted_controls) == "1"
+        ):
+            _lifecycle_manager.activate_recipient_controls()
+            if str(persisted_controls) != "1":
+                try:
+                    db.set_chain_state_value("recipient_controls_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist recipient_controls_active from genesis",
+                        exc_info=True)
 
         for p in pending_updates:
             update = ConsensusRuleUpdate(
@@ -2439,6 +2466,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
             _lifecycle_manager.approval_requests.snapshot_rule_change_requests()
         )
         approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
+        recipient_controls_active_snapshot = _lifecycle_manager.recipient_controls_active
         retractable_snapshot = _retractable_state(_lifecycle_manager)
 
     db.save_canonical_state_atomically(
@@ -2457,6 +2485,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         approval_requests=approval_requests_list,
         rule_change_requests=rule_change_requests_list,
         approval_slots_active=approval_slots_active_snapshot,
+        recipient_controls_active=recipient_controls_active_snapshot,
         retractable_transfers=retractable_snapshot,
     )
 
@@ -2954,6 +2983,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                     _lifecycle_manager.approval_requests.snapshot_rule_change_requests()
                 ),
                 approval_slots_active=_lifecycle_manager.approval_slots_active,
+                recipient_controls_active=_lifecycle_manager.recipient_controls_active,
                 retractable_transfers=_retractable_state(_lifecycle_manager),
             )
     except Exception as exc:

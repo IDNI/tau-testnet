@@ -26,6 +26,13 @@ from consensus.rule_offers import (
     RULE_OFFER_TX_TYPES,
 )
 from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.recipient_policy import (
+    CODE_PLAIN,
+    controls_active,
+    park_hold_code,
+    recipient_refusal,
+    sender_clause_inputs,
+)
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -936,6 +943,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         or idx in tau_defs.reserved_operation_keys(
                             tip_view.eligibility_mode,
                             approval_slots_active=approval_slots_active(tip_view),
+                            recipient_controls_active=controls_active(tip_view),
                         ):
                     return _qt_err(
                         "TX_INVALID",
@@ -1297,7 +1305,10 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
 
                         own_blocks, own_o5 = _sender_clause_blocks(
                             tip_view, sender_pubkey,
-                            tau_input_stream_values, admission_tau.budget,
+                            sender_clause_inputs(
+                                tau_input_stream_values, controls_active(tip_view),
+                            ),
+                            admission_tau.budget,
                         )
                         if own_blocks:
                             return _qt_err(
@@ -1309,6 +1320,34 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 ),
                                 transfer_index=i + 1,
                             )
+
+                        if controls_active(tip_view):
+                            if tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+                                hold = park_hold_code(
+                                    admission_eval.data["release_kind"],
+                                    admission_eval.data["release_at"],
+                                    tip_view.next_block_height,
+                                    admission_ts,
+                                )
+                            else:
+                                hold = CODE_PLAIN
+                            recipient = tau_input_dict["to_addr"]
+                            refusal = _policy_call(lambda: recipient_refusal(
+                                tip_view.clause_for(
+                                    recipient, tau_defs.USER_POLICY_STREAM_INDEX,
+                                ),
+                                tau_input_stream_values,
+                                hold,
+                                pool="admission",
+                                timeout=admission_tau.budget,
+                            ))
+                            if refusal is not None:
+                                return _qt_err(
+                                    refusal.code,
+                                    refusal.message,
+                                    transfer_index=i + 1,
+                                    **refusal.details,
+                                )
 
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.
@@ -1373,7 +1412,10 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                     # allows: the o5 rules and the sender's own clause, which
                     # the registry holds apart from the step.
                     if _o5_allows(fee_outputs) and not _sender_clause_blocks(
-                        tip_view, sender_pubkey, fee_query_inputs,
+                        tip_view, sender_pubkey,
+                        sender_clause_inputs(
+                            fee_query_inputs, controls_active(tip_view),
+                        ),
                         admission_tau.budget,
                     )[0]:
                         return _qt_err(

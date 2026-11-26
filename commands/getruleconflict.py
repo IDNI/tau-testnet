@@ -176,7 +176,12 @@ def execute(raw_command: str, container):
     if body is not None:
         from consensus.admission import _screen_clause_domains
 
-        domain_error = _screen_clause_domains(body)
+        from consensus.recipient_policy import controls_active
+        from consensus.facade import TipAdmissionView
+
+        domain_error = _screen_clause_domains(
+            body, recipient_controls_active=controls_active(TipAdmissionView()),
+        )
         if domain_error:
             layers.append(_layer("reserved_domains", "conflict", domain_error))
             escalate(VERDICT_CONFLICT)

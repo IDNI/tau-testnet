@@ -220,6 +220,35 @@ To remove your clause, submit the neutral clause
 `always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) ).`. Changing or removing it fails
 your open approval requests.
 
+### Incoming payments (`i17`)
+
+Until a governance patch sets `recipient_controls_active`, `i17` is an ordinary
+custom input and a clause that types it `bv[64]` is refused
+(`RECIPIENT_CONTROLS_INACTIVE`). `getgovernance` reports the flag. After the
+patch, the node feeds `i17` and a sender cannot write it.
+
+`0` is your own send. `1` is a plain payment arriving. A time park is
+`1 + seconds` (up to 7,776,000). A height park of N blocks is
+`(2^63 - 1 - 100,000) + N`, at the top of the non-negative `bv[64]` range.
+A comparison written in seconds therefore refuses every height park, including
+one whose number is longer than the 90-day release window. A clause that never
+mentions `i17` keeps judging only what you send.
+One that does is also asked about each payment to you. Branch on `0` so an
+inbound rule does not block your own sends:
+
+- **Inbound allow-list:** allow when `i17` is `0`, otherwise allow only when `i3` is an approved payer.
+- **Instant only:** block when `i17 > 1`. Plain payments pass. A time park is refused with `max_hold_seconds=0`. A height park is refused with `max_hold_seconds=0` and `max_hold_blocks=0`.
+- **Up to 10 minutes:** block when `i17 > 601`. A 600-second park passes. A longer time park is refused with `max_hold_seconds=600`. A height park is refused with `max_hold_blocks=0` and `max_hold_seconds=600`, because that comparison still accepts a 10-minute time park.
+- **No height park, any time park:** block when `i17 > 7776001`. The refusal is `max_hold_blocks=0` and does not name a seconds cap.
+
+The number is reported only when every `i17` mention is a direct comparison with a literal, or with another `bv[64]` input this payment fixes. A clause that does arithmetic on `i17` is still enforced, and the refusal carries no number.
+
+The approval slots `i18`–`i25` are the sender's co-signers. The recipient pass reads a slot the transfer already carries as `0`; the sender's own clause still sees the keys. A slot the transfer does not carry stays absent.
+
+`getrecipientpolicy <recipient>` reports the flag and whether the clause judges incoming payments. `getrecipientpolicy <recipient> <sender> <amount> [<hold> <seconds|blocks>]` asks the same helper admission and apply use, so a refused hold comes back with the same cap. A hold of `0` is a plain payment. The answer is advisory: apply measures a real park against the block that carries it.
+
+Admission measures a time park against `next_block_timestamp` (the later of the tip timestamp and the wall clock) and a height park against `next_block_height`. Apply measures against the block being applied, so a park that lands later has a shorter hold. A refusal at admission or at apply charges no fee: apply hard-rejects, and the fee is taken only from a transaction that stays accepted. A retract is not judged again, and a release is not judged again. Rule offers and approval requests are not gated; the transfer that an approval later pays is.
+
 Policy clauses **may** read `i2` (balance): it is the sender's balance at the
 parent block, frozen for the whole block, so admission and apply agree. A
 min-balance floor is expressible:

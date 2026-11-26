@@ -193,6 +193,16 @@ class TipAdmissionView:
         lm = getattr(chain_state, "_lifecycle_manager", None)
         return getattr(lm, "approval_slots_active", False) is True
 
+    @property
+    def recipient_controls_active(self) -> bool:
+        """Whether i17 is reserved and fed as the recipient-hold input.
+
+        Same source as block apply: the canonical lifecycle manager. Apply
+        mutates a copy and publishes it by swapping the reference.
+        """
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        return getattr(lm, "recipient_controls_active", False) is True
+
     def get_approval_request(self, request_id: str) -> Optional[dict]:
         """The full request row, or None. Includes the recorded votes."""
         import json as _json

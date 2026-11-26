@@ -258,6 +258,15 @@ COOLDOWN_NEVER_SENT = (1 << 63) - 1
 # feed, so by the time this is switched on the history is already accumulated.
 COOLDOWN_STREAM_ACTIVE = False
 
+# --- Recipient hold (i17) ----------------------------------------------------
+# Fed by the node only after `recipient_controls_active`, the same one-way
+# switch as the approval slots. Until then i17 is a custom stream, so a
+# deployed bv[24] use keeps working. Once on, a sender cannot write it and an
+# o5 clause may read the hold at bv[64]. The index and width live here, next
+# to the other reserved streams, so admission and apply share one definition.
+RECIPIENT_HOLD_STREAM_INDEX = 17
+RECIPIENT_HOLD_BV_WIDTH = 64
+
 # --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
 # Proposer BLS pubkey fed so a consensus rule can test set membership itself
 # (o7 = 1 iff i13 equals one of the validator pubkey constants baked into the
@@ -322,17 +331,19 @@ def approval_slot_indices() -> tuple:
 
 
 def reserved_operation_keys(
-    eligibility_mode: str = "", approval_slots_active: bool = False
+    eligibility_mode: str = "", approval_slots_active: bool = False,
+    recipient_controls_active: bool = False,
 ) -> tuple:
     """Operation keys a user_tx may not target, for the given eligibility mode.
 
     Every ingest/apply site must derive the set through this helper so admission,
     sendtx and block apply agree — a disagreement here is a consensus split.
 
-    `approval_slots_active` comes from CONSENSUS STATE (the lifecycle manager's
-    one-way activation flag, read from the parent snapshot), never from a module
-    global: block apply deep-copies the lifecycle manager per candidate, so a
-    global would leak across simulation, rollback and reorg.
+    `approval_slots_active` and `recipient_controls_active` come from CONSENSUS
+    STATE (the lifecycle manager's one-way activation flags, read from the parent
+    snapshot), never from a module global: block apply deep-copies the lifecycle
+    manager per candidate, so a global would leak across simulation, rollback
+    and reorg.
     """
     keys = EXTRA_RESERVED_OPERATION_KEYS
     if eligibility_mode == "tau_validator_set":
@@ -345,6 +356,10 @@ def reserved_operation_keys(
         # Reserved exactly when the node starts feeding them, mirroring the i13
         # and i16 precedents.
         keys = keys + approval_slot_indices()
+    if recipient_controls_active:
+        # i17 is a custom input until recipient controls activate. From then
+        # only the node may feed it; a sender-supplied value would forge a hold.
+        keys = keys + (RECIPIENT_HOLD_STREAM_INDEX,)
     return keys
 
 
@@ -352,6 +367,7 @@ def rule_text_forbidden_input_streams(
     context: str = RULE_TEXT_CONTEXT_USER,
     eligibility_mode: str = "",
     approval_slots_active: bool = False,
+    recipient_controls_active: bool = False,
 ) -> tuple:
     """Input stream NAMES that rule text of this kind may not reference.
 
@@ -360,12 +376,16 @@ def rule_text_forbidden_input_streams(
     rule text depends on what the rule is. i12 is the standing example — reading
     the sender pubkey is how a policy rule scopes itself, only writing it as an
     operation is forbidden. Approval slots are the second: write-forbidden
-    everywhere, readable only from a registered o5 clause.
+    everywhere, readable only from a registered o5 clause. i17 is the third,
+    once recipient controls are on: the clause reads the hold, the sender does
+    not write it.
     """
     keys = reserved_operation_keys(
-        eligibility_mode, approval_slots_active=approval_slots_active
+        eligibility_mode, approval_slots_active=approval_slots_active,
+        recipient_controls_active=recipient_controls_active,
     )
     readable = {12}
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
+        readable.add(RECIPIENT_HOLD_STREAM_INDEX)
     return tuple(f"i{idx}" for idx in keys if idx not in readable)

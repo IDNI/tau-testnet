@@ -1,0 +1,509 @@
+"""Recipient controls (#47, #76): the hold code, the clause screen, and the refusal.
+
+The evaluator is the in-process mock. These tests do not need the native engine:
+the admission and apply paths call the same `recipient_refusal`.
+"""
+import json
+import pytest
+from unittest.mock import MagicMock
+
+import db
+import tau_defs
+from consensus.admission import (
+    _admission_from_domain_error,
+    _screen_clause_domains,
+    validate_user_tx_reserved_domains,
+)
+from consensus.governance import ConsensusLifecycleManager, build_mechanism_metadata
+from consensus.policy_mock import MockPolicyEvaluator
+from consensus.recipient_policy import (
+    BLOCKS_LO,
+    CODE_PLAIN,
+    HEIGHT_CODE_BASE,
+    HEIGHT_CODE_MAX,
+    MAX_CAP_POINTS,
+    MAX_HOLD,
+    POLICY_BLOCK,
+    TIME_CODE_MAX,
+    audit_hold_stream,
+    clause_reads_hold_stream,
+    change_points,
+    comparison_literals,
+    controls_active,
+    park_hold_code,
+    recipient_refusal,
+    screen_hold_clause,
+    sender_clause_inputs,
+)
+from consensus.retractable import KIND_HEIGHT, KIND_TIME, MAX_RELEASE_WINDOW_BLOCKS
+from consensus import sender_policy
+
+HOLD = "i17[t]:bv[64]"
+CAP_600 = 601  # i17 > 601, a hold of 600 seconds
+PAYER = "aa" * 48
+OTHER = "bb" * 48
+
+
+@pytest.fixture(autouse=True)
+def _mock_evaluator():
+    sender_policy.set_evaluator("apply", None)
+    sender_policy.set_evaluator("admission", None)
+    yield
+    sender_policy.set_evaluator("apply", None)
+    sender_policy.set_evaluator("admission", None)
+
+
+def _use(decide, body=HOLD):
+    mock = MockPolicyEvaluator()
+    mock.set_verdict(body, decide)
+    sender_policy.set_evaluator("apply", mock)
+    return mock
+
+
+def _over(limit):
+    def decide(inputs):
+        return 0 if int(inputs["i17"]) > limit else 1
+    return decide
+
+
+def _allow_payer(payer, body=HOLD):
+    def decide(inputs):
+        if int(inputs["i17"]) == 0:
+            return 1
+        return 1 if inputs.get("i3") == payer else 0
+    _use(decide, body)
+    return body
+
+
+def test_a_time_park_and_a_height_park_use_different_ranges():
+    assert park_hold_code(KIND_TIME, 1_000 + 600, 0, 1_000) == 601
+    assert park_hold_code(KIND_HEIGHT, 10 + 3, 10, 0) == HEIGHT_CODE_BASE + 3
+    assert park_hold_code(KIND_TIME, 5, 0, 5) == 2
+    assert HEIGHT_CODE_BASE > TIME_CODE_MAX
+    assert BLOCKS_LO == HEIGHT_CODE_BASE + 1
+    assert HEIGHT_CODE_MAX == (1 << 63) - 1
+    assert park_hold_code(
+        KIND_HEIGHT, MAX_RELEASE_WINDOW_BLOCKS, 0, 0,
+    ) == HEIGHT_CODE_MAX
+
+
+def test_the_sender_pass_feeds_zero_only_when_the_feature_is_on():
+    values = {1: "5", 3: PAYER}
+    assert sender_clause_inputs(values, False) is values
+    fed = sender_clause_inputs(values, True)
+    assert fed[17] == "0"
+    assert 17 not in values
+
+
+def test_an_outbound_clause_is_not_asked_about_an_incoming_payment():
+    body = "i4[t]:bv[384]"
+    assert clause_reads_hold_stream(body) is False
+
+    def explode(_inputs):
+        raise AssertionError("recipient pass ran")
+
+    _use(explode, body)
+    assert recipient_refusal(body, {3: OTHER}, CODE_PLAIN, pool="apply") is None
+
+
+def test_cap_zero_admits_a_plain_payment_and_refuses_every_park():
+    body = _literal(CODE_PLAIN)
+    _use(_over(CODE_PLAIN), body)
+    assert recipient_refusal(body, {}, CODE_PLAIN, pool="apply") is None
+    for code in (2, 601):
+        refusal = recipient_refusal(body, {}, code, pool="apply")
+        assert refusal.code == MAX_HOLD
+        assert refusal.details == {"max_hold_seconds": 0}
+        assert "straight away" in refusal.message
+    height = recipient_refusal(
+        body, {}, park_hold_code(KIND_HEIGHT, 20, 10, 0), pool="apply",
+    )
+    assert height.code == MAX_HOLD
+    assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 0}
+    assert "straight away" in height.message
+
+
+def test_a_600_second_cap_allows_600_and_refuses_an_hour():
+    body = _literal(CAP_600)
+    _use(_over(CAP_600), body)
+    assert recipient_refusal(body, {}, 601, pool="apply") is None
+    refusal = recipient_refusal(body, {}, 1 + 3600, pool="apply")
+    assert refusal.code == MAX_HOLD
+    assert refusal.details == {"max_hold_seconds": 600}
+    assert "600 seconds" in refusal.message
+    height = recipient_refusal(body, {}, HEIGHT_CODE_BASE + 10, pool="apply")
+    assert height.code == MAX_HOLD
+    assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 600}
+    assert "600 seconds" in height.message
+    assert "straight away" not in height.message
+    assert "max_hold_blocks=0" in height.message
+
+
+def test_the_recipient_pass_sees_co_signers_as_zero_and_leaves_absent_slots_out():
+    cosigner = "{ #x" + PAYER + " }:bv[384]"
+    values = {3: OTHER, 18: cosigner, "i25": cosigner}
+    mock = _use(lambda inputs: 0 if inputs.get("i18") not in (None, "0") else 1)
+    assert recipient_refusal(HOLD, values, CODE_PLAIN, pool="apply") is None
+    assert values[18] == cosigner
+    seen = mock.verdict_calls[0][1]
+    assert seen["i18"] == "0"
+    assert seen["i25"] == "0"
+    bare = {3: OTHER}
+    mock = _use(lambda inputs: 1)
+    assert recipient_refusal(HOLD, bare, CODE_PLAIN, pool="apply") is None
+    assert "i18" not in mock.verdict_calls[0][1]
+    assert "i25" not in mock.verdict_calls[0][1]
+
+
+def test_an_allow_list_names_the_payer_and_does_not_invent_a_hold_cap():
+    body = _allow_payer(PAYER)
+    assert recipient_refusal(body, {3: PAYER}, CODE_PLAIN, pool="apply") is None
+    assert recipient_refusal(body, {3: PAYER}, 1 + 3600, pool="apply") is None
+    blocked = recipient_refusal(body, {3: OTHER}, CODE_PLAIN, pool="apply")
+    assert blocked.code == POLICY_BLOCK
+    assert blocked.details == {}
+    parked = recipient_refusal(body, {3: OTHER}, 1 + 60, pool="apply")
+    assert parked.code == POLICY_BLOCK
+    assert "max_hold" not in parked.message
+
+
+def test_a_non_monotonic_hold_rule_does_not_report_a_maximum():
+    def decide(inputs):
+        code = int(inputs["i17"])
+        if code == CODE_PLAIN or code == TIME_CODE_MAX:
+            return 1
+        return 0
+    _use(decide)
+    refusal = recipient_refusal(HOLD, {}, 1 + 60, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
+
+
+def test_inactive_screen_refuses_a_bv64_hold_clause_and_keeps_a_custom_i17():
+    hold = (
+        "(i17[t]:bv[64] > {1}:bv[64]) ? "
+        "(o5[t]:bv[24] = { #x000000 }:bv[24]) : "
+        "(o5[t]:bv[24] = { #x000001 }:bv[24])"
+    )
+    custom = (
+        "(i17[t]:bv[24] = { #x000007 }:bv[24]) ? "
+        "(o5[t]:bv[24] = { #x000000 }:bv[24]) : "
+        "(o5[t]:bv[24] = { #x000001 }:bv[24])"
+    )
+    inactive = _screen_clause_domains(hold)
+    assert inactive.startswith("recipient controls are not active")
+    assert _admission_from_domain_error(inactive).code == "RECIPIENT_CONTROLS_INACTIVE"
+    assert _screen_clause_domains(custom) is None
+    assert screen_hold_clause(hold, active=True) is None
+    assert screen_hold_clause(custom, active=True) is not None
+
+
+def test_a_deployed_i17_mention_blocks_activation_and_a_clean_spec_does_not():
+    validators = ["ab" * 48]
+    blocked = ConsensusLifecycleManager(active_validators=validators)
+    blocked.apply_host_contract_patch(
+        {"recipient_controls_active": True},
+        effective_spec_texts=[("application_rules", "i17[t]:bv[24] = 1")],
+    )
+    assert blocked.recipient_controls_active is False
+
+    clean = ConsensusLifecycleManager(active_validators=validators)
+    before = clean.consensus_meta_hash()
+    clean.apply_host_contract_patch(
+        {"recipient_controls_active": True}, effective_spec_texts=[],
+    )
+    assert clean.recipient_controls_active is True
+    assert clean.consensus_meta_hash() != before
+    assert "recipient_controls_active" not in build_mechanism_metadata("majority")
+    assert build_mechanism_metadata(
+        "majority", recipient_controls_active=True,
+    )["recipient_controls_active"] is True
+
+
+def test_the_flag_cannot_be_turned_off():
+    lm = ConsensusLifecycleManager(active_validators=["ab" * 48])
+    with pytest.raises(ValueError):
+        lm.apply_host_contract_patch({"recipient_controls_active": False})
+
+
+def test_i17_is_reserved_only_while_the_feature_is_on():
+    assert tau_defs.RECIPIENT_HOLD_STREAM_INDEX == 17
+    assert tau_defs.RECIPIENT_HOLD_BV_WIDTH == 64
+    assert 17 not in tau_defs.reserved_operation_keys("")
+    assert 17 in tau_defs.reserved_operation_keys("", recipient_controls_active=True)
+    user = tau_defs.rule_text_forbidden_input_streams(
+        tau_defs.RULE_TEXT_CONTEXT_USER, recipient_controls_active=True,
+    )
+    clause = tau_defs.rule_text_forbidden_input_streams(
+        tau_defs.RULE_TEXT_CONTEXT_O5_CLAUSE, recipient_controls_active=True,
+    )
+    assert "i17" in user
+    assert "i17" not in clause
+
+
+def test_a_sender_cannot_write_i17_once_the_feature_is_on():
+    tip = MagicMock()
+    tip.eligibility_mode = ""
+    tip.approval_slots_active = False
+    tip.recipient_controls_active = True
+    result = validate_user_tx_reserved_domains(
+        {"operations": {"17": "1"}, "sender_pubkey": PAYER}, tip,
+    )
+    assert result.is_valid is False
+    assert "17" in result.error
+
+
+def test_a_missing_flag_reads_as_off_even_on_a_mock():
+    assert controls_active(object()) is False
+    assert controls_active(MagicMock()) is False
+
+    class On:
+        recipient_controls_active = True
+
+    assert controls_active(On()) is True
+
+
+def test_audit_reports_every_deployed_mention():
+    assert audit_hold_stream([("consensus_rules", "o6[t]:bv[8] = 1")]) == []
+    found = audit_hold_stream([
+        ("clause:alice", "i17[t]:bv[24] = {7}:bv[24]"),
+        ("comment_only", "# i17 is discussed here"),
+    ])
+    assert len(found) == 1
+    assert "clause:alice" in found[0]
+
+
+def test_the_flag_round_trips_through_canonical_state(temp_database):
+    db.save_canonical_state_atomically(
+        "aa" * 32, 1, {}, {}, "", "", "", [], [], [], [],
+        recipient_controls_active=True,
+    )
+    assert db.get_chain_state_value("recipient_controls_active", None) == "1"
+
+
+def _literal(limit):
+    return f"(i17[t]:bv[64] > {{{limit}}}:bv[64])"
+
+
+def test_a_direct_comparison_names_the_cap_from_its_literal():
+    body = _literal(601)
+    assert comparison_literals(body) == (601,)
+    ev = _use(_over(601), body)
+    refusal = recipient_refusal(body, {}, 1 + 3600, pool="apply")
+    assert refusal.details == {"max_hold_seconds": 600}
+    assert len(ev.verdict_calls) <= 12
+    height = recipient_refusal(body, {}, HEIGHT_CODE_BASE + 10, pool="apply")
+    assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 600}
+    assert "600 seconds" in height.message
+    assert "straight away" not in height.message
+
+
+def test_a_seconds_cap_past_the_release_window_still_refuses_a_height_park():
+    """A one-year literal is not a binding seconds cap: every legal time park
+    is shorter. It must still refuse a height park. Packed against the 90-day
+    window, that same literal sat above every height code and admitted them.
+    """
+    year = 1 + 365 * 24 * 3600
+    body = _literal(year)
+    _use(_over(year), body)
+    assert recipient_refusal(body, {}, TIME_CODE_MAX, pool="apply") is None
+    height = recipient_refusal(body, {}, HEIGHT_CODE_BASE + 1, pool="apply")
+    assert height.code == MAX_HOLD
+    assert height.details == {"max_hold_blocks": 0}
+    assert "max_hold_seconds" not in height.message
+
+
+def test_a_time_lock_literal_stays_on_the_exact_path():
+    """i5 is bv[64] too. That literal is not an i17 change point, so the cap
+    is still read off the i17 comparison.
+    """
+    body = "(i17[t]:bv[64] > {601}:bv[64]) && (i5[t]:bv[64] > {100}:bv[64])"
+    assert comparison_literals(body) == (601,)
+    ev = _use(_over(601), body)
+    refusal = recipient_refusal(body, {5: "200"}, 1 + 3600, pool="apply")
+    assert refusal.details == {"max_hold_seconds": 600}
+    assert len(ev.verdict_calls) <= 12
+
+    holed = (
+        "(i5[t]:bv[64] > {10}:bv[64]) && ("
+        "(i17[t]:bv[64] <= {101}:bv[64]) || "
+        "((i17[t]:bv[64] >= {5000}:bv[64]) && (i17[t]:bv[64] <= {6000}:bv[64])))"
+    )
+
+    def decide(inputs):
+        code = int(inputs["i17"])
+        if code <= 101 or 5000 <= code <= 6000:
+            return 1
+        return 0
+
+    _use(decide, holed)
+    refusal = recipient_refusal(holed, {5: "200"}, 200, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
+
+
+def test_a_hex_literal_and_an_implication_are_still_one_threshold():
+    body = "(i17[t]:bv[64] > { #x0259 }:bv[64]) -> (o5[t]:bv[24] = {0}:bv[24])"
+    assert comparison_literals(body) == (0x259,)
+    _use(_over(601), body)
+    refusal = recipient_refusal(body, {}, 1 + 3600, pool="apply")
+    assert refusal.details == {"max_hold_seconds": 600}
+
+
+def test_a_hole_between_the_literals_is_not_quoted():
+    """Allow up to 100 seconds, and again from 4999 to 5999 seconds.
+
+    The literals are the change points, and the second allow cancels the number.
+    """
+    body = (
+        "(i17[t]:bv[64] <= {101}:bv[64]) || "
+        "((i17[t]:bv[64] >= {5000}:bv[64]) && (i17[t]:bv[64] <= {6000}:bv[64]))"
+    )
+
+    def decide(inputs):
+        code = int(inputs["i17"])
+        if code <= 101 or 5000 <= code <= 6000:
+            return 1
+        return 0
+
+    _use(decide, body)
+    refusal = recipient_refusal(body, {}, 200, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
+
+
+def test_too_many_literals_refuse_without_a_number():
+    limits = range(100, 100 + MAX_CAP_POINTS)
+    body = " && ".join(_literal(limit) for limit in limits)
+    ev = _use(_over(601), body)
+    refusal = recipient_refusal(body, {}, 1 + 3600, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
+    assert len(ev.verdict_calls) == 2
+
+
+def test_arithmetic_is_enforced_and_not_numbered():
+    added = "(i17[t]:bv[64] + {0}:bv[64] > {601}:bv[64])"
+    assert comparison_literals(added) is None
+    ev = _use(_over(601), added)
+    refusal = recipient_refusal(added, {}, 1 + 3600, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
+    assert len(ev.verdict_calls) == 2
+
+
+def test_a_comparison_with_another_input_names_that_inputs_value():
+    other = "(i17[t]:bv[64] > i26[t]:bv[64])"
+    assert comparison_literals(other) is None
+
+    def decide(inputs):
+        raw = inputs.get("i26")
+        if raw is None:
+            return 0 if int(inputs["i17"]) > CODE_PLAIN else 1
+        return 0 if int(inputs["i17"]) > int(raw) else 1
+
+    ev = _use(decide, other)
+    assert change_points(other, {26: "601"}) == (601,)
+    assert change_points(other, {"i26": "{ #x0259 }:bv[64]"}) == (601,)
+    assert change_points(other, {26: "601", "i26": "1"}) == (1,)
+    assert change_points("(i26[t]:bv[64] >= i17[t]:bv[64])", {26: "10"}) == (10,)
+    assert change_points("(i17[t]:bv[64] > i17[t]:bv[64])", {17: "5"}) is None
+    cosigner = "{ #x" + PAYER + " }:bv[384]"
+    assert change_points("(i17[t]:bv[64] > i18[t]:bv[64])", {18: cosigner}) == (0,)
+    assert recipient_refusal(other, {26: "601"}, 601, pool="apply") is None
+    refusal = recipient_refusal(other, {26: "601"}, 1 + 3600, pool="apply")
+    assert refusal.details == {"max_hold_seconds": 600}
+    assert len(ev.verdict_calls) <= 12
+    height = recipient_refusal(other, {26: "601"}, HEIGHT_CODE_BASE + 10, pool="apply")
+    assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 600}
+
+    missing = recipient_refusal(other, {}, 1 + 3600, pool="apply")
+    assert missing.code == POLICY_BLOCK
+    assert missing.details == {}
+
+    holed = (
+        "(i17[t]:bv[64] <= i26[t]:bv[64]) || "
+        "((i17[t]:bv[64] >= {5000}:bv[64]) && (i17[t]:bv[64] <= {6000}:bv[64]))"
+    )
+
+    def band(inputs):
+        code = int(inputs["i17"])
+        if code <= int(inputs["i26"]) or 5000 <= code <= 6000:
+            return 1
+        return 0
+
+    _use(band, holed)
+    refusal = recipient_refusal(holed, {26: "101"}, 200, pool="apply")
+    assert refusal.code == POLICY_BLOCK
+    assert refusal.details == {}
+
+
+def test_getrecipientpolicy_reports_the_same_cap_the_helper_does(monkeypatch):
+    from commands.getrecipientpolicy import execute
+    from consensus.facade import TipAdmissionView
+
+    body = _literal(601)
+    mock = MockPolicyEvaluator()
+    mock.set_verdict(body, _over(601))
+    sender_policy.set_evaluator("admission", mock)
+    monkeypatch.setattr(
+        TipAdmissionView, "clause_for", lambda self, pubkey, stream: body,
+    )
+    monkeypatch.setattr(
+        TipAdmissionView, "recipient_controls_active", property(lambda self: True),
+    )
+    monkeypatch.setattr(
+        TipAdmissionView, "approval_slots_active", property(lambda self: False),
+    )
+    monkeypatch.setattr("commands.sendtx._admission_i2", lambda address: "10")
+    monkeypatch.setattr("commands.sendtx._admission_timestamp", lambda: 1_700_000_000)
+
+    bare = json.loads(execute(f"getrecipientpolicy {PAYER}", None))
+    assert bare["data"]["judges_incoming"] is True
+    assert "allowed" not in bare["data"]
+
+    asked = json.loads(execute(
+        f"getrecipientpolicy {PAYER} {OTHER} 5 3600 seconds", None,
+    ))
+    assert asked["data"]["allowed"] is False
+    assert asked["data"]["code"] == MAX_HOLD
+    assert asked["data"]["max_hold_seconds"] == 600
+    assert asked["data"]["hold_seconds"] == 3600
+    seen = mock.verdict_calls[0][1]
+    assert seen["i2"] == "10"
+    assert OTHER in seen["i12"]
+    assert PAYER in seen["i4"]
+
+    height = json.loads(execute(
+        f"getrecipientpolicy {PAYER} {OTHER} 5 10 blocks", None,
+    ))
+    assert height["data"]["max_hold_blocks"] == 0
+    assert height["data"]["max_hold_seconds"] == 600
+    assert "straight away" not in height["data"]["message"]
+
+
+def test_getrecipientpolicy_allows_when_the_feature_is_off_or_the_args_are_bad(monkeypatch):
+    from commands.getrecipientpolicy import execute
+    from consensus.facade import TipAdmissionView
+    from server import _EXPENSIVE_COMMANDS
+
+    assert "getrecipientpolicy" in _EXPENSIVE_COMMANDS
+    monkeypatch.setattr(TipAdmissionView, "clause_for", lambda self, pubkey, stream: HOLD)
+    monkeypatch.setattr(
+        TipAdmissionView, "recipient_controls_active", property(lambda self: False),
+    )
+
+    def explode(_inputs):
+        raise AssertionError("the clause was asked while the feature is off")
+
+    sender_policy.set_evaluator("admission", MockPolicyEvaluator())
+    sender_policy.evaluator("admission").set_verdict(HOLD, explode)
+    off = json.loads(execute(f"getrecipientpolicy {PAYER} {OTHER} 5", None))
+    assert off["data"]["allowed"] is True
+    assert off["data"]["judges_incoming"] is False
+    assert off["data"]["hold_seconds"] == 0
+
+    assert json.loads(execute("getrecipientpolicy", None))["error"]["code"] == "INVALID_PARAMS"
+    assert json.loads(execute(
+        f"getrecipientpolicy {PAYER} {OTHER} 5 3 minutes", None,
+    ))["error"]["code"] == "INVALID_PARAMS"
