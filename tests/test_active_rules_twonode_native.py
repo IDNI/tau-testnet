@@ -417,14 +417,25 @@ def test_rules_view_agrees_across_two_nodes(tmp_path):
         assert cut["spec_revision"] == \
             proposer["answers"][h]["spec_revision"]
     # Follower: snapshots KEPT (Opsi B) -> its command still answers
-    # from the durable table, and its cuts serve the kept snapshot
-    # (no derived marker) with the same hash and revision.
+    # from the durable table, and its served answers agree with the
+    # journal cuts (same hash and revision). NOTE (F1b): a cut always
+    # carries derived="journal_cut" (a cut IS a journal cut) -- the
+    # earlier assert cut["derived"] is None was wrong by
+    # construction and was never reached while the follower was
+    # wiped. The claim is the hash/revision agreement, not the
+    # source marker: the served answers may themselves carry
+    # derived="journal_cut" when the Step 7 stopgap fires (here the
+    # genesis b02 is shrunk to bv[8] in the worker's fed form,
+    # bv[384] in the mirror cut -- O-4).
     assert follower["snapshots_present"] is True
     assert "answers_after_wipe" not in follower
     for h in heights:
         assert follower["answers"][h]["available"] is True
         cut = follower["cuts"][h]
-        assert cut["derived"] is None
+        assert cut["derived"] == "journal_cut"
+        assert cut["spec_hash"] == follower["answers"][h]["spec_hash"]
+        assert cut["spec_revision"] == \
+            follower["answers"][h]["spec_revision"]
         assert cut["spec_hash"] == proposer["answers"][h]["spec_hash"]
         assert cut["spec_revision"] == \
             proposer["answers"][h]["spec_revision"]
