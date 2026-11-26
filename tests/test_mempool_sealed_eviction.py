@@ -24,7 +24,7 @@ from commands import getsequence, sendtx
 from network.service import NetworkService
 
 from test_reorg_mempool_restore import (
-    ALICE, BOB, CAROL, MALLORY, PROPOSER_A, SK_ALICE, SK_BOB,
+    ALICE, BOB, CAROL, MALLORY, PROPOSER_A, PROPOSER_B, SK_ALICE, SK_BOB,
     ReorgRestoreTestCase, _echo_multi, quiet, transfer,
 )
 
@@ -161,6 +161,58 @@ class TestStaleSequenceEviction(SealedEvictionTestCase):
         self.assertEqual(self.next_sequence(BOB), 1)
 
 
+class TestForkOnlyStaleRow(SealedEvictionTestCase):
+    def test_row_sealed_only_in_a_fork_block_is_evicted(self):
+        forked = transfer(SK_ALICE, MALLORY, 3, 0)
+        self.queue(forked)
+        fork = self.block(2, self.head(), [forked], PROPOSER_B)
+        won = self.block(2, self.head(), [transfer(SK_ALICE, CAROL, 5, 0)], PROPOSER_A)
+        longer = self.block(3, won.block_hash, [], PROPOSER_A)
+        self.ingest([fork, won, longer])
+        with quiet():
+            self.assertTrue(chain_state.maybe_update_canonical_head())
+
+        self.assertEqual(self.head(), longer.block_hash)
+        self.assertFalse(self.in_mempool(forked))
+        self.assertEqual(self.status(forked)["status"], "evicted")
+
+
+class TestSequenceDuringRebuild(SealedEvictionTestCase):
+    """A `sendtx` that runs while the rebuild replays the chain from genesis."""
+
+    def test_replay_does_not_lower_the_admission_sequence(self):
+        first = transfer(SK_ALICE, CAROL, 5, 0)
+        self.queue(first)
+        sealed = self.next_block([first])
+        self.ingest([sealed])
+        with quiet():
+            self.assertTrue(chain_state.maybe_update_canonical_head())
+        self.assertEqual(chain_state.get_sequence_number(ALICE), 1)
+
+        reused = transfer(SK_ALICE, MALLORY, 3, 0)
+        during = []
+        real_engine = chain_state.TauConsensusEngine
+
+        def engine_after_probe(*args, **kwargs):
+            # Probe after the replay funded ALICE, so only her sequence decides.
+            if not during and chain_state._balances.get(ALICE, 0) > 0:
+                during.append(sendtx.queue_transaction(json.dumps(reused), propagate=False))
+            return real_engine(*args, **kwargs)
+
+        b2 = self.block(2, self.prefix.block_hash, [], PROPOSER_B)
+        b3 = self.block(3, b2.block_hash, [], PROPOSER_B)
+        self.ingest([b2, b3])
+        with patch.object(chain_state, "TauConsensusEngine", side_effect=engine_after_probe), \
+                quiet():
+            self.assertTrue(chain_state.maybe_update_canonical_head())
+
+        self.assertEqual(self.head(), b3.block_hash)
+        self.assertEqual(len(during), 1)
+        self.assertFalse(during[0]["ok"], during[0])
+        self.assertEqual(during[0]["code"], "INVALID_SEQUENCE")
+        self.assertFalse(self.in_mempool(reused))
+
+
 class TestStaleSequenceRows(SealedEvictionTestCase):
     """`db.remove_mempool_stale_sequences` on rows that admission never writes."""
 
@@ -210,11 +262,45 @@ class TestAdmissionRacesTheBlock(SealedEvictionTestCase):
         tx = transfer(SK_ALICE, CAROL, 5, 0)
         blk, result = self.admit_while_block_lands(tx)
 
-        self.assertFalse(result["ok"], result)
-        self.assertEqual(result["code"], "INVALID_SEQUENCE")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(result["block_hash"], blk.block_hash)
+        self.assertEqual(result["block_number"], 2)
         self.assert_sealed_gone(blk)
         self.assertEqual(self.status(tx)["status"], "confirmed")
         self.assertEqual(self.next_sequence(ALICE), 1)
+
+    def test_confirmed_answer_reaches_the_envelope(self):
+        tx = transfer(SK_ALICE, CAROL, 5, 0)
+        blk = self.next_block([tx])
+        confirmed = {"ok": True, "tx_hash": compute_tx_hash(tx), "message": "confirmed",
+                     "status": "confirmed", "block_hash": blk.block_hash, "block_number": 2}
+        with patch.object(sendtx, "queue_transaction", return_value=confirmed):
+            raw = sendtx.execute(f"sendtx {json.dumps(tx)}", self.container)
+        data = json.loads(raw)["data"]
+        self.assertEqual((data["status"], data["block_hash"], data["block_number"]),
+                         ("confirmed", blk.block_hash, 2))
+
+    def test_other_transaction_with_the_same_sequence_is_refused(self):
+        tx = transfer(SK_ALICE, CAROL, 5, 0)
+        rival = transfer(SK_ALICE, MALLORY, 3, 0)
+        blk = self.next_block([rival])
+        import consensus.admission as admission
+        real = admission.validate_mempool_admission
+
+        def admit_then_apply(*args, **kwargs):
+            verdict = real(*args, **kwargs)
+            self.ingest([blk])
+            with quiet():
+                self.assertTrue(chain_state.maybe_update_canonical_head())
+            return verdict
+
+        with patch.object(admission, "validate_mempool_admission", side_effect=admit_then_apply):
+            result = sendtx.queue_transaction(json.dumps(tx), propagate=False)
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["code"], "INVALID_SEQUENCE")
+        self.assertFalse(self.in_mempool(tx))
 
     def test_entry_left_by_the_race_goes_at_the_next_block(self):
         tx = transfer(SK_ALICE, CAROL, 5, 0)

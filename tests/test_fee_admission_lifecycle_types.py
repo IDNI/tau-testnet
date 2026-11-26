@@ -42,7 +42,7 @@ def node(temp_database, mock_policy_evaluators, monkeypatch):
         patch("tau_manager.tau_ready"),
         patch("tau_manager.communicate_with_tau", return_value="x1001"),
         patch("tau_manager.communicate_with_tau_multi", side_effect=multi),
-        patch("commands.sendtx.chain_state.get_sequence_number", return_value=1),
+        patch("commands.sendtx.chain_state.get_committed_sequence_number", return_value=1),
         patch("tau_native.compile_revisions_isolated_subprocess", return_value=None),
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}),
         patch.object(TipAdmissionView, "next_block_height",

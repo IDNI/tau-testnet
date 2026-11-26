@@ -111,21 +111,18 @@ def execute(raw_command: str, container):
             return api_response.success_response("gettxstatus", data)
 
         # 2. Confirmed on the canonical chain?
-        for loc in db.get_tx_block_locations(tx_hash):
-            is_canonical, head_number = db.get_canonical_confirmation(
-                loc["block_hash"], loc["block_number"]
-            )
-            if is_canonical:
-                confirmations = head_number - loc["block_number"] + 1
-                data = {
-                    "tx_hash": tx_hash,
-                    "status": "confirmed",
-                    "block_hash": loc["block_hash"],
-                    "block_number": loc["block_number"],
-                    "confirmations": max(1, confirmations),
-                }
-                data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
-                return api_response.success_response("gettxstatus", data)
+        loc = db.get_canonical_tx_location(tx_hash)
+        if loc is not None:
+            confirmations = loc["head_number"] - loc["block_number"] + 1
+            data = {
+                "tx_hash": tx_hash,
+                "status": "confirmed",
+                "block_hash": loc["block_hash"],
+                "block_number": loc["block_number"],
+                "confirmations": max(1, confirmations),
+            }
+            data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
+            return api_response.success_response("gettxstatus", data)
 
         # 3. Dropped without being mined?
         dropped = db.get_dropped_tx(tx_hash)

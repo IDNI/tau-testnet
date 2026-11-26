@@ -292,7 +292,7 @@ def node(temp_database, monkeypatch):
         patch("tau_manager.tau_ready"),
         patch("tau_manager.communicate_with_tau", return_value="x1001"),
         patch("tau_manager.communicate_with_tau_multi", side_effect=multi),
-        patch("commands.sendtx.chain_state.get_sequence_number", return_value=1),
+        patch("commands.sendtx.chain_state.get_committed_sequence_number", return_value=1),
         patch("commands.sendtx.validate_bls_pubkey", return_value=None),
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}),
     ]

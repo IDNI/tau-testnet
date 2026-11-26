@@ -60,7 +60,8 @@ class TestCustomInputs(unittest.TestCase):
         self.addCleanup(self.test_mode_patcher.stop)
         self.addCleanup(self.isolated_patcher.stop)
 
-        self.seq_patcher = patch('commands.sendtx.chain_state.get_sequence_number', return_value=1)
+        self.seq_patcher = patch('commands.sendtx.chain_state.get_committed_sequence_number',
+                                 return_value=1)
         self.seq_patcher.start()
         self.addCleanup(self.seq_patcher.stop)
         self.pending_seq_patcher = patch('commands.sendtx.db.get_pending_sequence', return_value=None)

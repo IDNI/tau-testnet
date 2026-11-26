@@ -206,6 +206,29 @@ async def test_tx_valid(service):
 
 
 @pytest.mark.trio
+async def test_tx_confirmed_result_keeps_the_peer_keys(service):
+    service._queue_tx = MagicMock(return_value={
+        "ok": True, "tx_hash": "abc", "message": "Transaction confirmed in block 2.",
+        "status": "confirmed", "block_hash": "def", "block_number": 2,
+    })
+    stream = _make_stream(json.dumps({"tx": {"hash": "abc"}}).encode())
+    await service._handle_tx(stream)
+    assert _written_json(stream) == {"ok": True, "result": {
+        "ok": True, "tx_hash": "abc", "message": "Transaction confirmed in block 2.",
+    }}
+
+
+@pytest.mark.trio
+async def test_tx_refusal_keeps_the_peer_keys(service):
+    refusal = {"ok": False, "code": "INVALID_SEQUENCE", "message": "used",
+               "details": {"expected": 1, "received": 0}}
+    service._queue_tx = MagicMock(return_value={**refusal, "internal": True})
+    stream = _make_stream(json.dumps({"tx": {"hash": "abc"}}).encode())
+    await service._handle_tx(stream)
+    assert _written_json(stream) == {"ok": True, "result": refusal}
+
+
+@pytest.mark.trio
 async def test_tx_invalid_json(service):
     service._queue_tx = MagicMock()
     stream = _make_stream(b"garbage")

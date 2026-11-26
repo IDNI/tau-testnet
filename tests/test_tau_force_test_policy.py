@@ -41,7 +41,8 @@ def test_sendtx_ignores_force_test_outside_test_env(monkeypatch):
             return "syntax error in rule"  # non-None -> rejection
 
         monkeypatch.setattr(sendtx, "validate_bls_pubkey", lambda *args, **kwargs: None)
-        monkeypatch.setattr(sendtx.chain_state, "get_sequence_number", lambda *_args, **_kwargs: 0)
+        monkeypatch.setattr(sendtx.chain_state, "get_committed_sequence_number",
+                            lambda *_args, **_kwargs: 0)
         monkeypatch.setattr(sendtx.chain_state, "get_rules_state", lambda: None)
         monkeypatch.setattr(sendtx.db, "get_pending_sequence", lambda *_args, **_kwargs: None)
         # Op-"0" rule validation runs only via the killable isolated subprocess

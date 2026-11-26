@@ -144,6 +144,12 @@ _sequence_lock = threading.Lock()
 # In-memory sequence numbers table: maps address to sequence number
 _sequence_numbers = {}
 
+# The sequences of the last committed head while a rebuild replays the chain.
+# The replay starts `_sequence_numbers` again at genesis.
+# Guarded by _sequence_lock.
+_committed_sequences: Optional[dict] = None
+_rebuild_depth = 0
+
 # Block timestamp of each account's previous transfer, 0/absent = never sent
 # (issue #21). Guarded by _sequence_lock rather than a fourth lock: it is written
 # in the same commit paths, and adding another lock to the
@@ -1118,8 +1124,11 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
     Rebuilds or updates the chain state by replaying transactions from the database.
     If start_block is 0, it clears existing state.
     """
-    
-    
+    with _sequences_held_for_admission():
+        return _replay_chain(start_block, path_hashes)
+
+
+def _replay_chain(start_block, path_hashes):
     print(f"[INFO][chain_state] Starting blockchain state reconstruction from block {start_block}...")
     global _canonical_head_hash, _tau_engine_state_hash, _application_rules_state, _consensus_rules_state
     global _active_consensus_id, _lifecycle_manager
@@ -1738,6 +1747,31 @@ def get_sequence_number(address_hex: str) -> int:
     """Returns the current sequence number for the given address (defaults to 0)."""
     with _sequence_lock:
         return _sequence_numbers.get(address_hex, 0)
+
+
+def get_committed_sequence_number(address_hex: str) -> int:
+    """The sequence number of the last committed head, also while a rebuild runs."""
+    with _sequence_lock:
+        sequences = _committed_sequences if _committed_sequences is not None else _sequence_numbers
+        return sequences.get(address_hex, 0)
+
+
+@contextmanager
+def _sequences_held_for_admission():
+    """Keep the committed sequences for admission while a rebuild rewrites them."""
+    global _committed_sequences, _rebuild_depth
+    with _sequence_lock:
+        if _rebuild_depth == 0:
+            _committed_sequences = dict(_sequence_numbers)
+        _rebuild_depth += 1
+    try:
+        yield
+    finally:
+        with _sequence_lock:
+            _rebuild_depth -= 1
+            if _rebuild_depth == 0:
+                _committed_sequences = None
+
 
 def increment_sequence_number(address_hex: str):
     """Increments the sequence number for the given address."""
@@ -2890,6 +2924,31 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
     new_path = shared + new_suffix
     old_path = shared + old_suffix
 
+    # The hold also covers the restore of the prior head after an abort.
+    with _sequences_held_for_admission():
+        committed = _rebuild_and_commit(new_head_hash, new_path, old_path, old_head_hash)
+    if not committed:
+        return False
+
+    # Phase 5: Mempool Restore
+    _evict_settled_from_mempool(new_txs)
+
+    orphaned = [tx for tx_id, tx in old_txs.items() if tx_id not in new_txs]
+    if orphaned:
+        try:
+            from commands import sendtx
+            sendtx.readmit_orphaned_transactions(orphaned)
+        except Exception as e:
+            logger.error(f"[chain_state] Failed to restore orphaned txs to mempool: {e}")
+
+    return True
+
+
+def _rebuild_and_commit(new_head_hash, new_path, old_path, old_head_hash) -> bool:
+    """Replay `new_path` and save it as the canonical state (phases 3 and 4 of
+    `reorg_to`). Returns False after an abort that restored the prior head."""
+    import db
+
     rebuild = _rebuild_state_from_blockchain_internal(0, path_hashes=new_path)
 
     # Phase 3b: Abort guard (Bug B). If the replay failed, the in-memory state
@@ -2970,17 +3029,5 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
         )
         _restore_prior_head(old_path, old_head_hash)
         return False
-
-    # Phase 5: Mempool Restore
-    _evict_settled_from_mempool(new_txs)
-
-    orphaned = [tx for tx_id, tx in old_txs.items() if tx_id not in new_txs]
-    if orphaned:
-        try:
-            from commands import sendtx
-            sendtx.readmit_orphaned_transactions(orphaned)
-        except Exception as e:
-            logger.error(f"[chain_state] Failed to restore orphaned txs to mempool: {e}")
-
     return True
 

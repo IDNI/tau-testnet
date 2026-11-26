@@ -421,7 +421,7 @@ class TestAdmissionFees(unittest.TestCase):
         # Sequence enforcement is on; pin the sender's expected sequence to match
         # the payload (sequence_number=1) and fund the sender (no auto-faucet).
         self.seq_patcher = patch(
-            "commands.sendtx.chain_state.get_sequence_number", return_value=1
+            "commands.sendtx.chain_state.get_committed_sequence_number", return_value=1
         )
         self.seq_patcher.start()
         self.addCleanup(self.seq_patcher.stop)
