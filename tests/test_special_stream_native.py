@@ -93,9 +93,9 @@ def rule_tx(tx_id, sender, sk, rule):
 
 
 tx_u = rule_tx("u-tx", A, SK_ALICE, U_RULE)
-tx_fee = rule_tx("fee-tx", C, SK_CAROL, FEE_RULE)
+tx_fee = rule_tx("fee-tx", B, SK_BOB, FEE_RULE)
 tx_transfer = sign_tx({"tx_id": "transfer-tx", "tx_type": "user_tx", "sender_pubkey": B,
-                       "sequence_number": 0, "fee_limit": "1000",
+                       "sequence_number": 1, "fee_limit": "1000",
                        "operations": {"1": [[B, A, str(AMOUNT)]]}}, SK_BOB)
 
 lifecycle = ConsensusLifecycleManager(active_validators=[PROPOSER])
@@ -168,4 +168,4 @@ def test_apply_rejects_the_u_rule_and_the_fee_rule_still_applies(tmp_path, repla
     assert out["u_reason"] == "rule_fragment", out
     assert not out["u_in_saved_state"], "the rejected rule was persisted"
     assert out["fee_rule_in_saved_state"], out
-    assert out["sender_balance"] == 1000 - AMOUNT - FEE - O8_FEE, out
+    assert out["sender_balance"] == 1000 - AMOUNT - 2 * (FEE + O8_FEE), out

@@ -67,12 +67,22 @@ O8_READS_I2 = (
 )
 UNSCOPED_O5 = f"always ( o5[t]:bv[24] = {ZERO} )."
 UNSCOPED_O8 = "always ( o8[t]:bv[24] = { #x0f4240 }:bv[24] )."
+FOREIGN_O8 = f"always ( (i12[t]:bv[384] = {{ #x{MALLORY} }}:bv[384]) -> (o8[t]:bv[24] = i1[t]:bv[24]) )."
+TAX_O8 = (
+    f"always ( ({GUARD} || (i1[t]:bv[24] > {{ #x000000 }}:bv[24])) -> "
+    f"(o8[t]:bv[24] = {{ #x000064 }}:bv[24]) )."
+)
+TOTAL_O8 = (
+    f"always ( ({GUARD} && (i1[t]:bv[24] > {{ #x000000 }}:bv[24])) ? "
+    f"(o8[t]:bv[24] = {{ #x000005 }}:bv[24]) : (o8[t]:bv[24] = {ZERO}) )."
+)
+I3_O8 = (
+    f"always ( (i3[t]:bv[384] = {{ #x{ALICE} }}:bv[384]) -> (o8[t]:bv[24] = i1[t]:bv[24]) )."
+)
 MIXED_O5_O8 = f"always ( o5[t]:bv[24] = {{ #x000001 }}:bv[24] && o8[t]:bv[24] = {ZERO} )."
 ROUTED_O5 = "always ( o5[t]:bv[24] = i1[t]:bv[24] )."
 FREE_I1 = "always ( o13[t]:bv[24] = i1[t]:bv[24] )."
-GUARDED_O8_I1 = (
-    f"always ( {GUARD} ? (o8[t]:bv[24] = i1[t]:bv[24]) : (o8[t]:bv[24] = {ZERO}) )."
-)
+GUARDED_O8_I1 = f"always ( {GUARD} -> (o8[t]:bv[24] = i1[t]:bv[24]) )."
 GUARDED_O5 = f"always ( {GUARD} -> (o5[t]:bv[24] = {ZERO}) )."
 U_RULE = "always ( u[t] = 0 )."
 THIS_READ = "always ( o13[t]:bv[24] = this[t] )."
@@ -108,6 +118,10 @@ REFUSED_RULES = [
     pytest.param(O8_READS_I2, "slots_on", "fee_reads_balance", id="o8-reads-i2-slots-on"),
     pytest.param(UNSCOPED_O8, "slots_off", "unscoped_user_rule", id="unscoped-o8-slots-off"),
     pytest.param(UNSCOPED_O8, "slots_on", "unscoped_user_rule", id="unscoped-o8-slots-on"),
+    pytest.param(FOREIGN_O8, "slots_off", "unscoped_user_rule", id="foreign-o8"),
+    pytest.param(TAX_O8, "slots_off", "unscoped_user_rule", id="disjoined-o8"),
+    pytest.param(TOTAL_O8, "slots_on", "unscoped_user_rule", id="total-form-o8"),
+    pytest.param(I3_O8, "slots_off", "unscoped_user_rule", id="i3-guarded-o8"),
     pytest.param(U_RULE, "slots_off", "rule_fragment", id="u-rule-slots-off"),
     pytest.param(U_RULE, "slots_on", "rule_fragment", id="u-rule-slots-on"),
     pytest.param(THIS_READ, "slots_off", "rule_fragment", id="this-read"),
@@ -132,6 +146,10 @@ MATRIX_ROWS = {
     "o8_reads_i2": (O8_READS_I2, {}),
     "unscoped_o5": (UNSCOPED_O5, {}),
     "unscoped_o8": (UNSCOPED_O8, {}),
+    "foreign_o8": (FOREIGN_O8, {}),
+    "disjoined_o8": (TAX_O8, {}),
+    "total_form_o8": (TOTAL_O8, {}),
+    "i3_guarded_o8": (I3_O8, {}),
     "mixed_o5_o8": (MIXED_O5_O8, {}),
     "routed_with_transfer": (ROUTED_O5, TRANSFER),
     "u_rule": (U_RULE, {}),

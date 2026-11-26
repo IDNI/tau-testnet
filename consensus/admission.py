@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import os
 import re
 import json
@@ -99,7 +99,7 @@ MAX_CUSTOM_INPUT_STREAMS = 16
 # pubkeys) and i5 (block timestamp) are NOT mocked — they are immutable in the
 # transfer tuple / injected by consensus, hence identical at admission and apply,
 # so recipient-aware and time-aware policy rules are deterministic across both and
-# are permitted. Fee/policy rules may scope on i12 (sender), i3/i4 (from/to), i5
+# are permitted. Fee/policy rules may read i12 (sender), i3/i4 (from/to), i5
 # (time) and i1 (amount). See tau_defs.py "DETERMINISM CONSTRAINT".
 APPLY_MOCKED_INPUT_STREAMS = ("i2",)
 
@@ -168,13 +168,16 @@ def screen_rule_fragment(unit_text: str) -> Optional[str]:
 
     The single entry point every admission and apply screen goes through.
     """
+    return _parse_fragment(unit_text)[1]
+
+
+def _parse_fragment(unit_text: str) -> Tuple[Optional[RuleShape], Optional[str]]:
     try:
-        parse_rule_unit(unit_text)
+        return parse_rule_unit(unit_text), None
     except RuleFragmentError as exc:
         if exc.temporal_reference:
-            return exc.message
-        return RULE_FRAGMENT_PREFIX + exc.message
-    return None
+            return None, exc.message
+        return None, RULE_FRAGMENT_PREFIX + exc.message
 
 
 def is_temporal_reference_error(error_text: Optional[str]) -> bool:
@@ -280,8 +283,17 @@ class UserRuleRejection(NamedTuple):
     details: Optional[Dict] = None
 
 
+_HEX_RE = re.compile(r"[0-9A-Fa-f]+")
+
+
+def _sender_key_value(sender_pubkey: Optional[str]) -> Optional[int]:
+    if not isinstance(sender_pubkey, str) or _HEX_RE.fullmatch(sender_pubkey) is None:
+        return None
+    return int(sender_pubkey, 16)
+
+
 def screen_user_rule_text(
-    rule_text: str, eligibility_mode: str, slots_active: bool
+    rule_text: str, eligibility_mode: str, slots_active: bool, sender_pubkey: Optional[str]
 ) -> Optional[UserRuleRejection]:
     """Screens for an accumulated op-0 rule, run by admission and by block apply.
 
@@ -290,7 +302,7 @@ def screen_user_rule_text(
     """
     import tau_native
 
-    fragment_error = screen_rule_fragment(
+    shape, fragment_error = _parse_fragment(
         tau_native.TauInterface.preprocess_spec_text(rule_text)
     )
     if is_temporal_reference_error(fragment_error):
@@ -336,21 +348,26 @@ def screen_user_rule_text(
             "TX_REJECTED",
         )
 
-    # o8 is shared across senders, so an unscoped write taxes fees for all.
-    # A reference is not proof of gating; this catches the accidental global rule only.
+    # o8 is shared across senders, so a fee rule must be fenced to its author's own key.
     policy_out = _streams_referenced(rule_text, ("o8",))
-    if policy_out and not _streams_referenced(rule_text, ("i12", "i3")):
-        return UserRuleRejection(
-            f"user_tx rule text writes shared policy stream '{policy_out[0]}' "
-            f"without a sender scope: it would apply to every account on the "
-            f"network. Guard the rule on your own identity — reference i12 "
-            f"(sender pubkey) or i3 (from address), e.g. "
-            f"always ((i12[t]:bv[384] = {{ #x<your pubkey> }}:bv[384]) -> "
-            f"{policy_out[0]}[t]:bv[24] = {{ #x000000 }}:bv[24]).",
-            "unscoped_user_rule",
-            "UNSCOPED_USER_RULE",
-            {"stream": policy_out[0]},
-        )
+    if policy_out:
+        own = _sender_key_value(sender_pubkey)
+        guard = shape.sender_guard if shape is not None else None
+        if own is None or guard != own:
+            if guard is not None and own is not None:
+                problem = "its i12 guard names a different account than the sender"
+            else:
+                problem = "it is not guarded on the sender's own key"
+            return UserRuleRejection(
+                f"user_tx rule text writes shared policy stream '{policy_out[0]}' "
+                f"but {problem}: a fee rule applies to every account unless it is "
+                f"fenced to its author. Write it as "
+                f"always ( (i12[t]:bv[384] = {{ #x<your pubkey> }}:bv[384]) -> ( ... ) ). "
+                f"with your own sender pubkey.",
+                "unscoped_user_rule",
+                "UNSCOPED_USER_RULE",
+                {"stream": policy_out[0]},
+            )
 
     # Per-stream typing is process-global and sticky, so a bv[16] or untyped
     # o5/o8 write pins the interpreter for everyone, even from a scoped rule.
@@ -503,7 +520,9 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if routing is not None:
             return routing
 
-        rejection = screen_user_rule_text(rule_text, tip_view.eligibility_mode, slots_active)
+        rejection = screen_user_rule_text(
+            rule_text, tip_view.eligibility_mode, slots_active, tx.get("sender_pubkey")
+        )
         if rejection:
             return format_error(
                 rejection.error, code=rejection.code, **(rejection.details or {})

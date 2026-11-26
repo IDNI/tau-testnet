@@ -71,6 +71,7 @@ class RuleShape:
     unit_bytes: int
     refs: Tuple[StreamRef, ...]
     max_width: int = 0
+    sender_guard: Optional[int] = None
 
 
 def clause_unit(body: str) -> str:
@@ -184,7 +185,10 @@ def _lex_ref(text: str, name: str, name_end: int, bracket_end: int) -> _Token:
 
 
 class _Node:
-    __slots__ = ("nodes", "depth", "comparisons", "literal")
+    __slots__ = (
+        "nodes", "depth", "comparisons", "literal",
+        "ref", "hex_value", "cmp_guard", "impl_guard",
+    )
 
     def __init__(self, nodes: int, depth: int, comparisons: int, literal: bool = False):
         if depth > MAX_DEPTH:
@@ -193,6 +197,10 @@ class _Node:
         self.depth = depth
         self.comparisons = comparisons
         self.literal = literal
+        self.ref: Optional[Tuple[str, int, int]] = None
+        self.hex_value: Optional[Tuple[int, int]] = None
+        self.cmp_guard: Optional[int] = None
+        self.impl_guard: Optional[int] = None
 
 
 def _leaf(literal: bool = False) -> _Node:
@@ -312,7 +320,9 @@ class _Parser:
             self.pos += 1
             width = self.annotation(required=True)
             self.note_width(value[0], value[1], width)
-            return self.postfix(_leaf())
+            leaf = _leaf()
+            leaf.ref = (value[0], value[1], width)
+            return self.postfix(leaf)
         if kind == "lit":
             self.pos += 1
             body = value[1:-1].strip()
@@ -328,7 +338,10 @@ class _Parser:
             self.literal_width = max(self.literal_width, width)
             if number >= 1 << width:
                 raise _fail(f"constant {_clip(body)} does not fit in bv[{width}].")
-            return self.postfix(_leaf(literal=True))
+            leaf = _leaf(literal=True)
+            if body.startswith("#x"):
+                leaf.hex_value = (number, width)
+            return self.postfix(leaf)
         if kind == "num":
             if value not in ("0", "1"):
                 raise _fail(
@@ -382,7 +395,15 @@ class _Parser:
         right = self.bf_expr()
         if self.peek_op() in _CMP_OPS:
             raise _fail("comparisons cannot be chained.")
-        return _join(left, right, comparison=True)
+        node = _join(left, right, comparison=True)
+        if (
+            op == "="
+            and left.ref == ("i", 12, 384)
+            and right.hex_value is not None
+            and right.hex_value[1] == 384
+        ):
+            node.cmp_guard = right.hex_value[0]
+        return node
 
     def unary(self) -> _Node:
         negations = 0
@@ -407,6 +428,8 @@ class _Parser:
                 self.leave()
                 self.expect_op(")")
                 node = _Node(inner.nodes, inner.depth, inner.comparisons)
+                node.cmp_guard = inner.cmp_guard
+                node.impl_guard = inner.impl_guard
         else:
             node = self.comparison()
         for _ in range(negations):
@@ -421,7 +444,9 @@ class _Parser:
         while self.peek_op() == op:
             self.pos += 1
             right = self.level(index + 1)
+            guard = left.cmp_guard if op == "->" else None
             left = _join(left, right)
+            left.impl_guard = guard
             if op not in _WFF_ASSOCIATIVE and self.peek_op() == op:
                 raise _fail(f"a chain of '{op}' needs parentheses.")
         return left
@@ -476,6 +501,7 @@ def _parse(text: str) -> RuleShape:
         unit_bytes=len(text.encode("utf-8")),
         refs=refs,
         max_width=max([parser.literal_width, *parser.widths.values()]),
+        sender_guard=node.impl_guard,
     )
 
 

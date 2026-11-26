@@ -533,7 +533,7 @@ on how many accounts hold clauses.
 | `TEMPORAL_REFERENCE` | The rule or clause body reads a step other than the current one (`i1[t-1]`, `i1[0]`). User rules reference `[t]` only. |
 | `RULE_FRAGMENT` | The rule or clause body uses syntax outside the admitted rule syntax (see [What registration requires](#what-registration-requires)). |
 | `RULE_BUDGET` | A rule that joins the shared specification exceeds one of the shared rule limits (rule size, depth, bytes, width, or the occurrence and node totals). It does not apply to `o5` clauses. |
-| `UNSCOPED_USER_RULE` | An `o8` fee rule that references neither `i12` nor `i3`. It does not apply to `o5` rules. |
+| `UNSCOPED_USER_RULE` | An `o8` fee rule that is not exactly `always ( (i12[t]:bv[384] = { #x<sender pubkey> }:bv[384]) -> ( ... ) ).` with the submitting account's own key. It does not apply to `o5` rules. |
 | `MIXED_OUTPUT_RULE` | The rule writes `o5` and something else. |
 | `RULE_WITH_TRANSFERS` | A routed `o5` rule shares a `user_tx` with transfers. Admission would judge those transfers against the policy being replaced. |
 | `TOO_MANY_REQUESTS` | `MAX_PENDING_REQUESTS_PER_SENDER` reached. |

@@ -68,7 +68,7 @@ def test_fragment_screen_accepts_ordinary_rules(text):
 
 @pytest.mark.parametrize("body,name", REFUSED)
 def test_user_rule_screen_refuses_with_fragment_reason(body, name):
-    rejection = screen_user_rule_text(_unit(body), "", False)
+    rejection = screen_user_rule_text(_unit(body), "", False, SENDER)
     assert rejection is not None
     assert rejection.reason == "rule_fragment"
     assert rejection.code == "RULE_FRAGMENT"
@@ -77,7 +77,7 @@ def test_user_rule_screen_refuses_with_fragment_reason(body, name):
 
 @pytest.mark.parametrize("text", [pytest.param(p.values[0], id=p.id) for p in ACCEPTED])
 def test_user_rule_screen_accepts_ordinary_rules(text):
-    rejection = screen_user_rule_text(text, "", False)
+    rejection = screen_user_rule_text(text, "", False, SENDER)
     assert rejection is None or rejection.reason not in ("rule_fragment", "temporal_reference")
 
 

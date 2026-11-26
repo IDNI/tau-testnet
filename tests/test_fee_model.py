@@ -523,10 +523,9 @@ class TestAdmissionFees(unittest.TestCase):
             self.assertFalse(result["ok"], msg=f"stream {stream} not screened")
             self.assertIn(stream, result["message"])
 
-    # o8 rule text must carry a sender scope. These tests target the other
-    # screens, so they wrap their body in the guard; the unscoped form is covered
-    # by TestUserRuleSenderScope in test_launch_hardening.py.
-    _SCOPE = "i12[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]"
+    # o8 rule text must be fenced to the sender's own key; these tests target the
+    # other screens, so they wrap their body in that fence.
+    _SCOPE = "i12[t]:bv[384] = { #x" + SENDER + " }:bv[384]"
 
     def _scoped(self, body: str) -> str:
         return f"always (({self._SCOPE}) -> ({body}))."

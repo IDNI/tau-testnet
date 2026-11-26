@@ -232,8 +232,9 @@ Note two transfers from the same sender in one block both see the same pre-block
 balance, so a floor does not compound within a block. **Fee** rules (`o8`) still
 may not read `i2`: admission estimates it against the current head, so the fee
 charged at inclusion could differ from the estimate quoted to the sender. Fee
-rules, unlike clauses, accumulate in a shared specification and must reference
-`i12` or `i3` to scope themselves to you (`UNSCOPED_USER_RULE`).
+rules, unlike clauses, accumulate in a shared specification and must be written
+as `always ( (i12[t]:bv[384] = { #x<your pubkey> }:bv[384]) -> ( ... ) ).` with
+your own key (`UNSCOPED_USER_RULE`).
 Such rules also count against the network's shared rule budget and are refused
 with `RULE_BUDGET` once a limit is reached (see the README).
 
