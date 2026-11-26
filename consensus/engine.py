@@ -1201,10 +1201,28 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # its revisions with accumulate=False, so it does
                         # not change the application-rules accumulation;
                         # the candidate for the revision it advanced is
-                        # the composition of the block-end accumulation.
-                        _act_canonical = _compose_canonical_spec_text(
-                            next_app_rules
-                        )
+                        # the session's own spec at that revision (the
+                        # interpreter/mirror spec, B02 §2 permanent),
+                        # as captured in the activation receipt -- the
+                        # composition of the block-end accumulation is
+                        # only the fallback when the session cannot
+                        # speak. NOTE: the §6.1 test has no activation,
+                        # so this path is NOT verified by CI.
+                        _act_spec = _act_receipt.get("current_spec")
+                        if _act_spec:
+                            _act_canonical = tau_native.TauInterface._ensure_trailing_period(
+                                _act_spec
+                            )
+                        else:
+                            logger.warning(
+                                "B02 §2: activation receipt carries no spec "
+                                "for spec_revision %s; falling back to "
+                                "composed snapshot text",
+                                _act_after,
+                            )
+                            _act_canonical = _compose_canonical_spec_text(
+                                next_app_rules
+                            )
                         if _act_canonical:
                             spec_snapshots.append((_act_after, _act_canonical))
             except Exception:
@@ -3036,15 +3054,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     # commit time only the block's final text
                                     # would still be readable, and the
                                     # intra-block states would be lost. The
-                                    # text is composed from the canonical
-                                    # accumulation as this step's own session
-                                    # leaves it (see
-                                    # _compose_canonical_spec_text), NOT read
-                                    # from tau_manager's process global: that
-                                    # global is a debug aid holding the
-                                    # interpreter's possibly shrunk spec, and
-                                    # under worker-backed authority it need
-                                    # not describe the executing session.
+                                    # text is the executing session's own spec
+                                    # as captured in the receipt at this step
+                                    # (the interpreter/mirror spec, B02 §2
+                                    # permanent) -- the same normalized form
+                                    # the journal-cut mirror serves, so the
+                                    # snapshot and the cut are one
+                                    # canonicalization. It is NOT read from
+                                    # tau_manager's process global: that
+                                    # global is a debug aid, and under
+                                    # worker-backed authority it need not
+                                    # describe the executing session. Only
+                                    # when the session cannot speak its spec
+                                    # (the receipt carries none) is the text
+                                    # composed from the canonical accumulation
+                                    # as before -- that fallback is logged,
+                                    # not silent.
                                     try:
                                         _rev_before = receipt.get("spec_revision_before")
                                         _rev_after = receipt.get("spec_revision_after")
@@ -3053,9 +3078,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             and isinstance(_rev_after, int)
                                             and _rev_after > _rev_before
                                         ):
-                                            _canonical = _compose_canonical_spec_text(
-                                                _step_accumulation_text(rule_text)
-                                            )
+                                            _session_spec = receipt.get("current_spec")
+                                            if _session_spec:
+                                                _canonical = tau_native.TauInterface._ensure_trailing_period(
+                                                    _session_spec
+                                                )
+                                            else:
+                                                logger.warning(
+                                                    "B02 §2: session spec unavailable "
+                                                    "for spec_revision %s; falling back "
+                                                    "to composed snapshot text",
+                                                    _rev_after,
+                                                )
+                                                _canonical = _compose_canonical_spec_text(
+                                                    _step_accumulation_text(rule_text)
+                                                )
                                             if _canonical:
                                                 tx_receipt["spec_snapshot"] = {
                                                     "spec_revision": _rev_after,
