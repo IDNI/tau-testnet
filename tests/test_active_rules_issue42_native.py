@@ -124,6 +124,27 @@ GENESIS_O6 = "o6[t]:bv[16] = i10[t]:bv[16]"
 GENESIS_O7 = "o7[t]:bv[16] = { 1 }:bv[16]"
 GENESIS_O9 = "o9[t]:bv[24] = { #x00000a }:bv[24]"
 
+# GENESIS_SURVIVING_STORED: the genesis unit's 9 surviving
+# conjuncts as the STORED snapshot renders them (pinned from mirror
+# run 45779972374: the journal cut renders the 8 non-b02 conjuncts
+# identically, and the ledger union's single diff gives the stored
+# b02 form -- bv[8] with the operands i3=i4, vs the cut's bv[384]
+# i4=i3). The APP ternary renders as TWO conjuncts (a conjunction
+# of two disjunctions), so the genesis unit has 9 conjuncts, not 8.
+# This replaces the as-fed constants above as the asserted model;
+# the as-fed constants are kept as documentation of what was fed.
+GENESIS_SURVIVING_STORED = [
+    "(i0[t]:tau = 0 || o0[t]:tau = 0 && u[t]:tau = i0[t]:tau)",
+    "(o0[t]:tau' = 0 || i0[t]:tau != 0)",
+    "o7[t]:bv[16] = { 1 }:bv[16]",
+    "o9[t]:bv[24] = { 10 }:bv[24]",
+    "o6[t]:bv[16] = i10[t]:bv[16]",
+    "(o2[t]:bv[24] = 0 && i2[t]:bv[24] < i1[t]:bv[24] || o2[t]:bv[24] = { 1 }:bv[24] && i2[t]:bv[24] !< i1[t]:bv[24])",
+    "(o3[t]:bv[16] = 0 && i3[t]:bv[8] = i4[t]:bv[8] || o3[t]:bv[16] = { 1 }:bv[16] && i3[t]:bv[8] != i4[t]:bv[8])",
+    "(o4[t]:bv[24] = 0 && i1[t]:bv[24] = 0 || i1[t]:bv[24] != 0 && o4[t]:bv[24] = { 1 }:bv[24])",
+    "o1[t]:bv[24] = i1[t]:bv[24]",
+]
+
 
 def _env():
     env = dict(os.environ)
@@ -525,22 +546,15 @@ def test_unit_ledger_served_under_authority(authority, _mining_allowed):
     assert genesis["introduced_at_height"] == 0
     assert genesis["introduced_at_revision"] == first["introduced_at_revision"] - 1
     assert genesis["status"] == "in_force"
-    # NOTE (coordinator correction of the F4 test): the exact genesis
-    # conjunct strings are NOT asserted here. They depend on the
-    # interpreter's rendering (O-1, unverified): the baseline CI cut
-    # already shows the interpreter normalizes the as-fed forms (APP
-    # ternary -> disjunction, o1 simplified to i1, o9 rendered
-    # '{ 10 }' not '{ #x00000a }', B01 reordered) -- so the as-fed
-    # constants above cannot be asserted verbatim (the baseline log
-    # truncates the cut, so the full normalized strings are not
-    # recoverable from it). What IS asserted (rendering-robust): the
-    # genesis unit is in_force, and the two plain-assignment conjuncts
-    # the cut verifies verbatim (O6, O7) survive in it. The exact
-    # normalized strings will be pinned from CI output once the mirror
-    # reveals the rendering.
-    assert GENESIS_O6 in genesis["surviving_conjuncts"]
-    assert GENESIS_O7 in genesis["surviving_conjuncts"]
-    assert len(genesis["surviving_conjuncts"]) >= 2
+    # NOTE (F5d): the exact genesis conjuncts ARE now asserted (the
+    # coordinator correction asked for them to be pinned once CI
+    # revealed the rendering -- mirror run 45779972374 did: the cut
+    # renders the 8 non-b02 conjuncts, the union diff gives the
+    # stored b02). The genesis unit is the STORED form (bv[8],
+    # i3=i4), not the cut form (bv[384], i4=i3) -- the ledger reads
+    # stored snapshots, and the two differ on b02 alone (O-4).
+    assert sorted(genesis["surviving_conjuncts"]) == sorted(
+        GENESIS_SURVIVING_STORED)
     assert genesis["displaced_conjuncts"] == []
     assert first["introduced_by_tx"] == install["tx_hash"]
     assert first["status"] == "partially_displaced"
