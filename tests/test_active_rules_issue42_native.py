@@ -448,6 +448,61 @@ def test_forged_journal_fingerprint_rejected_under_authority(
     assert active_rules._authority_spec_text() is None
 
 
+# --- B02 O-2: a TAMPERED cut holds the view -------------------------------
+
+def test_tampered_journal_cut_holds_snapshot_under_authority(
+        authority, _mining_allowed):
+    """O-2: when the journal the served snapshot rests on no longer
+    verifies (one journal row's link rewritten to a bogus value,
+    without re-linking the chain), the view HOLDS -- available:false
+    with cut_status TAMPERED -- instead of serving the snapshot
+    silently. A cut that merely does not exist yet still falls through
+    to the snapshot (the stopgap); only TAMPERED holds. This is the
+    native counterpart of the mock tamper tests (which have no
+    snapshots): here the snapshot EXISTS and would have been served
+    fail-open before O-2."""
+    import tau_journal
+
+    sk, pk = _sender("authority-tamper-hold")
+    for seq, rule in enumerate((PROBE_A, PROBE_B)):
+        _submit_and_mine(sk, pk, rule, seq)
+
+    # The view answers before the tamper (sanity: the harness works
+    # and the snapshot is served).
+    view = _answer_at()
+    assert view["available"] is True, view
+    height = view["height"]
+
+    # Break the chain: rewrite the first journal row's link to a bogus
+    # value without recomputing anything after it, so verify_entries
+    # raises and the cut at every height crossing the row reads
+    # TAMPERED. (The forge shape, where the links ARE recomputed, is
+    # a different mechanism -- caught by the rebuild replay check,
+    # exercised above -- and does not reach this hold.)
+    entries = tau_journal.journal_from_rows(
+        db.committed_journal_entries()).entries()
+    target = entries[0]
+    with db._db_lock:
+        cur = db._db_conn.cursor()
+        cur.execute(
+            "UPDATE tau_journal_v1 SET link = ? WHERE seq = ?",
+            ("00" * 32, target.seq))
+        db._db_conn.commit()
+
+    assert active_rules.journal_cut_status(height) == "TAMPERED"
+    held = _answer_at()
+    assert held["available"] is False, held
+    assert held.get("cut_status") == "TAMPERED", held
+    # The height-pinned view holds too, with the same classification.
+    held_h = _answer_at(height)
+    assert held_h["available"] is False, held_h
+    assert held_h.get("cut_status") == "TAMPERED", held_h
+    # And the resolve path (getpaymentconditions' surface) carries the
+    # same code instead of an answer.
+    answer, code = active_rules.resolve_answer_with_status(height)
+    assert answer is None and code == "TAMPERED"
+
+
 # --- B02-6 (§6.1): snapshot text == journal replay, per height -------------
 
 def test_snapshot_text_equals_journal_cut_replay_at_each_height(

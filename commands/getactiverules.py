@@ -342,6 +342,19 @@ def execute(raw_command: str, container):
     # by construction, and the stored-vs-cut divergence is visible
     # only through the derived="journal_cut" marker.
     view = active_rules.checked_snapshot_answer(snapshot)
+    if view is None:
+        # O-2: the served snapshot's own journal-cut check held (its
+        # cut is TAMPERED) -- hold, do not serve the snapshot. Fail
+        # closed for integrity, with the code carried so the caller
+        # can say why the view is unavailable.
+        data = {"available": False}
+        if height is not None:
+            data["requested_height"] = height
+        data["message"] = (
+            "the journal cut for the served snapshot is TAMPERED; "
+            "the active rules are not available")
+        data["cut_status"] = active_rules.CUT_TAMPERED
+        return api_response.success_response("getactiverules", data)
     data = {
         "available": True,
         "spec_revision": view["spec_revision"],

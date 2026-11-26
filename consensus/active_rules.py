@@ -567,15 +567,17 @@ def checked_snapshot_answer(snap: Optional[Dict]) -> Optional[Dict]:
     a snapshot that disagrees with the cut is answered with the cut
     instead -- the cut's text and its sha256, with ``derived`` marking
     the source. When the snapshot and the cut agree, the snapshot is
-    served unchanged. When the cut cannot be derived at all (no commit
-    record, a journal that no longer verifies, a mirror that cannot
-    speak), the snapshot is served as today: the cut is a check that
-    runs when it can speak, not a gate that withholds the view (O-2,
-    recorded openly; the coordinator may tighten this to "hold when
-    TAMPERED"). A snapshot with no height cannot be checked and is
-    served unchanged. The comparison covers the served text, its
-    sha256, and the spec revision: all three must agree, or the cut
-    answers.
+    served unchanged. When the cut cannot be derived because no commit
+    record exists (NOT_FOUND) or the mirror cannot speak
+    (UNAVAILABLE), the snapshot is served as today: the cut is a check
+    that runs when it can speak, not a gate that withholds the view
+    for a missing record. When the cut is TAMPERED -- the journal the
+    snapshot rests on no longer verifies -- the snapshot is HELD
+    (None, with a hard log): O-2, fail closed for integrity, never
+    serve a snapshot whose journal is broken. A snapshot with no
+    height cannot be checked and is served unchanged. The comparison
+    covers the served text, its sha256, and the spec revision: all
+    three must agree, or the cut answers.
     """
     view = _view_shape(snap)
     if view is None:
@@ -583,8 +585,18 @@ def checked_snapshot_answer(snap: Optional[Dict]) -> Optional[Dict]:
     height = view.get("height")
     if height is None:
         return view
-    cut, _code = _journal_cut_at_height(int(height))
+    cut, code = _journal_cut_at_height(int(height))
     if cut is None:
+        if code == CUT_TAMPERED:
+            # O-2: HOLD. The journal the snapshot rests on no longer
+            # verifies; serving the snapshot would hand out an answer
+            # whose integrity is already broken. Fail closed, and log
+            # it hard so the hold is visible, not silent.
+            logger.error(
+                "active_rules: journal cut at height %s is TAMPERED; "
+                "holding the stored snapshot (spec_revision %s)",
+                height, view.get("spec_revision"))
+            return None
         return view
     if (view.get("spec_text") != cut.get("spec_text")
             or view.get("spec_hash") != cut.get("spec_hash")
@@ -643,7 +655,13 @@ def resolve_answer_with_status(
     if height is None:
         snap = db.get_latest_spec_snapshot()
         if snap is not None:
-            return checked_snapshot_answer(snap), None
+            # O-2: the Step 7 check may HOLD the snapshot (its cut is
+            # TAMPERED) -- then there is no answer, classified
+            # CUT_TAMPERED, not a served snapshot.
+            answer = checked_snapshot_answer(snap)
+            if answer is None:
+                return None, CUT_TAMPERED
+            return answer, None
         tip = db.canonical_tip_height()
         if tip is None:
             return None, CUT_NOT_FOUND
@@ -651,7 +669,11 @@ def resolve_answer_with_status(
         return cut, (None if cut is not None else code)
     snap = db.get_spec_snapshot_at_or_before(int(height))
     if snap is not None:
-        return checked_snapshot_answer(snap), None
+        # O-2: same hold as above, for the height-pinned branch.
+        answer = checked_snapshot_answer(snap)
+        if answer is None:
+            return None, CUT_TAMPERED
+        return answer, None
     cut, code = _journal_cut_at_height(int(height))
     if cut is not None:
         return cut, None
