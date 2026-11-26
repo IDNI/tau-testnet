@@ -273,7 +273,7 @@ slots, such as the weaker template below, therefore leaves those kinds open.
 | Field | Notes |
 |---|---|
 | `kind` | `1`–`5`, as above. |
-| `rule_text` | Required for kinds 1 and 4. For kind 3, the exact raw text of the offer. Absent for kinds 2 and 5. At most `MAX_RULE_CHANGE_TEXT_BYTES` (8192). |
+| `rule_text` | Required for kinds 1 and 4. For kind 3, the exact raw text of the offer. Absent for kinds 2 and 5. At most `MAX_RULE_CHANGE_TEXT_BYTES` (8192). The whole request in canonical JSON must also fit `TAU_MAX_RULE_CHANGE_REQUEST_BYTES` (24576), else admission gives `TX_TOO_LARGE`. A JSON escape makes a control or non-ASCII character longer. |
 | `offer_id` | Kind 3 only: the offer being accepted. |
 | `approvers` | Slot to public key, up to 8. A request that names approvers needs approval slots active. May be empty, which leaves the time escape as the only way out. |
 | `expire_at_height` | The height after which the request expires. |

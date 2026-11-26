@@ -201,7 +201,7 @@ async def test_snapshot_replays_both_types_on_the_retractable_topic(service):
     published = []
 
     async def publish(topic, payload, **kwargs):
-        published.append((topic, payload["tx_type"]))
+        published.append((topic, json.loads(payload)["tx_type"]))
 
     service.publish_gossip = publish
     txs = ["json:" + json.dumps(_park()), json.dumps(_retract())]
@@ -218,7 +218,7 @@ async def test_snapshot_caps_retractable_txs_without_starving_others(service):
     published = []
 
     async def publish(topic, payload, **kwargs):
-        published.append(payload["tx_type"])
+        published.append(json.loads(payload)["tx_type"])
 
     service.publish_gossip = publish
     flood = [json.dumps(_park(sequence_number=i)) for i in range(
