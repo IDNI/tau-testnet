@@ -770,6 +770,8 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             sim_proposal = _speculative_proposal(candidate_rules=candidate_rules)
         if sim_proposal is not None:
             sim_proposal.budget = config.MINING_BUDGET
+            # Only a proposer may give up on a slow recheck: it defers the tx.
+            sim_proposal.recheck_budget = tau_proposal.RECHECK_BUDGET_SECONDS
         sim_session = sim_proposal.session if sim_proposal is not None else None
         # The terminal catch for an isolation breach. Inside apply the leak is a
         # BaseException precisely so no broad handler can turn it into a rejected

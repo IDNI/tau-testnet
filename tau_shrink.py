@@ -741,6 +741,26 @@ def wide_input_streams(text: str) -> frozenset:
     return frozenset(out)
 
 
+def declared_input_widths(text: str) -> dict:
+    """{stream: width} of each input stream that `text` declares at one width only."""
+    found: dict = {}
+    try:
+        toks = _tokenize(text or "")
+        bare_widths = _bare_ref_widths(toks, _equality_edges(toks))
+        for pos, t in enumerate(toks):
+            if t.kind != "streamref":
+                continue
+            ref = _ref_of(t, pos)
+            if ref is None or ref.io != "i":
+                continue
+            width = bare_widths.get(pos, ref.width)
+            if width >= 0:
+                found.setdefault(ref.index, set()).add(width)
+    except Exception:  # a scan must never break the eval path
+        return {}
+    return {s: ws.pop() for s, ws in found.items() if len(ws) == 1}
+
+
 def untyped_input_streams(text: str) -> frozenset:
     """Input streams with a bare reference that has no width source.
 
@@ -992,7 +1012,8 @@ class RuntimeEncoded(str):
 _STREAM_LITERAL_RE = re.compile(r"^\{\s*([^{}]*?)\s*\}\s*:\s*bv\[\s*(\d+)\s*\]$")
 
 
-def shrink_stream_value(value, stream_index: int, shrunk_streams) -> str:
+def shrink_stream_value(value, stream_index: int, shrunk_streams,
+                        declared_widths=None) -> str:
     """Encode ONE canonical input-stream value for the runtime representation.
 
     The native engine expects input-stream VALUES as BARE constants (`1`, `#x..`)
@@ -1004,6 +1025,10 @@ def shrink_stream_value(value, stream_index: int, shrunk_streams) -> str:
     can supply one (apply forwards user custom inputs here). Pass a
     `RuntimeEncoded` when the value is genuinely already encoded.
 
+    `declared_widths` maps a stream to the width its rules declare. With a known
+    width, every numeric form is interned at that width, and a value that does
+    not fit it stays as it is, so the engine refuses it as a full-width stream does.
+
     Raises ShrinkUnavailable if a value that MUST shrink cannot be interned --
     callers fail closed rather than feed a mixed-width convention.
     """
@@ -1013,16 +1038,18 @@ def shrink_stream_value(value, stream_index: int, shrunk_streams) -> str:
     if stream_index not in shrunk_streams or not text:
         return text
 
+    declared = (declared_widths or {}).get(stream_index) or _canonical_width_for(stream_index)
     m = _STREAM_LITERAL_RE.match(text)
     if m:
         inner = m.group(1).strip()
-        width = int(m.group(2))
+        # A full-width step drops the type of an input value.
+        width = declared if declared is not None else int(m.group(2))
         if width < MIN_SHRINK_WIDTH:
             return text
     else:
         # bare constant: canonical value at the stream's shrink-eligible width
         inner = text
-        width = None
+        width = declared
 
     low = inner.lower()
     if low.startswith("#x"):
@@ -1040,15 +1067,15 @@ def shrink_stream_value(value, stream_index: int, shrunk_streams) -> str:
         return text
 
     if width is None:
-        # A bare value carries no declared width. Intern it at the width the rule
-        # literals used, so the stream value and the literal collide on one id.
-        width = _canonical_width_for(stream_index)
-        if width is None:
-            return text
+        return text
 
     if _hex_is_zero(hex_digits):
         return "0"
-    return str(intern_value(hex_digits, width))
+    number = int(hex_digits, 16)
+    if number >> width:
+        return text
+    # Extra leading zeros must not give a second key for the same value.
+    return str(intern_value(format(number, "x"), width))
 
 
 # Canonical widths for shrink-eligible input streams. A bare stream value has no

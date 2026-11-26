@@ -16,6 +16,7 @@ def local_apply_errors() -> tuple[type[BaseException], ...]:
     # Imported on first use: tau_shrink loads this package through db before
     # it defines its classes.
     import tau_reconstruction
+    import tau_session
     import tau_shrink
     import tau_speculation
     from errors import (
@@ -36,6 +37,7 @@ def local_apply_errors() -> tuple[type[BaseException], ...]:
         tau_reconstruction.RepresentationConflict,
         tau_reconstruction.ReconstructionMismatch,
         tau_speculation.SpeculationError,
+        tau_session.StepRefusedLocally,
         TauCommunicationError,
         TauEngineCrash,
         MemoryError,

@@ -241,6 +241,47 @@ def test_stream_value_shrink_raises_on_db_error(temp_database, monkeypatch):
         ts.shrink_stream_value(f"{{ #x{HEX96} }}:bv[384]", 12, frozenset({12}))
 
 
+def test_a_custom_value_is_interned_at_the_declared_width(temp_database):
+    shrunk, declared = frozenset({13}), {13: 384}
+    one = str(ts.intern_value("1", 384))
+    assert ts.shrink_stream_value("1", 13, shrunk, declared) == one
+    assert ts.shrink_stream_value("#x01", 13, shrunk, declared) == one
+    assert ts.shrink_stream_value("#b1", 13, shrunk, declared) == one
+    wide = str(ts.intern_value("01ff", 384))
+    assert ts.shrink_stream_value("{ #x01ff }:bv[16]", 13, shrunk, declared) == wide
+    assert ts.shrink_stream_value("{ #x01ff }:bv[256]", 13, shrunk, declared) == wide
+    assert ts.shrink_stream_value("511", 13, shrunk, declared) == wide
+    key = str(ts.intern_value(HEX96, 384))
+    assert ts.shrink_stream_value("#x00" + HEX96, 13, shrunk, declared) == key
+    assert ts.shrink_stream_value("{ #x00" + HEX96 + " }:bv[384]", 13, shrunk, declared) == key
+
+
+def test_a_narrow_typed_value_on_a_canonical_stream_is_interned_at_384(temp_database):
+    assert (ts.shrink_stream_value("{ #x01ff }:bv[16]", 12, frozenset({12}))
+            == str(ts.intern_value("1ff", 384)))
+
+
+def test_a_custom_value_wider_than_the_declared_width_stays_as_it_is(temp_database):
+    too_wide = "#x1" + "0" * 96
+    assert ts.shrink_stream_value(too_wide, 13, frozenset({13}), {13: 384}) == too_wide
+    assert ts.shrink_stream_value(too_wide, 12, frozenset({12})) == too_wide
+
+
+def test_a_custom_value_with_no_declared_width_stays_as_it_is(temp_database):
+    assert ts.shrink_stream_value("300", 13, frozenset({13})) == "300"
+    assert ts.shrink_stream_value("{ #x01ff }:bv[16]", 13, frozenset({13})) == "{ #x01ff }:bv[16]"
+
+
+def test_declared_input_widths_skips_a_stream_with_two_widths():
+    text = _rule("i13[t]:bv[384] = i14[t]:bv[384] && i13[t-1]:bv[256] = { #x01 }:bv[256]")
+    assert ts.declared_input_widths(text) == {14: 384}
+
+
+def test_declared_input_widths_of_a_text_it_cannot_scan_is_empty(monkeypatch):
+    monkeypatch.setattr(ts, "_tokenize", lambda text: 1 / 0)
+    assert ts.declared_input_widths(_rule("i13[t]:bv[384] = i14[t]:bv[384]")) == {}
+
+
 # --- prepare_rule fail-closed / all-or-nothing -------------------------------
 
 def test_prepare_rule_db_error_disables_whole_spec(temp_database, monkeypatch):

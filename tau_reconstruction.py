@@ -80,23 +80,45 @@ class RepresentationPlan:
     width: int
     interned: frozenset = frozenset()
     plain: frozenset = frozenset()
+    #: Sorted (stream, declared width) pairs of the interned streams. None for
+    #: a plan stored without them, so its id matches its stored id.
+    widths: tuple | None = None
 
     @property
     def plan_id(self) -> str:
-        return tau_journal.fingerprint({
+        payload = {
             "width": self.width,
             "interned": sorted(self.interned),
             "plain": sorted(self.plain),
-        })
+        }
+        if self.widths is not None:
+            payload["widths"] = [list(pair) for pair in self.widths]
+        return tau_journal.fingerprint(payload)
+
+    @classmethod
+    def no_shrink(cls, width: int) -> "RepresentationPlan":
+        """A plan that interns nothing: every stream runs at full width."""
+        return cls(width=width, widths=())
 
     def excludes(self) -> frozenset:
         """Streams the optimizer must leave alone under this plan."""
         return frozenset(self.plain)
 
+    def declared_widths(self) -> dict:
+        return dict(self.widths or ())
+
+    def with_declared_widths(self, rules) -> "RepresentationPlan":
+        """This plan, with the declared width of each interned stream taken from `rules`."""
+        from dataclasses import replace
+        return replace(self, widths=_declared_widths(self.interned, rules))
+
     def to_json(self) -> str:
         import json
-        return json.dumps({"width": self.width, "interned": sorted(self.interned),
-                           "plain": sorted(self.plain)}, sort_keys=True)
+        data = {"width": self.width, "interned": sorted(self.interned),
+                "plain": sorted(self.plain)}
+        if self.widths is not None:
+            data["widths"] = [list(pair) for pair in self.widths]
+        return json.dumps(data, sort_keys=True)
 
     @classmethod
     def from_json(cls, text: str) -> "RepresentationPlan":
@@ -105,9 +127,39 @@ class RepresentationPlan:
         from the record that names it."""
         import json
         data = json.loads(text)
+        widths = data.get("widths")
         return cls(width=int(data["width"]),
                    interned=frozenset(int(x) for x in data.get("interned", ())),
-                   plain=frozenset(int(x) for x in data.get("plain", ())))
+                   plain=frozenset(int(x) for x in data.get("plain", ())),
+                   widths=None if widths is None else tuple(
+                       sorted((int(s), int(w)) for s, w in widths)))
+
+
+def _declared_widths(interned, rules) -> tuple:
+    """(stream, width) of each interned stream with one declared width over all `rules`.
+
+    A stream that the rules declare at two widths gets no entry, so its values
+    keep the encoding of a stream with no declared width.
+    """
+    seen = _widths_by_stream(rules)
+    return tuple(sorted((s, ws.pop()) for s, ws in seen.items()
+                        if s in interned and len(ws) == 1))
+
+
+def _widths_by_stream(rules) -> dict:
+    import tau_shrink
+
+    seen: dict = {}
+    for text in rules:
+        if not text or not str(text).strip():
+            continue
+        for stream, width in tau_shrink.declared_input_widths(str(text)).items():
+            seen.setdefault(stream, set()).add(width)
+    return seen
+
+
+def _streams_with_two_widths(rules) -> set:
+    return {s for s, ws in _widths_by_stream(rules).items() if len(ws) > 1}
 
 
 def plan_representation(*, history_rules=(), candidate_rules=(), width=None):
@@ -136,6 +188,8 @@ def plan_representation(*, history_rules=(), candidate_rules=(), width=None):
     # shrunk feed of that stream, or of its equality partners, cannot match it.
     for text in texts:
         plain |= tau_shrink.untyped_input_streams(text)
+    # A plan also covers rejected candidates, so it can meet two widths.
+    plain |= _streams_with_two_widths(texts)
     # A plain stream also makes its equality partners plain, in every rule, so
     # repeat with the plain set excluded until it stops growing.
     while True:
@@ -161,7 +215,8 @@ def plan_representation(*, history_rules=(), candidate_rules=(), width=None):
     # A stream that must be plain anywhere is plain everywhere.
     interned -= plain
     return RepresentationPlan(width=width, interned=frozenset(interned),
-                              plain=frozenset(plain))
+                              plain=frozenset(plain),
+                              widths=_declared_widths(interned, texts))
 
 
 @dataclass(frozen=True)

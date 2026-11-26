@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+from tau_reconstruction import RepresentationPlan
+
 
 def _native_available():
     try:
@@ -214,13 +216,6 @@ def _width():
     return tau_shrink.current_shrink_width()
 
 
-def _no_shrink_plan(width):
-    import tau_reconstruction
-
-    return tau_reconstruction.RepresentationPlan(width=width, interned=frozenset(),
-                                                 plain=frozenset())
-
-
 def _addr(hex_digits):
     return "{ #x" + hex_digits + " }:bv[384]"
 
@@ -297,7 +292,7 @@ def test_a_rule_gives_the_same_verdict_with_and_without_shrink(temp_database, na
     assert 13 in plan.interned
     inputs = [{13: _addr(CUSTOM_KEY)}, {13: _addr(OTHER_KEY)}]
     shrunk = _run_rules(plan, [rule], inputs)
-    canonical = _run_rules(_no_shrink_plan(plan.width), [rule], inputs)
+    canonical = _run_rules(RepresentationPlan.no_shrink(plan.width), [rule], inputs)
     assert shrunk[0] == [True]
     assert shrunk == canonical
 
@@ -321,7 +316,8 @@ def test_annotated_then_bare_gives_the_no_shrink_verdict(temp_database):
     """B then A: the bare i14 takes its width from i13, so a shrunk i13 typed i14
     shrunk while its input stayed full width."""
     live = _run_live([SHRINKS_I13, BARE_I13], PAIR_STEPS)
-    canonical = _run_rules(_no_shrink_plan(_width()), [SHRINKS_I13, BARE_I13], PAIR_STEPS)
+    canonical = _run_rules(RepresentationPlan.no_shrink(_width()), [SHRINKS_I13, BARE_I13],
+                           PAIR_STEPS)
     assert live[0] == [True, True]
     assert live == canonical
     assert [(out.get(5), out.get(6)) for out in canonical[1]] == [
@@ -331,7 +327,8 @@ def test_annotated_then_bare_gives_the_no_shrink_verdict(temp_database):
 def test_bare_then_annotated_gives_the_no_shrink_verdict(temp_database):
     """A then B: the engine refuses B also with no shrink."""
     live = _run_live([BARE_I13, SHRINKS_I13], PAIR_STEPS)
-    canonical = _run_rules(_no_shrink_plan(_width()), [BARE_I13, SHRINKS_I13], PAIR_STEPS)
+    canonical = _run_rules(RepresentationPlan.no_shrink(_width()), [BARE_I13, SHRINKS_I13],
+                           PAIR_STEPS)
     assert live[0] == [True, False]
     assert live == canonical
 
@@ -346,4 +343,4 @@ def test_replay_of_a_bare_ref_rule_before_its_stream_is_annotated(temp_database)
     assert {13, 14} <= set(plan.plain)
     replayed = _run_rules(plan, rules, PAIR_STEPS)
     assert replayed == _run_live(rules, PAIR_STEPS)
-    assert replayed == _run_rules(_no_shrink_plan(plan.width), rules, PAIR_STEPS)
+    assert replayed == _run_rules(RepresentationPlan.no_shrink(plan.width), rules, PAIR_STEPS)

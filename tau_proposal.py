@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 MAX_REPRESENTATION_RETRIES = 3
 
+#: Deadline of one recheck on the proposer, replay included. A recheck that
+#: runs out stops the block apply with no verdict, as a node-local error does.
+RECHECK_BUDGET_SECONDS = 60.0
+
 
 def branch_id(tx, index: int) -> str:
     """The id a transaction's branch is opened under. consensus/engine.py spells
@@ -268,6 +272,9 @@ class ProposalContext:
         #: a transaction branch is open: block-level work and replays never carry
         #: one. None means no deadline.
         self.budget = None
+        #: Deadline of a recheck in seconds. Only the proposer of a new block
+        #: sets it. None: the recheck runs to its end, so nodes agree.
+        self.recheck_budget = None
         #: The transaction whose branch is open, to name it if the worker is lost.
         self.open_tx = None
 
@@ -402,15 +409,91 @@ class ProposalContext:
                 f"representation still conflicting after {self._retries} attempts"
             )
         before = self.plan.plan_id
+        interned = frozenset(self.plan.interned) - frozenset(required_plain)
+        widths = self.plan.widths
         self.plan = tau_reconstruction.RepresentationPlan(
             width=self.plan.width,
-            interned=frozenset(self.plan.interned) - frozenset(required_plain),
+            interned=interned,
             plain=frozenset(self.plan.plain) | frozenset(required_plain),
+            widths=None if widths is None else tuple(
+                (s, w) for s, w in widths if s in interned),
         )
         if self.plan.plan_id == before:
             raise ProposalPoisoned("representation retry made no progress")
         self.mark_dirty("representation plan widened")
         self.reconstruct()
+
+    # --- recheck of a refused step --------------------------------------------
+
+    def recheck_step(self, inputs, *, branch=None):
+        """Step `inputs` once on a fresh full-width evaluator at this point.
+
+        The evaluator replays the committed journal, this proposal's journal and
+        the journal of `branch`. Returns the outputs or raises StepRefused. The
+        proposal session, journal and allocator do not change. The deadline is
+        `recheck_budget`.
+        """
+        import threading
+
+        import tau_allocator
+        import tau_session
+
+        self._check_usable()
+        if self._rebuild is None:
+            raise ProposalPoisoned("no reconstruction available for this proposal")
+        plan = tau_reconstruction.RepresentationPlan.no_shrink(self.plan.width)
+        scratch = tau_allocator.Allocator(
+            tau_allocator.MappingSnapshot(epoch="recheck"), width=plan.width,
+            label="recheck",
+        )
+        spawned = []
+        expired = threading.Event()
+        lock = threading.Lock()
+
+        def watch(session):
+            with lock:
+                spawned.append(session)
+                late = expired.is_set()
+            if late:
+                session.dispose()
+
+        def expire():
+            with lock:
+                expired.set()
+                victims = list(spawned)
+            for session in victims:
+                session.dispose()
+
+        budget = self.recheck_budget
+        timer = None
+        if budget is not None:
+            timer = threading.Timer(budget, expire)
+            timer.daemon = True
+            timer.start()
+        try:
+            extra = branch.journal.entries() if branch is not None else ()
+            try:
+                session = self._rebuild(self.journal, plan, allocation=scratch,
+                                        on_spawn=watch, extra=extra)
+            except tau_session.StepRefused as exc:
+                # Only the step under recheck may give a refusal verdict.
+                raise RuntimeError(
+                    f"the full-width replay refused a recorded step: {exc}") from exc
+            return session.evaluate(inputs, multi=True, record=False)
+        except tau_session.StepRefused:
+            raise
+        except Exception as exc:
+            if expired.is_set():
+                raise TimeoutError(f"the recheck ran out of its {budget}s budget") from exc
+            raise
+        finally:
+            if timer is not None:
+                timer.cancel()
+            for session in spawned:
+                try:
+                    session.dispose()
+                except Exception:
+                    pass
 
     # --- outcome --------------------------------------------------------------
 

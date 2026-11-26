@@ -153,7 +153,8 @@ class _Deadline:
 class AdmissionContext:
     """One request's evaluator. Used once, then disposed."""
 
-    def __init__(self, session, *, anchor, plan, label, deadline, release):
+    def __init__(self, session, *, anchor, plan, label, deadline, release,
+                 rebuild=None):
         self._session = session
         self.anchor = dict(anchor)
         self.plan = plan
@@ -161,6 +162,10 @@ class AdmissionContext:
         self._deadline = deadline
         self._release = release
         self._closed = False
+        #: plan -> (session, anchor, plan) at the committed head, for a recheck.
+        self._rebuild = rebuild
+        #: What this context fed, in order, so a recheck can feed it again.
+        self._feed = []
 
     # --- evaluation ---------------------------------------------------------------
 
@@ -190,17 +195,59 @@ class AdmissionContext:
             # Preparation that cannot represent the rule, a capacity overflow, a
             # dead worker: all node-local, none of them the author's fault.
             raise self._operational(exc) from exc
+        self._feed.append(("rule", rule_text))
         return self._session.last_receipt() or {}
 
-    def step(self, inputs: dict) -> dict:
-        """One evaluation step; the indexed outputs, or StepRefused."""
+    def step(self, inputs: dict, *, recheck=False) -> dict:
+        """One evaluation step; the indexed outputs, or StepRefused.
+
+        With `recheck`, a refusal is StepRefused only when a fresh full-width
+        evaluator refuses the step too. Else it is AdmissionUnavailable.
+        """
         self._check()
         try:
-            return self._session.evaluate(inputs, multi=True, record=False)
-        except StepRefused:
+            outputs = self._session.evaluate(inputs, multi=True, record=False)
+        except StepRefused as refused:
+            if recheck:
+                self._recheck(inputs, refused)
             raise
         except (Exception, WorkerLost) as exc:
             raise self._operational(exc) from exc
+        self._feed.append(("step", dict(inputs or {})))
+        return outputs
+
+    def _recheck(self, inputs, refused) -> None:
+        """Return when the full-width evaluator refuses `inputs` too."""
+        import tau_reconstruction
+
+        if self._rebuild is None:
+            raise AdmissionUnavailable(
+                f"{self.label}: a refused step cannot be checked again") from refused
+        session = None
+        try:
+            session, anchor, _ = self._rebuild(
+                tau_reconstruction.RepresentationPlan.no_shrink(self.plan.width))
+            if _anchor_key(anchor) != _anchor_key(self.anchor):
+                raise AdmissionUnavailable("a block committed during the recheck")
+            for kind, item in self._feed:
+                if kind == "rule":
+                    session.apply_rule(item, target=0, record=False)
+                else:
+                    session.evaluate(item, multi=True, record=False)
+            try:
+                session.evaluate(inputs, multi=True, record=False)
+            except StepRefused:
+                return
+        except (Exception, WorkerLost) as exc:
+            # A timeout too: admission waits for no slow recheck.
+            raise AdmissionUnavailable(
+                f"{self.label}: the full-width recheck of a refused step failed: {exc}"
+            ) from exc
+        finally:
+            if session is not None:
+                session.dispose()
+        raise AdmissionUnavailable(
+            f"{self.label}: only the shrunk evaluator refuses the step") from refused
 
     # --- disposal -----------------------------------------------------------------
 
@@ -258,15 +305,17 @@ def _plan_for(anchor, entries, candidate_rules):
     import tau_journal
     import tau_reconstruction
 
+    history = [e.rule_text for e in entries
+               if e.kind == tau_journal.REVISION and e.rule_text]
     if anchor.get("plan_json"):
         committed = tau_reconstruction.RepresentationPlan.from_json(anchor["plan_json"])
         if anchor.get("plan_id") and committed.plan_id != anchor["plan_id"]:
             raise AdmissionUnavailable(
                 "the stored representation plan does not hash to its recorded id")
+        if committed.widths is None:
+            committed = committed.with_declared_widths(history)
         if not _conflicts(committed, candidate_rules):
             return committed
-    history = [e.rule_text for e in entries
-               if e.kind == tau_journal.REVISION and e.rule_text]
     import tau_manager
     with tau_manager.reexec_on_width_overflow():
         return tau_reconstruction.plan_representation(
@@ -274,8 +323,11 @@ def _plan_for(anchor, entries, candidate_rules):
         )
 
 
-def _build(*, candidate_rules, label, deadline, cwd, env, store):
-    """A session at the committed head: (session, anchor, plan)."""
+def _build(*, candidate_rules, label, deadline, cwd, env, store, plan=None):
+    """A session at the committed head: (session, anchor, plan).
+
+    `plan` replaces the plan that a block built now would use.
+    """
     import tau_allocator
     import tau_authority
     import tau_journal
@@ -294,7 +346,8 @@ def _build(*, candidate_rules, label, deadline, cwd, env, store):
     except Exception as exc:
         raise AdmissionUnavailable(f"the committed journal does not verify: {exc}") from exc
     entries = journal.entries()
-    plan = _plan_for(anchor, entries, candidate_rules)
+    if plan is None:
+        plan = _plan_for(anchor, entries, candidate_rules)
     # Pinned to the anchor it was read with: a block committing while this
     # context evaluates must not hand it bindings from a later state.
     snapshot = tau_allocator.PinnedDbMappingSnapshot(
@@ -366,8 +419,14 @@ def open_context(*, candidate_rules=(), budget=None, label="admission",
                 cwd=cwd, env=env, store=store,
             )
         _count("opened")
+
+        def rebuild(recheck_plan):
+            return _build(candidate_rules=candidate_rules, label=f"{label}-recheck",
+                          deadline=deadline, cwd=cwd, env=env, store=store,
+                          plan=recheck_plan)
+
         context = AdmissionContext(session, anchor=anchor, plan=plan, label=label,
-                                   deadline=deadline, release=release)
+                                   deadline=deadline, release=release, rebuild=rebuild)
         release = None
         return context
     except BaseException:

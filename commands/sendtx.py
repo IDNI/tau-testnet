@@ -486,7 +486,7 @@ class _AdmissionTau:
             return outputs
         import tau_admission
         try:
-            outputs = self._ctx().step(inputs)
+            outputs = self._ctx().step(inputs, recheck=True)
         except tau_admission.StepRefused:
             # The engine evaluated the step and refused it: Tau did run.
             self.facts.tau_steps += 1
@@ -1509,8 +1509,8 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         logger.error("Tau rule validation failed: %s", e)
         return _qt_err("TX_REJECTED", f"Transaction rejected by Tau. {e}")
     except tau_admission.StepRefused as e:
-        # The engine refused this request's own inputs, against committed state:
-        # the same refusal wherever they run.
+        # A fresh full-width evaluator refused the same inputs too, so every
+        # node refuses them. A shrunk-only refusal is ADMISSION_UNAVAILABLE.
         return _qt_err("TX_REJECTED", f"Transaction rejected by Tau. {e}")
     except tau_admission.EstimateBusy as e:
         logger.info("Fee estimate refused: %s", e)
