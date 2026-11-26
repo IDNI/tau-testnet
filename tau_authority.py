@@ -700,6 +700,53 @@ class AuthoritativeTauOwner:
         entries = journal.entries()
         delta = dict(allocator.delta())
         state = tau_commit._worker_state(session)
+        # B02 §3 (F4): the genesis spec is the ledger's baseline -- record
+        # it as the first snapshot (height 0), so the unit ledger shows
+        # the genesis unit instead of starting at the first rule revision.
+        # The text is the executing session's own spec, receipt-carried
+        # under the key "current_spec" (F3-permanent): _worker_state reads
+        # it from the worker's op "state", and the last apply receipt
+        # carries the same key as a fallback. The in-process
+        # tau_direct_interface.get_current_spec() global is NOT a source
+        # here -- under worker-backed authority it need not describe this
+        # session (consensus/engine.py:3042). Best effort, like
+        # _record_rule_view_data: a missing snapshot degrades the view,
+        # never the committed block. Re-record is idempotent (INSERT OR
+        # REPLACE per revision), so a rebuild re-committing genesis
+        # re-records the same row. The raw current_spec() carries no
+        # trailing-period guarantee (that is why
+        # TauInterface._ensure_trailing_period exists, tau_native.py:428);
+        # the stored form is ensured, matching the cut's convention
+        # (tau_native.py:781-782). NOTE (new world): the worker already
+        # ensures the trailing period in _current_spec_or_none (F3), so
+        # the _ensure_trailing_period call below is now a redundant but
+        # idempotent safety net, kept deliberately.
+        genesis_revision = state.get("spec_revision")
+        genesis_spec_text = state.get("current_spec")
+        if (not isinstance(genesis_spec_text, str)
+                or not genesis_spec_text.strip()):
+            receipt = session.last_receipt() or {}
+            genesis_spec_text = receipt.get("current_spec")
+        if (isinstance(genesis_revision, int)
+                and isinstance(genesis_spec_text, str)
+                and genesis_spec_text.strip()):
+            import db as _db
+            import tau_native
+            try:
+                _db.record_spec_snapshots(
+                    0,
+                    [(genesis_revision,
+                      tau_native.TauInterface._ensure_trailing_period(
+                          genesis_spec_text))],
+                )
+            except Exception:
+                logger.exception("could not record genesis spec snapshot")
+        else:
+            logger.warning(
+                "genesis spec snapshot not recorded: no usable current_spec "
+                "from the worker (revision %r)",
+                genesis_revision,
+            )
         store.commit_prepared_block(
             execution_id=f"genesis:{genesis_hash or ''}",
             tip=genesis_hash or "",
