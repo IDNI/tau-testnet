@@ -18,8 +18,10 @@ semantics end-to-end, with exact balance deltas:
     one (three amounts), and periods 2 and 3 stay unpaid;
 (d) the composition with FIX 5's due_retry — a clause-form due point
     refused short is owed a retry by the block's sweep; once funded,
-    a plain execution settles that period and the owed retry dies
-    with the settlement: a further block's sweep pays nothing again;
+    the next block's sweep pays that period and the owed retry dies
+    with the settlement, so a plain execution then finds the period
+    already settled: a further block's sweep pays nothing again —
+    the period is never paid twice;
 (e) restore round-trips the count from the canonical book's rows,
     and a pre-FIX 9 row (no trailing count) restores as count 0 with
     the same root.
@@ -297,18 +299,27 @@ class TestCatchUpPeriodsNative(unittest.TestCase):
         self.assertEqual(owed[0].period_index, 0)
         self.assertEqual(self._book().total_executed(entry.auth_id), (0, 0))
 
-        # Act 2: the payer is funded; a plain execution settles the
-        # period — and the settlement drops the owed retry with it.
+        # Act 2: the payer is funded — and the funding block's own sweep
+        # pays the owed retry (FIX 5: a retry runs in a LATER block's
+        # sweep, never the block that owed it), so the period settles
+        # without any execution at all.
         fund = self._transfer(EXTRA, SK_MALLORY, PAYER, 300)
         res = sendtx.queue_transaction(fund, propagate=False)
         self.assertTrue(res["ok"], f"funding transfer rejected: {res}")
+        before = self._balances(PAYER, RECIPIENT)
         self._mine()
-        before, after = self._execute_and_mine(entry)
+        after = self._balances(PAYER, RECIPIENT)
+        self.assertEqual(after[PAYER] - before[PAYER], 300 - CLAUSE_AMOUNT)
         self.assertEqual(after[RECIPIENT] - before[RECIPIENT], CLAUSE_AMOUNT)
-        self.assertEqual(after[PAYER] - before[PAYER], -CLAUSE_AMOUNT)
         book = self._book()
         self.assertEqual(book.owed_retries(), [])
         self.assertEqual(book.total_executed(entry.auth_id), (1, CLAUSE_AMOUNT))
+        # And a plain execution now is refused: the period is already
+        # settled — exactly the never-paid-twice property this test's
+        # name claims.
+        res = sendtx.queue_transaction(self._execute_tx(entry.auth_id), propagate=False)
+        self.assertFalse(res["ok"], f"execution on a settled period admitted: {res}")
+        self.assertIn("already settled", str(res))
 
         # Act 3: another block's sweep runs — the settled period is
         # not paid a second time through the (dead) retry.
