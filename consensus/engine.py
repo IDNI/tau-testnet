@@ -1865,10 +1865,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     == tau_defs.USER_POLICY_BLOCK_VALUE
                 )
                 if allows:
-                    own_blocks, _own_o5 = sender_policy.clause_blocks(
-                        lifecycle_mgr.rule_offers.clause_for(
-                            from_addr, tau_defs.USER_POLICY_STREAM_INDEX),
-                        inputs, pool="apply",
+                    # Send path: a recipient-relevant clause (reads the
+                    # counterparty or a hold stream) is a receive policy
+                    # and never blocks the owner's own sends — see
+                    # recipient_policy.send_path_clause_blocks.
+                    own_blocks, _own_o5 = recipient_policy.send_path_clause_blocks(
+                        lifecycle_mgr.rule_offers.clause_for,
+                        from_addr, inputs, pool="apply",
                         timeout=getattr(_session, "request_budget", None),
                     )
                     allows = not own_blocks
@@ -1992,10 +1995,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                             return False
 
-                        own_blocks, own_o5 = sender_policy.clause_blocks(
-                            lifecycle_mgr.rule_offers.clause_for(
-                                from_addr, tau_defs.USER_POLICY_STREAM_INDEX),
-                            tau_input_stream_values, pool="apply",
+                        # Send path, through the same funnel as admission:
+                        # a recipient-relevant clause is a receive policy
+                        # and never blocks the owner's own sends (see
+                        # recipient_policy.send_path_clause_blocks).
+                        own_blocks, own_o5 = recipient_policy.send_path_clause_blocks(
+                            lifecycle_mgr.rule_offers.clause_for,
+                            from_addr, tau_input_stream_values, pool="apply",
                             timeout=getattr(_session, "request_budget", None),
                         )
                         if own_blocks:
