@@ -30,7 +30,11 @@ from tests.chain_harness import ALICE, BOB, CAROL, HEIGHT, PROPOSER, TS, Chain, 
 from tests.test_payout_apply import DAVE, TWO, _events, _reason, exec_tx, rid, set_tx
 from tests.test_payout_conditions_native import REPO, TIMEOUT, pytestmark  # noqa: F401
 from tests.test_payout_triggers import RECURRING, ROUTE, STEP
-from tests.wallet_templates import shipped_templates
+from tests.wallet_templates import APP_JS, shipped_templates
+
+if not os.path.exists(APP_JS):
+    # The CI image is built without web-wallet/, so the templates are not there to read.
+    pytest.skip("web-wallet/app.js is not in this tree", allow_module_level=True)
 
 TEMPLATES = shipped_templates()
 BLOCKED = "the account's o5 clause blocks the payment of slot"
