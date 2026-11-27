@@ -123,6 +123,54 @@ def test_path_removed_when_every_entry_dropped(tmp_path):
     assert "PATH" not in env
 
 
+def test_path_scrub_keeps_the_other_programs_of_a_tool_dir(tmp_path):
+    shared = tmp_path / "usr_bin"
+    shared.mkdir()
+    _fake_tool(shared, "ltlsynt")
+    _fake_tool(shared, "autfilt")
+    _fake_tool(shared, "systool")
+    other = tmp_path / "other"
+    other.mkdir()
+    env = {"PATH": os.pathsep.join([str(other), str(shared)])}
+    assert profile.prepare_environment(env) == [str(shared)]
+    entries = env["PATH"].split(os.pathsep)
+    assert entries[0] == str(other)
+    assert len(entries) == 2 and entries[1] != str(shared)
+    assert sorted(os.listdir(entries[1])) == ["systool"]
+    assert not profile._unscrubbable_locations(env)
+    found = subprocess.run(["systool"], env={"PATH": env["PATH"]})
+    assert found.returncode == 0
+
+
+def test_path_scrub_reuses_its_copy(tmp_path):
+    _fake_tool(tmp_path, "ltlfilt")
+    _fake_tool(tmp_path, "systool")
+    first = {"PATH": str(tmp_path)}
+    second = {"PATH": str(tmp_path)}
+    profile.prepare_environment(first)
+    profile.prepare_environment(second)
+    assert first["PATH"] == second["PATH"] != str(tmp_path)
+    # a scrubbed PATH holds no tool, so a second scrub keeps it as it is
+    again = dict(first)
+    assert profile.prepare_environment(again) == []
+    assert again["PATH"] == first["PATH"]
+
+
+def test_path_scrub_drops_the_dir_when_it_cannot_link(tmp_path, monkeypatch):
+    _fake_tool(tmp_path, "ltlsynt")
+    _fake_tool(tmp_path, "systool")
+
+    def refuse(src, dst):
+        raise OSError("no links here")
+
+    monkeypatch.setattr(profile.os, "symlink", refuse)
+    keep = tmp_path / "keep"
+    keep.mkdir()
+    env = {"PATH": os.pathsep.join([str(tmp_path), str(keep)])}
+    assert profile.prepare_environment(env) == [str(tmp_path)]
+    assert env["PATH"] == str(keep)
+
+
 def test_node_variables_do_not_collide_with_option_variables():
     option_vars = {profile.option_env_name(o) for o in profile.MANIFEST}
     used = set()

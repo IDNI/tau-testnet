@@ -3,11 +3,14 @@
 `prepare_environment` strips engine inputs before `import tau`; `apply` forces
 and verifies the tested option values after it, raising `EngineProfileError`.
 """
+import atexit
 import hashlib
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -150,16 +153,70 @@ def _dir_has_tool(directory):
                for tool in _EXTERNAL_TOOLS)
 
 
-def scrub_path(path_value, has_tool=_dir_has_tool):
-    """Returns (kept PATH text, dropped entries), preserving order."""
+# PATH entry -> its copy without the tools, made once per process.
+_shadow_dirs = {}
+
+
+def _remove_shadow_dirs(owner=os.getpid()):
+    # a forked child inherits the table, but the parent owns the directories
+    if os.getpid() != owner:
+        return
+    for shadow in _shadow_dirs.values():
+        if shadow:
+            shutil.rmtree(shadow, ignore_errors=True)
+
+
+atexit.register(_remove_shadow_dirs)
+
+
+def shadow_without_tools(directory):
+    """A private directory linking every entry of `directory` but the tools.
+
+    None when `directory` holds nothing else, or the links cannot be made.
+    """
+    if directory in _shadow_dirs:
+        return _shadow_dirs[directory]
+    shadow = None
+    try:
+        names = [n for n in os.listdir(directory or ".")
+                 if n not in _EXTERNAL_TOOLS]
+    except OSError:
+        names = []
+    if names:
+        source = os.path.abspath(directory or ".")
+        shadow = tempfile.mkdtemp(prefix="tau-path-")
+        try:
+            for name in names:
+                os.symlink(os.path.join(source, name), os.path.join(shadow, name))
+        except OSError as exc:
+            logger.warning("Cannot link %r without the Spot tools: %s", directory, exc)
+            shutil.rmtree(shadow, ignore_errors=True)
+            shadow = None
+    _shadow_dirs[directory] = shadow
+    return shadow
+
+
+def scrub_path(path_value, has_tool=_dir_has_tool, shadow=shadow_without_tools):
+    """Returns (scrubbed PATH text, entries that held a tool), preserving order.
+
+    An entry that holds a tool is replaced by `shadow(entry)`, the same
+    programs without the tools, so a Spot install in /usr/bin does not take
+    every system tool with it; it is dropped when `shadow` returns None.
+    """
     kept, dropped = [], []
     for entry in path_value.split(os.pathsep):
-        (dropped if has_tool(entry) else kept).append(entry)
+        if not has_tool(entry):
+            kept.append(entry)
+            continue
+        dropped.append(entry)
+        replacement = shadow(entry)
+        if replacement:
+            kept.append(replacement)
     return os.pathsep.join(kept), dropped
 
 
 def prepare_environment(environ=os.environ):
-    """Removes engine inputs from `environ`; returns the dropped PATH entries."""
+    """Removes engine inputs from `environ`; returns the PATH entries that held a tool."""
     for option in MANIFEST:
         name = option_env_name(option)
         if name in environ:
@@ -173,7 +230,7 @@ def prepare_environment(environ=os.environ):
     if path_value:
         kept, dropped = scrub_path(path_value)
         for entry in dropped:
-            logger.warning("Dropping PATH entry %r", entry)
+            logger.warning("Hiding the Spot tools of PATH entry %r", entry)
         if dropped:
             if kept:
                 environ["PATH"] = kept
