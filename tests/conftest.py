@@ -178,11 +178,20 @@ def allow_history_rules(monkeypatch):
     """Let a rule that reads an earlier step through admission and apply.
 
     Evaluator-continuity tests need a stateful evaluator behind the real entry
-    points, which the temporal screen refuses for user rules.
+    points, which the rule-fragment screen refuses for user rules.
     """
+    import re
+    from types import SimpleNamespace
+
     import consensus.admission
 
-    monkeypatch.setattr(consensus.admission, "screen_temporal_rule", lambda _rule_text: None)
+    def parse_without_screen(unit_text):
+        found = re.search(r"i12\[t\]:bv\[384\] = \{ #x([0-9A-Fa-f]+) \}", unit_text)
+        guard = int(found.group(1), 16) if found else None
+        return SimpleNamespace(sender_guard=guard), None
+
+    monkeypatch.setattr(consensus.admission, "screen_rule_fragment", lambda _unit_text: None)
+    monkeypatch.setattr(consensus.admission, "_parse_fragment", parse_without_screen)
 
 
 class FakeEngine:

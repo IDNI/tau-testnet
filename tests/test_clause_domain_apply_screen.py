@@ -22,6 +22,7 @@ from bls_keys import FAR_FUTURE, SK_ALICE, SK_MALLORY, pubkey_hex, sign_tx
 HEIGHT = 20
 WIDTH_MISMATCH = "width_mismatch"
 NOT_APPLIED = "rule_not_applied"
+FRAGMENT = "rule_fragment"
 TEMPORAL = "temporal_reference"
 
 
@@ -30,6 +31,10 @@ MALLORY = pubkey_hex(SK_MALLORY)  # offerer and block proposer
 
 _ON = "(o5[t]:bv[24] = { #x000001 }:bv[24])"
 _OFF = "(o5[t]:bv[24] = { #x000000 }:bv[24])"
+
+
+def _body_of(rule):
+    return rule[len("always ( "):-len(" ).")]
 
 
 def _cond(condition):
@@ -45,6 +50,9 @@ BAD_BODIES = {
     "slot_untyped": _cond("i18[t] = { #x000001 }:bv[24]"),
     "o5_bv16": "always ( o5[t]:bv[16] = { #x0001 }:bv[16] ).",
     "o5_bare_int": "always ( o5[t]:bv[24] = 1 ).",
+    "operator_word": "always ( o5[t]:bv[24] = i1[t]:bv[24] && F ( i1[t]:bv[24] = 1 ) ).",
+    "time_constraint": "always ( [t > 3] && o5[t]:bv[24] = i1[t]:bv[24] ).",
+    "quantifier": "always ( ex x ( o5[t]:bv[24] = i1[t]:bv[24] ) ).",
 }
 
 # Only the o5/o8 width errors carry a WIDTH_MISMATCH payload; the other screens
@@ -54,9 +62,12 @@ EXPECTED_REASON = {
     "i14": NOT_APPLIED,
     "i15": NOT_APPLIED,
     "slot_bv24": NOT_APPLIED,
-    "slot_untyped": NOT_APPLIED,
+    "slot_untyped": FRAGMENT,
     "o5_bv16": WIDTH_MISMATCH,
     "o5_bare_int": WIDTH_MISMATCH,
+    "operator_word": FRAGMENT,
+    "time_constraint": FRAGMENT,
+    "quantifier": FRAGMENT,
 }
 
 TEMPORAL_BODY = "always ( o5[t]:bv[24] = i1[t-1]:bv[24] )."
@@ -67,14 +78,14 @@ CONTROL_SLOT = _cond("i18[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]")
 
 @pytest.mark.parametrize("name", BAD_BODIES)
 def test_the_expected_reason_follows_the_admission_screen(name):
-    error = _screen_clause_domains(BAD_BODIES[name])
+    error = _screen_clause_domains(_body_of(BAD_BODIES[name]))
     assert error is not None
     assert bool(_width_mismatch_details(error)) == (EXPECTED_REASON[name] == WIDTH_MISMATCH)
 
 
 @pytest.mark.parametrize("body", [CONTROL_I1, CONTROL_I2, CONTROL_SLOT])
 def test_the_controls_pass_the_screen(body):
-    assert _screen_clause_domains(body) is None
+    assert _screen_clause_domains(_body_of(body)) is None
 
 
 # --- harness ------------------------------------------------------------------
@@ -294,6 +305,7 @@ def test_admission_and_apply_reach_the_same_verdict(tip_view, door, name):
     assert (not admitted.is_valid) == refused
     assert (admitted.code == "WIDTH_MISMATCH") == (reason == WIDTH_MISMATCH)
     assert (admitted.code == TEMPORAL_REFERENCE_CODE) == (reason == TEMPORAL)
+    assert (admitted.code == "RULE_FRAGMENT") == (reason == FRAGMENT)
 
 
 # --- clean bodies still land --------------------------------------------------

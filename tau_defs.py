@@ -93,18 +93,9 @@ TAU_OUTPUT_STREAM_RULES = "o0"
 TAU_OUTPUT_STREAM_VALIDATION_RESULT = "o1"
 
 # --- User Policy Stream ---
-# o5 is the shared user-policy output stream.
-# Multiple users can write sender-scoped rules to o5; Tau composes them
-# into a single logical constraint. Each user rule MUST be guarded by
-# that user's sender identity (i12 sender pubkey, or i3 from-address) to
-# avoid affecting other users. This is ENFORCED at mempool admission and at
-# block apply for both o5 and o8: rule text writing either without referencing
-# i12 or i3 is rejected with UNSCOPED_USER_RULE (consensus/admission.py),
-# because a single unscoped `always (o5[t] = 0)` would block every account on
-# the network. The screen is textual — it cannot prove the scope actually
-# gates the assignment. Rules may also read i4 (recipient) and i5
-# (block timestamp) — both real at admission and apply — for recipient
-# whitelists and time-locks.
+# o5 rules are per-account clauses. o8 fee rules share one spec, so each must be fenced to its
+# author with `(i12[t]:bv[384] = { #x<own pubkey> }:bv[384]) -> ( ... )` (UNSCOPED_USER_RULE), or it
+# would charge every account; i4/i5 are real at admission and apply, so they may gate rules.
 #
 # Semantics:
 #   o5 = 0       -> explicit block (user policy rejects transfer)

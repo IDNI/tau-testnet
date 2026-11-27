@@ -528,7 +528,7 @@ def test_an_ordinary_clause_still_registers_without_the_feature():
     ("i17[t]:bv[24]", "i17[t]:bv[64]"),       # the receive record's own screen
     ("i50[t]:bv[24]", "i50[t]:bv[64]"),
     ("i53[t]:bv[32]", "i53[t]:bv[64]"),
-    ("i17[t]", "explicit width"),             # the screen every clause clears first
+    ("i17[t]", "must carry a :bv[N] type"),   # the rule syntax every clause clears first
 ])
 def test_a_wrongly_typed_receive_stream_is_refused_on_an_active_chain(mention, said):
     body = "( (%s = { 1 }:bv[64]) ? %s : %s )" % (mention, rules.ALLOW, rules.BLOCK)
@@ -544,7 +544,7 @@ def test_a_receive_clause_with_a_step_constraint_is_refused_on_an_active_chain(s
     tx = _rule_tx("always ( %s )." % body)
     result = validate_o5_clause_routing(tx, _view(True), tx["operations"]["0"])
     assert result is not None and result.is_valid is False
-    assert "receive record" in result.error and "found '%s'" % step in result.error
+    assert "outside the admitted syntax" in result.error
 
 
 @pytest.mark.parametrize("key", [str(i) for i in tau_defs.RECEIVE_RECORD_INDICES])

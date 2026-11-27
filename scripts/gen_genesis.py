@@ -177,6 +177,13 @@ def validate_consensus_rules(rules: str, validator_keys=None):
         print(f"[WARNING] tau_native not available to run static evaluation: {e}")
         return
 
+    from consensus.rule_fragment import RuleFragmentError, parse_rule_unit
+
+    try:
+        parse_rule_unit(tau_native.TauInterface.preprocess_spec_text(rules))
+    except RuleFragmentError as e:
+        raise SystemExit(f"error: consensus rules are outside the admitted syntax: {e.message}")
+
     # A rule that tests proposer membership reads i13 (proposer pubkey, bv[384]).
     # The probes below then feed i13 so the ABI check exercises the real branch.
     references_i13 = bool(re.search(r"\bi13\s*\[", rules))

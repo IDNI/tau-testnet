@@ -58,7 +58,7 @@ class TestInvalidRuleRegression(unittest.TestCase):
                     "expiration_time": 9999999999,
                     "expire_at_height": 5000,
                     "operations": {
-                        "0": "invalid rule here"
+                        "0": "always ( o12[t]:bv[24] = i1[t]:bv[24] )."
                     },
                     "fee_limit": "0",
                 }, SK_ALICE)

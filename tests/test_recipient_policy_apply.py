@@ -462,7 +462,7 @@ def test_a_receive_clause_with_a_step_constraint_does_not_land_at_apply(ev, step
     result, lm, _ = ap._apply([ap.rule_tx("always ( %s )." % body)], lm=lm)
     assert lm.rule_offers.clause_for(ap.ALICE, 5) is None
     logs = ap._logs(result)
-    assert "o5 clause ignored" in logs and "found '%s'" % step in logs
+    assert "o5 clause ignored" in logs and "outside the admitted syntax" in logs
 
 
 def test_the_same_clause_without_the_step_constraint_lands(ev):

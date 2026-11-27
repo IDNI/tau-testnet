@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
-FROM python:3.14-trixie AS tau-builder
+# Digest-pinned so an upstream tag move cannot silently invalidate the CI layer cache.
+FROM python:3.14-trixie@sha256:40bc16b613d4d54b03d301542b3123b855b167a66436bfdc91004e46d3a64043 AS tau-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TAU_LANG_REPO=https://github.com/IDNI/tau-lang.git
@@ -49,7 +50,7 @@ RUN set -eux; \
       -DTAU_BUILD_TESTS=OFF
 
 
-FROM python:3.14-slim-trixie AS runtime
+FROM python:3.14-slim-trixie@sha256:22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
 

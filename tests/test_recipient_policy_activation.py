@@ -44,10 +44,11 @@ def test_an_untouched_chain_keeps_the_legacy_meta_hash(mode):
 
 
 def test_the_genesis_shaped_call_is_unaffected():
-    assert build_mechanism_metadata("supermajority") == {
-        "vote_quorum": "supermajority",
-        "retractable_transfers_root": RetractableBook().root().hex(),
-    }
+    meta = build_mechanism_metadata("supermajority")
+    assert "recipient_policy_active" not in meta
+    assert meta["vote_quorum"] == "supermajority"
+    assert meta["retractable_transfers_root"] == RetractableBook().root().hex()
+    assert meta == build_mechanism_metadata("supermajority", recipient_policy_active=False)
     mech = build_mechanism_metadata("supermajority", recipient_policy_active=True)
     assert mech["recipient_policy_active"] is True
 
@@ -377,19 +378,19 @@ def test_every_documented_and_helper_rule_has_the_shape():
         assert recipient_policy.screen_receive_clause_shape(body) is None, body
 
 
-def test_the_shape_screen_rides_on_the_chain_flag_at_admission_and_apply():
-    """Before activation the record's inputs are ordinary custom streams, so a
-    block may already carry such a clause; apply must not change for it."""
+def test_the_rule_syntax_refuses_a_step_constraint_with_or_without_the_feature():
+    """The node's rule syntax refuses a step constraint in every clause, at
+    admission and at apply, so no block carries one. The record's own screen
+    stays behind it as a second line."""
     from consensus.admission import _screen_clause
     from consensus.engine import _clause_domain_rejection
 
     body = _reading_the_record("[t > 3] && ")
-    assert _screen_clause(body, receive_active=False) is None
-    assert _clause_domain_rejection(body, receive_active=False) is None
-    refused = _screen_clause(body, receive_active=True)
-    assert refused is not None and "found '[t > 3]'" in refused
-    error, reason = _clause_domain_rejection(body, receive_active=True)
-    assert error == refused and reason == "rule_not_applied"
+    for active in (False, True):
+        refused = _screen_clause(body, receive_active=active)
+        assert refused is not None and "outside the admitted syntax" in refused
+        error, reason = _clause_domain_rejection(body, receive_active=active)
+        assert error == refused and reason == "rule_fragment"
 
 
 # --- which condition refused, and what the receiver would take ------------------
