@@ -154,6 +154,16 @@ _last_transfer_ts: dict = {}
 # Lock for thread-safe access to rules state
 _rules_lock = threading.Lock()
 
+# Shadow replay state (issue #42, step 2): an isolated TauInterface advanced
+# at commit with exactly the units that entered _application_rules_state,
+# whose normalized spec backs the getaccountrules view. Guarded by its own
+# lock -- it is touched only from the commit-path recorder and the view's
+# accessors, never inside the balance/sequence/rules lock ordering.
+_shadow_lock = threading.Lock()
+_shadow_spec = None
+_shadow_driver_factory = None  # None -> the production TauInterface driver
+_shadow_unavailable = False  # construction failed once; do not retry per block
+
 # In-memory rules state storage
 # In-memory rules state storage
 _application_rules_state = ""
@@ -564,6 +574,434 @@ def _record_retractable_events(block, next_snapshot) -> None:
             )
     except Exception:
         logger.exception("could not record retractable events")
+
+
+def _record_rule_outcomes(block, next_snapshot) -> None:
+    """Best-effort history write, mirroring _record_retractable_events.
+
+    The confirmed rule-tx outcomes _apply_block collected into the snapshot,
+    persisted per block so gettxstatus can answer what a confirmed rule
+    transaction actually did (issue #42). Read from the snapshot, not the
+    apply result, for the same reason as retractable events.
+    """
+    try:
+        outcomes = (getattr(next_snapshot, "metadata", None) or {}).get("rule_outcomes")
+        if outcomes:
+            db.record_rule_outcomes(
+                block.block_hash, block.header.block_number, list(outcomes)
+            )
+    except Exception:
+        logger.exception("could not record rule outcomes")
+
+
+def _default_shadow_driver():
+    """The production shadow driver, or None when the native bindings are
+    unavailable -- the shadow is a view accelerator, never a commit
+    dependency, so a node without a working engine binding simply serves
+    `not_recorded` for the shared-spec half of the view."""
+    try:
+        from consensus.shadow_spec import TauInterfaceShadowDriver
+
+        return TauInterfaceShadowDriver()
+    except Exception:
+        logger.exception("shadow replay unavailable; spec snapshots disabled")
+        return None
+
+
+def set_shadow_driver_factory(factory) -> None:
+    """Install the factory get_shadow_spec() builds drivers from, and drop
+    any shadow already built. Test hook, mirroring
+    consensus.sender_policy.set_evaluator: pass a factory returning a
+    scripted driver to exercise the snapshot machinery without the native
+    engine, or None to restore the production default."""
+    global _shadow_driver_factory, _shadow_spec, _shadow_unavailable
+    with _shadow_lock:
+        _shadow_driver_factory = factory
+        _shadow_spec = None
+        _shadow_unavailable = False
+
+
+def get_shadow_spec():
+    """The node's shadow, built lazily on first use; None when no driver
+    can be constructed (native bindings unavailable)."""
+    global _shadow_spec, _shadow_unavailable
+    with _shadow_lock:
+        if _shadow_spec is None:
+            if _shadow_unavailable:
+                return None
+            factory = _shadow_driver_factory or _default_shadow_driver
+            driver = factory()
+            if driver is None:
+                _shadow_unavailable = True
+                return None
+            from consensus.shadow_spec import ShadowSpec
+
+            _shadow_spec = ShadowSpec(driver)
+        return _shadow_spec
+
+
+def _shared_rule_submissions(block, next_snapshot):
+    """(tx_hash, account, canonical unit) per accepted shared-spec rule
+    transaction in this block, in block order -- the attribution source
+    for the shadow's feed steps.
+
+    The unit is staged exactly as the engine stages it in _apply
+    (`_preprocess_tau_spec_text(rule_text)`, raw text as fallback), so it
+    compares equal to the accumulation line the shadow feeds. Transactions
+    whose rule text cannot be recovered from the block are skipped: their
+    units are still fed and recorded, just unattributed.
+    """
+    outcomes = (getattr(next_snapshot, "metadata", None) or {}).get(
+        "rule_outcomes") or []
+    by_hash = {}
+    txs = getattr(block, "transactions", None) or []
+    tx_ids = getattr(block, "tx_ids", None) or []
+    for i, tx in enumerate(txs):
+        if i < len(tx_ids):
+            tx_hash = tx_ids[i]
+        else:
+            try:
+                from block import compute_tx_hash
+
+                tx_hash = compute_tx_hash(tx)
+            except Exception:
+                continue
+        by_hash[tx_hash] = tx
+    submissions = []
+    for tx_hash, record in outcomes:
+        if not isinstance(record, dict) or record.get("path") != "shared_spec":
+            continue
+        tx = by_hash.get(tx_hash)
+        rule_text = None
+        if isinstance(tx, dict):
+            operations = tx.get("operations")
+            if isinstance(operations, str):
+                try:
+                    operations = json.loads(operations)
+                except Exception:
+                    operations = None
+            if isinstance(operations, dict):
+                rule_text = operations.get("0")
+        if not isinstance(rule_text, str) or not rule_text.strip():
+            continue
+        try:
+            unit = (_preprocess_tau_spec_text(rule_text)
+                    or rule_text).strip()
+        except Exception:
+            unit = rule_text.strip()
+        submissions.append((tx_hash, record.get("account"), unit))
+    return submissions
+
+
+def _record_survival_feeds(block, next_snapshot, shadow, first_advance,
+                           before_text) -> None:
+    """Persist the block's shadow-feed steps for the survival ledger
+    (issue #42, step 3), and enrich the block's shared-spec receipts.
+
+    Each step is attributed to the block transaction that submitted its
+    unit (see _shared_rule_submissions); a step no transaction in this
+    block submitted -- the block's journal group and its rule outcomes
+    disagreeing -- is recorded unattributed, and on the shadow's first
+    advance a baseline row carries the spec it started from, so the
+    ledger's replay (db.get_survival_ledger) can diff from the true
+    initial text.
+
+    The same attribution carries the design's `shadow_revision` receipt
+    field: the revision the shadow took when it fed this transaction's
+    unit exists only here, at commit, so the persisted rule_outcome
+    record is re-recorded with it alongside the live spec-revision pair
+    captured at apply.
+    """
+    steps = shadow.last_steps
+    if not steps:
+        return
+    submissions = _shared_rule_submissions(block, next_snapshot)
+    used = [False] * len(submissions)
+    outcomes = (getattr(next_snapshot, "metadata", None) or {}).get(
+        "rule_outcomes") or []
+    outcome_by_hash = {h: r for h, r in outcomes if isinstance(r, dict)}
+    rows = []
+    if first_advance:
+        rows.append({
+            "unit_text": None, "tx_hash": None, "account": None,
+            "spec_text_after": before_text,
+        })
+    enriched = []
+    for step in steps:
+        tx_hash = account = None
+        for i, (sub_hash, sub_account, sub_unit) in enumerate(submissions):
+            if not used[i] and sub_unit == step["unit"]:
+                used[i] = True
+                tx_hash, account = sub_hash, sub_account
+                break
+        rows.append({
+            "unit_text": step["unit"], "tx_hash": tx_hash,
+            "account": account, "spec_text_after": step["text_after"],
+        })
+        if tx_hash is not None and step.get("revision_after") is not None:
+            record = outcome_by_hash.get(tx_hash)
+            if record is not None:
+                enriched.append((tx_hash, {
+                    **record,
+                    "evidence": {
+                        **(record.get("evidence") or {}),
+                        "shadow_revision": step["revision_after"],
+                    },
+                }))
+    db.record_spec_unit_feeds(
+        block.block_hash, block.header.block_number, rows)
+    if enriched:
+        db.record_rule_outcomes(
+            block.block_hash, block.header.block_number, enriched)
+
+
+def _stage_rule_unit(rule_text):
+    """A rule text staged exactly as the engine stages it into the
+    application-rules accumulation (`_preprocess_tau_spec_text`, raw text
+    as fallback) -- so a journal-fed unit compares equal to the
+    accumulation line and to a block submission's unit (see
+    _shared_rule_submissions)."""
+    try:
+        return (_preprocess_tau_spec_text(rule_text) or rule_text).strip()
+    except Exception:
+        return (rule_text or "").strip()
+
+
+def _journal_groups_after(cursor):
+    """The durable committed journal's rule revisions after `cursor`,
+    grouped per block: [{tip, height, units, last_seq}] in journal order.
+
+    Only REVISION entries that accumulated carry shared-spec rule units:
+    STEP entries do not change the spec; governance activations record
+    accumulate=False (they are the lifecycle's state, not the shared
+    spec's -- the accumulation never held them either); and a RESET's
+    units re-state texts whose own REVISION entries the shadow already
+    consumes in order, so replaying the revisions reproduces the
+    post-reset spec without re-feeding the reset. The journal only ever
+    holds the canonical chain (a reorg rebuilds it from genesis), so
+    journal order is canonical order and no block-hash resolution is
+    needed to replay it; the height is read from the blocks table for
+    snapshot bookkeeping only.
+    """
+    import tau_journal as _tau_journal
+
+    groups = []
+    for row in db.committed_journal_entries_after(cursor):
+        if row.get("kind") != _tau_journal.REVISION:
+            continue
+        if not row.get("accumulate") or not row.get("rule_text"):
+            continue
+        unit = _stage_rule_unit(row["rule_text"])
+        if not unit:
+            continue
+        tip = row.get("tip")
+        if groups and groups[-1]["tip"] == tip:
+            groups[-1]["units"].append(unit)
+            groups[-1]["last_seq"] = int(row["seq"])
+        else:
+            groups.append({
+                "tip": tip,
+                "height": db.get_block_number(tip) if tip else None,
+                "units": [unit],
+                "last_seq": int(row["seq"]),
+            })
+    return groups
+
+
+def _memory_journal_units_for_block(block, next_snapshot):
+    """This block's rule revisions from the in-process committed journal,
+    or [] when they cannot be identified there.
+
+    The journal is one record with two embodiments: durable
+    (tau_journal_v1, written by the commit protocol under worker-backed
+    authority) and in-process (tau_journal.committed(), written live by
+    the in-process evaluator session). Where the durable table holds no
+    revisions for this block, the block's execution lives only in the
+    in-process journal, whose entries carry no block attribution -- so
+    the block's share is identified by content: this block's shared-spec
+    submissions (from the snapshot's rule outcomes) must appear in the
+    journal's accumulated REVISION entries as a contiguous run, in
+    order. The newest such run is used: the recorder is not necessarily
+    called between two applies (a commit path may apply several blocks
+    before recording any), and where two runs are identical the units
+    are verbatim the same, so the occurrences are interchangeable.
+    Anything in the journal that matches no recorded block's submissions
+    -- a discarded candidate's revisions, an apply whose recorder never
+    ran -- is never fed. On no match nothing is fed: a shadow that
+    cannot identify its block's revisions in the journal must record
+    nothing rather than guess.
+    """
+    import tau_journal as _tau_journal
+
+    submissions = _shared_rule_submissions(block, next_snapshot)
+    if not submissions:
+        return []
+    wanted = [unit for _hash, _account, unit in submissions]
+    revisions = [
+        _stage_rule_unit(entry.rule_text)
+        for entry in _tau_journal.committed().entries()
+        if entry.kind == _tau_journal.REVISION and entry.accumulate
+        and entry.rule_text
+    ]
+    if not revisions:
+        # The in-process journal is not the embodiment in use here (the
+        # durable journal is); nothing to identify.
+        return []
+    span = len(wanted)
+    for start in range(len(revisions) - span, -1, -1):
+        if revisions[start:start + span] == wanted:
+            return wanted
+    logger.warning(
+        "shadow: in-process journal holds no run matching block #%s "
+        "rule submissions; recording no snapshot for it",
+        block.header.block_number,
+    )
+    return []
+
+
+def _record_shadow_snapshot(block, next_snapshot) -> None:
+    """Best-effort shadow advance + snapshot write, mirroring
+    _record_rule_outcomes.
+
+    The feed source is the committed journal, never the accumulation:
+    the accumulation dedups exact units, so a unit that was displaced
+    and then submitted again (a resend) would never be re-fed, while the
+    engine applied it again and runs it. The journal records every
+    application in order, resends included, so the shadow fed from it
+    tracks what the engine last applied.
+
+    Durable embodiment first: every journal group after the shadow's
+    cursor is fed in journal order. The current block's group is
+    snapshotted and its steps persisted for the survival ledger (see
+    _record_survival_feeds); an earlier group -- a restarted shadow
+    catching up, or a state rebuild whose journal commit lands after
+    the recorder runs -- is fed and snapshotted under its own block,
+    without survival feeds: its steps belong to that block's recording,
+    not this one's. Where the durable journal holds no group for this
+    block, the block's revisions are identified in the in-process
+    journal instead (see _memory_journal_units_for_block).
+    """
+    try:
+        shadow = get_shadow_spec()
+        if shadow is None:
+            return
+        if block.block_hash in shadow.journal_fed_blocks:
+            # Already fed: journal feeding is not idempotent (a re-fed
+            # unit is a resend), so a duplicate recording of the same
+            # block must not feed its revisions a second time.
+            return
+        first_advance = not shadow.fed_units
+        before_text = shadow.normalized_text
+        fed_current = False
+        for group in _journal_groups_after(shadow.journal_cursor):
+            snap = shadow.advance_journal(
+                group["units"],
+                height=group["height"]
+                if group["height"] is not None
+                else block.header.block_number,
+                block_hash=group["tip"] or block.block_hash,
+            )
+            shadow.journal_cursor = group["last_seq"]
+            if snap is not None:
+                db.record_spec_snapshot(
+                    snap["block_hash"], snap["height"],
+                    snap["shadow_revision"], snap["normalized_text"],
+                    snap["sha256"],
+                )
+            if group["tip"] == block.block_hash:
+                fed_current = True
+                shadow.journal_fed_blocks.add(block.block_hash)
+                if snap is not None:
+                    _record_survival_feeds(
+                        block, next_snapshot, shadow, first_advance,
+                        before_text)
+        if fed_current:
+            return
+        units = _memory_journal_units_for_block(block, next_snapshot)
+        if not units:
+            return
+        snap = shadow.advance_journal(
+            units,
+            height=block.header.block_number,
+            block_hash=block.block_hash,
+        )
+        shadow.journal_fed_blocks.add(block.block_hash)
+        if snap is not None:
+            db.record_spec_snapshot(
+                snap["block_hash"], snap["height"], snap["shadow_revision"],
+                snap["normalized_text"], snap["sha256"],
+            )
+            _record_survival_feeds(
+                block, next_snapshot, shadow, first_advance, before_text)
+    except Exception:
+        logger.exception("could not record spec snapshot")
+
+
+def rebuild_shadow_from_journal():
+    """Rebuild the shadow from sequence 0 over the committed journal and
+    make it the node's shadow. Returns the rebuilt shadow (or None when
+    no driver is available). The snapshots this produces are the same
+    ones the incremental advance recorded -- that equality is the
+    cross-node comparability claim of the design, and it is what a
+    restart relies on instead of trusting process-local interpreter
+    text.
+
+    The durable journal is the source. Where it holds nothing (the
+    in-process embodiment keeps the journal only in memory), the
+    in-process journal's accumulated revisions are replayed as one
+    group instead -- within one process that is the same record. Across
+    a restart of such a node the journal is gone by its own design, and
+    the rebuilt shadow tracks from the next recorded block.
+    """
+    global _shadow_spec
+    from consensus.shadow_spec import ShadowSpec
+
+    factory = _shadow_driver_factory or _default_shadow_driver
+    driver = factory()
+    if driver is None:
+        return None
+    shadow = ShadowSpec(driver)
+    groups = _journal_groups_after(0)
+    with _shadow_lock:
+        _shadow_spec = shadow
+    if groups:
+        for group in groups:
+            shadow.advance_journal(
+                group["units"],
+                height=group["height"] if group["height"] is not None else 0,
+                block_hash=group["tip"] or "",
+            )
+            shadow.journal_cursor = group["last_seq"]
+    else:
+        import tau_journal as _tau_journal
+
+        units = [
+            unit for unit in (
+                _stage_rule_unit(entry.rule_text)
+                for entry in _tau_journal.committed().entries()
+                if entry.kind == _tau_journal.REVISION and entry.accumulate
+                and entry.rule_text
+            ) if unit
+        ]
+        if units:
+            shadow.advance_journal(
+                units,
+                height=int(db.get_chain_state_value(
+                    "canonical_head_number", "0") or 0),
+                block_hash=db.get_chain_state_value(
+                    "canonical_head_hash", ""),
+            )
+    return shadow
+
+
+def get_clauses_root() -> str | None:
+    """The clause-registry root at the current tip, hex -- the registry
+    half of the state hash, served beside the registry clauses in the
+    getaccountrules view."""
+    try:
+        return _lifecycle_manager.rule_offers.clauses_root().hex()
+    except Exception:
+        return None
 
 
 def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
@@ -1088,6 +1526,8 @@ def _process_new_block_locked(block: Block) -> bool:
                 _swap_in_memory_state(next_snapshot, block)
 
             _record_retractable_events(block, next_snapshot)
+            _record_rule_outcomes(block, next_snapshot)
+            _record_shadow_snapshot(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -1369,6 +1809,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                                       reason="state_hash invariant mismatch")
 
             _record_retractable_events(block, next_snapshot)
+            _record_rule_outcomes(block, next_snapshot)
+            _record_shadow_snapshot(block, next_snapshot)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live
