@@ -400,40 +400,98 @@ after a late defect, to its finder and the poster. The rule reads what it has
 already paid (`i26`) to tell the two executions apart. On the real engine every
 settlement path pays exactly the locked price, and nothing after it.
 
-## Conditional grants
+## Conditional grants as a rule pattern
 
-A conditional grant is an escrow the node itself holds, without an `o5` clause
-or a guard: the grantor installs a payout rule with `grant_amount` and
-`grant_deadline`, and the node debits the grantor the granted amount at
-install. The money is not paid out; it is held in the book until the rule
-draws it or the deadline refunds it. The two fields ride on the install
-transaction (and on the canonical spec text, so a rule-change request can
-carry them too): `grant_amount` is the amount escrowed, `grant_deadline` is
-the point on the rule's own clock at which the remainder is refunded.
+A conditional grant is not a node feature. It is one payout rule, one `o5`
+clause and one guard, all existing machinery -- no grant-specific code in the
+node. The grantor funds a dedicated escrow account with the grant plus the
+install fee, installs the rule below on that account, registers the `o5`
+below, and sets a guard requiring the grantee's co-signature for rule
+changes. The rule pays the grantee weekly and refunds the remainder to the
+grantor at the deadline. Case 5 of the bounty (a 5,000 grant, 500 a week from
+December 1, refund at the deadline) is the worked example: 500 + 500 + 200
+drawn, 3,800 refunded, covered by `tests/test_payout_grant_rule.py`.
 
-Draws are ordinary executions (`payout_execute`): the rule decides each
-amount, under its caps, and every draw comes out of the held balance. The
-rule reads the held balance as `i2`, so it judges the escrow, not the
-grantor's account; a draw over what the grant holds is refused. At the
-deadline the node refunds the remainder to the grantor automatically and the
-rule ends, so no further draw is possible -- a draw in the deadline block
-itself is already refused. Revoking refunds the remainder the same way.
+The rule (slots: 0 = grantee, 1 = grantor; `D0` = first payment, `DL` =
+deadline, `WEEK` = one week; all times `bv[64]`, all money `bv[24]`):
+
+```
+always ( (i5>=DL) ? ((o30=0) && (o31=min(i2, 5000-i26))) : ((C_PAY) ? ((i40>0) ? (MANUAL) : (DUE)) : (ZERO)) ).
+```
+
+with `C_PAY = ((i5>=D0) && (i5-i49>=WEEK))`, `MANUAL = ((o30=min(i40,500)) && (o31=0))`,
+`DUE = ((o30=500) && (o31=0))`, `ZERO = ((o30=0) && (o31=0))`. Terms:
+`due_at = D0`, `due_every = WEEK`, `expires_at = DL`,
+`cap_per_execution = cap_per_period = 5000`, and a long period so `i26` is
+the lifetime total paid. The refund branch pays slot 1 the smaller of the
+escrow balance and `5000 - i26`; a due run at the deadline fires it, and so
+does the first manual execute at or after the deadline. Weekly pacing comes
+from the `i49` gate in the clause, not from a cap -- a weekly cap would
+refuse the 3,800 refund at settle.
+
+The `o5` (on the escrow account) blocks signed transfers before the
+deadline, allows them after, and always allows payout execution -- told
+apart by `i4 = 0` on the execution re-check, which a payout has because it
+has no single recipient:
+
+```
+always ((i4[t]:bv[384] = {#x00…00 (48 bytes)}:bv[384] ? o5[t]:bv[24] = { #x000001 }:bv[24] : (i5[t]:bv[64] < {DL}:bv[64] ? o5[t]:bv[24] = { #x000000 }:bv[24] : o5[t]:bv[24] = { #x000001 }:bv[24] )))
+```
+
+The guard requires the grantee's co-signature for rule changes (kinds 6, 7,
+8), so the grantor cannot revoke or rewrite the rule unilaterally. This is
+the standard Tau governance for every rule change, and it is a delay, not a
+veto: a change request becomes escapable after 1,000 blocks
+(`mark_escape_due_ready` releases any request then, with no guard check), so
+the grantor can force a change through after that delay. State it honestly:
+the pattern gives a 1,000-block delay with on-chain visibility, not a veto.
+It is still strictly stronger than the grant code it replaces, which let the
+grantor revoke and be refunded immediately with no guard at all.
+
+Setup order (matters): (1) fund the dedicated escrow account with 5,000 +
+the install fee, from the grantor's main account; (2) install the payout
+rule on the escrow account; (3) register the `o5` on the escrow account;
+(4) set the guard. Funding is an incoming transfer (judged by the sender's
+`o5`, not the escrow's); install / `o5` / guard are rule-change
+transactions, not transfers, so the `o5` never blocks setup. After the
+deadline the `o5` allows transfers again, so the grantor recovers any
+leftover by plain transfer.
 
 Rules of a grant:
 
-- `grant_amount` and `grant_deadline` come together or not at all;
-  `grant_amount` is in `1..MAX_TRANSFER_VALUE`, and `grant_deadline` is in
-  the future and no later than `expires_at`, on the rule's own clock.
-- Installing one the grantor cannot fund is refused outright; the grantor
-  pays the install fee on top of the grant.
-- A grant rule is never updated: revoke it (the remainder is refunded) and
-  install a new one. Updating a plain rule into a grant is refused the same
-  way.
+- C1 -- aligned deadline. The deadline must be a due point
+  (`DL = D0 + N` weeks), so the refund fires exactly at the deadline.
+  Otherwise it fires at the next weekly due point (at most a week late) or
+  on the first manual execute after `DL`. Fallback for an arbitrary
+  deadline: `expires_at = DL + 1 week`.
+- C2 -- install at least a week before the first payment. The `i49` gate
+  measures from the install clock until the first payment, so installing
+  later delays the first payment.
+- C3 -- dedicated escrow account holding exactly 5,000 (+ fee). Extra
+  inflows are safe (the `min` in the refund branch) but stay locked behind
+  the `o5` until `DL`. The escrow account must be a dedicated key: a slot
+  may not pay the account itself.
+- C4 -- long cap period (e.g. twice `DL - install`) so `i26` means lifetime
+  paid and the refund's `5000 - i26` is exact; a period rollover before
+  expiry would zero `i26`.
+- C5 -- partial draws forfeit the week's remainder. A 200 draw in a week
+  means that week's other 300 is gone (one paid execution per week). A
+  manual draw can catch up a missed week (gate passes, amount capped
+  at 500).
+- A grant rule may be updated like any rule, through the guard's
+  co-signature; revoking needs the grantee too, and the funds stay
+  `o5`-locked until `DL` -- there is no automatic refund on revoke.
+- A fully drawn grant refunds 0: the due run at the deadline computes 0, is
+  refused, the point is missed, and the rule expires.
 - The payer's current `o5` clause is re-checked at every draw, as for any
-  payout; a frozen payer draws nothing. The deadline refund is not a draw
-  and is never blocked.
-- The escrow counts toward the supply like a parked retractable transfer,
-  so installing, drawing and refunding conserve supply.
+  payout; a frozen payer draws nothing.
+- The refund is an ordinary settled execution, so it counts toward a shared
+  cap like any other run -- a grant rule on a shared cap needs the cap to be
+  at least 5,000.
+- Caveat: the native engine has not evaluated the nested ternary in the rule
+  above (the libp2p tree is incomplete in this test environment);
+  admissibility is proven by the shape screen and the plumbing by
+  `tests/test_payout_grant_rule.py` with a scripted evaluator.
 
 ## Shared caps
 
@@ -457,10 +515,11 @@ Rules of a shared cap:
   own limit, and its rules draw on a separate total.
 - The cap bounds what the rules pay in total, on top of each rule's own
   `cap_per_execution` and `cap_per_period`: a run must fit all three.
-- The room frees when a rule leaves the book -- revoked, expired,
-  superseded by an update, or refunded at a grant deadline -- because the
-  cap counts what the open rules have paid. An update resets its rule's
-  contribution, as it resets the rule's period caps.
+- The room frees when a rule leaves the book -- revoked, expired, or
+  superseded by an update -- because the cap counts what the open rules have
+  paid. An update resets its rule's contribution, as it resets the rule's
+  period caps. A refund leg of a grant rule counts toward the cap like any
+  other settled run; the room frees only when the rule leaves the book.
 - The ledger is not stored separately: on restore it is rebuilt from the
   open rules' paid totals, so it can never disagree with the stored rows,
   and a stored book that names one cap with two limits is refused.
@@ -475,9 +534,8 @@ tau-testnet getpayoutrule <address>       # raw RPC
 `getpayoutrule` answers `installed`, every rule with its terms and where it
 stands (`spent_this_period`, `left_this_period`, `executions`, `paid_total`,
 `last_height`, `version`, `lineage`, and the due / missed / open-arrival
-fields where the rule has them, the grant / held / drawn fields where the
-rule is a grant, and the shared-cap id / amount / spent / left fields where
-the rule draws on a shared cap), its history on this node (newest first,
+fields where the rule has them, and the shared-cap id / amount / spent /
+left fields where the rule draws on a shared cap), its history on this node (newest first,
 canonical blocks only), and `semantics`: the node's own constants, so a
 wallet can explain the feature before offering it. `gettxstatus` names what a
 confirmed payout transaction did (`payout`: the outcome, legs and, for an

@@ -5,8 +5,7 @@ A rule names a shared cap with `shared_cap_id` and `shared_cap_amount`
 one spent total per (account, cap id): each settled run counts exactly once
 across every rule that draws on it, a run that would pass the limit is
 refused with no debt and no completion, and the room frees when a rule
-leaves the book -- revoked, expired, superseded, or refunded at a grant
-deadline. The ledger is rebuilt from the open rules' paid totals on
+leaves the book -- revoked, expired, or superseded. The ledger is rebuilt from the open rules' paid totals on
 restore, so it can never disagree with the stored rows.
 
 Part A is book-level (no engine). Part B runs the real `apply_block` with
@@ -145,17 +144,20 @@ def test_shared_cap_frees_on_revoke_and_forgets_a_dead_cap():
     assert book.shared_cap_limit(AKEY, "rent") == 2000
 
 
-def test_shared_cap_frees_on_grant_refund():
+def test_shared_cap_counts_a_grant_refund_as_a_settled_run():
+    """A rule-pattern grant's deadline refund is an ordinary settled
+    execution, so it counts toward the shared cap -- unlike the old node
+    refund, which removed the rule and freed the cap without counting.
+    The room frees only when the rule leaves the book."""
     book = PayoutBook()
-    grant = _cap(AKEY, 1, grant_amount=5000, grant_deadline=500)
+    grant = _cap(AKEY, 1, amount=5000)
     book.install(grant, anchor=10)
     assert book.shared_spent_for(grant) == 0
-    book.record(AKEY, grant.rule_id, 1200, 100, 0)  # a draw out of the escrow
+    book.record(AKEY, grant.rule_id, 1200, 100, 0)  # draws of 500 + 500 + 200
     assert book.shared_spent_for(grant) == 1200
-    assert book.escrow_total() == 3800
-    gone = book.refund_due(500, 0)
-    assert len(gone) == 1 and gone[0][0] == grant
-    assert gone[0][1].held == 3800  # the remainder is refunded
+    book.record(AKEY, grant.rule_id, 3800, 200, 0)  # the refund leg to slot 1
+    assert book.shared_spent_for(grant) == 5000
+    book.revoke(AKEY, grant.rule_id)
     assert book.shared_spent_for(grant) == 0
     assert book.shared_cap_limit(AKEY, "rent") is None
 
@@ -170,7 +172,7 @@ def test_shared_cap_store_restore_round_trips_the_ledger():
     _pay(book, b, 300)
     root = book.root()
     rows = book.store_rows()
-    assert len(rows[0][18]) == 16  # `more` carries the shared-cap pair
+    assert len(rows[0][18]) == 14  # `more` carries the shared-cap pair
     restored = PayoutBook.restore(rows, *book.resolved_state())
     assert restored.root() == root
     assert restored.shared_spent_for(a) == 900

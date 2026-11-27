@@ -1900,9 +1900,8 @@ def validate_payout_execute_payload(
             return format_error(
                 f"payout_execute refused: the rule caps a manual execution's fee at "
                 f"{rule.max_fee_per_execution}", code="PAYOUT_REFUSED")
-        # A grant rule reads and spends its held escrow, not the account.
-        balance = (state.held if rule.is_grant
-                   else int(chain_state.get_balance(exe.account_pubkey) or 0))
+        # The rule reads the account's spendable balance as i2.
+        balance = int(chain_state.get_balance(exe.account_pubkey) or 0)
         values = payout_execution_inputs(rule, state, exe, parent_balance=balance,
                                          height=height, ts=ts)
         outputs = _payout_evaluator_call(

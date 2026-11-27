@@ -865,7 +865,7 @@ def compute_payout_rule_id(
 
 
 def compute_payout_resolved_acc(acc: Any, rule_id: Any, outcome: int) -> bytes:
-    """Fold one removal (revoked, expired, replaced, superseded, refunded)
+    """Fold one removal (revoked, expired, replaced, superseded)
     into the running commitment."""
     out = bytearray()
     out.extend(encode_string(DOMAIN_PAYOUT_RESOLVED_V1.decode()))
@@ -905,11 +905,11 @@ def encode_payout_entry(
     `more`, only for an extended rule (optional terms or a rule that reads the
     kept clocks): (periods_from, due_at, last_clock, due_done, due_every,
     due_months, on_arrival, due_index, missed, max_fee_per_execution, version,
-    lineage), with (grant_amount, grant_deadline) after it for a rule that
-    carries a conditional grant, and (shared_cap_id, shared_cap_amount) after
-    that for a rule that draws on a shared cap. A stored row without the
-    grant pair is the old shape and encodes as before. A rule without it
-    keeps the entry it always had.
+    lineage), with (shared_cap_id, shared_cap_amount) after it for a rule that
+    draws on a shared cap, and the settled (due_index, slot) pairs after that
+    for a rule with a manual-settled due point. A stored row without the
+    shared-cap pair is the old shape and encodes as before; a rule with no
+    settled point keeps the 14-shape entry, so its root does not move.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -943,18 +943,11 @@ def encode_payout_entry(
         if len(more) == 12:
             (periods_from, due_at, last_clock, due_done, due_every, due_months,
              on_arrival, due_index, missed, max_fee, version, lineage) = more
-            grant_amount, grant_deadline = None, None
             shared_cap_id, shared_cap_amount = None, None
-        elif len(more) == 14:
+        elif len(more) in (14, 15):
             (periods_from, due_at, last_clock, due_done, due_every, due_months,
              on_arrival, due_index, missed, max_fee, version, lineage,
-             grant_amount, grant_deadline) = more
-            shared_cap_id, shared_cap_amount = None, None
-        elif len(more) == 16:
-            (periods_from, due_at, last_clock, due_done, due_every, due_months,
-             on_arrival, due_index, missed, max_fee, version, lineage,
-             grant_amount, grant_deadline, shared_cap_id,
-             shared_cap_amount) = more
+             shared_cap_id, shared_cap_amount) = more[:14]
         else:
             raise ValueError("payout entry has a bad more")
         out.extend(b"\x01")
@@ -982,18 +975,11 @@ def encode_payout_entry(
             out.extend(encode_uint64(int(max_fee)))
         out.extend(encode_uint64(int(version)))
         out.extend(encode_hash32(bytes.fromhex(lineage)))
-        if len(more) in (14, 16):
-            # A grant rule's entry carries its terms; an old-shape entry keeps
-            # the bytes it always had, so its root does not move.
-            for value in (grant_amount, grant_deadline):
-                if value is None:
-                    out.extend(b"\x00")
-                else:
-                    out.extend(b"\x01")
-                    out.extend(encode_uint64(int(value)))
-        if len(more) == 16:
+        if len(more) in (14, 15):
             # A shared-cap rule's entry carries its cap id and limit; the
             # spent ledger itself is rebuilt from the open rules on restore.
+            # An old-shape entry keeps the bytes it always had, so its root
+            # does not move.
             if shared_cap_id is None:
                 out.extend(b"\x00")
             else:
@@ -1004,6 +990,15 @@ def encode_payout_entry(
             else:
                 out.extend(b"\x01")
                 out.extend(encode_uint64(int(shared_cap_amount)))
+        if len(more) == 15:
+            # A rule with a manual-settled due point carries the settled
+            # (due_index, slot) pairs, count first, sorted so equal sets
+            # encode the same. A rule with none keeps the 14-shape bytes.
+            settled = more[14]
+            out.extend(encode_uint32(len(settled)))
+            for index, slot in sorted(settled):
+                out.extend(encode_uint64(int(index)))
+                out.extend(encode_uint64(int(slot)))
     else:
         out.extend(b"\x00")
     return bytes(out)
