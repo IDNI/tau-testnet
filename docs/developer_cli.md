@@ -436,8 +436,9 @@ tau-testnet tx raw-submit --file signed_tx.json
 
 A rule that writes `o5` is registered as the sender's own policy clause, so it
 carries no `i12` guard and cannot share a transaction with transfers
-(`RULE_WITH_TRANSFERS`); send it on its own. Fee rules that write `o8` must
-reference `i12` or `i3` (`UNSCOPED_USER_RULE`).
+(`RULE_WITH_TRANSFERS`); send it on its own. Fee rules that write `o8` must have the form
+`always ( (i12[t]:bv[384] = { #x<your pubkey> }:bv[384]) -> ( ... ) ).`
+with your own key (`UNSCOPED_USER_RULE`).
 
 `tx send` exits `1` when the node returns a `{"status":"error",...}`
 envelope (any `error.code`, e.g. `INVALID_SIGNATURE`, `INVALID_SEQUENCE`,

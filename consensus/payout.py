@@ -479,12 +479,13 @@ def parse_payout_execute(tx: Dict[str, Any]) -> PayoutExecution:
 def screen_payout_body(body: str, slot_count: int, per_sale: bool = False) -> Optional[str]:
     """None when the body fits the payout ABI, else why not. Shared by admission,
     apply and the rule-change release."""
-    from consensus.admission import screen_temporal_rule
+    from consensus.admission import screen_rule_fragment
+    from consensus.rule_fragment import clause_unit
     from consensus.rule_offers import screen_clause_structure, strip_clause_comments
 
-    temporal = screen_temporal_rule(body)
-    if temporal:
-        return temporal
+    fragment = screen_rule_fragment(clause_unit(body))
+    if fragment:
+        return fragment
     scrubbed = strip_clause_comments(body)
     seen: Dict[str, int] = {}
     for match in _MENTION_RE.finditer(scrubbed):

@@ -936,8 +936,7 @@ def _run_server(container: ServiceContainer):
         tau_module.set_rules_handler(chain_state_module.save_effective_tau_spec)
 
     logger.info("Starting Tau Process Manager Thread...")
-    manager_thread = threading.Thread(target=tau_module.start_and_manage_tau_process, daemon=True)
-    manager_thread.start()
+    manager_thread = tau_module.start_manager_thread()
 
     logger.info("Waiting for Tau to signal readiness...")
     # This waits for 'tau_ready', which is set AFTER the callback completes

@@ -19,16 +19,34 @@ def get_templates():
     inA, inB, inC = 1, 2, 2
     sh1, sh2 = 3, 2
     bit = 1
-    
-    # Keep these consistent with the current web wallet generator, which uses bv[24].
+
     hx = lambda n: f"{{ #x{n:02x} }}:bv[24]"
 
     return [
-        f"always (o{outA}[t] = {hx(bit)}).",
-
-        f"always ( ((i{inA}[t]:bv[24] + i{inB}[t]:bv[24]) >= {hx(0x80)} && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[24] + i{inB}[t]:bv[24]) < {hx(0x80)} && o{outA}[t] = {hx(0)}) ).",
-
-        f"always ( o{outA}[t]:bv[24] = (i{inA}[t]:bv[24] >> {hx(sh1)}) + (i{inB}[t]:bv[24] << {hx(sh2)}) )."
+        "\n".join([
+            "# Example 1 - Constant flag output (sanity test)",
+            f"always (o{outA}[t]:bv[24] = {hx(bit)}).",
+        ]),
+        "\n".join([
+            "# Example 2 - Threshold gate (classifier-like)",
+            f"always ( ((i{inA}[t]:bv[24] + i{inB}[t]:bv[24]) >= {hx(0x80)} && o{outA}[t]:bv[24] = {hx(1)}) || ((i{inA}[t]:bv[24] + i{inB}[t]:bv[24]) < {hx(0x80)} && o{outA}[t]:bv[24] = {hx(0)}) ).",
+        ]),
+        "\n".join([
+            "# Example 3 - Feature extraction (bit shifts + combine)",
+            f"always ( o{outA}[t]:bv[24] = (i{inA}[t]:bv[24] >> {hx(sh1)}) + (i{inB}[t]:bv[24] << {hx(sh2)}) ).",
+        ]),
+        "\n".join([
+            "# Example 4 - Multiple outputs",
+            f"always ( (o{outA}[t]:bv[24] = i{inA}[t]:bv[24] + i{inB}[t]:bv[24]) && (o{outB}[t]:bv[24] = i{inC}[t]:bv[24] - i{inB}[t]:bv[24]) ).",
+        ]),
+        "\n".join([
+            "# Example 5 - Network style rule with a score gate",
+            "always (",
+            f"  ((((i{inA}[t]:bv[24] * {hx(0x03)}) + (i{inB}[t]:bv[24] * {hx(0x02)})) >= {hx(0x80)})",
+            f"    ? (o{outA}[t]:bv[24] = {hx(1)} && o{outB}[t]:bv[24] = {hx(0xC8)})",
+            f"    : (o{outA}[t]:bv[24] = {hx(0)} && o{outB}[t]:bv[24] = {hx(0x32)}) )",
+            ").",
+        ]),
     ]
 
 @pytest.mark.parametrize("rule_idx, rule_text", enumerate(get_templates()))

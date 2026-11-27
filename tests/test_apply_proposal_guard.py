@@ -7,6 +7,8 @@ a verdict about whichever transaction happened to be executing.
 """
 from unittest.mock import MagicMock, patch
 
+from consensus.governance import DEFAULT_SHARED_RULE_LIMITS
+
 import pytest
 
 import tau_allocator as alloc
@@ -33,7 +35,11 @@ def _proposal(session):
         journal=tj.Journal(authoritative=False),
         allocator=alloc.Allocator(snapshot, width=plan.width, label="proposal"),
         plan=plan,
-        lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
+        lifecycle=MagicMock(
+            approval_slots_active=False, faucet_amount=0,
+            shared_rule_limits=DEFAULT_SHARED_RULE_LIMITS,
+            shared_rule_count=0, shared_rule_nodes=0,
+        ),
     )
 
 
@@ -135,7 +141,11 @@ def test_non_proposal_apply_installs_no_guard(temp_database):
             [_tx()], 1700000000,
             target_balances={SENDER: 1000},
             target_sequences={},
-            target_lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
+            target_lifecycle=MagicMock(
+            approval_slots_active=False, faucet_amount=0,
+            shared_rule_limits=DEFAULT_SHARED_RULE_LIMITS,
+            shared_rule_count=0, shared_rule_nodes=0,
+        ),
             proposer_pubkey=PROPOSER,
             block_height=1,
         )

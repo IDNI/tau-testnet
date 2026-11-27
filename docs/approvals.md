@@ -459,8 +459,10 @@ processes, never in the interpreter that holds the consensus rules.
 The same screens run at admission and at block apply, for a clause submitted as
 the sender's own `o5` rule and for an offered or accepted one. A body must:
 
-- be exactly one `always ( … ).` unit with balanced parentheses and no nested
-  temporal operator, and not reference `i12`;
+- be exactly one `always ( … ).` unit in the admitted rule syntax
+  (`RULE_FRAGMENT` otherwise: typed bitvector comparisons joined by `!`, `&&`,
+  `^^`, `||`, `->`, `<-`, `<->` and `? :`, no quantifiers or
+  definitions), and not reference `i12`;
 - reference the current step `[t]` only (`TEMPORAL_REFERENCE` otherwise);
 - write every stream mention as `xN[t]:bv[W]` with an explicit width and use one
   width per stream within the body; `o5` is `bv[24]` (`WIDTH_MISMATCH`
@@ -515,7 +517,9 @@ the width the clause declared for that stream, the transfer is blocked.
 
 Nothing limits how many accounts hold a clause. The per-block rule budget
 (`max_rule_txs_per_block`) counts every rule-offer transaction and every user
-transaction carrying an `o5` rule.
+transaction carrying a rule in `operations["0"]`, whether it registers an `o5`
+clause or joins the shared specification. Clauses are not part of the shared
+rule budget (`RULE_BUDGET`, see the README).
 
 ### Cost
 
@@ -533,7 +537,9 @@ on how many accounts hold clauses.
 | `CLAUSE_SHAPE` | The rule is not exactly one `always ( … ).` unit, nests a temporal operator, or its body references `i12`. |
 | `WIDTH_MISMATCH` | `o5` (or an `o8` rule's `o8`) is untyped or typed at a width other than `bv[24]`. Other width violations in a clause are reported as `TX_REJECTED`. |
 | `TEMPORAL_REFERENCE` | The rule or clause body reads a step other than the current one (`i1[t-1]`, `i1[0]`). User rules reference `[t]` only. |
-| `UNSCOPED_USER_RULE` | An `o8` fee rule that references neither `i12` nor `i3`. It does not apply to `o5` rules. |
+| `RULE_FRAGMENT` | The rule or clause body uses syntax outside the admitted rule syntax (see [What registration requires](#what-registration-requires)). |
+| `RULE_BUDGET` | A rule that joins the shared specification exceeds one of the shared rule limits (rule size, depth, bytes, width, or the occurrence and node totals). It does not apply to `o5` clauses. |
+| `UNSCOPED_USER_RULE` | An `o8` fee rule that is not exactly `always ( (i12[t]:bv[384] = { #x<sender pubkey> }:bv[384]) -> ( ... ) ).` with the submitting account's own key. It does not apply to `o5` rules. |
 | `MIXED_OUTPUT_RULE` | The rule writes `o5` and something else. |
 | `RULE_WITH_TRANSFERS` | A routed `o5` rule shares a `user_tx` with transfers. Admission would judge those transfers against the policy being replaced. |
 | `TOO_MANY_REQUESTS` | `MAX_PENDING_REQUESTS_PER_SENDER` reached. |

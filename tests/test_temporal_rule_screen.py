@@ -22,7 +22,7 @@ from consensus.admission import (
     TipAdmissionView,
     _screen_clause_domains,
     is_temporal_reference_error,
-    screen_temporal_rule,
+    screen_rule_fragment,
     validate_mempool_admission,
 )
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
@@ -30,6 +30,7 @@ from consensus.governance import ConsensusLifecycleManager
 from consensus.rule_offers import STATUS_OFFERED, RuleOffer
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
+from tau_native import TauInterface
 
 pytestmark = pytest.mark.usefixtures("mock_policy_evaluators")
 
@@ -67,9 +68,13 @@ def _policy(ref):
 
 # --- the shared screen --------------------------------------------------------
 
+def _screen(rule):
+    return screen_rule_fragment(TauInterface.preprocess_spec_text(rule))
+
+
 @pytest.mark.parametrize("ref", TEMPORAL_REFS)
 def test_every_spelling_of_another_step_is_caught(ref):
-    error = screen_temporal_rule(_free(ref))
+    error = _screen(_free(ref))
     assert error is not None
     assert is_temporal_reference_error(error)
     assert ref.replace("OUT", FREE_STREAM).split("[")[0] in error
@@ -78,15 +83,20 @@ def test_every_spelling_of_another_step_is_caught(ref):
 @pytest.mark.parametrize("rule", [
     CURRENT_FREE,
     CURRENT_POLICY,
-    "always ( o13[ t ]:bv[24] = i1[ t ]:bv[24] ).",
     "# i1[t-1] was considered and dropped\n" + CURRENT_FREE,
 ])
 def test_current_step_rules_pass(rule):
-    assert screen_temporal_rule(rule) is None
+    assert _screen(rule) is None
+
+
+def test_padded_brackets_are_refused_as_a_fragment_error():
+    error = _screen("always ( o13[ t ]:bv[24] = i1[ t ]:bv[24] ).")
+    assert error is not None
+    assert not is_temporal_reference_error(error)
 
 
 def test_a_stream_the_scanner_cannot_resolve_fails_closed():
-    assert screen_temporal_rule("always ( o13[t]:bv[24] = i1:bv[24] ).") is not None
+    assert _screen("always ( o13[t]:bv[24] = i1:bv[24] ).") is not None
 
 
 def test_the_clause_screen_carries_the_same_check():
@@ -371,7 +381,7 @@ def test_apply_does_not_record_a_consensus_update_reading_another_step(ref, repl
     result, post, _ = _apply(_update_tx(_consensus_rule(ref)), lm, replay_mode=replay_mode)
     assert "update" not in result.invalid_tx_ids
     logs = " | ".join(str(x) for x in _outcome(result, "update").receipt_logs)
-    assert "reads a previous step" in logs
+    assert "reads a step other than the current one" in logs
     assert post.pending_updates == set()
     assert post.update_payloads == {}
 
