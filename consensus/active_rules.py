@@ -521,6 +521,122 @@ def _journal_cut_at_height(
         return None, CUT_UNAVAILABLE
 
 
+def _journal_cut_at_revision(
+        height: int, revision: int) -> Tuple[Optional[Dict], Optional[str]]:
+    """`_journal_cut_at_height` for one revision inside the block.
+
+    A block that advanced the spec revision more than once holds one
+    stored snapshot per revision, but the per-height cut is the block's
+    END state: checking an intermediate snapshot against it replaces
+    the snapshot's text with the end-of-block text, and the unit
+    ledger then births every unit of the block at the block's first
+    revision (the C6 defect). The per-revision cut replays the same
+    committed prefix stepwise -- the consumption pattern
+    `_feed_from_scratch` uses (the last RESET's units, then every
+    REVISION text) -- and captures the mirror's text at the moment
+    the mirror's own spec_revision (the interpreter's counter, the
+    same one the engine records) equals the requested revision. The
+    replay is anchored at the end: fully fed, the mirror must sit on
+    the commit's recorded revision and speak the per-height cut's
+    text for the same prefix, or the stepwise reading is not trusted.
+    Returns (cut, None) on success, else (None, code) with the same
+    codes as `_journal_cut_at_height`.
+    """
+    import db
+    import tau_journal
+
+    try:
+        height = int(height)
+        revision = int(revision)
+        if height == 0:
+            commit = db.genesis_block_commit()
+            block_hash = db.get_genesis_hash() or None
+            if commit is None or not block_hash:
+                return None, CUT_NOT_FOUND
+        else:
+            commit = db.block_commit_at_height(height)
+            if commit is None:
+                return None, CUT_NOT_FOUND
+            block_hash = commit["block_hash"]
+        final_revision = commit.get("spec_revision")
+        if final_revision is None:
+            return None, CUT_NOT_FOUND
+        if revision >= int(final_revision):
+            # Not an intermediate revision of this block: the
+            # per-height cut IS the cut at this revision.
+            return _journal_cut_at_height(height)
+        head_link = commit.get("journal_head")
+        if head_link is None:
+            return None, CUT_NOT_FOUND
+        journal = tau_journal.journal_from_rows(
+            db.committed_journal_entries())
+        entries = journal.entries()
+        cut_len = None
+        for i, entry in enumerate(entries):
+            if entry.link == head_link:
+                cut_len = i + 1
+        if cut_len is None:
+            # The commit names a journal head the journal no longer
+            # holds (see `_journal_cut_at_height`).
+            return None, CUT_TAMPERED
+        prefix = entries[:cut_len]
+        try:
+            tau_journal.verify_entries(prefix)
+        except Exception:
+            return None, CUT_TAMPERED
+        from tau_native import _interpreter_spec_revision
+
+        iface = _new_mirror_iface()
+
+        def _mirror_revision() -> Optional[int]:
+            try:
+                return _interpreter_spec_revision(iface.interpreter)
+            except Exception:
+                return None
+
+        captured: Optional[str] = None
+        if _mirror_revision() == revision:
+            captured = iface.get_current_spec()
+        reset_idx = tau_journal.last_reset_index(prefix)
+        start = 0
+        if reset_idx is not None:
+            for text, _persist in prefix[reset_idx].units:
+                if text:
+                    _feed_mirror(iface, text)
+                    if captured is None \
+                            and _mirror_revision() == revision:
+                        captured = iface.get_current_spec()
+            start = reset_idx + 1
+        for entry in prefix[start:]:
+            if entry.kind == tau_journal.REVISION and entry.rule_text:
+                _feed_mirror(iface, entry.rule_text)
+                if captured is None and _mirror_revision() == revision:
+                    captured = iface.get_current_spec()
+        if not captured:
+            return None, CUT_UNAVAILABLE
+        # Anchor the stepwise reading: fully fed, the mirror must sit
+        # on the commit's recorded revision and speak the per-height
+        # cut's text for the same prefix.
+        if _mirror_revision() != int(final_revision):
+            return None, CUT_UNAVAILABLE
+        cut, _code = _journal_cut_at_height(height)
+        if cut is None or iface.get_current_spec() != cut.get("spec_text"):
+            return None, CUT_UNAVAILABLE
+        return {
+            "spec_revision": revision,
+            "height": height,
+            "block_hash": block_hash,
+            "spec_hash": spec_hash_of(captured),
+            "spec_text": captured,
+            "derived": "journal_cut",
+        }, None
+    except Exception:
+        logger.warning(
+            "active_rules: journal cut at height %s revision %s "
+            "unavailable", height, revision, exc_info=True)
+        return None, CUT_UNAVAILABLE
+
+
 def journal_cut_at_height(height: int) -> Optional[Dict]:
     """The spec in force at `height`, derived from the committed journal.
 
@@ -575,9 +691,13 @@ def checked_snapshot_answer(snap: Optional[Dict]) -> Optional[Dict]:
     snapshot rests on no longer verifies -- the snapshot is HELD
     (None, with a hard log): O-2, fail closed for integrity, never
     serve a snapshot whose journal is broken. A snapshot with no
-    height cannot be checked and is served unchanged. The comparison
-    covers the served text, its sha256, and the spec revision: all
-    three must agree, or the cut answers.
+    height cannot be checked and is served unchanged. A snapshot
+    whose revision is below its height's final revision is an
+    intermediate of a multi-revision block: it is checked against
+    the per-revision cut (`_journal_cut_at_revision`), not the
+    block's end state. The comparison covers the served text, its
+    sha256, and the spec revision: all three must agree, or the cut
+    answers.
     """
     view = _view_shape(snap)
     if view is None:
@@ -597,6 +717,31 @@ def checked_snapshot_answer(snap: Optional[Dict]) -> Optional[Dict]:
                 "holding the stored snapshot (spec_revision %s)",
                 height, view.get("spec_revision"))
             return None
+        return view
+    if (view.get("spec_revision") is not None
+            and cut.get("spec_revision") is not None
+            and int(view["spec_revision"]) < int(cut["spec_revision"])):
+        # An intermediate snapshot of a multi-revision block: the
+        # per-height cut is the block's END state, not this
+        # snapshot's revision, so checking against it would replace
+        # this snapshot's text with the end-of-block text (the C6
+        # defect). Check against the per-revision cut instead. When
+        # that cut cannot speak (UNAVAILABLE), the snapshot is served
+        # as stored, like any cut that cannot speak; a TAMPERED
+        # per-revision cut holds the snapshot (O-2), as above.
+        rcut, rcode = _journal_cut_at_revision(
+            int(height), int(view["spec_revision"]))
+        if rcut is None:
+            if rcode == CUT_TAMPERED:
+                logger.error(
+                    "active_rules: journal cut at height %s revision "
+                    "%s is TAMPERED; holding the stored snapshot",
+                    height, view.get("spec_revision"))
+                return None
+            return view
+        if (view.get("spec_text") != rcut.get("spec_text")
+                or view.get("spec_hash") != rcut.get("spec_hash")):
+            return rcut
         return view
     if (view.get("spec_text") != cut.get("spec_text")
             or view.get("spec_hash") != cut.get("spec_hash")
