@@ -192,8 +192,17 @@ def execute(raw_command: str, container):
         }
 
     if running.get("block_hash") not in (None, head_hash):
-        # A block committed between the two reads: read the spec again at the
-        # head the rest of this answer describes, or say which head it is at.
-        payload["running_spec"] = tau_running_spec.at_head()
+        # A block committed between the two reads: answer the spec at the
+        # head the rest of this answer describes, pinned by hash (the
+        # AtticKnight pattern from PR #180) -- re-reading the head can
+        # answer with a newer block's spec while this response still names
+        # the old head.
+        pinned = tau_running_spec.running_spec_at(db, head_hash)
+        if "unavailable" not in pinned:
+            payload["running_spec"] = pinned
+        else:
+            # A store that cannot answer historical blocks: best effort,
+            # the old single re-read.
+            payload["running_spec"] = tau_running_spec.at_head()
 
     return api_response.success_response("getgovernance", payload)
