@@ -47,6 +47,8 @@ MagicMock
 !docs/packaging.md
 !docs/programmable_payments.md
 !docs/programmable_payments_amendment.md
+!docs/payment_interface_design.md
+!docs/payment_interface_comment.md
 
 # Python
 __pycache__/
