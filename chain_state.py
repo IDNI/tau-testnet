@@ -1,3 +1,4 @@
+import hashlib
 import threading
 import json
 import logging
@@ -572,12 +573,38 @@ def _record_rule_outcomes(block, next_snapshot) -> None:
     Same discipline as _record_retractable_events: read from the snapshot,
     not the apply result, so a block that reuses its own evaluation still
     records what its apply observed (issue #42, milestone 1).
+
+    Every record is anchored to the snapshot being committed: the
+    snapshot's `state_hash` (the consensus state hash this block commits,
+    computed over the canonical rules bytes) and `canonical_rules_sha256`
+    (the sha256 of the snapshot's application-rules bytes — the
+    full-width accumulation this module itself persists as the canonical
+    state). The outcome scalars are the applying engine's own revision
+    receipt, captured at the rule step; the anchor is what ties them to
+    committed chain state a reader can verify, rather than to any live
+    session's runtime view of the spec — a session interpreter's current
+    spec is a per-process, possibly shrunken projection and is never read
+    here or at query time (maintainer review of PR #135, 2026-11-27).
     """
     try:
         outcomes = (getattr(next_snapshot, "metadata", None) or {}).get("rule_outcomes")
         if outcomes:
+            anchors = {}
+            tau_bytes = getattr(next_snapshot, "tau_bytes", None) or b""
+            if isinstance(tau_bytes, str):
+                tau_bytes = tau_bytes.encode("utf-8")
+            if tau_bytes:
+                anchors["canonical_rules_sha256"] = hashlib.sha256(
+                    tau_bytes).hexdigest()
+            state_hash = getattr(next_snapshot, "state_hash", None)
+            if state_hash:
+                anchors["state_hash"] = state_hash
+            anchored = [
+                (tx_hash, {**outcome, **anchors})
+                for tx_hash, outcome in outcomes
+            ]
             db.record_rule_outcomes(
-                block.block_hash, block.header.block_number, list(outcomes)
+                block.block_hash, block.header.block_number, anchored
             )
     except Exception:
         logger.exception("could not record rule outcomes")
