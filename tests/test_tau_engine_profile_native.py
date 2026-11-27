@@ -25,26 +25,35 @@ def _native_python():
 
 def _child_env(extra=None):
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [REPO_ROOT, os.path.join(REPO_ROOT, "tests"), env.get("PYTHONPATH", "")])
+    # A child cannot inherit the parent's runtime sys.path insert of the engine dir.
+    paths = [REPO_ROOT, os.path.join(REPO_ROOT, "tests"), _ENGINE_DIR,
+             env.get("PYTHONPATH", "")]
+    env["PYTHONPATH"] = os.pathsep.join(p for p in paths if p)
     env.update(extra or {})
     return env
 
 
-def _native_available():
+def _probe_native():
     try:
         proc = subprocess.run(
             [_native_python(), "-c",
-             "import tau_native; assert tau_native.load_tau_module() is not None"],
+             "import tau_native; assert tau_native.load_tau_module() is not None;"
+             " print(tau_native.native_tau_dir() or '')"],
             capture_output=True, text=True, env=_child_env(), timeout=120,
         )
-        return proc.returncode == 0
+        if proc.returncode != 0:
+            return False, ""
+        lines = proc.stdout.strip().splitlines()
+        return True, lines[-1] if lines else ""
     except Exception:
-        return False
+        return False, ""
 
+
+_ENGINE_DIR = ""
+_NATIVE_OK, _ENGINE_DIR = _probe_native()
 
 requires_native = pytest.mark.skipif(
-    not _native_available(), reason="native tau module not importable"
+    not _NATIVE_OK, reason="native tau module not importable"
 )
 
 _BODY = r'''
