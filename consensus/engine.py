@@ -48,6 +48,7 @@ from .rule_offers import (
     RuleOfferShapeError,
     clause_body_v1,
     is_neutral_clause_body,
+    normalize_offer_rule_text,
     TX_TYPE_RULE_OFFER,
     TX_TYPE_RULE_OFFER_ACCEPT,
     parse_rule_offer,
@@ -246,6 +247,150 @@ def _release_due_retractables(lm, balances, sequences, height, timestamp) -> Lis
     return [entry.retractable_id.hex() for entry in released]
 
 
+TX_OUTCOME_APPLIED = "applied"
+TX_OUTCOME_SKIPPED = "skipped"
+TX_OUTCOME_REJECTED = "rejected"
+TX_OUTCOME_NOT_PROCESSED = "not_processed"
+
+
+def _note_rule_effect(receipt, account, action, *, stream=None, body=None,
+                      kind="clause", revision=None) -> None:
+    """Record on the receipt what a transaction did to one account's rules.
+
+    kind "clause": a per-account registry clause; `action` is "registered",
+    "replaced" or "revoked" and `stream` its target stream (the rule-change
+    guard is RULE_CHANGE_GUARD_INDEX). kind "application_rule": a unit joined
+    the application-rules accumulation; `action` is "accumulated".
+
+    `sha256` names the text exactly as the node stores it (registry body, or
+    the accumulated unit), so a wallet can compare it with what it sent. The
+    text itself goes beside the effects, under the receipt's `rule_bodies`, for
+    the node's own record (`db.record_tx_outcomes` keeps it once per hash).
+    """
+    import hashlib
+
+    effect = {"account": str(account).lower(), "kind": kind, "action": action}
+    if stream is not None:
+        effect["stream"] = int(stream)
+    if body is not None:
+        effect["sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        receipt.setdefault("rule_bodies", {})[effect["sha256"]] = body
+    if revision is not None:
+        effect["revision"] = revision
+    receipt.setdefault("rule_effects", []).append(effect)
+
+
+def _engine_revision(engine_receipt):
+    """What the engine did with an application rule, read off its revision receipt.
+
+    `taken`: the engine's specification changed (`ACCEPTED_CHANGED`); false for
+    a unit it accepted without a change (`ACCEPTED_NOOP`, for example one that
+    is already implied). `spec_revision`: the engine's revision counter after
+    the unit, as the evaluator that applied the block reports it. None when the
+    evaluator gave no receipt (the mock engine).
+    """
+    if not engine_receipt or not engine_receipt.get("outcome"):
+        return None
+    after = engine_receipt.get("spec_revision_after", engine_receipt.get("spec_revision"))
+    return {
+        "taken": engine_receipt["outcome"] == "ACCEPTED_CHANGED",
+        "engine_outcome": engine_receipt["outcome"],
+        "spec_revision": int(after) if after is not None else None,
+    }
+
+
+def _note_accumulated_rule(receipt, sender, rule_text, engine_receipt=None) -> None:
+    """`_note_rule_effect` for a unit that joined the application-rules accumulation.
+
+    Hashes the unit in the form `chain_state.save_effective_tau_spec` stores it,
+    and carries what the engine did with it (`_engine_revision`).
+    """
+    if not isinstance(sender, str):
+        return
+    import chain_state
+
+    raw = (rule_text or "").strip()
+    try:
+        unit = (chain_state._preprocess_tau_spec_text(raw) or raw).strip()
+    except Exception:
+        unit = raw
+    _note_rule_effect(receipt, sender, "accumulated", body=unit, kind="application_rule",
+                      revision=_engine_revision(engine_receipt))
+
+
+# Receipt logs kept per outcome. They are what issue #42 asks a wallet to see,
+# but a log line can quote a whole rule, so the record is bounded.
+OUTCOME_MAX_LOG_LINES = 16
+OUTCOME_MAX_LOG_CHARS = 400
+
+
+def _bounded_logs(logs) -> List[str]:
+    lines = [str(line) for line in (logs or [])]
+    kept = [
+        line if len(line) <= OUTCOME_MAX_LOG_CHARS
+        else line[:OUTCOME_MAX_LOG_CHARS] + "..."
+        for line in lines[:OUTCOME_MAX_LOG_LINES]
+    ]
+    if len(lines) > OUTCOME_MAX_LOG_LINES:
+        kept.append(f"... {len(lines) - OUTCOME_MAX_LOG_LINES} more line(s)")
+    return kept
+
+
+def _tx_outcomes(block, exec_result) -> List[Dict[str, Any]]:
+    """What each transaction of a block did, in block order (issue #42).
+
+    Built during apply, replay included, so every node records the same
+    status, fee and rule effects (logs can carry node-local errors). Without it
+    a block's transaction index made every included transaction read as
+    "confirmed", even one the apply step skipped as a no-op, and nothing said
+    what a rule transaction changed. An honest proposer leaves rejected
+    transactions out of the block; "rejected" appears only if a block carries
+    one anyway.
+    """
+    from block import compute_tx_hash
+
+    hashes = list(getattr(block, "tx_ids", None) or [])
+    rows: List[Dict[str, Any]] = []
+    for i, tx in enumerate(block.transactions):
+        tx_hash = hashes[i] if i < len(hashes) else compute_tx_hash(tx)
+        receipt = exec_result.receipts.get(tx.get("tx_id", str(i))) or {}
+        logs = receipt.get("logs") or []
+        if tx in exec_result.rejected_transactions:
+            status = TX_OUTCOME_REJECTED
+        elif tx in exec_result.accepted_transactions:
+            # Same test as the block's structural outcomes below, except that a
+            # transaction which changed someone's rules is never a no-op, even
+            # when another of its operations logged "ignored".
+            no_op = any("valid no-op" in log.lower() or "ignored" in log.lower() for log in logs)
+            status = (TX_OUTCOME_SKIPPED if no_op and not receipt.get("rule_effects")
+                      else TX_OUTCOME_APPLIED)
+        else:
+            status = TX_OUTCOME_NOT_PROCESSED
+        row: Dict[str, Any] = {"tx_hash": tx_hash, "index": i, "status": status}
+        if isinstance(tx.get("tx_id"), str):
+            # The block builder executes copies that carry the mempool hash as
+            # tx_id, then drops the rejected ones from the block it commits;
+            # recording maps rows back to that block through it.
+            row["tx_id"] = tx["tx_id"]
+        if receipt.get("reason"):
+            row["reason"] = str(receipt["reason"])
+        # Step 5 of apply is the only place a fee is charged, and it records
+        # fee_charged when it does; an included transaction without it paid 0.
+        if status in (TX_OUTCOME_APPLIED, TX_OUTCOME_SKIPPED):
+            row["fee_charged"] = int(receipt.get("fee_charged") or 0)
+        elif receipt.get("fee_charged") is not None:
+            row["fee_charged"] = int(receipt["fee_charged"])
+        if logs:
+            row["logs"] = _bounded_logs(logs)
+        effects = receipt.get("rule_effects")
+        if effects and status == TX_OUTCOME_APPLIED:
+            row["rule_effects"] = [dict(e) for e in effects]
+            if receipt.get("rule_bodies"):
+                row["rule_bodies"] = dict(receipt["rule_bodies"])
+        rows.append(row)
+    return rows
+
+
 TEMPORAL_REFERENCE_REASON = "temporal_reference"
 RULE_FRAGMENT_REASON = "rule_fragment"
 RULE_CHANGE_NEEDS_APPROVAL_REASON = "rule_change_needs_approval"
@@ -274,12 +419,46 @@ def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tupl
     return error, "rule_not_applied"
 
 
-def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str]]:
+def _clause_diff_effects(before: Dict, after: Dict) -> List[Dict[str, Any]]:
+    """Rule effects between two views of one account's registry clauses.
+
+    `before`/`after` map stream -> clause body. Used where a write is not tied
+    to one transaction (the rule-change release sweep), so the effect is read
+    off the registry itself rather than re-derived from the request kind.
+    """
+    import hashlib
+
+    effects = []
+    for stream in sorted(set(before) | set(after)):
+        old, new = before.get(stream), after.get(stream)
+        if old == new:
+            continue
+        effect = {"kind": "clause", "stream": int(stream),
+                  "action": "revoked" if new is None
+                  else ("registered" if old is None else "replaced")}
+        if new is not None:
+            effect["sha256"] = hashlib.sha256(new.encode("utf-8")).hexdigest()
+        effects.append(effect)
+    return effects
+
+
+def _clauses_of(offers, account) -> Dict[int, str]:
+    return {stream: body for (who, stream), body in offers.accepted_clauses.items()
+            if who == account}
+
+
+def _release_rule_changes(lm, height, timestamp, timeout,
+                          releases_out: Optional[List[Dict[str, Any]]] = None,
+                          ) -> List[Tuple[str, str]]:
     """Write every READY rule-change request, lowest id first, up to the per-block cap.
 
     Runs after the transaction loop and before expiry, so a deferred request
     whose window closes this block expires instead of releasing. A failure is
     recorded on the request, never on the block. Returns (id, status name).
+
+    `releases_out`, when given, receives one record per processed request for
+    the node-local history (issue #42): its status, the failure reason, and the
+    rule effects the release wrote. Nothing in it is consensus state.
     """
     approvals = lm.approval_requests
     if not approvals.rule_change_requests:
@@ -294,14 +473,27 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
         if entry is None or entry.status != STATUS_OPEN:
             continue
         processed += 1
+        before = _clauses_of(lm.rule_offers, entry.sender_pubkey) if releases_out is not None else None
         problem = _write_rule_change(lm, rid, entry, int(height), timeout)
         if problem:
             approvals.resolve_rule_change(rid, STATUS_FAILED)
             logger.info("Rule-change request %s failed at release: %s", rid.hex(), problem)
             events.append((rid.hex(), "failed"))
+            if releases_out is not None:
+                releases_out.append({"request_id": rid.hex(), "account": entry.sender_pubkey,
+                                     "status": "failed", "detail": str(problem)})
             continue
         approvals.resolve_rule_change(rid, STATUS_EXECUTED)
         events.append((rid.hex(), "executed"))
+        if releases_out is not None:
+            after = _clauses_of(lm.rule_offers, entry.sender_pubkey)
+            effects = _clause_diff_effects(before, after)
+            releases_out.append({
+                "request_id": rid.hex(), "account": entry.sender_pubkey, "status": "executed",
+                "rule_effects": effects,
+                "rule_bodies": {e["sha256"]: after[e["stream"]]
+                                for e in effects if e.get("sha256")},
+            })
     return events
 
 
@@ -899,12 +1091,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         released_retractables = _release_due_retractables(
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
+        rule_change_releases: List[Dict[str, Any]] = []
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
                 session if session is not None else getattr(proposal, "session", None),
                 "request_budget", None,
             ),
+            releases_out=rule_change_releases,
         )
 
         minted = faucet.granted(
@@ -958,6 +1152,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
+        tx_outcomes = _tx_outcomes(block, exec_result)
 
         # 3. Post-State Materialization Layer
         
@@ -1114,6 +1309,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "tx_outcomes": tx_outcomes,
+                "rule_change_releases": rule_change_releases,
             }
         )
         
@@ -1778,6 +1975,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     "o5 clause %s for %s"
                     % ("revoked" if revoking else "registered", sender_n[:10])
                 )
+                _note_rule_effect(
+                    tx_receipt, sender_n,
+                    "revoked" if revoking else ("replaced" if registered else "registered"),
+                    stream=stream, body=None if revoking else body,
+                )
                 return True
 
             def _transfer_input_map(from_addr, to_addr, amount,
@@ -2222,7 +2424,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 f"Offer accept ignored (rule-change guard blocks: {guard_detail})"
                             )
                         else:
+                            replaced_before = None
+                            if accept and accepted_body is not None:
+                                try:
+                                    _, accept_target = normalize_offer_rule_text(decision.rule_text or "")
+                                    replaced_before = offers.accepted_clauses.get(
+                                        (decision.actor_pubkey, accept_target))
+                                except RuleOfferShapeError:
+                                    replaced_before = None
                             target_stream = offers.submit_decision(decision)
+                            if target_stream is not None:
+                                _note_rule_effect(
+                                    tx_receipt, decision.actor_pubkey,
+                                    "replaced" if replaced_before is not None else "registered",
+                                    stream=target_stream,
+                                    body=offers.accepted_clauses.get(
+                                        (decision.actor_pubkey, target_stream)),
+                                )
                             if target_stream is None:
                                 tx_receipt["logs"].append(
                                     "Offer resolved: " + decision.offer_id_hex
@@ -2844,6 +3062,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     current_tau_bytes = "\n".join(units).encode("utf-8")
                                     _rule_touched_canonical = True
                                     tx_receipt["logs"].append("Rule applied (staged)")
+                                    _note_accumulated_rule(tx_receipt, sender, rule_text, receipt)
                                 elif not _application_rule_landed(rule_text):
                                     # Live apply: the handler did not persist, so
                                     # this is a no-op that must not sit in the
@@ -2862,6 +3081,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         )
                                     else:
                                         tx_receipt["logs"].append("Rule applied")
+                                        _note_accumulated_rule(tx_receipt, sender, rule_text, receipt)
                                 else:
                                     rules_text = None
                                     try:
@@ -2877,6 +3097,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         current_tau_bytes += rule_op_data.encode("utf-8")
                                     _rule_touched_canonical = True
                                     tx_receipt["logs"].append("Rule applied")
+                                    _note_accumulated_rule(tx_receipt, sender, rule_text, receipt)
 
                           except tau_shrink.ShrinkTypeConflict as e:
                             # W3: node-local. This process cannot represent the

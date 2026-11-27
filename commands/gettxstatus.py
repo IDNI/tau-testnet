@@ -7,6 +7,14 @@ Resolution order:
                  (with block_hash/number and confirmation depth). Fork-only
                  locations fall through (a reorged-out tx is re-queued into the
                  mempool, so step 1 usually catches it).
+                 "confirmed" means included. What the transaction DID is in
+                 `outcome` (issue #42): `status` "applied" or "skipped" (a
+                 valid no-op), the receipt `reason`, `fee_charged`, the
+                 receipt `logs`, and for rule transactions `rule_effects`
+                 (registered / replaced / revoked / accumulated, with the
+                 sha256 of the stored text). Every node records it for each
+                 block it applies or replays; `{"status": "not_recorded"}` for
+                 blocks applied before the node began recording.
   3. mempool_dropped -> "expired" / "evicted" / "rejected". A "rejected" row
                  may carry the apply receipt's `reason` code and a `detail`
                  log trail. Only the node that built the block records these;
@@ -70,6 +78,81 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
         return {}
 
 
+def _rule_text(tx) -> str:
+    """The rule a user transaction carries on operation 0, as the engine gets it."""
+    if not isinstance(tx, dict) or (tx.get("tx_type") or "user_tx") != "user_tx":
+        return ""
+    ops = tx.get("operations")
+    rule = ops.get("0") if isinstance(ops, dict) else None
+    return rule.strip() if isinstance(rule, str) else ""
+
+
+def journal_rule_outcome(db, tx_hash: str, block_hash: str):
+    """What the engine did with the rule this transaction carried, read from the
+    committed journal (issue #42), or None when the journal holds no revision
+    for it (no rule, a clause kept in the registry, a node without the journal).
+
+    Every revision the engine was asked for in a block is a row of the committed
+    journal with that block as its tip, in block order, with the rule text and
+    the engine's outcome. The k-th transaction of the block that carries a
+    given text is the k-th row with that text. The journal is committed with
+    the block, so this needs no record of this node's own and answers for a
+    block the node applied before it kept outcomes. A count that does not match
+    is reported, never guessed.
+    """
+    from block import compute_tx_hash
+
+    block = db.get_block_by_hash(block_hash)
+    transactions = (block or {}).get("transactions") or []
+    position = next((i for i, tx in enumerate(transactions)
+                     if isinstance(tx, dict) and compute_tx_hash(tx) == tx_hash), None)
+    text = _rule_text(transactions[position]) if position is not None else ""
+    if not text:
+        return None
+    journal = db.journal_revisions_of_block(block_hash)
+    rows = [row for row in journal["revisions"] if row["rule_text"] == text]
+    if not rows:
+        return None
+    same = [i for i, tx in enumerate(transactions) if _rule_text(tx) == text]
+    out = {"source": "committed_journal"}
+    if len(same) != len(rows):
+        out["unavailable"] = (f"the block carries this rule {len(same)} time(s) and its "
+                              f"journal {len(rows)}")
+        return out
+    row = rows[same.index(position)]
+    outcome = row.get("outcome")
+    out.update({
+        "engine_outcome": outcome,
+        "accepted": outcome in ("ACCEPTED_CHANGED", "ACCEPTED_NOOP"),
+        "taken": outcome == "ACCEPTED_CHANGED",
+    })
+    if journal.get("spec_revision") is not None:
+        # The commit record holds the counter after the block; every revision
+        # the engine took later in the block lies between this one and it.
+        later = sum(1 for r in journal["revisions"]
+                    if r["seq"] > row["seq"] and r.get("outcome") == "ACCEPTED_CHANGED")
+        out["spec_revision"] = journal["spec_revision"] - later
+    return out
+
+
+def _outcome(db, tx_hash: str, block_hash: str) -> dict:
+    """What the confirmed transaction did in its block (issue #42)."""
+    try:
+        recorded = db.get_tx_outcome(tx_hash, block_hash)
+    except Exception:
+        logger.exception("Failed to read outcome for %s", tx_hash)
+        recorded = None
+    outcome = recorded if recorded is not None else {"status": "not_recorded"}
+    try:
+        from_journal = journal_rule_outcome(db, tx_hash, block_hash)
+    except Exception:
+        logger.exception("Failed to read the journal outcome for %s", tx_hash)
+        from_journal = None
+    if from_journal is not None:
+        outcome["rule_outcome"] = from_journal
+    return outcome
+
+
 def execute(raw_command: str, container):
     parts = raw_command.split()
     if len(parts) != 2:
@@ -124,6 +207,7 @@ def execute(raw_command: str, container):
                     "block_number": loc["block_number"],
                     "confirmations": max(1, confirmations),
                 }
+                data["outcome"] = _outcome(db, tx_hash, loc["block_hash"])
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 

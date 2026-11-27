@@ -318,3 +318,119 @@ def test_approve_on_a_rule_change_id_builds_a_plain_vote(alice):
     assert tx["tx_type"] == "transfer_vote"
     assert tx["request_id"] == REQ_ID
     assert tx["approve"] is True
+
+
+# --- policy show (issue #42) ---------------------------------------------------
+
+ACCOUNT_RULES = {
+    "address": APPROVER, "block_number": 41, "block_hash": "ee" * 32,
+    "rule_clauses_root": "11" * 32,
+    "clauses": [{"stream": 5, "name": "o5", "body": "(o5[t]:bv[24] = { #x000000 }:bv[24])",
+                 "sha256": "22" * 32, "since": {"block_number": 40, "tx_hash": "33" * 32}}],
+    "rule_change_guard": None,
+    "application_rules": [],
+    "open_rule_changes": [{"request_id": REQ_ID, "kind": "set_policy", "body_sha256": "44" * 32,
+                           "offer_id": None, "approvers": {"18": APPROVER}, "voted": {},
+                           "declined": [], "ready": False, "created_height": 39,
+                           "expire_at_height": 2039}],
+    "awaiting_my_vote": [], "pending_offers": 1, "mempool": [],
+    "history": [{"block_number": 40, "kind": "clause", "action": "registered", "stream": 5,
+                 "tx_hash": "33" * 32, "sha256": "22" * 32},
+                {"block_number": 38, "kind": "rule_change_request",
+                 "action": "release_failed", "request_id": "55" * 32,
+                 "detail": "no policy to revoke"}],
+}
+
+
+def test_policy_show_reads_getaccountrules_and_explains_it(alice):
+    recorded = []
+    rc, out, err = _run(["policy", "show", APPROVER], [_ok(ACCOUNT_RULES)], recorded)
+    assert rc == 0, err
+    assert recorded == [f"getaccountrules {APPROVER}"]
+    assert "o5 clause: sha256 " + "22" * 32 in out
+    assert "set at block 40 by tx 333333333333..." in out
+    assert "rule-change guard: none" in out
+    assert "open rule-change requests: 1" in out
+    assert "votes 0/1  waiting  expires at 2039" in out
+    assert "block 38  rule_change_request release_failed" in out
+    assert "(no policy to revoke)" in out
+
+
+def test_policy_show_lists_every_fee_rule_and_who_sent_it(alice):
+    fees = dict(ACCOUNT_RULES, fee_rules=[
+        {"unit": "always (x).", "sha256": "77" * 32, "names_this_account": True,
+         "sent_by": [APPROVER], "since": {"block_number": 30, "tx_hash": "88" * 32}},
+        {"unit": "always (y).", "sha256": "99" * 32, "names_this_account": False,
+         "sent_by": None, "since": None}])
+    rc, out, err = _run(["policy", "show", APPROVER], [_ok(fees)])
+    assert rc == 0, err
+    assert "fee rules (o8) of every account, each with its sender: 2" in out
+    assert "sha256 " + "77" * 32 + "  sent by " + APPROVER[:12] + "...  names this account" in out
+    assert "sha256 " + "99" * 32 + "  sent by sender not recorded" in out
+
+
+def test_policy_show_says_when_the_fee_rules_are_not_known(alice):
+    partial = dict(AT_BLOCK, complete=False, fee_rules=None)
+    rc, out, _ = _run(["policy", "show", APPROVER, "--block", "12"], [_ok(partial)])
+    assert rc == 0
+    assert "fee rules (o8) of every account: not known" in out
+
+
+def test_policy_show_defaults_to_the_key_and_passes_json_through(alice):
+    recorded = []
+    rc, out, _ = _run(["--json", "policy", "show", "--key", "alice"],
+                      [_ok(ACCOUNT_RULES)], recorded)
+    assert rc == 0
+    assert recorded == [f"getaccountrules {alice}"]
+    assert json.loads(out)["data"]["clauses"][0]["sha256"] == "22" * 32
+
+
+AT_BLOCK = {
+    "address": APPROVER, "block_number": 12, "block_hash": "ee" * 32, "at_block": True,
+    "head_block_number": 41, "complete": True, "recorded_from": 1,
+    "clauses": [{"stream": 5, "name": "o5", "body": "(o5[t]:bv[24] = { #x000000 }:bv[24])",
+                 "sha256": "22" * 32, "since": {"block_number": 9, "tx_hash": "33" * 32}}],
+    "rule_change_guard": None,
+    "application_rules": [],
+    "running_spec": {"text": "always (x)", "sha256": "66" * 32, "block_hash": "ee" * 32,
+                     "spec_revision": 3},
+    "history": [{"block_number": 9, "kind": "clause", "action": "registered", "stream": 5,
+                 "tx_hash": "33" * 32, "sha256": "22" * 32}],
+}
+
+
+def test_policy_show_at_a_block_asks_for_that_block_and_says_where_it_read(alice):
+    recorded = []
+    rc, out, err = _run(["policy", "show", APPROVER, "--block", "12"], [_ok(AT_BLOCK)], recorded)
+    assert rc == 0, err
+    assert recorded == [f"getaccountrules {APPROVER} 12"]
+    assert "at block 12 (eeeeeeeeeeee...), read at head 41" in out
+    assert "o5 clause: sha256 " + "22" * 32 in out
+    assert "set at block 9 by tx 333333333333..." in out
+    assert "running spec: sha256 " + "66" * 32 in out
+    assert "block 9  o5 registered" in out
+    # What exists only at the tip is not printed for an earlier block.
+    assert "open rule-change requests" not in out and "NOT COMPLETE" not in out
+
+
+def test_policy_show_at_a_block_says_what_the_node_does_not_know(alice):
+    partial = dict(AT_BLOCK, complete=False, recorded_from=30, application_rules=None,
+                   application_rules_unavailable="this node did not record every block up to this one",
+                   clauses=[{"stream": 5, "name": "o5", "body": None, "sha256": None,
+                             "since": None,
+                             "unavailable": "this node did not record the block that set it"}],
+                   running_spec={"text": None, "sha256": None, "block_hash": "ee" * 32,
+                                 "unavailable": "this node holds no commit record for that block"})
+    rc, out, _ = _run(["policy", "show", APPROVER, "--block", "ee" * 32], [_ok(partial)])
+    assert rc == 0
+    assert "NOT COMPLETE: this node's record begins at block 30" in out
+    assert "o5 clause: text not known (this node did not record the block that set it)" in out
+    assert "application rules naming this account: not known" in out
+    assert "running spec: not available (this node holds no commit record for that block)" in out
+
+
+def test_policy_show_refuses_a_block_that_is_neither_a_number_nor_a_hash(alice):
+    recorded = []
+    rc, _, err = _run(["policy", "show", APPROVER, "--block", "latest"], [], recorded)
+    assert rc != 0 and recorded == []
+    assert "--block takes a block number or a 64-character block hash" in err
