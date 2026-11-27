@@ -189,6 +189,7 @@ class ShadowSpec:
         self._text: str = driver.current_spec() or ""
         self._last_steps: List[Dict] = []
         self._journal_cursor: int = 0
+        self._memory_cursor: int = 0
         self._journal_fed_blocks = set()
 
     # -- introspection ----------------------------------------------------
@@ -227,6 +228,23 @@ class ShadowSpec:
     @journal_cursor.setter
     def journal_cursor(self, value: int) -> None:
         self._journal_cursor = int(value)
+
+    @property
+    def memory_cursor(self) -> int:
+        """How many of the in-process journal's accumulated revisions
+        this shadow has consumed. The in-process journal carries no
+        block attribution and no sequence numbers, so consumption is
+        positional: the commit path identifies a block's revisions as
+        the next unconsumed run matching the block's submissions and
+        advances this cursor past it. Each entry is consumed at most
+        once, in journal order -- a resent unit is a later entry, never
+        a re-read of its first occurrence, so attribution follows the
+        journal position rather than the unit text."""
+        return self._memory_cursor
+
+    @memory_cursor.setter
+    def memory_cursor(self, value: int) -> None:
+        self._memory_cursor = int(value)
 
     @property
     def journal_fed_blocks(self):
