@@ -2166,6 +2166,127 @@ def cmd_policy_guard_show(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+_LENGTH_SECONDS = {"": 1, "s": 1, "m": 60, "h": 3_600, "d": 86_400, "w": 604_800}
+
+
+def _length(text: str, what: str) -> tuple[str, int]:
+    """A length on one of the two clocks: `600`, `600s`, `10m`, `2h`, `30d` and
+    `1w` are block time, in seconds; `100b` is block height, in blocks."""
+    raw = str(text).strip().lower()
+    digits, suffix = raw.rstrip("smhdwb"), raw[len(raw.rstrip("smhdwb")):]
+    if not digits.isdigit() or suffix not in tuple(_LENGTH_SECONDS) + ("b",):
+        raise _PayloadError(
+            f"{what}: '{text}' is not a length. Use seconds (600), 10m, 2h, 30d, 1w, "
+            f"or blocks (100b)")
+    if suffix == "b":
+        return "blocks", int(digits)
+    return "seconds", int(digits) * _LENGTH_SECONDS[suffix]
+
+
+def _lengths_by_clock(values, what: str) -> dict:
+    """`--max-hold 30d --max-hold 100b` -> {"seconds": 2592000, "blocks": 100}."""
+    out: dict = {}
+    for text in values or []:
+        unit, length = _length(text, what)
+        if unit in out:
+            raise _PayloadError(f"{what} is given twice in {unit}")
+        out[unit] = length
+    return out
+
+
+def _receive_terms(args: argparse.Namespace) -> str:
+    """The terms of the payment `policy receive` asks about, as
+    `getrecipientpolicy` takes them. Empty for a payment that is final at once."""
+    given = []
+    for flag in ("park", "hold", "recall", "period", "refund"):
+        text = getattr(args, flag, None)
+        if text is None:
+            continue
+        if flag == "refund" and str(text).strip().lower() == "never":
+            given.append((flag, None, "never"))
+        else:
+            unit, length = _length(text, "--" + flag)
+            given.append((flag, unit, str(length)))
+    limit = getattr(args, "limit", None)
+    if (limit is None) != (getattr(args, "period", None) is None):
+        raise _PayloadError("--limit and --period go together")
+    if not given:
+        return ""
+    units = {unit for _flag, unit, _text in given if unit is not None}
+    if len(units) > 1:
+        raise _PayloadError(
+            "a payment has one clock: give every length in seconds or every length "
+            "in blocks")
+    unit = units.pop() if units else "seconds"
+    pairs = [f"{flag}={text}" for flag, _unit, text in given]
+    if limit is not None:
+        pairs.append(f"limit={limit}")
+    return " ".join([unit] + pairs)
+
+
+def cmd_policy_receive(args: argparse.Namespace) -> int:
+    """Whether an address judges the payments made to it, and one probe."""
+    try:
+        address = _address_or_key(args)
+        terms = _receive_terms(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    payer, amount = getattr(args, "payer", None), getattr(args, "amount", None)
+    if (payer is None) != (amount is None):
+        print_error("--from and --amount go together")
+        return EXIT_LOCAL
+    if terms and payer is None:
+        print_error("the terms of a payment need --from and --amount")
+        return EXIT_LOCAL
+    command = f"getrecipientpolicy {address}"
+    if payer is not None:
+        command += f" {payer} {amount}"
+    if terms:
+        command += f" {terms}"
+    return _simple_query(args, command)
+
+
+def cmd_policy_receive_rule(args: argparse.Namespace) -> int:
+    """Write a receive rule from numbers. Nothing is sent: the rule is printed
+    (or written to --out) and deployed like any o5 policy rule."""
+    from consensus import recipient_policy
+
+    try:
+        hold = _lengths_by_clock(args.max_hold, "--max-hold")
+        recall = _lengths_by_clock(args.max_recall, "--max-recall")
+        refund = _lengths_by_clock(args.min_refund, "--min-refund")
+        per = _lengths_by_clock(args.per, "--per")
+        rule = recipient_policy.receive_rule(
+            senders=args.only_from or (),
+            final_only=args.final_only,
+            max_hold_seconds=hold.get("seconds"), max_hold_blocks=hold.get("blocks"),
+            max_recall_seconds=recall.get("seconds"), max_recall_blocks=recall.get("blocks"),
+            min_allowance=args.min_allowance,
+            per_seconds=per.get("seconds"), per_blocks=per.get("blocks"),
+            average=args.average, no_limits=args.no_limits,
+            min_refund_seconds=refund.get("seconds"), min_refund_blocks=refund.get("blocks"),
+            no_refunds=args.no_refunds,
+        )
+    except (_PayloadError, ValueError) as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    if args.out:
+        try:
+            with open(args.out, "w", encoding="utf-8") as handle:
+                handle.write(rule + "\n")
+        except OSError as exc:
+            print_error(f"cannot write {args.out}: {exc}")
+            return EXIT_LOCAL
+    if args.json:
+        print_result({"rule": rule, "out": args.out}, json_mode=True)
+    elif args.out:
+        print(f"wrote {args.out}")
+    else:
+        print(rule)
+    return EXIT_OK
+
+
 def cmd_policy_change_request(args: argparse.Namespace) -> int:
     kind = _KIND_BY_NAME[args.kind]
     rule_text, offer_id = "", ""
@@ -2276,6 +2397,67 @@ def _add_policy_subparsers(sub) -> None:
     p_gshow.add_argument("address", nargs="?", help="Address (default: your key's)")
     _key_group(p_gshow, required=False)
     p_gshow.set_defaults(func=cmd_policy_guard_show)
+
+    p_recv = psub.add_parser(
+        "receive", parents=common,
+        help="Does this address judge payments made to it? (recipient-side policy)",
+    )
+    p_recv.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_recv, required=False)
+    p_recv.add_argument("--from", dest="payer", metavar="PUBKEY",
+                        help="Ask the rule about a payment from this sender (advisory)")
+    p_recv.add_argument("--amount", type=int, help="Amount of that payment")
+    length = "a length: seconds (600), 10m, 2h, 30d, 1w, or blocks (100b)"
+    p_recv.add_argument("--park", metavar="LENGTH",
+                        help=f"Ask about a retractable transfer released this far ahead; {length}")
+    p_recv.add_argument("--hold", metavar="LENGTH",
+                        help="Ask about a payment held this long before all of it is in reach")
+    p_recv.add_argument("--recall", metavar="LENGTH",
+                        help="... that the sender can take back for this long")
+    p_recv.add_argument("--limit", type=int, metavar="AMOUNT",
+                        help="... with a spending limit of this much per --period")
+    p_recv.add_argument("--period", metavar="LENGTH", help="The period of --limit")
+    p_recv.add_argument("--refund", metavar="LENGTH|never",
+                        help="... of which something goes back to the sender by itself "
+                             "after this long")
+    p_recv.set_defaults(func=cmd_policy_receive)
+
+    p_rule = psub.add_parser(
+        "receive-rule", parents=common,
+        help="Write a receive rule from numbers (who may pay you, holds, limits, refunds)",
+        description=(
+            "Writes the o5 rule of an account that accepts exactly the payments "
+            "described. Nothing is sent: deploy the rule with `tx send --rule-file`. "
+            f"LENGTH is {length}. Seconds and blocks are never converted: a rule "
+            "with numbers for one clock alone accepts no payment with conditions "
+            "on the other."
+        ),
+    )
+    p_rule.add_argument("--only-from", action="append", metavar="PUBKEY",
+                        help="Only this sender may pay you. Repeatable.")
+    p_rule.add_argument("--final-only", action="store_true",
+                        help="Only payments that are final at once")
+    p_rule.add_argument("--max-hold", action="append", metavar="LENGTH",
+                        help="Longest time until all of a payment is within your reach. "
+                             "Once per clock.")
+    p_rule.add_argument("--max-recall", action="append", metavar="LENGTH",
+                        help="Longest time the sender may still take a payment back. "
+                             "Once per clock.")
+    p_rule.add_argument("--min-allowance", type=int, metavar="AMOUNT",
+                        help="A spending limit must leave you at least this much per --per")
+    p_rule.add_argument("--per", action="append", metavar="LENGTH",
+                        help="The stretch --min-allowance is counted in. Once per clock.")
+    p_rule.add_argument("--average", action="store_true",
+                        help="Read --min-allowance as an average over the limit's period")
+    p_rule.add_argument("--no-limits", action="store_true",
+                        help="Only payments without a spending limit")
+    p_rule.add_argument("--min-refund", action="append", metavar="LENGTH",
+                        help="Nothing may go back to the sender by itself earlier than "
+                             "this. Once per clock.")
+    p_rule.add_argument("--no-refunds", action="store_true",
+                        help="Nothing may ever go back to the sender by itself")
+    p_rule.add_argument("--out", metavar="FILE", help="Write the rule to this file")
+    p_rule.set_defaults(func=cmd_policy_receive_rule)
 
     p_change = psub.add_parser("change", parents=common,
                                help="Request or cancel a policy change")

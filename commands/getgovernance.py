@@ -34,6 +34,7 @@ def execute(raw_command: str, container):
 
         pending_updates = []
         scheduled_updates = []
+        prechecks = []
         archival_updates = sorted(_normalize_hexish(uid) for uid in chain_state._lifecycle_manager.archival_updates)
         votes = []
         lifecycle = {}
@@ -102,12 +103,13 @@ def execute(raw_command: str, container):
             # between (issue #24 ask 4). Informational only — consensus never
             # reads it, so an operator gets a warning window while the terminal
             # behaviour of a bad activation is unchanged.
-            precheck = precheck_scheduled_update(
-                payload_obj, chain_state._lifecycle_manager.active_validators
-            )
-            entry["precheck"] = precheck["status"]
-            if precheck["error"]:
-                entry["precheck_error"] = precheck["error"]
+            #
+            # Run AFTER the locks are released (below): the check of a patch
+            # that switches a stream on audits the rules in force, which takes
+            # _rules_lock itself. Under the locks held here that never returns,
+            # and it would hold the balance and sequence locks with it, so the
+            # node could not apply another block.
+            prechecks.append((entry, payload_obj))
             scheduled_updates.append(entry)
 
         for uid, voter_set in chain_state._lifecycle_manager.votes.items():
@@ -167,6 +169,12 @@ def execute(raw_command: str, container):
             # confirm that an activated vote_quorum patch took effect (#23).
             "vote_quorum": chain_state._lifecycle_manager.effective_quorum_policy(),
             "eligibility_mode": chain_state._lifecycle_manager.effective_eligibility_mode(),
+            # Whether an account's own o5 clause is also asked about payments
+            # made TO it (the receive record). False until a governance
+            # patch activates it; see docs/recipient_controls.md.
+            "recipient_policy_active": getattr(
+                chain_state._lifecycle_manager, "recipient_policy_active", False
+            ) is True,
             # "" means the levy goes to each block's proposer (the default).
             "fee_beneficiary": chain_state._lifecycle_manager.effective_fee_beneficiary(),
             "active_validators": active_validators,
@@ -182,5 +190,12 @@ def execute(raw_command: str, container):
             "lifecycle": lifecycle,
             "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
         }
+        validators_at_read = list(chain_state._lifecycle_manager.active_validators)
+
+    for entry, payload_obj in prechecks:
+        precheck = precheck_scheduled_update(payload_obj, validators_at_read)
+        entry["precheck"] = precheck["status"]
+        if precheck["error"]:
+            entry["precheck_error"] = precheck["error"]
 
     return api_response.success_response("getgovernance", payload)

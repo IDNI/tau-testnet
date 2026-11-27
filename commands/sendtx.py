@@ -14,7 +14,7 @@ import tau_manager
 from tau_manager import parse_tau_output
 import utils
 from errors import TauCommunicationError
-from consensus import fees, sender_policy
+from consensus import fees, recipient_policy, sender_policy
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
@@ -26,6 +26,9 @@ from consensus.rule_offers import (
     RULE_OFFER_TX_TYPES,
 )
 from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.retractable import (
+    KIND_TIME, MAX_RELEASE_WINDOW_BLOCKS, MAX_RELEASE_WINDOW_SECONDS,
+)
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -521,6 +524,206 @@ def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     ))
 
 
+def _receive_record(tx_type, admission_data, admission_ts, next_height):
+    """The record the recipient's clause reads for the transfers of this
+    transaction.
+
+    A park's hold is counted from the same advisory block timestamp admission
+    feeds on i5 and uses to refuse a park that could be mined at or after its
+    release, or from the height of the next block for a height-based one; apply
+    counts from the block's own timestamp and height. Both only get shorter by
+    the time the park is mined, so a park admitted under a cap stays under it.
+    """
+    if tx_type != TX_TYPE_RETRACTABLE_TRANSFER:
+        return recipient_policy.FINAL
+    if int(admission_data["release_kind"]) == KIND_TIME:
+        return recipient_policy.park_record(
+            recipient_policy.SECONDS,
+            int(admission_data["release_at"]) - int(admission_ts),
+        )
+    return recipient_policy.park_record(
+        recipient_policy.BLOCKS,
+        int(admission_data["release_at"]) - int(next_height),
+    )
+
+
+class _CapSearchOver(Exception):
+    """The search for the recipient's bound used up its time."""
+
+
+# condition -> (how a payment with it is described, the same for "none of it")
+_CONDITION_WORDS = {
+    recipient_policy.HOLD: ("held for", "that is held"),
+    recipient_policy.RECALL: ("open to a recall by the sender for",
+                              "the sender can take back"),
+}
+_CONDITION_NOUNS = {
+    recipient_policy.HOLD: "hold",
+    recipient_policy.RECALL: "recall window",
+}
+
+
+def _bound_refusal_text(condition, bounds, record):
+    """(what the recipient accepts, what was asked) for a payment refused for
+    its hold or its recall window."""
+    phrase, none_of = _CONDITION_WORDS[condition]
+    unit = record.unit
+    asked_length = int(record.hold if condition == recipient_policy.HOLD else record.recall)
+    name = "max_%s_" % condition
+    own = bounds.get(name + unit)
+    seconds = bounds.get(name + recipient_policy.SECONDS)
+    asked = f"this one would be {phrase} {asked_length} {unit}"
+    if own:
+        return (
+            f"the recipient accepts a payment {phrase} at most {own} {unit} "
+            f"({name}{unit}={own})",
+            asked,
+        )
+    if unit == recipient_policy.BLOCKS and seconds:
+        return (
+            f"the recipient accepts a payment {phrase} at most {seconds} seconds "
+            f"({name}seconds={seconds}) and none on a block-height clock "
+            f"({name}blocks=0)",
+            "this one releases at a block height; use release_at_time",
+        )
+    shown = ", ".join(f"{key}=0" for key in sorted(bounds))
+    clock = "at all" if unit == recipient_policy.BLOCKS else "on block time"
+    return (
+        f"the recipient accepts no payment {none_of} {clock} ({shown}); one that "
+        f"is final at once it accepts, so send an ordinary transfer",
+        asked,
+    )
+
+
+def _recipient_refusal(tip_view, recipient, values, record, budget,
+                       *, transfer_index, transfer_details):
+    """The rejection envelope when the recipient's own clause refuses one
+    incoming payment, or None.
+
+    Asked after every check on the sender's side, and only when the recipient's
+    clause reads the receive record. The verdict is one evaluation on the whole
+    record. A refusal then names the condition that failed (the sender, the
+    hold, the recall window, the limit, the refund terms, or their combination)
+    and, for a hold or a recall window, the longest one the recipient accepts
+    in the payment's own unit.
+
+    Finding the condition and the bound asks the clause again, and all of that
+    together gets one more admission budget and no more: a refusal costs the
+    payer nothing, so what it may cost the node is bounded. If the time runs
+    out the payment is refused as RECIPIENT_POLICY and the message says where
+    to read the rest.
+    """
+    if not recipient_policy.recipient_policy_active(tip_view):
+        return None
+    body = recipient_policy.recipient_clause(tip_view.clause_for, recipient)
+    if body is None:
+        return None
+
+    above = recipient_policy.record_ceiling_error(record)
+    if above:
+        return _qt_err(
+            "RECIPIENT_LIMIT",
+            f"Transaction rejected before the recipient's policy was asked: {above}.",
+            transfer_index=transfer_index, recipient=recipient,
+        )
+
+    def verdict(asked, timeout=budget):
+        return _policy_call(lambda: sender_policy.clause_blocks(
+            body, recipient_policy.receive_inputs(values, asked),
+            pool="admission", timeout=timeout,
+        ))
+
+    blocked, their_o5 = verdict(record)
+    if not blocked:
+        return None
+
+    search_ends = time.monotonic() + float(budget)
+
+    def allows(asked):
+        left = search_ends - time.monotonic()
+        if left <= 0:
+            raise _CapSearchOver()
+        try:
+            return not verdict(asked, timeout=left)[0]
+        except tau_admission.AdmissionTimeout as exc:
+            raise _CapSearchOver() from exc
+
+    details = {"transfer_index": transfer_index, "recipient": recipient}
+    try:
+        condition = recipient_policy.refused_condition(allows, record)
+    except _CapSearchOver:
+        return _qt_err(
+            "RECIPIENT_POLICY",
+            (
+                f"Transaction rejected by recipient policy (o5) for transfer "
+                f"#{transfer_index} ({transfer_details}): the recipient's own rule "
+                f"does not accept this payment. Policy output: {their_o5}. Which "
+                f"condition failed could not be worked out in time; "
+                f"getrecipientpolicy reports it."
+            ),
+            **details,
+        )
+    code = recipient_policy.REFUSAL_CODES[condition]
+    details["condition"] = condition
+
+    if condition == recipient_policy.SENDER:
+        # A sender the recipient does not accept learns that, and nothing of
+        # the recipient's other terms.
+        return _qt_err(
+            code,
+            (
+                f"Transaction rejected by recipient policy (o5) for transfer "
+                f"#{transfer_index} ({transfer_details}): the recipient's own rule "
+                f"does not accept a payment from this sender. Policy output: {their_o5}"
+            ),
+            **details,
+        )
+
+    if condition in _CONDITION_WORDS:
+        unit = record.unit
+        asked_length = int(record.hold if condition == recipient_policy.HOLD
+                           else record.recall)
+        details[f"{condition}_{unit}"] = asked_length
+        try:
+            bounds = recipient_policy.accepted_instead(
+                allows, record, condition,
+                seconds_window=MAX_RELEASE_WINDOW_SECONDS,
+                blocks_window=MAX_RELEASE_WINDOW_BLOCKS,
+            )
+        except _CapSearchOver:
+            return _qt_err(
+                code,
+                (
+                    f"Transaction rejected by recipient policy (o5): the recipient "
+                    f"does not accept the {_CONDITION_NOUNS[condition]} of this "
+                    f"payment ({asked_length} {unit}). The longest it accepts could "
+                    f"not be worked out in time; getrecipientpolicy reports it."
+                ),
+                **details,
+            )
+        accepts, asked = _bound_refusal_text(condition, bounds, record)
+        return _qt_err(
+            code,
+            f"Transaction rejected by recipient policy (o5): {accepts}; {asked}.",
+            **details, **bounds,
+        )
+
+    what = {
+        recipient_policy.LIMIT: "the spending limit on this payment",
+        recipient_policy.REFUND: "the refund terms of this payment",
+        recipient_policy.COMBINED: "this payment's conditions together",
+    }[condition]
+    return _qt_err(
+        code,
+        (
+            f"Transaction rejected by recipient policy (o5) for transfer "
+            f"#{transfer_index} ({transfer_details}): the recipient's own rule "
+            f"does not accept {what}. Policy output: {their_o5}"
+        ),
+        **details,
+    )
+
+
 def _clause_build_refusal(body, budget):
     """The rejection envelope when `body` does not build as a clause, or None."""
     ok, error = _policy_call(lambda: sender_policy.clause_builds(
@@ -936,6 +1139,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         or idx in tau_defs.reserved_operation_keys(
                             tip_view.eligibility_mode,
                             approval_slots_active=approval_slots_active(tip_view),
+                            recipient_policy_active=recipient_policy.recipient_policy_active(tip_view),
                         ):
                     return _qt_err(
                         "TX_INVALID",
@@ -1309,6 +1513,22 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 ),
                                 transfer_index=i + 1,
                             )
+
+                        # --- Recipient policy (the recipient's own clause) ---
+                        # After the sender's side, as at apply: each transfer is
+                        # judged by its own recipient, and one refusal fails the
+                        # whole transaction.
+                        refusal = _recipient_refusal(
+                            tip_view, tau_input_dict['to_addr'],
+                            tau_input_stream_values,
+                            _receive_record(tx_type, admission_eval.data, admission_ts,
+                                            tip_view.next_block_height),
+                            admission_tau.budget,
+                            transfer_index=i + 1,
+                            transfer_details=transfer_details,
+                        )
+                        if refusal is not None:
+                            return refusal
 
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.
