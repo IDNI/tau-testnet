@@ -28,7 +28,6 @@ NEITHER = "always ( o6[t]:bv[16] = i10[t]:bv[16] )."
 REFUSED = [
     ("o5_bv16", "always ( o5[t]:bv[16] = { #x0001 }:bv[16] ).", "o5", "bv[16]"),
     ("o8_bv16", "always ( o8[t]:bv[16] = { #x0001 }:bv[16] ).", "o8", "bv[16]"),
-    ("o5_untyped", "always ( o5[t] = i1[t]:bv[24] ).", "o5", "bv[24]"),
     ("o5_bare_literal", "always ( o5[t]:bv[24] = 1 ).", "o5", "bv[24]"),
     ("o5_literal_bv16", "always ( o5[t]:bv[24] = { #x0001 }:bv[16] ).", "o5", "bv[24]"),
 ]
@@ -54,6 +53,12 @@ def test_admission_refuses_a_revision_mistyping_a_policy_stream(tip_view, name, 
     assert not result.is_valid
     assert result.code == "WIDTH_MISMATCH"
     assert stream in result.error and width in result.error
+
+
+def test_admission_refuses_an_untyped_policy_stream_as_a_fragment_error(tip_view):
+    result = _admit(["always ( o5[t] = i1[t]:bv[24] )."], tip_view)
+    assert not result.is_valid
+    assert result.code == "RULE_FRAGMENT"
 
 
 def test_admission_refuses_when_any_revision_of_several_mistypes(tip_view):

@@ -153,8 +153,8 @@ class TestGhostTxIntegration(unittest.TestCase):
         # So we need to patch chain_state.get_rules_state to return "rule X" when called inside execution.
         # However, chain_state is imported both in test and in createblock.
         
-        with patch('chain_state.get_rules_state', return_value="rule X"), \
-             patch('chain_state.get_application_rules_state', return_value="rule X"), \
+        with patch('chain_state.get_rules_state', return_value="always ( o13[t]:bv[24] = i1[t]:bv[24] )."), \
+             patch('chain_state.get_application_rules_state', return_value="always ( o13[t]:bv[24] = i1[t]:bv[24] )."), \
              patch('consensus.engine.TauConsensusEngine.query_eligibility', return_value=True), \
              patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True), \
              patch('consensus.engine.tau_manager.tau_ready.is_set', return_value=True), \
@@ -171,7 +171,7 @@ class TestGhostTxIntegration(unittest.TestCase):
                  "sequence_number": 0,
                  "expiration_time": int(time.time() + 3600),
                  "expire_at_height": 5000,
-                 "operations": {"0": "rule X"}
+                 "operations": {"0": "always ( o13[t]:bv[24] = i1[t]:bv[24] )."}
              }, SK_ALICE))
              db.add_mempool_tx(payload_rule, "hash_rule", 1000)
              
@@ -184,7 +184,7 @@ class TestGhostTxIntegration(unittest.TestCase):
         
         # Verify Global State (simulating next block effect)
         import chain_state
-        self.assertEqual(chain_state._application_rules_state, "rule X")
+        self.assertEqual(chain_state._application_rules_state, "always ( o13[t]:bv[24] = i1[t]:bv[24] ).")
         
         print("[TEST] Rule correctly applied and state hash updated.")
         

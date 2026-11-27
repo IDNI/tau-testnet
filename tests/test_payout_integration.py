@@ -133,7 +133,7 @@ def test_the_abi_widths():
 
 @pytest.mark.parametrize("body, problem", [
     (BODY, None),
-    ("o30[t]:bv[24] = i40[t]", "must be written"),
+    ("o30[t]:bv[24] = i40[t]", "must carry a :bv[N] type"),
     ("o30[t]:bv[24] = i41[t]:bv[24] + i2[t]:bv[24]", None),
     ("o30[t]:bv[24] = i3[t]:bv[24]", "not part of the payout ABI"),
     ("o30[t]:bv[24] = i13[t]:bv[24]", "must be bv[384]"),
@@ -149,6 +149,7 @@ _O, _P = "o30[t]:bv[24]", "o31[t]:bv[24]"
 _X, _Y = "i40[t]:bv[24]", "i41[t]:bv[24]"
 _Z = "{ #x000000 }:bv[24]"
 _KEY = "{ #x" + "ab" * 48 + " }:bv[384]"
+_SYNTAX = "outside the admitted syntax"
 
 
 @pytest.mark.parametrize("body, problem", [
@@ -157,11 +158,10 @@ _KEY = "{ #x" + "ab" * 48 + " }:bv[384]"
     (f"({_O} = {_X}) && ({_P} = {_Y})", None),
     (f"(i13[t]:bv[384] = {_KEY}) ? ({_O} = {_X}) : ({_O} = {_Z})", None),
     (f"(i13[t]:bv[384] = {_KEY}) ? (({_O} = {_X}) && ({_P} = {_Z})) : (({_O} = {_Z}) && ({_P} = {_X}))", None),
-    (f"({_X} > {_Z}) ? ({_O} = min({_X}, i2[t]:bv[24])) : ({_O} = {_Z})", None),
     (f"({_X} > {_Z} || {_Y} > {_Z}) ? ({_O} = {_X} - {_Y}) : ({_O} = {_Z})", None),
     (f"{_O} = {{ 5 }}:bv[24] + {_X}'", None),
     # a bare condition beside an amount: no answer where it does not hold
-    (f"({_X} > {_Z}) && {_O} = min({_X}, i2[t]:bv[24])", "a bare condition on inputs"),
+    (f"({_X} > {_Z}) && {_O} = {_X} + i2[t]:bv[24]", "a bare condition on inputs"),
     (f"({_X} > {_Z} || {_Y} > {_Z}) && {_O} = {_X} - {_Y}", "a bare condition on inputs"),
     (f"({_X} > {_Z}) ? (({_Y} > {_Z}) && {_O} = {_X}) : ({_O} = {_Z})", "a bare condition on inputs"),
     # an amount the rule leaves open: the engine would pick one
@@ -176,18 +176,20 @@ _KEY = "{ #x" + "ab" * 48 + " }:bv[384]"
     (f"{_X} > {_Z} || {_Y} > {_Z} && {_O} = {_X}", "put parentheses around"),
     (f"!({_X} = {_Z}) && {_O} = {_X}", "put parentheses around"),
     (f"({_X} = {_Z}) ? ({_O} = {_X}) : ({_O} = {_Z}) && {_P} = {_X}", "put parentheses around"),
-    # anything that reads earlier steps, in every spelling the engine parses
-    (f"{_O} = {_X} && ({_X} = {_Z} since {_Y} = {_Z})", "may not use 'since'"),
-    (f"{_O} = {_X} && ({_X} = {_Z} S {_Y} = {_Z})", "may not use 'S'"),
-    (f"{_O} = {_X} && ({_X} = {_Z} U {_Y} = {_Z})", "may not use 'U'"),
-    (f"{_O} = {_X} && <> ({_X} = {_Z})", "may not use '<>'"),
-    (f"{_O} = {_X} && [] ({_X} = {_Z})", "may not use '[]"),
-    (f"{_O} = {_X} && G ({_X} = {_Z})", "may not use 'G'"),
-    (f"{_O} = {_X} && F", "may not use 'F'"),
-    (f"{_O} = {_X} && [t > 3]", "may not use '[t'"),
-    (f"{_O} = {_X} && ex x ({_X} = x)", "may not use 'ex'"),
-    (f"{_O} = {_X} && <a:b>", "may not use"),
-    (f"{_O} = -{_X}", "may not use '-'"),
+    # anything outside the one rule syntax the node admits: a function, and
+    # every spelling the engine parses that reads earlier steps
+    (f"({_X} > {_Z}) ? ({_O} = min({_X}, i2[t]:bv[24])) : ({_O} = {_Z})", _SYNTAX),
+    (f"{_O} = {_X} && ({_X} = {_Z} since {_Y} = {_Z})", _SYNTAX),
+    (f"{_O} = {_X} && ({_X} = {_Z} S {_Y} = {_Z})", _SYNTAX),
+    (f"{_O} = {_X} && ({_X} = {_Z} U {_Y} = {_Z})", _SYNTAX),
+    (f"{_O} = {_X} && <> ({_X} = {_Z})", _SYNTAX),
+    (f"{_O} = {_X} && [] ({_X} = {_Z})", _SYNTAX),
+    (f"{_O} = {_X} && G ({_X} = {_Z})", _SYNTAX),
+    (f"{_O} = {_X} && F", _SYNTAX),
+    (f"{_O} = {_X} && [t > 3]", _SYNTAX),
+    (f"{_O} = {_X} && ex x ({_X} = x)", _SYNTAX),
+    (f"{_O} = {_X} && <a:b>", _SYNTAX),
+    (f"{_O} = -{_X}", _SYNTAX),
 ])
 def test_every_amount_is_fixed_and_reads_this_step_only(body, problem):
     got = screen_payout_body(body, 2)
@@ -262,6 +264,10 @@ def test_a_valid_rule_is_admitted_with_its_id(tip_view, evaluator):
     ({"slots": ["ab" * 48]}, "INVALID_PAYOUT_RULE"),
     ({"cap_per_execution": 0}, "INVALID_PAYOUT_RULE"),
     ({"rule_text": "nope"}, "INVALID_PAYOUT_RULE"),
+    ({"rule_text": "always ( o30[t]:bv[24] = min(i40[t]:bv[24], i2[t]:bv[24]) )."},
+     "RULE_FRAGMENT"),
+    ({"rule_text": "always ( o30[t]:bv[24] = i40[t-1]:bv[24] )."}, "TEMPORAL_REFERENCE"),
+    ({"rule_text": "always ( o30[t]:bv[24] <= i40[t]:bv[24] )."}, "INVALID_PAYOUT_RULE"),
     ({"expires_at": NEXT_HEIGHT}, "INVALID_PAYOUT_RULE"),
 ])
 def test_rule_refusals_carry_a_code(tip_view, over, code):

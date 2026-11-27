@@ -74,7 +74,7 @@ def test_gov_update_acceptance():
         "expiration_time": int(time.time()) + 600,
         "expire_at_height": 5000,
         "fee_limit": "0",
-        "rule_revisions": ["always."],
+        "rule_revisions": ["always ( o6[t]:bv[16] = i10[t]:bv[16] )."],
         "activate_at_height": 100,
         "host_contract_patch": {
             "proof_scheme": "bls_header_sig",

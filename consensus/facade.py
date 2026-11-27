@@ -193,6 +193,14 @@ class TipAdmissionView:
         lm = getattr(chain_state, "_lifecycle_manager", None)
         return getattr(lm, "approval_slots_active", False) is True
 
+    @property
+    def shared_rule_budget(self) -> Optional[tuple]:
+        """(limits, accepted rule count, node total) at the canonical tip, or None before boot."""
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        if lm is None:
+            return None
+        return (lm.shared_rule_limits, lm.shared_rule_count, lm.shared_rule_nodes)
+
     def get_approval_request(self, request_id: str) -> Optional[dict]:
         """The full request row, or None. Includes the recorded votes."""
         import json as _json
