@@ -16,6 +16,7 @@ The native test at the bottom projects a real TauInterface receipt
 through the same code when the native bindings are usable, and skips
 otherwise.
 """
+import hashlib
 import json
 import os
 import types
@@ -442,3 +443,82 @@ def test_worker_session_passes_the_workers_counters_through():
     assert outcome["spec_revision_after"] == 8
     assert outcome["revision_taken"] == "F"
     assert outcome["outcome"] == "ACCEPTED_CHANGED"
+
+
+# --- the committed-state anchor (maintainer review of PR #135, 2026-11-27) ---
+
+
+def test_rule_outcome_is_anchored_to_the_committed_snapshot(temp_database):
+    """The served outcome names the committed state it belongs to.
+
+    Review objection: a result read off a live interpreter does not hold
+    the active rules on a production node — the interpreter's current spec
+    is a per-process, possibly shrunken projection. The outcome scalars
+    are the applying engine's own receipt, and the record anchors them to
+    the snapshot committed with the block: its state hash, and the sha256
+    of its canonical application-rules bytes. A reader verifies the
+    outcome against committed chain state, never against a session view.
+    """
+    tx = _rule_tx("anchor-1", RULE_INSTALL)
+    result, block_obj = _apply_block(
+        [tx], [_receipt("ACCEPTED_CHANGED", 0, 1)], [RULE_INSTALL]
+    )
+    _confirm(block_obj, result)
+    served = _status(block_obj.tx_ids[0])["rule_outcome"]
+    snap = result.next_snapshot
+    assert served["state_hash"] == snap.state_hash
+    assert served["canonical_rules_sha256"] == hashlib.sha256(
+        snap.tau_bytes).hexdigest()
+    # The engine scalars ride along unchanged.
+    assert served["spec_revision_before"] == 0
+    assert served["spec_revision_after"] == 1
+    assert served["revision_taken"] == "F"
+
+
+def test_anchor_comes_from_the_snapshot_not_from_any_session(temp_database):
+    """The anchor is computed from the committed snapshot alone.
+
+    Two outcomes with different engine receipts recorded against one
+    snapshot share its anchor; the same outcome recorded against a
+    snapshot carrying different rules bytes gets a different anchor. The
+    receipt path never supplies the anchor, so no live interpreter's
+    current spec — shrunk, stale or otherwise — can leak into the record.
+    """
+    def _snap(tau_bytes, state_hash, outcomes):
+        return types.SimpleNamespace(
+            metadata={"rule_outcomes": outcomes},
+            tau_bytes=tau_bytes, state_hash=state_hash,
+        )
+
+    block = types.SimpleNamespace(
+        block_hash="anchor-block",
+        header=types.SimpleNamespace(block_number=7),
+    )
+    outcomes = [
+        ("tx-a", {"spec_revision_before": 0, "spec_revision_after": 1,
+                  "revision_taken": "F", "outcome": "ACCEPTED_CHANGED"}),
+        ("tx-b", {"spec_revision_before": 1, "spec_revision_after": 1,
+                  "revision_taken": "F", "outcome": "ACCEPTED_NOOP"}),
+    ]
+    canonical = b"always (o26[t]:bv[64] = { 7 }:bv[64])."
+    chain_state._record_rule_outcomes(
+        block, _snap(canonical, "cd" * 32, outcomes))
+    first = db.get_rule_outcome("tx-a", "anchor-block")
+    second = db.get_rule_outcome("tx-b", "anchor-block")
+    assert first["state_hash"] == second["state_hash"] == "cd" * 32
+    assert (first["canonical_rules_sha256"]
+            == second["canonical_rules_sha256"]
+            == hashlib.sha256(canonical).hexdigest())
+    assert first["spec_revision_after"] == 1
+    assert second["outcome"] == "ACCEPTED_NOOP"
+
+    other = types.SimpleNamespace(
+        block_hash="anchor-block-2",
+        header=types.SimpleNamespace(block_number=8),
+    )
+    chain_state._record_rule_outcomes(
+        other, _snap(b"a different, runtime-shaped spec", "cd" * 32, outcomes))
+    moved = db.get_rule_outcome("tx-a", "anchor-block-2")
+    assert moved["canonical_rules_sha256"] != first["canonical_rules_sha256"]
+    assert moved["canonical_rules_sha256"] == hashlib.sha256(
+        b"a different, runtime-shaped spec").hexdigest()
