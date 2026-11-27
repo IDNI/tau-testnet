@@ -54,6 +54,30 @@ from consensus.retractable import (
     MAX_OPEN_RETRACTABLE_TOTAL,
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
+)
+from consensus.payouts import (
+    MAX_PAYOUT_RULES,
+    PAYOUT_STREAM_INDEX,
+    PayoutShapeError,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_INSTALL,
+    TX_TYPE_PAYOUT_REMOVE,
+    parse_payout_execute,
+    parse_payout_install,
+    parse_payout_remove,
+    validate_payout_shape,
+)
+from consensus.grants import (
+    GRANT_STREAM_INDEX,
+    MAX_GRANTS,
+    GrantShapeError,
+    TX_TYPE_GRANT_CREATE,
+    TX_TYPE_GRANT_DRAW,
+    parse_grant_create,
+    parse_grant_draw,
+    validate_grant_shape,
+)
+from consensus.retractable import (
     RetractableShapeError,
     parse_retract_transfer,
     parse_retractable_transfer,
@@ -1557,6 +1581,205 @@ def validate_rule_change_cancel_payload(
 
 # --- Retractable transfers ---------------------------------------------------
 
+def validate_payout_install_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for installing (or replacing) a payout rule.
+
+    Shape is shared with block apply through `validate_payout_shape`.
+    """
+    try:
+        terms = parse_payout_install(tx)
+        validate_payout_shape(terms, now_ts=tip_view.next_block_timestamp)
+    except (PayoutShapeError, ValueError, TypeError) as exc:
+        return format_error(f"Malformed payout_rule_install: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.owner:
+        return format_error("payout_rule_install sender_pubkey must match the signer.")
+
+    for r in terms.recipients:
+        err = validate_bls_pubkey(r, "recipients")
+        if err:
+            return format_error(f"payout_rule_install rejected: {err}")
+
+    if tip_view.get_payout_rule(terms.owner) is None and \
+            tip_view.payout_rule_count() >= MAX_PAYOUT_RULES:
+        return format_error("The payout rule book is full.", code="PAYOUT_BOOK_FULL")
+
+    refusal = _rule_change_refusal(
+        tip_view, terms.owner, tau_defs.RULE_CHANGE_KIND_PAYOUT_INSTALL
+    )
+    if refusal is not None:
+        return refusal
+
+    return success({
+        "payout_rule_id": terms.rule_id,
+        "max_per_execution": terms.max_per_execution,
+        "max_per_period": terms.max_per_period,
+        "recipients": len(terms.recipients),
+    })
+
+
+def validate_payout_execute_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for a payout execution.
+
+    The rule's outputs can only be known by stepping it, which happens
+    at apply; admission screens the shape, the rule's existence and
+    the settlement id's freshness against the tip book.
+    """
+    try:
+        owner, settlement_id, gross = parse_payout_execute(tx)
+    except (PayoutShapeError, ValueError, TypeError) as exc:
+        return format_error(f"Malformed payout_execute: {exc}.")
+
+    if not settlement_id:
+        return format_error("payout_execute needs a settlement_id.")
+    if gross < 0:
+        return format_error("payout_execute gross cannot be negative.")
+
+    row = tip_view.get_payout_rule(owner)
+    if row is None:
+        return format_error(
+            "No payout rule is installed for that owner.",
+            code="NO_PAYOUT_RULE",
+        )
+    if settlement_id in (row.get("settlements") or []):
+        return format_error(
+            "That settlement id is already settled.",
+            code="SETTLEMENT_ALREADY_SETTLED",
+        )
+    if tip_view.clause_for(owner, PAYOUT_STREAM_INDEX) is None:
+        return format_error(
+            "The owner has published no payout clause.",
+            code="NO_PAYOUT_CLAUSE",
+        )
+
+    return success({
+        "payout_rule_id": row["rule_id"],
+        "settlement_id": settlement_id,
+    })
+
+
+def validate_payout_remove_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for removing a payout rule (owner-signed)."""
+    try:
+        owner, rule_id = parse_payout_remove(tx)
+    except (PayoutShapeError, ValueError, TypeError) as exc:
+        return format_error(f"Malformed payout_rule_remove: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != owner:
+        return format_error("payout_rule_remove sender_pubkey must match the signer.")
+
+    row = tip_view.get_payout_rule(owner)
+    if row is None:
+        return format_error(
+            "No payout rule is installed for the sender.",
+            code="NO_PAYOUT_RULE",
+        )
+    if row["rule_id"] != rule_id:
+        return format_error(
+            "rule_id does not match the installed rule.",
+            code="PAYOUT_RULE_MISMATCH",
+        )
+
+    refusal = _rule_change_refusal(
+        tip_view, owner, tau_defs.RULE_CHANGE_KIND_PAYOUT_REMOVE
+    )
+    if refusal is not None:
+        return refusal
+
+    return success({"payout_rule_id": rule_id})
+
+
+def validate_grant_create_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for creating a conditional grant."""
+    try:
+        terms = parse_grant_create(tx)
+        validate_grant_shape(terms)
+    except (GrantShapeError, ValueError, TypeError) as exc:
+        return format_error(f"Malformed grant_create: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.sender:
+        return format_error("grant_create sender_pubkey must match the signer.")
+
+    err = validate_bls_pubkey(terms.recipient, "recipient_pubkey")
+    if err:
+        return format_error(f"grant_create rejected: {err}")
+
+    if tip_view.get_grant(terms.grant_id) is not None:
+        return format_error(
+            "Duplicate grant_create (same sender, recipient, terms and sequence).",
+            code="DUPLICATE_GRANT",
+        )
+    if tip_view.grant_count() >= MAX_GRANTS:
+        return format_error("The grant book is full.", code="GRANT_BOOK_FULL")
+
+    return success({
+        "grant_id": terms.grant_id,
+        "total": terms.total,
+        "cap_per_period": terms.cap_per_period,
+    })
+
+
+def validate_grant_draw_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for drawing on a grant.
+
+    Admission checks the sender has published a grant clause (the
+    payout admission does the same for its clause) and screens the
+    window and remainder against the tip state; the clause's verdict
+    and the period-cap arithmetic run at apply, which re-checks
+    against the candidate book, so admission never promises a draw
+    apply would refuse for a book reason.
+    """
+    try:
+        grant_id, amount = parse_grant_draw(tx)
+    except (GrantShapeError, ValueError, TypeError) as exc:
+        return format_error(f"Malformed grant_draw: {exc}.")
+
+    row = tip_view.get_grant(grant_id)
+    if row is None:
+        return format_error("Unknown grant.", code="UNKNOWN_GRANT")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != row["recipient_pubkey"]:
+        return format_error("Only the grant recipient may draw.")
+
+    if tip_view.clause_for(row["sender_pubkey"], GRANT_STREAM_INDEX) is None:
+        return format_error(
+            "The grant sender has published no grant clause.",
+            code="NO_GRANT_CLAUSE",
+        )
+
+    if amount <= 0:
+        return format_error("A draw must be positive.")
+    if row["refunded"]:
+        return format_error("The grant is closed.", code="GRANT_CLOSED")
+    now = tip_view.next_block_timestamp
+    if now < row["opens_at"]:
+        return format_error("Draws have not opened yet.", code="GRANT_NOT_OPEN")
+    if now >= row["deadline"]:
+        return format_error("The grant has expired.", code="GRANT_EXPIRED")
+    if amount > row["remaining"]:
+        return format_error("Draw exceeds the remaining grant.", code="DRAW_TOO_LARGE")
+
+    return success({
+        "grant_id": grant_id,
+        "amount": amount,
+        "remaining_after": row["remaining"] - amount,
+    })
+
+
 def validate_retractable_transfer_payload(
     tx: Dict, tip_view: TipAdmissionView
 ) -> AdmissionResult:
@@ -1771,6 +1994,21 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_PAYOUT_INSTALL:
+         return validate_payout_install_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+         return validate_payout_execute_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_PAYOUT_REMOVE:
+         return validate_payout_remove_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_GRANT_CREATE:
+         return validate_grant_create_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_GRANT_DRAW:
+         return validate_grant_draw_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

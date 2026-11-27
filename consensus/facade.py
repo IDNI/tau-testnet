@@ -466,6 +466,81 @@ class TipAdmissionView:
     def open_retractable_count(self) -> int:
         return self._retractable_scalar("SELECT COUNT(*) FROM retractable_transfers_v1")
 
+    # --- Payout rules + grants (Bounty 01, issue #63) -----------------------
+    # Same read-from-tables discipline as the retractable accessors.
+
+    def get_payout_rule(self, owner_pubkey: str) -> Optional[dict]:
+        """The payout rule installed by this owner, or None."""
+        try:
+            with db._db_lock:
+                row = db._db_conn.execute(
+                    "SELECT rule_id, max_per_execution, max_per_period, "
+                    "recipients_json, period_kind, anchor_ts, "
+                    "sequence_number, period_index, spent_in_period, "
+                    "settlements_json FROM payout_rules_v1 "
+                    "WHERE owner_pubkey = ?",
+                    (owner_pubkey,),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        import json as _json
+        return {
+            "rule_id": row[0],
+            "owner_pubkey": owner_pubkey,
+            "max_per_execution": int(row[1]),
+            "max_per_period": int(row[2]),
+            "recipients": _json.loads(row[3]),
+            "period_kind": int(row[4]),
+            "anchor_ts": int(row[5]),
+            "sequence_number": int(row[6]),
+            "period_index": int(row[7]),
+            "spent_in_period": int(row[8]),
+            "settlements": _json.loads(row[9]),
+        }
+
+    def payout_rule_count(self) -> int:
+        return self._retractable_scalar("SELECT COUNT(*) FROM payout_rules_v1")
+
+    def get_grant(self, grant_id: str) -> Optional[dict]:
+        """One grant entry by id, or None."""
+        try:
+            with db._db_lock:
+                row = db._db_conn.execute(
+                    "SELECT sender_pubkey, recipient_pubkey, total, "
+                    "cap_per_period, opens_at, deadline, sequence_number, "
+                    "remaining, period_index, drawn_in_period, "
+                    "last_draw_ts, refunded, cap_group, cap_group_cap "
+                    "FROM grants_v1 "
+                    "WHERE grant_id = ?",
+                    (grant_id,),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {
+            "grant_id": grant_id,
+            "sender_pubkey": row[0],
+            "recipient_pubkey": row[1],
+            "total": int(row[2]),
+            "cap_per_period": int(row[3]),
+            "opens_at": int(row[4]),
+            "deadline": int(row[5]),
+            "sequence_number": int(row[6]),
+            "remaining": int(row[7]),
+            "period_index": int(row[8]),
+            "drawn_in_period": int(row[9]),
+            "last_draw_ts": int(row[10]),
+            "refunded": bool(row[11]),
+            "cap_group": str(row[12] or ""),
+            "cap_group_cap": int(row[13]),
+        }
+
+    def grant_count(self) -> int:
+        return self._retractable_scalar("SELECT COUNT(*) FROM grants_v1")
+
     def escrowed_out(self, pubkey: str) -> int:
         return self._retractable_scalar(
             "SELECT COALESCE(SUM(amount), 0) FROM retractable_transfers_v1 "

@@ -136,6 +136,12 @@ RULE_CHANGE_KIND_REVOKE_POLICY = 2
 RULE_CHANGE_KIND_ACCEPT_OFFER = 3
 RULE_CHANGE_KIND_SET_GUARD = 4
 RULE_CHANGE_KIND_REVOKE_GUARD = 5
+# Kind 6 is the stage-2 book's payout-rule update; the numbering is
+# shared across stages so a guard clause judges the same change kind
+# on either. Installing or removing a payout rule decides whose hands
+# a registered clause's legs land in, so both travel the guard too.
+RULE_CHANGE_KIND_PAYOUT_INSTALL = 7
+RULE_CHANGE_KIND_PAYOUT_REMOVE = 8
 
 # Blocks after which a parked rule-change request may release without approvals.
 RULE_CHANGE_DELAY_BLOCKS = 1000
