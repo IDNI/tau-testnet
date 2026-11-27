@@ -62,6 +62,16 @@ OUTBOUND_RULE = (
 )
 OUTBOUND_BODY = clause_body_v1(OUTBOUND_RULE)
 
+# A pure send policy: "never send more than 500". Reads only i1 — neither
+# the counterparty nor a hold stream — so it is NOT recipient-relevant and
+# must keep its send-path meaning under the direction split.
+SPENDCAP_RULE = (
+    "always ( (i1[t]:bv[24] <= { #x0001f4 }:bv[24]) "
+    "? (o5[t]:bv[24] = { #x000001 }:bv[24]) "
+    ": (o5[t]:bv[24] = { #x000000 }:bv[24]) )."
+)
+SPENDCAP_BODY = clause_body_v1(SPENDCAP_RULE)
+
 # Issue #76: "never hold a payment to me longer than 600 seconds". Reads
 # ONLY the hold stream i17 — no i3 — which is why the opt-in screen also
 # treats a hold-stream read as recipient-relevant.
@@ -111,6 +121,10 @@ def _evaluator():
         else "1",
     )
     evaluator.set_verdict(OUTBOUND_BODY, "0")
+    evaluator.set_verdict(
+        SPENDCAP_BODY,
+        lambda inputs: "1" if int(inputs.get("i1", "0")) <= 500 else "0",
+    )
     evaluator.set_verdict(
         HOLD600_BODY,
         lambda inputs: "1" if int(inputs.get("i17", "0")) <= 600 else "0",
@@ -441,11 +455,78 @@ def test_deploy_screen_refuses_a_hold_cap_without_the_gate(monkeypatch):
     monkeypatch.setitem(tau_defs.HOST_CAPABILITIES, "recipient_max_hold", False)
     error = _screen_clause_domains(HOLD600_BODY)
     assert error is not None and "recipient_max_hold" in error
-    # An i3-only inbound rule is not refused at deploy: statically it is a
-    # sender-pass clause too; the capabilities report covers the rest.
+    # An i3-only inbound rule is not refused at deploy either: it is a
+    # receive policy, and the capabilities report covers the rest.
     assert _screen_clause_domains(ALLOWLIST_BODY) is None
 
 
 def test_deploy_screen_admits_a_hold_cap_with_the_gate():
     from consensus.admission import _screen_clause_domains
     assert _screen_clause_domains(HOLD600_BODY) is None
+
+
+# --- Direction: one clause speaks to exactly one direction -------------------
+#
+# Maintainer review of PR #126 (2026-11-27): "one clause can't tell inbound
+# from outbound payments, so the documented allow-list refuses the owner's
+# own sends." Both passes feed a clause body the same input map and a body
+# may not reference i12, so the body cannot own the split — enforcement
+# does. send_path_clause_blocks is the funnel the send path (admission,
+# apply) judges the sender's own clause through; these tests pin its half
+# of the split against the same bodies the gate tests above use.
+
+
+def _send_path(clauses, sender, recipient, amount, pool="apply"):
+    evaluator = _evaluator()
+    sender_policy.set_evaluator(pool, evaluator)
+    clause_for = lambda pubkey, stream: clauses.get((pubkey, stream))
+    blocked, _detail = recipient_policy.send_path_clause_blocks(
+        clause_for, sender, _values(sender, recipient, amount), pool=pool)
+    return blocked, evaluator
+
+
+def test_owner_send_is_not_blocked_by_own_allowlist():
+    # The maintainer's scenario: CAROL deployed "allow incoming only from
+    # ALICE" and then sends to BOB herself. Her clause is a receive
+    # policy; the send path must not enforce it — it is not even stepped.
+    blocked, evaluator = _send_path(
+        {(CAROL, STREAM): ALLOWLIST_BODY}, CAROL, BOB, 100)
+    assert blocked is False
+    assert evaluator.verdict_calls == []
+
+
+def test_owner_send_is_not_blocked_by_own_hold_cap():
+    blocked, evaluator = _send_path(
+        {(CAROL, STREAM): HOLD600_BODY}, CAROL, BOB, 100)
+    assert blocked is False
+    assert evaluator.verdict_calls == []
+
+
+def test_the_same_allowlist_still_judges_inbound():
+    # One clause, both directions, opposite treatment: the gate still
+    # refuses an unlisted sender and admits the listed one.
+    blocked, _, _ = _gate({(CAROL, STREAM): ALLOWLIST_BODY}, BOB, CAROL, 100)
+    assert blocked is True
+    blocked, _, _ = _gate({(CAROL, STREAM): ALLOWLIST_BODY}, ALICE, CAROL, 100)
+    assert blocked is False
+
+
+def test_outbound_only_clause_still_blocks_owner_sends():
+    # The split is narrow: a clause reading only i4 keeps its send-path
+    # meaning and still blocks the owner's sends it disapproves of.
+    blocked, _ = _send_path({(CAROL, STREAM): OUTBOUND_BODY}, CAROL, BOB, 100)
+    assert blocked is True
+
+
+def test_send_policy_clause_still_blocks_owner_sends():
+    # A clause reading neither the counterparty nor a hold stream is a
+    # send policy: the spend cap still caps the owner's own sends.
+    blocked, _ = _send_path({(CAROL, STREAM): SPENDCAP_BODY}, CAROL, BOB, 600)
+    assert blocked is True
+    blocked, _ = _send_path({(CAROL, STREAM): SPENDCAP_BODY}, CAROL, BOB, 500)
+    assert blocked is False
+
+
+def test_send_path_without_a_clause_allows():
+    blocked, _ = _send_path({}, CAROL, BOB, 100)
+    assert blocked is False
