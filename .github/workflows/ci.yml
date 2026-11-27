@@ -54,6 +54,7 @@ jobs:
   native-tau-tests:
     name: Consensus tests (real Tau, in docker image)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -67,6 +68,9 @@ jobs:
           push: false
           load: true
           tags: tau-node:ci
+          # Cold builds with 4 compile jobs get the hosted runner killed mid-compile.
+          build-args: |
+            TAU_BUILD_JOBS=2
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
