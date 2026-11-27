@@ -44,6 +44,7 @@ import pathlib
 import subprocess
 import sys
 
+import db
 import pytest
 
 
@@ -518,9 +519,16 @@ def test_c6_same_block_two_updates_attribution(tmp_path):
 
     # Only steps that ADVANCED the revision (a no-op outcome that
     # merely landed on a revision carries no interval of its own).
+    # NOTE (C6 diagnosis, 27 Nov 2026): compare against the CONSTANT
+    # db.REVISION_RECORDED, whose VALUE is "RECORDED" (db.py:2083) --
+    # the literal "REVISION_RECORDED" is the constant's NAME, never a
+    # stored value, so it matched zero rows and the test failed at
+    # `assert len(by_block[1]) == 2` with an empty filter result in
+    # native run 45941233056. Every other consumer (survival_ledger,
+    # test_active_rules_revision_ledger.py) uses the constant.
     outcomes = [o for o in proposer["outcomes"]
                 if o["outcome"] and o["outcome"].startswith("ACCEPTED")
-                and o["revision_status"] == "REVISION_RECORDED"
+                and o["revision_status"] == db.REVISION_RECORDED
                 and o["spec_revision_before"] is not None
                 and o["spec_revision_before"] < o["spec_revision_after"]]
     by_block = {1: [o for o in outcomes if o["block_number"] == 1],
