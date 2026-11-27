@@ -157,6 +157,100 @@ def test_resent_unit_displaces_in_turn(temp_database, shadow_driver):
     }
 
 
+def test_resent_unit_step_attributed_to_resend_tx(
+        temp_database, shadow_driver):
+    # The resent-unit attribution rule: a step's identity is its
+    # journal entry, not its text. A, B, then A again -- the resend's
+    # step is the third journal entry, attributed to the resend
+    # transaction with its own shadow revision, even though its text
+    # equals the first submission's. The in-process journal is
+    # consumed monotonically (each entry once, in order), so the
+    # resend is never re-read as the first occurrence. The in-process
+    # journal is process-global, so reset it first: this test's three
+    # entries are then the whole journal.
+    import tau_journal as _tau_journal
+
+    _tau_journal.reset_all()
+    chain = step2.Chain()
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 1, 2)
+    b1 = chain.apply([step1._rule_tx(step2.PROBE_UNIT_1, seq=0)])
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 2, 3)
+    b2 = chain.apply([step1._rule_tx(step2.PROBE_UNIT_2, seq=1)])
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 3, 4)
+    b3 = chain.apply([step1._rule_tx(step2.PROBE_UNIT_1, seq=2)])
+    assert not b3[1].invalid_tx_ids, b3[1].outcomes
+    step2._commit(chain, [b1, b2, b3])
+    tx1_hash = b1[0].tx_ids[0]
+    tx3_hash = b3[0].tx_ids[0]
+
+    # All three journal entries consumed exactly once, in order: the
+    # consumption cursor sits past the resend's entry, at the end of
+    # the in-process journal's accumulated revisions.
+    import tau_journal as _tau_journal
+
+    shadow = chain_state.get_shadow_spec()
+    assert shadow.fed_units == [
+        step2.PROBE_UNIT_1, step2.PROBE_UNIT_2, step2.PROBE_UNIT_1]
+    revision_count = sum(
+        1 for entry in _tau_journal.committed().entries()
+        if entry.kind == _tau_journal.REVISION and entry.accumulate
+        and entry.rule_text)
+    assert shadow.memory_cursor == revision_count
+
+    # The resend block's persisted feed step names the resend tx.
+    with db._db_lock:
+        rows = db._db_conn.execute(
+            "SELECT tx_hash FROM spec_unit_feeds "
+            "WHERE block_hash = ? AND unit_text IS NOT NULL",
+            (b3[0].block_hash,)).fetchall()
+    assert [row[0] for row in rows] == [tx3_hash]
+
+    # Each receipt carries its own step's shadow revision: the first
+    # submission's is 1, the resend's is 3 -- the resend is not
+    # labelled with the first occurrence's revision.
+    container = types.SimpleNamespace(db=db)
+    for tx_hash, expected in ((tx1_hash, 1), (tx3_hash, 3)):
+        resp = json.loads(gettxstatus.execute(
+            f"gettxstatus {tx_hash}", container))
+        assert resp["status"] == "ok", resp
+        served = resp["data"]["rule_outcome"]
+        assert served["evidence"]["shadow_revision"] == expected
+
+
+def test_resend_within_one_block_attributed_in_order(
+        temp_database, shadow_driver):
+    # A, B, A again inside ONE block: positional attribution gives
+    # each step its own transaction in journal order, and B is
+    # displaced by the third transaction at the same height.
+    chain = step2.Chain()
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 1, 2)
+    block, result = chain.apply([
+        step1._rule_tx(step2.PROBE_UNIT_1, seq=0),
+        step1._rule_tx(step2.PROBE_UNIT_2, seq=1),
+        step1._rule_tx(step2.PROBE_UNIT_1, seq=2),
+    ])
+    assert not result.invalid_tx_ids, result.outcomes
+    step2._commit(chain, [(block, result)])
+    tx1_hash, tx2_hash, tx3_hash = block.tx_ids
+    height = block.header.block_number
+
+    with db._db_lock:
+        rows = db._db_conn.execute(
+            "SELECT tx_hash FROM spec_unit_feeds "
+            "WHERE block_hash = ? AND unit_text IS NOT NULL "
+            "ORDER BY rowid",
+            (block.block_hash,)).fetchall()
+    assert [row[0] for row in rows] == [tx1_hash, tx2_hash, tx3_hash]
+
+    entries = {e["unit"]: e for e in db.get_survival_ledger()}
+    assert entries[step2.PROBE_UNIT_1]["status"] == "in_force"
+    assert entries[step2.PROBE_UNIT_1]["tx_hash"] == tx1_hash
+    e2 = entries[step2.PROBE_UNIT_2]
+    assert e2["status"] == "displaced"
+    assert e2["displacer_tx_hash"] == tx3_hash
+    assert e2["displacer_block_height"] == height
+
+
 def test_two_updates_in_one_block_keep_own_attribution(
         temp_database, shadow_driver):
     # Two updates to independent outputs in ONE block: each unit's
