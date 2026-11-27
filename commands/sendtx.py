@@ -525,7 +525,7 @@ def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     return _policy_call(lambda: recipient_policy.send_path_clause_blocks(
         tip_view.clause_for, sender_pubkey, values,
         pool="admission", timeout=budget
-    )))
+    ))
 
 
 def _recipient_clause_blocks(tip_view, sender_pubkey, recipient_pubkey,
