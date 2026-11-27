@@ -476,6 +476,47 @@ def init_db():
                     PRIMARY KEY (retractable_id, block_hash, outcome)
                 );
             ''')
+            # Payout rules (#63): one installed rule per account with where it
+            # stands in its period. Bound into consensus_meta_hash once the book
+            # has held anything, so written in the same transaction as accounts.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS payout_rules_v1 (
+                    account_pubkey    TEXT PRIMARY KEY,
+                    rule_id           TEXT NOT NULL,
+                    sequence_number   INTEGER NOT NULL,
+                    body              TEXT NOT NULL,
+                    slots_json        TEXT NOT NULL,
+                    cap_per_execution INTEGER NOT NULL,
+                    cap_per_period    INTEGER NOT NULL,
+                    kind              INTEGER NOT NULL,
+                    period            INTEGER NOT NULL,
+                    expires_at        INTEGER NOT NULL,
+                    anchor            INTEGER NOT NULL,
+                    period_index      INTEGER NOT NULL,
+                    spent_in_period   INTEGER NOT NULL,
+                    executions        INTEGER NOT NULL,
+                    paid_total        INTEGER NOT NULL,
+                    last_height       INTEGER NOT NULL
+                );
+            ''')
+            # Node-local history: installs, revokes, executions with their legs,
+            # expiries. Keyed per block like the other event tables.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS payout_events (
+                    account_pubkey TEXT NOT NULL,
+                    rule_id        TEXT NOT NULL,
+                    block_hash     TEXT NOT NULL,
+                    block_number   INTEGER NOT NULL,
+                    event_index    INTEGER NOT NULL,
+                    outcome        TEXT NOT NULL,
+                    detail_json    TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (block_hash, event_index)
+                );
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_payout_events_account "
+                "ON payout_events(account_pubkey, block_number);"
+            )
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -1448,6 +1489,28 @@ def pending_retract_tx_hashes(sender_pubkey: str, retractable_id: str) -> List[s
     return found
 
 
+def pending_tx_hashes_naming(sender_pubkey: str, tx_type: str, field: str, value: str) -> List[str]:
+    """Mempool hashes of `tx_type` txs by this sender whose `field` equals `value`, any status."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT tx_hash, payload FROM mempool WHERE sender_pubkey = ? OR sender_pubkey IS NULL',
+            (sender_pubkey,),
+        ).fetchall()
+    found = []
+    for tx_hash, payload in rows:
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if (data.get('tx_type') == tx_type
+                and data.get('sender_pubkey') == sender_pubkey
+                and data.get(field) == value):
+            found.append(tx_hash)
+    return found
+
+
 def get_pending_sequences(sender_pubkey: str) -> set:
     """Every sequence number this sender holds in the mempool, any status."""
     if _db_conn is None:
@@ -2243,7 +2306,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, shared_rule_budget: Dict | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, payout_rules: Dict | None = None, shared_rule_budget: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2282,6 +2345,7 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 approval_slots_active=approval_slots_active,
                 retractable_transfers=retractable_transfers,
                 rule_change_requests=rule_change_requests,
+                payout_rules=payout_rules,
                 shared_rule_budget=shared_rule_budget,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
@@ -2347,7 +2411,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, shared_rule_budget: Dict | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, payout_rules: Dict | None = None, shared_rule_budget: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2556,6 +2620,9 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
     if retractable_transfers is not None:
         _write_retractable_rows(retractable_transfers)
 
+    if payout_rules is not None:
+        _write_payout_rows(payout_rules)
+
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
         # reproduces the same per-block budget as a from-genesis replay.
@@ -2705,6 +2772,183 @@ def get_canonical_retractable_events(retractable_id: str) -> List[Dict]:
                 {"block_hash": block_hash, "block_number": int(block_number), "outcome": outcome}
             )
     return out
+
+
+_PAYOUT_COLUMNS = (
+    'rule_id, account_pubkey, sequence_number, body, slots_json, cap_per_execution, '
+    'cap_per_period, kind, period, expires_at, anchor, period_index, spent_in_period, '
+    'executions, paid_total, last_height'
+)
+
+
+def _write_payout_rows(state: Dict) -> None:
+    """Full replace of the installed payout rules plus the removal commitment."""
+    _db_conn.execute('DELETE FROM payout_rules_v1')
+    # Rules that pay per sale (a 17th element: missed count and open sales) keep
+    # that part in one chain_state value, so the table keeps its columns.
+    # Optional terms and kept clocks (an 18th element) likewise: a rule without
+    # them is stored exactly as before.
+    sales, more = {}, {}
+    for row in state['rows']:
+        (rule_id, account, sequence, body, slots), rest = row[:5], row[5:16]
+        if len(row) > 16 and row[16] is not None:
+            missed, open_sales = row[16]
+            sales[account] = {'missed': int(missed), 'open': [
+                [bytes(sid).hex(), payer, int(amount), int(height)]
+                for sid, payer, amount, height in open_sales]}
+        if len(row) > 17 and row[17] is not None:
+            periods_from, due_at, last_clock, due_done = row[17]
+            more[account] = {
+                'periods_from': None if periods_from is None else int(periods_from),
+                'due_at': None if due_at is None else int(due_at),
+                'last_clock': int(last_clock), 'due_done': bool(due_done)}
+        _db_conn.execute(
+            f'INSERT INTO payout_rules_v1 ({_PAYOUT_COLUMNS}) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (bytes(rule_id).hex(), account, int(sequence), body, json.dumps(list(slots)))
+            + tuple(int(v) for v in rest),
+        )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        ('payout_sales', json.dumps(sales, sort_keys=True)),
+    )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        ('payout_more', json.dumps(more, sort_keys=True)),
+    )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        (
+            'payout_resolved',
+            json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
+        )
+    )
+
+
+def load_payout_state() -> tuple[List[tuple], int, bytes]:
+    """(rows, resolved_count, resolved_acc) in PayoutBook.restore order."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            f'SELECT {_PAYOUT_COLUMNS} FROM payout_rules_v1 ORDER BY account_pubkey'
+        ).fetchall()
+        raw = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = 'payout_resolved'"
+        ).fetchone()
+        raw_sales = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = 'payout_sales'"
+        ).fetchone()
+        raw_more = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = 'payout_more'"
+        ).fetchone()
+    sales = json.loads(raw_sales[0]) if raw_sales and raw_sales[0] else {}
+    more = json.loads(raw_more[0]) if raw_more and raw_more[0] else {}
+    count, acc = 0, bytes(32)
+    if raw and raw[0]:
+        parsed = json.loads(raw[0])
+        count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
+    out = []
+    for r in rows:
+        row = ((bytes.fromhex(r[0]), r[1], int(r[2]), r[3], tuple(json.loads(r[4])))
+               + tuple(int(v) for v in r[5:]))
+        kept = None
+        if r[1] in sales:
+            entry = sales[r[1]]
+            kept = (entry['missed'], tuple(tuple(e) for e in entry['open']))
+        if r[1] in more:
+            entry = more[r[1]]
+            row += (kept, (entry['periods_from'], entry['due_at'],
+                           entry['last_clock'], entry['due_done']))
+        elif kept is not None:
+            row += (kept,)
+        out.append(row)
+    return out, count, acc
+
+
+def record_payout_events(block_hash: str, block_number: int, events) -> None:
+    """Node-local history of what a block did to payout rules. Best effort."""
+    if _db_conn is None:
+        init_db()
+    try:
+        with _db_lock:
+            with _db_conn:
+                for index, event in enumerate(events):
+                    detail = {k: v for k, v in event.items()
+                              if k not in ('account_pubkey', 'rule_id', 'outcome')}
+                    _db_conn.execute(
+                        'INSERT OR REPLACE INTO payout_events '
+                        '(account_pubkey, rule_id, block_hash, block_number, event_index, '
+                        'outcome, detail_json) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                        (event['account_pubkey'], event['rule_id'], block_hash,
+                         int(block_number), index, event['outcome'],
+                         json.dumps(detail, sort_keys=True)),
+                    )
+    except Exception:
+        logger.exception("could not record payout events")
+
+
+def get_canonical_payout_events(account_pubkey: str, limit: int = 50) -> List[Dict]:
+    """History of one account's payout rules on the canonical chain, newest first."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT rule_id, block_hash, block_number, event_index, outcome, detail_json '
+            'FROM payout_events WHERE account_pubkey = ? '
+            'ORDER BY block_number DESC, event_index DESC',
+            (account_pubkey,),
+        ).fetchall()
+    out: List[Dict] = []
+    canonical: Dict[str, bool] = {}
+    for rule_id, block_hash, number, index, outcome, detail in rows:
+        if block_hash not in canonical:
+            canonical[block_hash] = get_canonical_confirmation(block_hash, int(number))[0]
+        if not canonical[block_hash]:
+            continue
+        item = {"block_number": int(number), "block_hash": block_hash,
+                "rule_id": rule_id, "outcome": outcome}
+        try:
+            item.update(json.loads(detail or '{}'))
+        except Exception:
+            pass
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def has_due_payouts(next_height: int, now: int) -> bool:
+    """True if a payout rule has a due point this height or time reaches and that
+    has not run yet.
+
+    A hint for the miner thread, from persisted rows like has_due_retractables;
+    the block builder re-checks against the book under the lock.
+    """
+    if _db_conn is None:
+        init_db()
+    try:
+        with _db_lock:
+            raw = _db_conn.execute(
+                "SELECT value FROM chain_state WHERE key = 'payout_more'"
+            ).fetchone()
+            if not raw or not raw[0]:
+                return False
+            pending = {account: entry['due_at'] for account, entry in json.loads(raw[0]).items()
+                       if entry.get('due_at') is not None and not entry.get('due_done')}
+            if not pending:
+                return False
+            rows = _db_conn.execute(
+                'SELECT account_pubkey, kind FROM payout_rules_v1'
+            ).fetchall()
+    except Exception:
+        return False
+    for account, kind in rows:
+        due = pending.get(account)
+        # kind 0 counts blocks, kind 1 seconds (consensus.payout.KIND_BLOCKS / KIND_SECONDS)
+        if due is not None and int(due) <= (next_height if int(kind) == 0 else now):
+            return True
+    return False
 
 
 def has_due_retractables(next_height: int, now: int) -> bool:
