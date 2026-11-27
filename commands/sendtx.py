@@ -514,11 +514,18 @@ def _policy_call(call):
 
 
 def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
-    """(blocked, detail) for the sender's own o5 clause on one transfer's inputs."""
-    body = tip_view.clause_for(sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
-    return _policy_call(lambda: sender_policy.clause_blocks(
-        body, values, pool="admission", timeout=budget
-    ))
+    """(blocked, detail) for the sender's own o5 clause on one transfer's inputs.
+
+    Judged through recipient_policy.send_path_clause_blocks: a clause that
+    reads the counterparty or a hold stream is a receive policy and is not
+    enforced against the owner's own sends (issue #47, maintainer review
+    of PR #126) — admission and apply must agree on this, so both go
+    through the same funnel.
+    """
+    return _policy_call(lambda: recipient_policy.send_path_clause_blocks(
+        tip_view.clause_for, sender_pubkey, values,
+        pool="admission", timeout=budget
+    )))
 
 
 def _recipient_clause_blocks(tip_view, sender_pubkey, recipient_pubkey,
