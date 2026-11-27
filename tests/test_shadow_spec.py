@@ -401,6 +401,40 @@ def test_resent_unit_restores_displaced_spec_in_view(
         at_second["shared_spec"]["normalized_text"]
 
 
+def test_two_updates_in_one_block_both_in_view(temp_database, shadow_driver):
+    # Two rule updates to independent outputs land in ONE block. The
+    # shadow feeds the block's journal group in journal order, so the
+    # view after that block reflects both -- the second update is not
+    # folded into the first update's step.
+    unit_a = "always ( o26[t]:bv[24] = { 7 }:bv[24] )."
+    unit_b = "always ( o27[t]:bv[24] = { 9 }:bv[24] )."
+    chain = Chain()
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 1, 2)
+    block, result = chain.apply([
+        step1._rule_tx(unit_a, seq=0),
+        step1._rule_tx(unit_b, seq=1),
+    ])
+    assert not result.invalid_tx_ids, result.outcomes
+    _commit(chain, [(block, result)])
+
+    shadow = chain_state.get_shadow_spec()
+    assert shadow.fed_units == [unit_a, unit_b]
+    assert shadow.revision == 2
+
+    oracle = ScriptedTauDriver()
+    for unit in shadow.fed_units:
+        oracle.feed(unit)
+    assert shadow.normalized_text == oracle.current_spec()
+
+    data = _view()
+    assert data["status"] == "recorded"
+    text = data["shared_spec"]["normalized_text"]
+    assert "o26[t]:bv[24] = { 7 }:bv[24]" in text
+    assert "o27[t]:bv[24] = { 9 }:bv[24]" in text
+    assert data["snapshot"]["height"] == block.header.block_number
+    assert data["snapshot"]["shadow_revision"] == 2
+
+
 def test_mirror_satisfiable_rule_in_force(temp_database, shadow_driver):
     # The scripted driver's normalization of the mirror unit is the form
     # measured on the real engine in the thread; the harness cannot run

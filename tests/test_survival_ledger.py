@@ -37,6 +37,7 @@ ALICE = step1.ALICE
 STREAM = tau_defs.USER_POLICY_STREAM_INDEX
 
 FULL_UNIT_1 = "always ( o26[t]:bv[24] = { 7 }:bv[24] )."
+UNIT_O27 = "always ( o27[t]:bv[24] = { 9 }:bv[24] )."
 UNSAT_UNIT = (
     "always ( o26[t]:bv[24] = "
     "o26[t]:bv[24]*{ 3 }:bv[24]+{ 1 }:bv[24] )."
@@ -154,6 +155,101 @@ def test_resent_unit_displaces_in_turn(temp_database, shadow_driver):
         "tx_hash": tx3_hash,
         "block_height": b3[0].header.block_number,
     }
+
+
+def test_two_updates_in_one_block_keep_own_attribution(
+        temp_database, shadow_driver):
+    # Two updates to independent outputs in ONE block: each unit's
+    # ledger entry and receipt carry its OWN transaction and shadow
+    # revision -- the second update is not labelled with the first
+    # update's revision (the same-block attribution case from #42).
+    chain = step2.Chain()
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 1, 2)
+    block, result = chain.apply([
+        step1._rule_tx(FULL_UNIT_1, seq=0),
+        step1._rule_tx(UNIT_O27, seq=1),
+    ])
+    assert not result.invalid_tx_ids, result.outcomes
+    step2._commit(chain, [(block, result)])
+    tx1_hash, tx2_hash = block.tx_ids[0], block.tx_ids[1]
+    height = block.header.block_number
+
+    entries = {e["unit"]: e for e in db.get_survival_ledger()}
+    e1 = entries[FULL_UNIT_1]
+    assert e1["tx_hash"] == tx1_hash
+    assert e1["block_height"] == height
+    assert e1["status"] == "in_force"
+    assert e1["displacer_tx_hash"] is None
+
+    e2 = entries[UNIT_O27]
+    assert e2["tx_hash"] == tx2_hash
+    assert e2["block_height"] == height
+    assert e2["status"] == "in_force"
+    assert e2["displacer_tx_hash"] is None
+
+    # Each receipt's shadow revision is the step that fed ITS unit:
+    # 1 for the first update, 2 for the second.
+    container = types.SimpleNamespace(db=db)
+    served = []
+    for tx_hash in (tx1_hash, tx2_hash):
+        resp = json.loads(gettxstatus.execute(
+            f"gettxstatus {tx_hash}", container))
+        assert resp["status"] == "ok", resp
+        served.append(resp["data"]["rule_outcome"]["evidence"])
+    assert served[0]["shadow_revision"] == 1
+    assert served[1]["shadow_revision"] == 2
+
+    # The view after the block reflects both updates.
+    data = step2._view()
+    text = data["shared_spec"]["normalized_text"]
+    assert "o26[t]:bv[24] = { 7 }:bv[24]" in text
+    assert "o27[t]:bv[24] = { 9 }:bv[24]" in text
+    status = {s["unit"]: s for s in data["shared_spec"]["unit_status"]}
+    assert status[FULL_UNIT_1]["status"] == "in_force"
+    assert status[UNIT_O27]["status"] == "in_force"
+
+
+def test_same_output_twice_in_one_block_displaces_first(
+        temp_database, shadow_driver):
+    # The same output updated twice in ONE block: the view shows the
+    # second value, and the ledger marks the first unit displaced BY
+    # the second transaction -- displacement attribution stays exact
+    # inside a single block.
+    chain = step2.Chain()
+    chain.receipt = step1._receipt("ACCEPTED_CHANGED", 1, 2)
+    block, result = chain.apply([
+        step1._rule_tx(FULL_UNIT_1, seq=0),
+        step1._rule_tx(step2.PROBE_UNIT_2, seq=1),
+    ])
+    assert not result.invalid_tx_ids, result.outcomes
+    step2._commit(chain, [(block, result)])
+    tx1_hash, tx2_hash = block.tx_ids[0], block.tx_ids[1]
+    height = block.header.block_number
+
+    entries = {e["unit"]: e for e in db.get_survival_ledger()}
+    e1 = entries[FULL_UNIT_1]
+    assert e1["tx_hash"] == tx1_hash
+    assert e1["status"] == "displaced"
+    assert e1["surviving_fragment"] is None
+    assert e1["displacer_tx_hash"] == tx2_hash
+    assert e1["displacer_block_height"] == height
+
+    e2 = entries[step2.PROBE_UNIT_2]
+    assert e2["tx_hash"] == tx2_hash
+    assert e2["status"] == "in_force"
+    assert e2["displacer_tx_hash"] is None
+
+    data = step2._view()
+    text = data["shared_spec"]["normalized_text"]
+    assert "o26[t]:bv[24] = { 3 }:bv[24]" in text
+    assert "{ 7 }" not in text
+    status = {s["unit"]: s for s in data["shared_spec"]["unit_status"]}
+    assert status[FULL_UNIT_1]["status"] == "displaced"
+    assert status[FULL_UNIT_1]["displacer"] == {
+        "tx_hash": tx2_hash,
+        "block_height": height,
+    }
+    assert status[step2.PROBE_UNIT_2]["status"] == "in_force"
 
 
 def test_full_displacement_marks_unit_displaced(temp_database, shadow_driver):
