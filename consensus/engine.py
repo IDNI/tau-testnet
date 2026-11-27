@@ -2746,6 +2746,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             rule_text,
                             getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")(),
                             approval_slots_on,
+                            sender,
                         )
                         if rejection and not hard_reject:
                             accepted_in_block = False

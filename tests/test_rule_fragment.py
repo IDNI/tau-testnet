@@ -638,3 +638,74 @@ def test_web_wallet_templates_mirror_the_generator():
     start = source.index("function generateRandomTauRule")
     body = source[start:source.index("// --- Wallet Management Functions", start)]
     assert body.count("() => [") == len(_load_wallet_templates())
+
+
+# ---------------------------------------------------------------- sender guard
+
+GUARD_REF = "i12[t]:bv[384]"
+GUARD_LIT = "{ #x" + PUBKEY + " }:bv[384]"
+GUARD_CMP = f"{GUARD_REF} = {GUARD_LIT}"
+FEE = "o8[t]:bv[24] = { #x000005 }:bv[24]"
+PUBKEY_VALUE = int(PUBKEY, 16)
+
+
+def guard_of(body: str):
+    return parse_rule_unit(unit(body)).sender_guard
+
+
+@pytest.mark.parametrize("body", [
+    pytest.param(f"{GUARD_CMP} -> ({FEE})", id="bare-antecedent"),
+    pytest.param(f"({GUARD_CMP}) -> ({FEE})", id="parenthesized-antecedent"),
+    pytest.param(f"(({GUARD_CMP})) -> {FEE}", id="double-parenthesized-antecedent"),
+    pytest.param(f"(({GUARD_CMP}) -> ({FEE}))", id="parenthesized-whole"),
+    pytest.param(f"((({GUARD_CMP}) -> ({FEE})))", id="doubly-parenthesized-whole"),
+    pytest.param(f"({GUARD_CMP}) -> ({FEE} || {CMP})", id="wide-consequent"),
+    pytest.param(f"({GUARD_CMP}) -> (({A} > {B}) -> ({FEE}))", id="implication-in-consequent"),
+])
+def test_sender_guard_is_reported(body):
+    assert guard_of(body) == PUBKEY_VALUE
+
+
+def test_sender_guard_hex_is_case_insensitive():
+    upper = "{ #x" + PUBKEY.upper() + " }:bv[384]"
+    assert guard_of(f"({GUARD_REF} = {upper}) -> ({FEE})") == PUBKEY_VALUE
+
+
+def test_sender_guard_ignores_leading_zeros_in_value():
+    zeros = "{ #x00" + PUBKEY[2:] + " }:bv[384]"
+    assert guard_of(f"({GUARD_REF} = {zeros}) -> ({FEE})") == int(PUBKEY[2:], 16)
+
+
+@pytest.mark.parametrize("body", [
+    pytest.param(f"({GUARD_CMP}) <- ({FEE})", id="reverse-implication"),
+    pytest.param(f"({GUARD_CMP}) <-> ({FEE})", id="equivalence"),
+    pytest.param(f"({GUARD_CMP}) || ({FEE})", id="or"),
+    pytest.param(f"({GUARD_CMP}) && ({FEE})", id="and"),
+    pytest.param(f"({GUARD_CMP}) ? ({FEE}) : ({CMP})", id="ternary"),
+    pytest.param(f"({GUARD_CMP}) -> ({FEE}) ? ({CMP}) : ({CMP})", id="implication-in-ternary-condition"),
+    pytest.param(f"(({GUARD_CMP}) -> ({FEE})) ? ({CMP}) : ({CMP})", id="parenthesized-implication-ternary"),
+    pytest.param(f"!(({GUARD_CMP}) -> ({FEE}))", id="negated-implication"),
+    pytest.param(f"!({GUARD_CMP}) -> ({FEE})", id="negated-antecedent"),
+    pytest.param(f"({GUARD_REF} = {{ 1234 }}:bv[384]) -> ({FEE})", id="decimal-literal"),
+    pytest.param(f"({GUARD_REF} = {{ #b101 }}:bv[384]) -> ({FEE})", id="binary-literal"),
+    pytest.param(f"({GUARD_LIT} = {GUARD_REF}) -> ({FEE})", id="literal-on-the-left"),
+    pytest.param(f"({GUARD_REF} != {GUARD_LIT}) -> ({FEE})", id="inequality"),
+    pytest.param(f"(i3[t]:bv[384] = {GUARD_LIT}) -> ({FEE})", id="from-address-guard"),
+    pytest.param(f"(i120[t]:bv[384] = {GUARD_LIT}) -> ({FEE})", id="other-input"),
+    pytest.param(f"({GUARD_REF} = {{ #x{'ab' * 24} }}:bv[192]) -> ({FEE})", id="other-width"),
+    pytest.param(f"(({GUARD_CMP}) -> ({CMP})) -> ({FEE})", id="nested-implication-antecedent"),
+    pytest.param(f"(({GUARD_CMP}) && ({A} = {B})) -> ({FEE})", id="conjoined-antecedent"),
+    pytest.param(f"(({GUARD_CMP}) || ({A} = {B})) -> ({FEE})", id="disjoined-antecedent"),
+    pytest.param(f"(i12[t]:bv[384]' = {GUARD_LIT}) -> ({FEE})", id="complemented-ref"),
+    pytest.param(f"({GUARD_REF} = {GUARD_LIT}') -> ({FEE})", id="complemented-literal"),
+    pytest.param(f"({A} = {B}) -> ({FEE})", id="no-guard"),
+    pytest.param(FEE, id="bare-comparison"),
+])
+def test_sender_guard_absent_for_other_shapes(body):
+    assert guard_of(body) is None
+
+
+def test_sender_guard_does_not_change_what_is_admitted():
+    for text in (unit(f"({GUARD_CMP}) -> ({FEE})"), unit(f"({GUARD_CMP}) ? ({FEE}) : ({CMP})")):
+        assert isinstance(parse_rule_unit(text), RuleShape)
+    refused(unit(f"({GUARD_REF} = {{ #x{PUBKEY} }}) -> ({FEE})"))

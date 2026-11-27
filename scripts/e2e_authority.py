@@ -118,18 +118,14 @@ def history_policy_total(previous="00005a"):
             ": (o5[t]:bv[24] = { #x000001 }:bv[24]) )." % previous)
 
 
-def sender_fee(dave, carol):
-    """dave pays his own amount as a custom fee; carol pays its low six bits;
-    nobody else pays one. o8 is on no other rule, so this composes with the
-    incident's o5 rules."""
-    return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) ? (o8[t]:bv[24] = i1[t]:bv[24]) : "
-            "((i12[t]:bv[384] = { #x%s }:bv[384]) ? "
-            "(o8[t]:bv[24] = (i1[t]:bv[24] & { #x00003f }:bv[24])) : "
-            "(o8[t]:bv[24] = { #x000000 }:bv[24])) )." % (dave, carol))
+def sender_fee(pk, amount_expr):
+    """A fee rule fenced to `pk`'s own key: the account pays `amount_expr` as a custom fee."""
+    return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) -> "
+            "(o8[t]:bv[24] = %s) )." % (pk, amount_expr))
 
 
 def fee_for(who, amount):
-    """What the base fee and `sender_fee` charge `who` for a transfer."""
+    """What the base fee and the two `sender_fee` rules charge `who` for a transfer."""
     return BASE_FEE + {"dave": amount, "carol": amount & 0x3f}.get(who, 0)
 
 
@@ -697,10 +693,12 @@ def _run(root, keys, chain, nodes, args):
 
     # ---------------------------------------------------------------- 5, 6, 7
     say("== 5-7: A/B/C/D -- B steps the evaluator and allocates, then is rejected ==")
-    r = chain.send(a, "carol", {"0": sender_fee(pk["dave"], pk["carol"])})
-    check(5, "sender fee rule admitted", ok(r), r)
+    r = chain.send(a, "dave", {"0": sender_fee(pk["dave"], "i1[t]:bv[24]")})
+    r_c = chain.send(a, "carol", {"0": sender_fee(
+        pk["carol"], "(i1[t]:bv[24] & { #x00003f }:bv[24])")})
+    check(5, "sender fee rules admitted", ok(r) and ok(r_c), [r, r_c])
     _mine(chain, a)
-    check(5, "and included", tx_hash(r) in block_txs(a))
+    check(5, "and included", {tx_hash(r), tx_hash(r_c)} <= set(block_txs(a)))
     new_addr, x_addr = fresh_address("abcd-new"), fresh_address("abcd-x")
     carol0, dave0, erin0 = a.balance("carol"), a.balance("dave"), a.balance("erin")
     journal0 = a.journal()

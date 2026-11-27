@@ -257,7 +257,8 @@ class TestAdmissionLimits:
             "|| (i1[t]:bv[24] <= { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000001 }:bv[24])"
         )
         for rule in (flat, ladder):
-            result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+            result = validate_user_tx_reserved_domains(
+                {"sender_pubkey": "ab" * 48, "operations": {"0": rule}}, self._tip_view())
             assert result.is_valid, f"benign rule rejected: {rule} -> {result.error}"
 
     def test_user_rule_mocked_stream_only_in_comment_passes(self):
@@ -265,14 +266,16 @@ class TestAdmissionLimits:
         from consensus.admission import validate_user_tx_reserved_domains
         rule = (self._scoped("o8[t]:bv[24] = { #x000003 }:bv[24]")
                 + " # flat fee, not scaled by i2 balance")
-        result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+        result = validate_user_tx_reserved_domains(
+            {"sender_pubkey": "ab" * 48, "operations": {"0": rule}}, self._tip_view())
         assert result.is_valid, f"comment false-positive: {result.error}"
 
     def test_user_rule_custom_stream_not_mistaken_for_mocked(self):
         # Custom input stream i23 must not be screened as i2 (word boundary).
         from consensus.admission import validate_user_tx_reserved_domains
         rule = self._scoped("o8[t]:bv[24] = i23[t]:bv[24]")
-        result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+        result = validate_user_tx_reserved_domains(
+            {"sender_pubkey": "ab" * 48, "operations": {"0": rule}}, self._tip_view())
         assert result.is_valid, f"i23 mis-screened as i2: {result.error}"
 
     def test_consensus_revision_reading_mocked_input_rejected(self):
@@ -345,9 +348,10 @@ class TestAdmissionLimits:
         # Reading i12 is how a fee rule scopes itself to its own sender; the
         # reserved-set reuse for rule TEXT must keep excluding it.
         from consensus.admission import validate_user_tx_reserved_domains
-        rule = "always ( o8[t]:bv[24] = { 1 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384] )."
+        rule = self._scoped("o8[t]:bv[24] = { 1 }:bv[24]")
         assert validate_user_tx_reserved_domains(
-            {"operations": {"0": rule}}, self._tau_validator_set_tip_view()).is_valid
+            {"sender_pubkey": "ab" * 48, "operations": {"0": rule}},
+            self._tau_validator_set_tip_view()).is_valid
 
     def test_user_rule_reading_stake_mode_stream_rejected(self):
         from consensus.admission import validate_user_tx_reserved_domains
@@ -478,7 +482,7 @@ class TestAdmissionLimits:
 
 
 class TestUserRuleSenderScope:
-    """o8 rule text must be scoped to its author.
+    """o8 rule text must be fenced to its author's own key.
 
     Tau composes every deployed user rule into one constraint, so an unscoped
     fee rule applies to every sender: `always (o8[t] = 3)` taxes the whole
@@ -523,12 +527,12 @@ class TestUserRuleSenderScope:
         )
         assert result.is_valid, result.error
 
-    def test_scoped_on_i3_accepted(self):
-        """i3 (from address) is the documented alternative to i12."""
+    def test_scoped_on_i3_rejected(self):
         result = self._screen(
             f"always ((i3[t]:bv[384] = {self.PUBKEY}) -> o8[t]:bv[24] = {{ #x000003 }}:bv[24])."
         )
-        assert result.is_valid, result.error
+        assert not result.is_valid
+        assert result.code == "UNSCOPED_USER_RULE"
 
     def test_scope_named_only_in_a_comment_does_not_count(self):
         """A comment scopes nothing, so it must not satisfy the screen — the
@@ -557,17 +561,12 @@ class TestUserRuleSenderScope:
         result = self._screen("always (o13[t]:bv[16] = { #x0001 }:bv[16]).")
         assert result.is_valid, result.error
 
-    def test_known_gap_reference_is_not_proof_of_gating(self):
-        """Documented limitation, asserted so it is a known state rather than a
-        surprise: the screen is textual, so a rule that merely mentions i12
-        without gating on it passes. Catching this needs formula analysis."""
+    def test_a_mere_reference_to_i12_is_not_a_guard(self):
         result = self._screen(
             "always (o8[t]:bv[24] = { #x000003 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384])."
         )
-        assert result.is_valid, (
-            "if this now fails, the screen gained real scope analysis — good, "
-            "update the docs in tau_defs.py and README that call it textual"
-        )
+        assert not result.is_valid
+        assert result.code == "UNSCOPED_USER_RULE"
 
 
 class TestBalanceReadingPolicyRules:

@@ -1402,7 +1402,7 @@ init();
 // and a parked approval request takes custom inputs from key 26 up (attach them via Custom op key 26+).
 //
 // Fee (o8) rules are the opposite: they accumulate on the shared interpreter, so
-// they must be scoped to your own key with i12.
+// they must have the form always ( (i12[t]:bv[384] = { #x<your pubkey> }:bv[384]) -> ( ... ) ).
 const ruleTemplates = {
     "Block all transfers": `# ---------------------------------------------------------
 # BLOCK ALL TRANSFERS FROM MY ACCOUNT
@@ -1696,7 +1696,7 @@ always (
 #     i3/i4  : from/to pubkeys        (bv[384]; real at admission and apply)
 #     i5[t]  : block timestamp        (bv[64])
 #     i6..i11: consensus ABI (height, ts, proposer, parent hash, ...)
-#     i12[t] : sender real public key (bv[384]; fee rules scope on it, a policy clause must not mention it)
+#     i12[t] : sender real public key (bv[384]; fee rules must be guarded on your own key with it, a policy clause must not mention it)
 #     i26+   : your custom inputs (attach via Custom op keys >= 26; i13-i15 and i18-i25 are reserved)
 #
 #   OUTPUTS (reserved):
