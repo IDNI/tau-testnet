@@ -3,6 +3,8 @@
 The field's EFFECT on block verification is Phase 3; this only exercises the
 field plumbing, mirroring the vote_quorum precedent.
 """
+from dataclasses import asdict
+
 import pytest
 
 from consensus.retractable import RetractableBook
@@ -11,6 +13,7 @@ from consensus.governance import (
     validate_eligibility_mode,
     is_tau_authoritative_eligibility_mode,
     DEFAULT_ELIGIBILITY_MODE,
+    DEFAULT_SHARED_RULE_LIMITS,
 )
 
 
@@ -194,6 +197,9 @@ class TestFeeBeneficiary:
             "vote_quorum": mgr.effective_quorum_policy(),
             "fee_beneficiary": "ab" * 48,
             "retractable_transfers_root": RetractableBook().root().hex(),
+            "shared_rule_limits": asdict(DEFAULT_SHARED_RULE_LIMITS),
+            "shared_rule_count": 0,
+            "shared_rule_nodes": 0,
         }
 
     def test_default_metadata_omits_the_field_entirely(self):
@@ -201,4 +207,7 @@ class TestFeeBeneficiary:
         assert build_mechanism_metadata("supermajority") == {
             "vote_quorum": "supermajority",
             "retractable_transfers_root": RetractableBook().root().hex(),
+            "shared_rule_limits": asdict(DEFAULT_SHARED_RULE_LIMITS),
+            "shared_rule_count": 0,
+            "shared_rule_nodes": 0,
         }

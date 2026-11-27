@@ -359,8 +359,7 @@ def test_an_estimate_under_force_test_does_not_say_admissible(node, kind):
 
 def _fee_rule():
     return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) "
-            "? (o8[t]:bv[24] = { #x000002 }:bv[24]) "
-            ": (o8[t]:bv[24] = { #x000000 }:bv[24]) )." % SENDER)
+            "-> (o8[t]:bv[24] = { #x000002 }:bv[24]) )." % SENDER)
 
 
 def test_the_plain_form_on_a_user_rule_opens_no_admission_context(node):

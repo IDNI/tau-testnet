@@ -16,6 +16,7 @@ from .governance import (
     is_tau_authoritative_eligibility_mode,
 )
 from . import faucet, fees
+from .lanes import user_tx_carries_rule
 from . import sender_policy
 from .fees import FeeRuleError
 from .approvals import (
@@ -246,6 +247,7 @@ def _release_due_retractables(lm, balances, sequences, height, timestamp) -> Lis
 
 
 TEMPORAL_REFERENCE_REASON = "temporal_reference"
+RULE_FRAGMENT_REASON = "rule_fragment"
 RULE_CHANGE_NEEDS_APPROVAL_REASON = "rule_change_needs_approval"
 
 
@@ -256,6 +258,7 @@ def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tupl
         _screen_clause_domains,
         _screen_guard_domains,
         _width_mismatch_details,
+        is_rule_fragment_error,
         is_temporal_reference_error,
     )
 
@@ -264,6 +267,8 @@ def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tupl
         return None
     if is_temporal_reference_error(error):
         return error, TEMPORAL_REFERENCE_REASON
+    if is_rule_fragment_error(error):
+        return error, RULE_FRAGMENT_REASON
     if _width_mismatch_details(error):
         return error, "width_mismatch"
     return error, "rule_not_applied"
@@ -578,23 +583,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
     @classmethod
     def _counts_against_rule_budget(cls, tx: dict) -> bool:
-        """Whether this transaction costs a clause build.
+        """Whether this transaction costs an interpreter or clause build.
 
-        The rule-sharing types always do, and so does a user_tx carrying an o5
-        policy rule, because every such rule registers a clause.
+        Rule-sharing types and every user_tx with an op-0 rule do: an o5 rule
+        registers a clause, any other rule rebuilds the shared spec.
         """
         tx_type = tx.get("tx_type", "user_tx")
         if tx_type in RULE_OFFER_TX_TYPES or tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
             return True
-        if tx_type != "user_tx":
-            return False
-        operations = tx.get("operations")
-        if not isinstance(operations, dict):
-            return False
-        rule_text = operations.get("0")
-        if not isinstance(rule_text, str) or not rule_text.strip():
-            return False
-        return tau_defs.USER_POLICY_STREAM_INDEX in clause_output_streams(rule_text)
+        return user_tx_carries_rule(tx)
 
     def verify_block_header(self, *args, **kwargs) -> bool:
         """
@@ -653,8 +650,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # on (COMM_TIMEOUT, then a watchdog kill).
         # This is consensus, not policy: over-budget blocks are invalid.
         #
-        # Counts the rule-sharing types and every user_tx carrying an o5 rule:
-        # each one builds a clause.
+        # Counts the rule-sharing types and every user_tx carrying an op-0 rule.
         if block is not None and active_view is not None:
             budget = self._view_rule_tx_budget(active_view)
             if budget is not None:
@@ -2090,22 +2086,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                     # Lazy: consensus.admission imports chain_state, which imports this module.
                     from consensus.admission import (
-                        _temporal_backreference,
+                        revision_fragment_error,
                         revision_policy_width_error,
                     )
 
-                    temporal_ref = _temporal_backreference(update.rule_revisions)
+                    fragment_error = revision_fragment_error(update.rule_revisions)
                     width_error = revision_policy_width_error(update.rule_revisions)
                     if min_activation is not None and update.activate_at_height < min_activation:
                         tx_receipt["logs"].append(
                             "Update ignored (activation delay breached): "
                             f"{update.activate_at_height} < {min_activation}"
                         )
-                    elif temporal_ref:
-                        # Activation would reset into a spec with lookback.
+                    elif fragment_error:
                         tx_receipt["logs"].append(
-                            "Update ignored (consensus rule revision reads a "
-                            f"previous step): {temporal_ref}"
+                            f"Update ignored (consensus rule revision: {fragment_error})"
                         )
                     elif width_error:
                         tx_receipt["logs"].append(
@@ -2706,6 +2700,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             _rule_prior_rules_state = None
             _rule_prior_tau_bytes = current_tau_bytes
             _rule_touched_canonical = False
+            _shared_rule_nodes = None
             try:
                 if hasattr(chain_state, "get_application_rules_state"):
                     _rule_prior_rules_state = _rules_state()
@@ -2741,11 +2736,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                      elif isinstance(rule_op_data, str) and rule_op_data.strip():
                         rule_text = rule_op_data.strip()
                         # Lazy: consensus.admission imports chain_state, which imports this module.
-                        from consensus.admission import screen_user_rule_text
+                        from consensus.admission import (
+                            counts_toward_shared_budget,
+                            screen_shared_rule_budget,
+                            screen_user_rule_text,
+                            shared_rule_shape,
+                        )
                         rejection = screen_user_rule_text(
                             rule_text,
                             getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")(),
                             approval_slots_on,
+                            sender,
                         )
                         if rejection and not hard_reject:
                             accepted_in_block = False
@@ -2753,6 +2754,26 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             execution_success = False
                             tx_receipt["reason"] = rejection.reason
                             tx_receipt["logs"].append(f"Error: {rejection.error}")
+                        if (execution_success and accepted_in_block and not hard_reject
+                                and counts_toward_shared_budget(rule_text)):
+                            _shape = shared_rule_shape(rule_text)
+                            budget_rejection = _shape and screen_shared_rule_budget(
+                                _shape,
+                                lifecycle_mgr.shared_rule_limits,
+                                lifecycle_mgr.shared_rule_count,
+                                lifecycle_mgr.shared_rule_nodes,
+                            )
+                            if budget_rejection:
+                                accepted_in_block = False
+                                hard_reject = True
+                                execution_success = False
+                                tx_receipt["reason"] = budget_rejection.reason
+                                tx_receipt["logs"].append(f"Error: {budget_rejection.error}")
+                                logger.error(
+                                    "Transaction invalid: %s", budget_rejection.error
+                                )
+                            elif _shape is not None:
+                                _shared_rule_nodes = _shape.nodes
                         if execution_success and accepted_in_block and not hard_reject:
                           try:
                             # The rule goes through the evaluator SESSION rather
@@ -3222,6 +3243,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     "the live interpreter still holds the rolled-back rule until "
                     "it is next reconstructed from canonical state"
                 )
+
+            if _shared_rule_nodes is not None and accepted_in_block and not hard_reject:
+                _usage = _lifecycle_for_write()
+                _usage.shared_rule_count += 1
+                _usage.shared_rule_nodes += _shared_rule_nodes
 
             if accepted_in_block and not hard_reject:
                 # Record this sender's transfer time for the cooldown stream

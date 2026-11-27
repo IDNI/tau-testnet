@@ -15,6 +15,7 @@ from errors import (
     TauSpecIntegrationError,
     TauSpecRejected,
 )
+import tau_engine_profile
 import tau_io_logger
 
 # Setup logging
@@ -119,8 +120,10 @@ def load_tau_module():
         logger.info(f"Found native tau module at: {found_path}")
         sys.path.insert(0, found_path)
         try:
+            tau_engine_profile.prepare_environment()
             import tau as tau_module
             _checked_tau_module(tau_module)
+            tau_engine_profile.apply(tau_module)
             tau = tau_module
             _native_tau_dir = found_path
             return tau
@@ -138,12 +141,14 @@ def load_tau_module():
             raise
     else:
         # Fallback: check if it's already in pythonpath
+        tau_engine_profile.prepare_environment()
         try:
             import tau as tau_module
         except ImportError:
             logger.error("Could not find native tau module in candidates or PYTHONPATH")
             raise ImportError("Native tau module not found. Ensure tau-lang is built and accessible.")
         _checked_tau_module(tau_module)
+        tau_engine_profile.apply(tau_module)
         tau = tau_module
         mod_file = getattr(tau_module, "__file__", None)
         if mod_file:

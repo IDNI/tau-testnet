@@ -165,6 +165,8 @@ def encode_host_contract_patch(patch: Dict[str, Union[int, str, bool, List[str]]
             v_bytes = b"\x03" + encode_string(v) # Type tag 3 for string
         elif isinstance(v, list):
             v_bytes = b"\x04" + _encode_string_list(v, canonicalize=k in VALIDATOR_DELTA_FIELDS)
+        elif isinstance(v, dict):
+            v_bytes = b"\x05" + encode_host_contract_patch(v) # Type tag 5 for a nested object
         else:
             raise ValueError(f"Unsupported property type for key {k}: {type(v)}")
         encoded_pairs.append((k, k_bytes, v_bytes))
