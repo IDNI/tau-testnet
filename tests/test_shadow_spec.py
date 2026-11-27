@@ -37,7 +37,7 @@ from consensus import sender_policy
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
 from consensus.policy_mock import MockPolicyEvaluator
-from consensus.shadow_spec import ShadowSpec
+from consensus.shadow_spec import ShadowSpec, _raise_gc_floor
 from consensus.state import TauStateSnapshot
 
 import test_approval_apply as ap
@@ -256,6 +256,19 @@ def _mixed_chain(shadow_driver):
 
 
 # --- the shadow's feed discipline --------------------------------------------
+
+def test_gc_floor_raised_for_second_interpreter():
+    calls = []
+    module = types.SimpleNamespace(
+        set_gc_min_size=lambda n: calls.append(("gc", n)),
+        set_tref_budget=lambda n: calls.append(("tref", n)),
+    )
+    _raise_gc_floor(types.SimpleNamespace(tau=module))
+    assert calls == [("gc", 100_000_000), ("tref", 0)]
+    # Bindings without the setters (scripted doubles) are left alone.
+    _raise_gc_floor(types.SimpleNamespace(tau=types.SimpleNamespace()))
+    _raise_gc_floor(types.SimpleNamespace())
+
 
 def test_shadow_matches_live_running_spec(temp_database, shadow_driver):
     chain, blocks = _mixed_chain(shadow_driver)
