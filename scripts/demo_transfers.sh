@@ -206,49 +206,41 @@ run "$PY" "$WALLET" balance --address "$BOB_ADDR" --host "$HOST" --port "$PORT"
 run "$PY" "$WALLET" balance --address "$CHARLIE_ADDR" --host "$HOST" --port "$PORT"
 
 # Generate a random *simple* Tau rule to ship alongside transfers.
-# IMPORTANT: We avoid touching `o1[t]` (transfer validation output) and we only
-# reference `i1..i4` so the node already provides those inputs during transfer
-# validation. This keeps rule injection "safe" while still exercising Tau's
-# parser/type system with a bit of structure.
+# Rules are one `always ( ... ).` unit over bv[24] values: they read only
+# i1/i2 (amount, balance) and write the free output streams o12..o21.
 random_tau_rule() {
-  local out_idx=$(( 5 + (RANDOM % 10) )) # o5..o14
+  local out_idx=$(( 12 + (RANDOM % 10) )) # o12..o21
+  local a="i1[t]:bv[24]"
+  local b="i2[t]:bv[24]"
+  local zero="{ #x000000 }:bv[24]"
 
-  # "Broken-down" building blocks inspired by more complex SBF-style rules.
-  # Here we stick to bitvectors (`:bv`) since the chain's built-in Tau rules
-  # cast i1..i4 as bitvectors.
   local -a exprs=(
-    "(i1[t] & i2[t] | { #b0 }:bv[64])"
-    "(i3[t] | i4[t] | { #b0 }:bv[64])"
-    "((i1[t] | { #b0 }:bv[64])')"
-    "((i1[t] | i2[t]) & (i3[t] | { 170 }:bv[64]))"
-    "((i4[t] | { 66 }:bv[64])' | (i1[t] & i2[t]))"
-    "(((i1[t] | i2[t]) & i3[t]) | { #b0 }:bv[64])"
-    "(((i1[t] & i2[t] | { #b0 }:bv[64]) | (i3[t] | i4[t] | { #b0 }:bv[64])))"
+    "($a & $b)"
+    "($a | { 1 }:bv[24])"
+    "(($a | { 1 }:bv[24])')"
+    "(($a | $b) & { 170 }:bv[24])"
+    "(($b | { 66 }:bv[24])' | ($a & $b))"
+    "((($a | $b) & $a) | { 1 }:bv[24])"
   )
 
   local expr="${exprs[$(( RANDOM % ${#exprs[@]} ))]}"
 
-  # Pick a small family of rule shapes (simple assignment vs. small conditional).
   local shape=$(( RANDOM % 4 ))
   case "$shape" in
     0)
-      # simplest: just define an unused output stream
-      printf 'always (o%s[t] = %s).' "$out_idx" "$expr"
+      printf 'always (o%s[t]:bv[24] = %s).' "$out_idx" "$expr"
       ;;
     1)
-      # conditional (mirrors examples like "cond ? o = expr : o = (expr)'")
-      printf "always ((%s != { #b0 }:bv[64]) ? o%s[t] = %s : o%s[t] = (%s)')." \
-        "$expr" "$out_idx" "$expr" "$out_idx" "$expr"
+      printf "always ((%s != %s) ? o%s[t]:bv[24] = %s : o%s[t]:bv[24] = (%s)')." \
+        "$expr" "$zero" "$out_idx" "$expr" "$out_idx" "$expr"
       ;;
     2)
-      # same structure, but flip the comparator
-      printf "always ((%s = { #b0 }:bv[64]) ? o%s[t] = %s : o%s[t] = (%s)')." \
-        "$expr" "$out_idx" "$expr" "$out_idx" "$expr"
+      printf "always ((%s = %s) ? o%s[t]:bv[24] = %s : o%s[t]:bv[24] = (%s)')." \
+        "$expr" "$zero" "$out_idx" "$expr" "$out_idx" "$expr"
       ;;
     *)
-      # constant output (keeps a very small/cheap option in the mix)
       local bit=$(( RANDOM % 2 )) # 0 or 1
-      printf 'always (o%s[t] = { #b%s }:bv[64]).' "$out_idx" "$bit"
+      printf 'always (o%s[t]:bv[24] = { %s }:bv[24]).' "$out_idx" "$bit"
       ;;
   esac
 }

@@ -475,8 +475,7 @@ def test_untyped_o5_is_refused_at_admission(tip_view):
     result = validate_user_tx_reserved_domains(
         _user_tx(operations={"0": _unit("o5[t] = 1")}), tip_view)
     assert result.is_valid is False
-    assert result.code == "WIDTH_MISMATCH"
-    assert result.details["found"] == "untyped"
+    assert result.code == "RULE_FRAGMENT"
 
 
 def test_bv24_unit_is_admitted(tip_view):

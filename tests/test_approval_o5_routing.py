@@ -163,7 +163,7 @@ def test_a_new_author_is_admitted_however_many_clauses_exist(tip_view):
 # --- the per-block budget ---------------------------------------------------
 
 def test_a_routed_rule_counts_against_the_block_budget():
-    """Each o5 rule builds a clause, so it costs what an offer costs."""
+    """Every op-0 rule costs a build: a clause for o5, a spec rebuild otherwise."""
     from consensus.engine import TauConsensusEngine as E
 
     plain = {"tx_type": "user_tx", "operations": {"1": [[A, B, "5"]]}}
@@ -175,7 +175,7 @@ def test_a_routed_rule_counts_against_the_block_budget():
     assert E._counts_against_rule_budget(_tx(NEUTRAL_RULE)) is True
     assert E._counts_against_rule_budget(offer) is True, "always counted"
     assert E._counts_against_rule_budget(plain) is False
-    assert E._counts_against_rule_budget(other_stream) is False
+    assert E._counts_against_rule_budget(other_stream) is True
 
 
 def test_a_whitespace_only_rule_does_not_count():

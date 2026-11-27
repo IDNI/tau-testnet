@@ -563,6 +563,30 @@ def test_the_book_round_trips(temp_database):
 
 
 @pytest.mark.usefixtures("isolated_chain_state")
+def test_a_settled_due_point_survives_a_restart(temp_database):
+    # #178: the settled (due_index, slot) pairs are what keep a manually-settled
+    # due point settled. They ride in `more` (element 14); the db layer used to
+    # truncate `more` to its first 12 elements on read, so a restart silently
+    # dropped them and the double-pay hole reopened. has_due_payout_rules also
+    # unpacked exactly 12 names from the stored 14/15-element `more` and raised
+    # on any installed extended rule.
+    lm = _seed()
+    book = lm.payout_rules
+    # A rule with a real due schedule (the seeded rules have none: their
+    # `more` is None, so there is no due point to settle).
+    terms = _installed(book, due_at=NEXT_HEIGHT + 10, due_every=10)
+    assert not book.state[(A, terms.rule_id)].settled_due
+    book.note_manual_due_payment(A, terms.rule_id, [(0, B, 25)])
+    settled = book.state[(A, terms.rule_id)].settled_due
+    assert settled, "manual payment must settle the outstanding due point"
+    chain_state.commit_state_to_db("head-hash", 60)
+    assert isinstance(db.has_due_payout_rules(NEXT_HEIGHT, TIP_TS), bool)
+    reloaded = _reload().payout_rules
+    assert reloaded.store_rows() == book.store_rows()
+    assert reloaded.state[(A, terms.rule_id)].settled_due == settled
+
+
+@pytest.mark.usefixtures("isolated_chain_state")
 @pytest.mark.parametrize("column, value", [
     ("cap_per_execution", 101), ("expires_at", 7), ("slots_json", "[\"\"]"),
     ("spent_in_period", 10_000), ("paid_total", 0),

@@ -836,7 +836,7 @@ def _golden_block():
     return lm, txs
 
 
-GOLDEN_STATE_HASH = "67173557fe8137ccef43622a0dba4b480c2ed498b3920533555c53523eb520a7"
+GOLDEN_STATE_HASH = "6b94863ae315da7a2e0b38b4994bc637ec422d11dd2ff7533002799fed377428"
 
 
 def test_a_block_of_genuine_policy_txs_reaches_the_pinned_state():

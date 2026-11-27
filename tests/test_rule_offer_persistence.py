@@ -10,9 +10,17 @@ The last test is the counterpart: `rule_text` and `status` are node-local
 durability for the RPC surface and must NOT affect the hash, exactly as
 governance update payloads do not.
 """
+from dataclasses import asdict, replace
+from types import SimpleNamespace
+
 import chain_state
 import pytest
-from consensus.governance import ConsensusLifecycleManager, DEFAULT_MAX_RULE_TXS_PER_BLOCK
+import db
+from consensus.governance import (
+    DEFAULT_MAX_RULE_TXS_PER_BLOCK,
+    DEFAULT_SHARED_RULE_LIMITS,
+    ConsensusLifecycleManager,
+)
 from consensus.rule_offers import (
     STATUS_ACCEPTED,
     STATUS_EXPIRED,
@@ -166,6 +174,90 @@ def test_default_block_budget_round_trips(temp_database):
     assert reloaded.consensus_meta_hash() == before
 
 
+def test_shared_rule_budget_round_trips(temp_database):
+    lm = _seed_state(ConsensusLifecycleManager(active_validators=[A]))
+    lm.shared_rule_limits = replace(
+        DEFAULT_SHARED_RULE_LIMITS, occurrences=4, total_nodes=33, width=48)
+    lm.shared_rule_count = 3
+    lm.shared_rule_nodes = 21
+    before = lm.consensus_meta_hash()
+
+    reloaded = _reload()
+
+    assert reloaded.shared_rule_limits == lm.shared_rule_limits
+    assert (reloaded.shared_rule_count, reloaded.shared_rule_nodes) == (3, 21)
+    assert reloaded.consensus_meta_hash() == before
+
+
+def test_default_shared_rule_budget_round_trips(temp_database):
+    lm = _seed_state(ConsensusLifecycleManager(active_validators=[A]))
+    before = lm.consensus_meta_hash()
+    reloaded = _reload()
+    assert reloaded.shared_rule_limits == DEFAULT_SHARED_RULE_LIMITS
+    assert (reloaded.shared_rule_count, reloaded.shared_rule_nodes) == (0, 0)
+    assert reloaded.consensus_meta_hash() == before
+
+
+def test_the_block_apply_rows_carry_the_budget(temp_database):
+    lm = _seed_state(ConsensusLifecycleManager(active_validators=[A]))
+    lm.shared_rule_limits = replace(DEFAULT_SHARED_RULE_LIMITS, rule_nodes=12)
+    lm.shared_rule_count = 5
+    lm.shared_rule_nodes = 17
+    snapshot = SimpleNamespace(
+        tau_bytes=b"app rules",
+        metadata={
+            "lifecycle_manager": lm,
+            "balances": {"acct": 1},
+            "sequence_numbers": {"acct": 0},
+            "consensus_rules_state": "consensus rules",
+        },
+    )
+    kwargs = chain_state._canonical_state_kwargs(snapshot, head_hash="head-hash", head_num=21)
+    assert kwargs["shared_rule_budget"] == {
+        "limits": {**asdict(DEFAULT_SHARED_RULE_LIMITS), "rule_nodes": 12},
+        "count": 5,
+        "nodes": 17,
+    }
+
+    db.save_canonical_state_atomically(**kwargs)
+    chain_state._lifecycle_manager = ConsensusLifecycleManager(active_validators=["d" * 96])
+    assert chain_state.load_state_from_db() is True
+    reloaded = chain_state._lifecycle_manager
+    assert reloaded.shared_rule_limits == lm.shared_rule_limits
+    assert (reloaded.shared_rule_count, reloaded.shared_rule_nodes) == (5, 17)
+
+
+def test_the_budget_rows_are_canonical_json_and_decimal_counters(temp_database):
+    lm = _seed_state(ConsensusLifecycleManager(active_validators=[A]))
+    lm.shared_rule_count = 2
+    _reload()
+    assert db.get_chain_state_value("shared_rule_limits", "") == (
+        '{"occurrences":10,"rule_bytes":1024,"rule_depth":8,"rule_nodes":32,'
+        '"total_nodes":80,"width":384}'
+    )
+    assert db.get_chain_state_value("shared_rule_count", "") == "2"
+    assert db.get_chain_state_value("shared_rule_nodes", "") == "0"
+
+
+@pytest.mark.parametrize("key,value", [
+    ("shared_rule_limits", "not json"),
+    ("shared_rule_limits", '{"occurrences":10}'),
+    ("shared_rule_limits", '{"occurrences":10,"rule_bytes":1024,"rule_depth":8,"rule_nodes":32,"total_nodes":80,"width":999}'),
+    ("shared_rule_count", "many"),
+    ("shared_rule_count", "-4"),
+    ("shared_rule_nodes", ""),
+])
+def test_malformed_budget_rows_fall_back_to_the_defaults(temp_database, key, value):
+    _seed_state(ConsensusLifecycleManager(active_validators=[A]))
+    chain_state.commit_state_to_db("head-hash", 20)
+    db.set_chain_state_value(key, value)
+    chain_state._lifecycle_manager = ConsensusLifecycleManager(active_validators=["d" * 96])
+    assert chain_state.load_state_from_db() is True
+    lm = chain_state._lifecycle_manager
+    assert lm.shared_rule_limits == DEFAULT_SHARED_RULE_LIMITS
+    assert (lm.shared_rule_count, lm.shared_rule_nodes) == (0, 0)
+
+
 def test_lost_rule_text_does_not_change_the_meta_hash(temp_database):
     """`rule_text` is node-local. A reload that loses it must still hash the
     same, which is what makes acceptance validate from hashed state alone."""
@@ -240,6 +332,8 @@ def test_every_commit_site_persists_rule_offers():
     tree = ast.parse(source)
     required = {
         "rule_offers", "rule_clauses", "max_rule_txs_per_block",
+        # Limits and usage counters of the shared-rule budget are hash-bound.
+        "shared_rule_budget",
         # Co-signature approvals: the request book root (including which
         # approvers have voted) is bound into consensus_meta_hash, so a path
         # that omits it rehydrates a stale book after a restart.

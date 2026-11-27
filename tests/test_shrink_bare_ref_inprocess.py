@@ -117,7 +117,7 @@ def _apply_block(rule_text):
         )
 
 
-def test_block_apply_bare_ref_of_a_shrunk_stream_is_node_local(in_process):
+def test_block_apply_bare_ref_of_a_shrunk_stream_is_node_local(in_process, allow_history_rules):
     engine = in_process(codes=(4,))
     result = _apply_block(BARE_I13)
     assert "r1" in [t.get("tx_id") for t in result.rejected_transactions]
@@ -129,7 +129,7 @@ def test_block_apply_bare_ref_of_a_shrunk_stream_is_node_local(in_process):
     assert engine.rules == []
 
 
-def test_block_apply_other_rejection_keeps_its_cause(in_process):
+def test_block_apply_other_rejection_keeps_its_cause(in_process, allow_history_rules):
     in_process(codes=(13,), shrunk=frozenset())
     result = _apply_block(BARE_I13)
     logs = "\n".join(result.receipts["r1"]["logs"])

@@ -18,19 +18,23 @@ def test_a_temporal_consensus_revision_is_refused_at_admission():
     it cannot reproduce the input history a `[t-k]` consensus rule would read.
     Nothing may introduce one while that is true.
     """
-    from consensus.admission import _temporal_backreference
+    from consensus.admission import is_temporal_reference_error, revision_fragment_error
+
+    def temporal(text):
+        return is_temporal_reference_error(revision_fragment_error([text]))
 
     # the boundary means "any reference to something other than the current step",
     # not "any text matching one spelling of t-N"
-    assert _temporal_backreference(["always ( o6[t]:bv[16] = i10[t-1]:bv[16] )."])
-    assert _temporal_backreference(["always ( o6[t]:bv[16] = i10[t - 1]:bv[16] )."])
-    assert _temporal_backreference(["always ( o6[t]:bv[16] = i10[ t  -  2 ]:bv[16] )."])
-    assert _temporal_backreference(["always ( o7[t]:bv[16] = o7[t-2]:bv[16] )."])
-    assert _temporal_backreference(["always ( o6[t]:bv[16] = i10[3]:bv[16] )."])
-    # a stream name the scanner cannot resolve fails closed
-    assert _temporal_backreference(["always ( o6[t]:bv[16] = i10 )."])
+    assert temporal("always ( o6[t]:bv[16] = i10[t-1]:bv[16] ).")
+    assert temporal("always ( o6[t]:bv[16] = i10[t - 1]:bv[16] ).")
+    assert temporal("always ( o6[t]:bv[16] = i10[ t  -  2 ]:bv[16] ).")
+    assert temporal("always ( o7[t]:bv[16] = o7[t-2]:bv[16] ).")
+    assert temporal("always ( o6[t]:bv[16] = i10[3]:bv[16] ).")
+    # a stream the parser cannot resolve is refused, though not as temporal
+    assert revision_fragment_error(["always ( o6[t]:bv[16] = i10 )."])
     # current-step references are fine
-    assert _temporal_backreference(["always ( o6[t]:bv[16] = { #x0001 }:bv[16] )."]) is None
-    assert _temporal_backreference(["always ( o6[ t ]:bv[16] = i10[t]:bv[16] )."]) is None
+    assert revision_fragment_error(["always ( o6[t]:bv[16] = { #x0001 }:bv[16] )."]) is None
     # a comment mentioning one is not one
-    assert _temporal_backreference(["# i10[t-1] was considered\nalways ( o6[t]:bv[16] = { #x0001 }:bv[16] )."]) is None
+    assert revision_fragment_error(["# i10[t-1] was considered\nalways ( o6[t]:bv[16] = { #x0001 }:bv[16] )."]) is None
+    # padded brackets are not the current step's spelling
+    assert revision_fragment_error(["always ( o6[ t ]:bv[16] = i10[t]:bv[16] )."])

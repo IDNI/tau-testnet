@@ -149,7 +149,7 @@ class TestSendTxMapping(unittest.TestCase):
             tau_native, "compile_revisions_isolated_subprocess",
             lambda *a, **k: "Error: rejected",
         ).start()
-        tx = self._base_tx(operations={"0": "broken_rule."})
+        tx = self._base_tx(operations={"0": "always ( o13[t]:bv[24] = i1[t]:bv[24] )."})
         with patch.dict(os.environ, {"TAU_FORCE_TEST": "0"}):
             result = sendtx.queue_transaction(json.dumps(tx))
         self.assertFalse(result["ok"])
@@ -188,7 +188,7 @@ class TestSendTxMapping(unittest.TestCase):
             raise RuntimeError("synthetic boom")
 
         patch.object(tau_native, "compile_revisions_isolated_subprocess", boom).start()
-        tx = self._base_tx(operations={"0": "some_rule."})
+        tx = self._base_tx(operations={"0": "always ( o13[t]:bv[24] = i1[t]:bv[24] )."})
         with patch.dict(os.environ, {"TAU_FORCE_TEST": "0"}):
             result = sendtx.queue_transaction(json.dumps(tx))
         self.assertFalse(result["ok"])
@@ -203,7 +203,7 @@ class TestSendTxMapping(unittest.TestCase):
             raise tau_native.RuleCompileTimeout("Rule compile timed out.")
 
         patch.object(tau_native, "compile_revisions_isolated_subprocess", timed_out).start()
-        tx = self._base_tx(operations={"0": "expensive_rule."})
+        tx = self._base_tx(operations={"0": "always ( o13[t]:bv[24] = i1[t]:bv[24] )."})
         with patch.dict(os.environ, {"TAU_FORCE_TEST": "0"}):
             result = sendtx.queue_transaction(json.dumps(tx))
         self.assertFalse(result["ok"])
@@ -237,7 +237,7 @@ class TestSendTxMapping(unittest.TestCase):
             "commands.sendtx.tau_manager.restore_full_tau_spec",
             lambda *a, **k: restore_calls.append(1),
         ).start()
-        tx = self._base_tx(operations={"0": "some_rule."})
+        tx = self._base_tx(operations={"0": "always ( o13[t]:bv[24] = i1[t]:bv[24] )."})
         with patch.dict(os.environ, {"TAU_FORCE_TEST": "0"}):
             result = sendtx.queue_transaction(json.dumps(tx))
         self.assertFalse(result["ok"])
