@@ -6,6 +6,7 @@ a due rule, a royalty is an on-arrival rule, and an update supersedes the old
 version instead of replacing the account's only rule.
 """
 from dataclasses import replace
+from datetime import date
 
 import pytest
 from py_ecc.bls import G2Basic
@@ -152,6 +153,66 @@ def test_add_months_clamps_to_the_end_of_the_month():
     assert p.add_months(jan31, 1) == 1772236800   # Feb 28 (2026 not a leap year)
     assert p.add_months(jan31, 2) == 1774915200   # Mar 31
     assert p.due_point_of(jan31, None, 1, 1) == 1772236800
+
+
+def test_monthly_grid_clamps_and_returns_on_leap_and_century_years():
+    # The 31st comes back after a short month: Feb clamps, Mar is the 31st
+    # again. Pins the Gregorian edges: leap years 2000/2028 (Feb 29) and the
+    # century non-leap year 2100 (Feb 28).
+    cases = [
+        # (Jan 31 00:00 UTC, Feb last day, Mar 31)
+        (949276800, 951782400, 954460800),    # 2000: Feb 29 (leap, div by 400)
+        (1832889600, 1835395200, 1838073600),  # 2028: Feb 29 (leap)
+        (4105036800, 4107456000, 4110134400),  # 2100: Feb 28 (century, not leap)
+    ]
+    for jan31, feb_last, mar31 in cases:
+        assert p.add_months(jan31, 1) == feb_last
+        assert p.add_months(jan31, 2) == mar31
+        assert p.due_point_of(jan31, None, 1, 1) == feb_last
+        assert p.due_point_of(jan31, None, 1, 2) == mar31
+    # The period boundary is exact: one second before the Feb due point is
+    # still period 0, the due point itself starts period 1.
+    terms = _terms(AKEY, 1, due_at=949276800, due_months=1,
+                   expires_at=10 ** 15)
+    feb29 = 951782400  # 2000-02-29 00:00 UTC, due point 1 of the Jan-31 rule
+    assert terms.due_index_after(0, feb29 - 1) - 1 == 0
+    assert terms.due_index_after(0, feb29) - 1 == 1
+    assert terms.due_index_after(0, feb29 + 1) - 1 == 1
+
+
+def test_monthly_grid_matches_independent_calendar_vectors():
+    # MarcoDiPolo's conformance vectors for #34 (gist e690cb5794025cca58c991d23f1aeab1):
+    # 62 schedules starting Jan 2000, signed days 1-31 at 00:00:00 and
+    # 23:59:59 UTC, every month through Dec 2399. Expected due times are built
+    # from the day distance between consecutive firsts of the month, never from
+    # add_months itself, so this checks the helper against an independent
+    # calendar. 297,600 due checks + 892,800 relative-index checks.
+    epoch = date(1970, 1, 1)
+    due_checks = index_checks = 0
+    for index in range(4800):
+        year_offset, zero_month = divmod(index, 12)
+        year = 2000 + year_offset
+        first = date(year, zero_month + 1, 1)
+        next_first = (date(year + 1, 1, 1) if zero_month == 11
+                      else date(year, zero_month + 2, 1))
+        length = (next_first - first).days
+        for day in range(1, 32):
+            anchor_midnight = (date(2000, 1, day) - epoch).days * 86400
+            expected_midnight = ((first - epoch).days + min(day, length) - 1) * 86400
+            for second in (0, 86399):
+                anchor = anchor_midnight + second
+                expected = expected_midnight + second
+                assert p.due_point_of(anchor, None, 1, index) == expected
+                due_checks += 1
+                terms = _terms(AKEY, 1, due_at=anchor, due_months=1,
+                               expires_at=10 ** 15)
+                for offset, expected_index in ((-1, index - 1), (0, index),
+                                               (1, index)):
+                    assert (terms.due_index_after(index - 1, expected + offset) - 1
+                            == expected_index)
+                    index_checks += 1
+    assert due_checks == 297600
+    assert index_checks == 892800
 
 
 def test_restore_round_trips_extended_rows_and_the_root():
