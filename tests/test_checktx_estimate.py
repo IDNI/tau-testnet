@@ -14,6 +14,7 @@ import db
 import tau_admission
 from commands import checktx
 from consensus.admission import TipAdmissionView
+from consensus.network_binding import chain_genesis_hash
 from consensus.rule_offers import RuleOffer
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 
@@ -27,6 +28,7 @@ FAR = 9_999_999_999
 BASE_FEE = 10
 CUSTOM_FEE = 3
 OFFER_RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
+PAYOUT_RULE = "always ( o30[t]:bv[24] = i40[t]:bv[24] )."
 
 
 class _Session:
@@ -95,9 +97,14 @@ def node(temp_database, mock_policy_evaluators, monkeypatch):
         patch.object(TipAdmissionView, "approval_slots_active",
                      new_callable=PropertyMock, return_value=True),
         patch.object(TipAdmissionView, "get_offer", return_value=_offer_row()),
+        patch.object(TipAdmissionView, "payout_book", return_value=_payout_book()),
     ]
     mocks = [p.start() for p in patches]
     mocks[3].is_set.return_value = True
+    from consensus import sender_policy
+    from consensus.payout import payout_rule_body
+    sender_policy.evaluator("payout_admission").set_outputs(
+        payout_rule_body(PAYOUT_RULE), {"o30": 7})
     monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
     monkeypatch.setitem(chain_state._balances, RECIPIENT, 1_000_000)
     yield script, standby
@@ -108,6 +115,22 @@ def node(temp_database, mock_policy_evaluators, monkeypatch):
 def _offer():
     return RuleOffer(offerer_pubkey=SENDER, recipient_pubkey=RECIPIENT,
                      rule_text=OFFER_RULE, expire_at_height=NEXT_HEIGHT + 100)
+
+
+def _payout_fields():
+    return {"rule_text": PAYOUT_RULE, "slots": [APPROVER], "cap_per_execution": 100,
+            "cap_per_period": 1000, "period_blocks": 10, "expires_at": NEXT_HEIGHT + 500}
+
+
+def _payout_book():
+    """RECIPIENT has a payout rule installed, so anyone may execute it."""
+    from consensus.payout import PayoutBook, parse_payout_rule_set
+
+    book = PayoutBook()
+    terms = parse_payout_rule_set({"sender_pubkey": RECIPIENT, "sequence_number": 0,
+                                   **_payout_fields()})
+    book.install(terms, NEXT_HEIGHT - 5)
+    return book
 
 
 def _offer_row():
@@ -147,6 +170,14 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind == "payout_rule_set":
+        return _envelope(kind, SENDER, fee_limit, genesis_hash=chain_genesis_hash(),
+                         **_payout_fields())
+    if kind == "payout_execute":
+        return _envelope(kind, SENDER, fee_limit, account_pubkey=RECIPIENT,
+                         rule_id=_payout_book().get(RECIPIENT).rule_id.hex(),
+                         recipients={}, data={"0": 7},
+                         genesis_hash=chain_genesis_hash())
     raise AssertionError(kind)
 
 
@@ -158,7 +189,7 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request", "payout_rule_set", "payout_execute"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():
@@ -419,6 +450,10 @@ def test_an_unfunded_sender_is_refused_before_the_estimate_slot(node, monkeypatc
     assert "estimated_fee" not in env["error"]["details"]
     assert script["built"] == 0 and script["steps"] == []
 
+    from consensus import sender_policy
+    from consensus.payout import payout_rule_body
+    sender_policy.evaluator("payout_admission").set_outputs(
+        payout_rule_body(PAYOUT_RULE), {"o30": 7})
     monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
     env = _check(_payload("rule_offer", fee_limit="1000"))
     assert env["data"]["estimated_fee"] == str(BASE_FEE + CUSTOM_FEE), env

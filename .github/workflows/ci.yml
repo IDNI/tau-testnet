@@ -99,6 +99,7 @@ jobs:
           tests/test_fee_model_native.py
           tests/test_rule_scoping_native.py
           tests/test_shrink_bare_ref_native.py
+          tests/test_payout_native.py
           tests/test_special_stream_native.py
           tests/test_rule_fragment_native.py
           tests/test_o8_sender_guard_native.py

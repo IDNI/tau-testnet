@@ -487,3 +487,13 @@ class TipAdmissionView:
             "WHERE recipient_pubkey = ?",
             (pubkey,),
         )
+
+    # --- Payout rules ------------------------------------------------------
+
+    def payout_book(self):
+        """The payout-rule book of the canonical tip; an empty book when the node has none yet."""
+        from consensus.payout import PayoutBook
+
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        book = getattr(lm, "payout_rules", None)
+        return book if isinstance(book, PayoutBook) else PayoutBook()

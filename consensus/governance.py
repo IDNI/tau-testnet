@@ -8,6 +8,7 @@ from consensus.rule_fragment import MAX_WIDTH
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.retractable import RetractableBook
+from consensus.payout import PayoutBook
 
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
@@ -251,6 +252,7 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    payout_rules_root: str = "",
     shared_rule_limits: SharedRuleLimits = DEFAULT_SHARED_RULE_LIMITS,
     shared_rule_count: int = 0,
     shared_rule_nodes: int = 0,
@@ -299,6 +301,10 @@ def build_mechanism_metadata(
     if retractable_transfers_root is None:
         retractable_transfers_root = RetractableBook().root().hex()
     mech["retractable_transfers_root"] = retractable_transfers_root
+    # Payout rules (#63): emitted only once the book has held something, like rule
+    # sharing, so a chain that never uses them keeps a byte-identical meta hash.
+    if payout_rules_root:
+        mech["payout_rules_root"] = payout_rules_root
     # Always present: the budget has no activation gate, so the limits and the
     # usage counters are part of every chain's hash from genesis.
     mech["shared_rule_limits"] = asdict(shared_rule_limits)
@@ -516,6 +522,8 @@ class ConsensusLifecycleManager:
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
         self.retractable_transfers = RetractableBook()
+        # Payout rules (#63). A FIELD for the same reason rule_offers is.
+        self.payout_rules = PayoutBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -611,6 +619,10 @@ class ConsensusLifecycleManager:
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
+            payout_rules_root=(
+                "" if self.payout_rules.is_empty()
+                else self.payout_rules.root().hex()
+            ),
             shared_rule_limits=self.shared_rule_limits,
             shared_rule_count=self.shared_rule_count,
             shared_rule_nodes=self.shared_rule_nodes,
