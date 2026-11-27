@@ -223,6 +223,21 @@ def get_sequence_and_tip(
     the height its ``expire_at_height`` is counted from. A node too old to
     report ``tip_height`` yields 0, and the caller falls back to getblocks.
     """
+    return get_sequence_tip_and_network(pubkey, host=host, port=port, timeout=timeout)[:2]
+
+
+def get_sequence_tip_and_network(
+    pubkey: str,
+    *,
+    host: str,
+    port: int,
+    timeout: float = rpc_mod.DEFAULT_TIMEOUT,
+) -> tuple[int, int, str]:
+    """Sequence number, tip height and the network's genesis hash, in one call.
+
+    The genesis hash is what the types bound to a network sign
+    (``consensus/network_binding.py``). A node too old to report it yields "".
+    """
     response = rpc_mod.send_command(
         f"getsequence {pubkey}", host, port, timeout=timeout
     )
@@ -244,7 +259,28 @@ def get_sequence_and_tip(
     tip = data.get("tip_height")
     if not isinstance(tip, int) or isinstance(tip, bool):
         tip = 0
-    return seq, tip
+    genesis_hash = data.get("genesis_hash")
+    if not isinstance(genesis_hash, str):
+        genesis_hash = ""
+    return seq, tip, genesis_hash
+
+
+def bind_to_network(payload: dict, genesis_hash: str) -> dict:
+    """Name the network in a payload whose type signs it; call before signing.
+
+    Other types are returned untouched. Raises ``ValueError`` when the type needs
+    the network and ``genesis_hash`` is empty.
+    """
+    from consensus.network_binding import BOUND_TX_TYPES, FIELD
+
+    if payload.get("tx_type") in BOUND_TX_TYPES:
+        if not genesis_hash:
+            raise ValueError(
+                "the node did not report its genesis hash, and this transaction "
+                "type is signed for one network"
+            )
+        payload[FIELD] = genesis_hash
+    return payload
 
 
 def submit_tx(
@@ -558,15 +594,21 @@ def build_rule_change_request_tx(
     """Construct a ``tx_type='rule_change_request'`` payload (without signature).
 
     Kinds 1 and 4 carry the clause in ``rule_text``; kind 3 carries the exact
-    offered text and the offer id; kinds 2 and 5 carry neither. Zero approvers is
-    valid: the time escape alone can release the request.
+    offered text and the offer id; kind 6 carries a payout rule's canonical spec
+    text (``payout_spec_text`` without a sequence number); kinds 2 and 5 carry
+    neither, and kind 7 carries nothing for the first payout rule or the place
+    "1".."7" of another. Zero approvers is valid: the time escape alone can
+    release the request.
     """
-    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5):
-        raise ValueError("kind must be 1..5")
-    has_body = kind in (1, 3, 4)
+    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5, 6, 7):
+        raise ValueError("kind must be 1..7")
+    has_body = kind in (1, 3, 4, 6)
     if has_body and not (isinstance(rule_text, str) and rule_text.strip()):
         raise ValueError("this kind needs a non-empty rule text")
-    if not has_body and rule_text:
+    if kind == 7 and rule_text:
+        if not (isinstance(rule_text, str) and rule_text in ("1", "2", "3", "4", "5", "6", "7")):
+            raise ValueError("kind 7 carries no rule text, or the place 1..7 of the rule")
+    elif not has_body and rule_text:
         raise ValueError("this kind carries no rule text")
     if kind == 3:
         if not isinstance(offer_id, str) or len(offer_id) != 64:
@@ -743,3 +785,167 @@ def build_retract_transfer_tx(
         "fee_limit": str(fee_limit),
         "retractable_id": retractable_id.lower(),
     }
+
+
+def build_payout_rule_set_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    rule_text: str,
+    slots: list,
+    cap_per_execution: int,
+    cap_per_period: int,
+    expires_at: int,
+    period_blocks: int | None = None,
+    period_seconds: int | None = None,
+    per_sale: bool = False,
+    periods_from: int | None = None,
+    due_at: int | None = None,
+    fee_limit: str | int = "0",
+    due_every: int | None = None,
+    due_months: int | None = None,
+    on_arrival: bool = False,
+    sealed: bool = False,
+    rule_index: int | None = None,
+    policy_exempt: bool = False,
+    due_retry: int | None = None,
+) -> dict:
+    """Construct a ``tx_type='payout_rule_set'`` payload (without signature).
+
+    ``per_sale``: the rule pays only against sales the chain recorded (signed
+    transfers into the account), once per sale; executions name one.
+
+    ``periods_from`` and ``due_at`` are on the period's clock like
+    ``expires_at``: where the periods count from (default: the install), and a
+    point at which the node runs the rule itself, once.
+
+    ``due_every`` (on the period's clock) or ``due_months`` (calendar months,
+    time clock only) repeat that run from ``due_at`` on. ``on_arrival`` (with
+    ``per_sale``): the node runs the rule itself inside each payment. ``sealed``: the
+    account signs nothing until the rule ends.
+
+    ``rule_index`` (1..7): the rule's place on the account; left out, the
+    first. ``due_retry`` (with ``due_at``, on the period's clock): a due point
+    that found the account short is run again until this much later.
+    ``policy_exempt``: the account's o5 clause is not asked for the rule's payments.
+
+    ``slots`` lists one entry per slot: a recipient's 96-hex key, or "" for an
+    open slot the executor names. ``expires_at`` is on the period's clock: a
+    height with ``period_blocks``, a unix time with ``period_seconds``.
+    """
+    if (period_blocks is None) == (period_seconds is None):
+        raise ValueError("give exactly one of period_blocks and period_seconds")
+    clean = []
+    for k, slot in enumerate(slots or []):
+        if slot in ("", None, "open"):
+            clean.append("")
+        elif isinstance(slot, str) and len(slot) == 96:
+            clean.append(slot.lower())
+        else:
+            raise ValueError(f"slot {k} must be a 96-hex public key or open")
+    tx = {
+        "tx_type": "payout_rule_set",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "rule_text": rule_text,
+        "slots": clean,
+        "cap_per_execution": int(cap_per_execution),
+        "cap_per_period": int(cap_per_period),
+        "expires_at": int(expires_at),
+    }
+    if period_blocks is not None:
+        tx["period_blocks"] = int(period_blocks)
+    else:
+        tx["period_seconds"] = int(period_seconds)
+    if per_sale:
+        tx["per_sale"] = True
+    if periods_from is not None:
+        tx["periods_from"] = int(periods_from)
+    if due_at is not None:
+        tx["due_at"] = int(due_at)
+    if due_every is not None:
+        tx["due_every"] = int(due_every)
+    if due_months is not None:
+        tx["due_months"] = int(due_months)
+    if on_arrival:
+        tx["on_arrival"] = True
+    if sealed:
+        tx["sealed"] = True
+    if policy_exempt:
+        tx["policy_exempt"] = True
+    if rule_index is not None:
+        tx["rule_index"] = int(rule_index)
+    if due_retry is not None:
+        tx["due_retry"] = int(due_retry)
+    return tx
+
+
+def build_payout_rule_revoke_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    fee_limit: str | int = "0",
+    rule_index: int | None = None,
+) -> dict:
+    """Construct a ``tx_type='payout_rule_revoke'`` payload (without signature).
+    Feeless. ``rule_index`` (1..7) names a rule in another place than the first."""
+    tx = {
+        "tx_type": "payout_rule_revoke",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+    }
+    if rule_index is not None:
+        tx["rule_index"] = int(rule_index)
+    return tx
+
+
+def build_payout_execute_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    account_pubkey: str,
+    rule_id: str,
+    recipients: dict | None = None,
+    data: dict | None = None,
+    sale_id: str | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='payout_execute'`` payload (without signature).
+
+    ``rule_id`` pins the exact rule: if the account replaced its rule since,
+    the execution is refused instead of running the new one. ``recipients``
+    names keys for open slots ({slot: pubkey}); ``data`` fills i40+k ({k: value}).
+    """
+    if not isinstance(account_pubkey, str) or len(account_pubkey) != 96:
+        raise ValueError("account_pubkey must be a 96-character hex public key")
+    if not isinstance(rule_id, str) or len(rule_id) != 64:
+        raise ValueError("rule_id must be a 64-character hex string")
+    tx = {
+        "tx_type": "payout_execute",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "account_pubkey": account_pubkey.lower(),
+        "rule_id": rule_id.lower(),
+        "recipients": {str(int(k)): v.lower() for k, v in (recipients or {}).items()},
+        "data": {str(int(k)): int(v) for k, v in (data or {}).items()},
+    }
+    if sale_id is not None:
+        if not isinstance(sale_id, str) or len(sale_id) != 64:
+            raise ValueError("sale_id must be a 64-character transaction hash")
+        tx["sale_id"] = sale_id.lower()
+    return tx

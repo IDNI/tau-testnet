@@ -38,12 +38,15 @@ class SoleMiner:
         self._wake_for_due = False
 
     def _due_wake_allowed(self) -> bool:
-        """Empty mempool, but a retractable release is due and the throttle is open."""
+        """Empty mempool, but a retractable release or the due point of a payout
+        rule is due and the throttle is open."""
         if time.time() - self._last_due_attempt < _DUE_WAKE_INTERVAL:
             return False
         head = db.get_canonical_head_block()
         next_height = head['header']['block_number'] + 1 if head else 0
-        return db.has_due_retractables(next_height, int(time.time()))
+        now = int(time.time())
+        return (db.has_due_retractables(next_height, now)
+                or db.has_due_payouts(next_height, now))
 
     def _should_mine(self) -> bool:
         # 1. Cheap local gates first to avoid driving the Tau engine on every tick.

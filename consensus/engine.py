@@ -42,6 +42,26 @@ from .retractable import (
     parse_retract_transfer,
     parse_retractable_transfer,
 )
+from .payout import (
+    MAX_PAYOUT_EXECUTIONS_PER_BLOCK,
+    PAYOUT_TX_TYPES,
+    POOL_APPLY as PAYOUT_POOL_APPLY,
+    PAYS_NOTHING,
+    PayoutBook,
+    PayoutRefused,
+    PayoutShapeError,
+    PayoutShort,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_RULE_SET,
+    check_policy as check_payout_policy,
+    execution_inputs as payout_execution_inputs,
+    parse_payout_execute,
+    parse_payout_rule_revoke_place,
+    parse_payout_rule_set,
+    payout_key,
+    payout_revoke_place,
+    settle as settle_payout,
+)
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
     RuleOfferDecision,
@@ -65,15 +85,27 @@ from .rule_offers import (
 # rule that changed while the request sat open. `transfer_vote` is exempt like a
 # governance vote, so approver bots need no funding.
 #
+# `payout_rule_set` pays because it builds a clause; `payout_execute` is paid by
+# its executor, whoever that is, because it steps the rule.
+#
 # MUST stay in step with commands.sendtx.FEE_BEARING_TX_TYPES -- the same
 # constant is deliberately duplicated there to keep the admission path free of
 # an engine import, and a divergence charges a different fee at admission than
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST,
+     TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
+
+
+def _sale_id_of(tx: Dict[str, Any]) -> str:
+    """The hash a block lists for `tx` (block.compute_tx_hash), without the
+    `tx_id` a block builder adds for its own bookkeeping."""
+    from block import compute_tx_hash
+
+    return compute_tx_hash({k: v for k, v in tx.items() if k != "tx_id"})
 
 
 def _receipt_lookup_key(tx: Dict[str, Any], index: int) -> str:
@@ -246,6 +278,307 @@ def _release_due_retractables(lm, balances, sequences, height, timestamp) -> Lis
     return [entry.retractable_id.hex() for entry in released]
 
 
+def _payout_book(lm) -> Optional[PayoutBook]:
+    book = getattr(lm, "payout_rules", None)
+    return book if isinstance(book, PayoutBook) else None
+
+
+def _expire_payout_rules(lm, height, timestamp) -> List[Dict[str, Any]]:
+    """Remove every payout rule whose end this block reached; their events.
+
+    The money stays where it is: an ended rule only stops paying.
+    """
+    book = _payout_book(lm)
+    if book is None or not book.has_expiring(int(height), int(timestamp)):
+        return []
+    return [
+        dict(_payout_rule_event(t), outcome="expired")
+        for t in book.expire(int(height), int(timestamp))
+    ]
+
+
+def _payout_rule_event(rule) -> Dict[str, Any]:
+    """The head of a payout event: the account, the rule's id, and its place
+    when it is not the first."""
+    return {"account_pubkey": rule.account_pubkey, "rule_id": rule.rule_id.hex(),
+            **({"rule_index": rule.rule_index} if rule.rule_index else {})}
+
+
+def _payout_policy(lm, balances, sequences, last_ts, timestamp, *, timeout, replay_mode,
+                   slots_active):
+    """The o5 check of the runs the node makes in a block: each payment is asked
+    like a transfer the account sends in it. The block passes its parent's
+    balances and cooldown clocks, which a transfer in it reads."""
+    grant = faucet.amount(lm)
+    cooldown = getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False)
+    offers = getattr(lm, "rule_offers", None)
+
+    def check(rule, legs):
+        account = rule.account_pubkey
+        clause = (offers.clause_for(account, tau_defs.USER_POLICY_STREAM_INDEX)
+                  if offers is not None else None)
+        since = None
+        if cooldown:
+            previous = int((last_ts or {}).get(account, 0) or 0)
+            since = (tau_defs.COOLDOWN_NEVER_SENT if previous <= 0 else
+                     max(0, min(int(timestamp) - previous, tau_defs.COOLDOWN_NEVER_SENT)))
+        held = faucet.spendable(balances or {}, sequences or {}, account, grant)
+        check_payout_policy(
+            rule, legs, clause, pool="apply", timeout=timeout, replay_mode=replay_mode,
+            parent_balance=max(0, min(held, tau_defs.MAX_TRANSFER_VALUE)), since_last=since,
+            slots_active=slots_active, timestamp=timestamp)
+    return check
+
+
+def _node_payout_step(lm, balances, sequences, rule, state, exe, height, timestamp, *,
+                      timeout, replay_mode, what, policy=None):
+    """Step a payout rule for a run the node makes by itself: (reason, legs,
+    have, short).
+
+    `have` is the balance the block has reached for the account, which is what
+    the rule reads on i2. Nothing has moved; `reason` says why nothing will,
+    and `short` whether that is because the account holds too little. `policy`
+    asks the account's current o5 clause about the payments.
+    """
+    have = faucet.spendable(balances, sequences, rule.account_pubkey, faucet.amount(lm))
+    try:
+        values = payout_execution_inputs(
+            rule, state, exe, parent_balance=have, height=int(height), ts=int(timestamp))
+        try:
+            outputs = sender_policy.payout_outputs(
+                rule.body, values, pool=PAYOUT_POOL_APPLY, timeout=timeout)
+        except PayoutRefused:
+            raise
+        except Exception:
+            if not replay_mode:
+                raise
+            # Tau-less replay, as for an execution a transaction sent: the
+            # legs are unknowable, nothing moves, the state hash says so.
+            logger.warning(
+                "Replay without a policy evaluator: %s payout %s not re-run.",
+                what, rule.rule_id.hex()[:16])
+            raise PayoutRefused("no evaluator during replay")
+        legs = settle_payout(rule, state, exe, outputs, height=int(height),
+                             ts=int(timestamp), balance=have)
+        if policy is not None:
+            policy(rule, legs)
+    except PayoutRefused as exc:
+        return str(exc), [], have, isinstance(exc, PayoutShort)
+    return "", legs, have, False
+
+
+def _node_payout_pay(lm, book, balances, sequences, last_ts, rule, legs, have, height,
+                     timestamp, sale_id=None) -> Dict[str, Any]:
+    """Move the legs of a run the node made and record it; the event's tail."""
+    grant = faucet.amount(lm)
+    total = sum(a for _, _, a in legs)
+    account = rule.account_pubkey
+    balances[account] = have - total
+    for _, who, amount in legs:
+        balances[who] = faucet.spendable(balances, sequences, who, grant) + amount
+    book.record(rule.key, total, int(height), int(timestamp), sale_id)
+    if last_ts is not None:
+        last_ts[account] = int(timestamp)
+    return {"outcome": "executed", "executor_pubkey": None, "total": total,
+            "legs": [{"slot": k, "recipient_pubkey": who, "amount": amount}
+                     for k, who, amount in legs]}
+
+
+def _run_arrival_payouts(lm, balances, sequences, last_ts, height, timestamp, *, timeout=None,
+                         replay_mode=False, policy=None) -> List[Dict[str, Any]]:
+    """Run, after the block's transactions, the sales still waiting for a rule
+    the node runs on arrival; their events.
+
+    A payment is run inside itself (_run_arrivals_of_payment) wherever its
+    transfers are staged. A sale waits only when an apply wrote the transfers
+    at once (one without a proposer). The node steps the rule once for each,
+    oldest first, at most MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK a block, with no
+    executor and no named recipient, under the rule's own caps. A run happens
+    once for a sale: paid or not, the sale is closed. Money the node moves is
+    never a sale, so what a rule pays out is not paid out again by the rule of
+    the account that gets it.
+    """
+    book = _payout_book(lm)
+    if book is None or not book.has_arrivals():
+        return []
+    policy = policy or _payout_policy(
+        lm, balances, sequences, last_ts, timestamp, timeout=timeout,
+        replay_mode=replay_mode, slots_active=getattr(lm, "approval_slots_active", False) is True)
+    events: List[Dict[str, Any]] = []
+    for key, sale_id in book.arrivals():
+        rule, state, exe = book.arrival_execution(key, sale_id)
+        reason, legs, have, _short = _node_payout_step(
+            lm, balances, sequences, rule, state, exe, height, timestamp,
+            timeout=timeout, replay_mode=replay_mode, what="arrival", policy=policy)
+        _, payer, amount, _ = state.sale(sale_id)
+        event = dict(_payout_rule_event(rule), sale_id=sale_id.hex(), sale_amount=amount,
+                     payer_pubkey=payer)
+        if reason:
+            book.drop_sale(key, sale_id)
+            events.append(dict(event, outcome="arrival_not_paid", reason=reason))
+            continue
+        events.append(dict(event, **_node_payout_pay(
+            lm, book, balances, sequences, last_ts, rule, legs, have, height, timestamp,
+            sale_id)))
+    return events
+
+
+class _StagedBalances:
+    """A transaction's view of the balances: its staged writes over the block's.
+
+    A write goes to the staged ones, so it commits with the transaction or not
+    at all."""
+
+    __slots__ = ("staged", "base")
+
+    def __init__(self, staged: Dict[str, int], base: Dict[str, int]) -> None:
+        self.staged, self.base = staged, base
+
+    def __contains__(self, address: Any) -> bool:
+        return address in self.staged or address in self.base
+
+    def get(self, address: Any, default: Any = None) -> Any:
+        if address in self.staged:
+            return self.staged[address]
+        return self.base.get(address, default)
+
+    def __getitem__(self, address: Any) -> int:
+        if address in self.staged:
+            return self.staged[address]
+        return self.base[address]
+
+    def __setitem__(self, address: Any, value: int) -> None:
+        self.staged[address] = value
+
+
+def _run_arrivals_of_payment(lm, book, balances, sequences, sale_id, sales, height,
+                             timestamp, *, timeout=None,
+                             replay_mode=False) -> Tuple[List[Dict[str, Any]], str]:
+    """Run, inside a payment, the rule each account it paid runs on arrival:
+    (events, refusal).
+
+    `sales` maps (recipient, payer) to what the transaction paid the recipient,
+    `balances` is the transaction's own view. An account has at most one such
+    rule, so a payment makes at most one run for each account it pays, and at
+    most MAX_TRANSFERS_PER_TX in all. The run reads the balance with the
+    payment in it and may pay at most the payment; its legs are written with
+    the payment's own, so no later transaction sees the share the rule sends
+    on. A run that pays nothing leaves the payment whole. Any other refusal is
+    returned, and the payment is refused with it: nothing moves, nobody pays a
+    fee. A run is the account receiving, not sending: its o5 clause is not
+    asked and its cooldown clock is not stamped. A replay keeps the payment
+    the chain carries and marks the run not paid.
+    """
+    events: List[Dict[str, Any]] = []
+    for (to, payer), _amount in sorted(sales.items()):
+        key = book.arrival_key(to, sale_id)
+        if not isinstance(key, str):        # no such rule (or a stand-in book)
+            continue
+        rule, state, exe = book.arrival_execution(key, sale_id)
+        _, _, amount, _ = state.sale(sale_id)
+        reason, legs, have, _short = _node_payout_step(
+            lm, balances, sequences, rule, state, exe, height, timestamp,
+            timeout=timeout, replay_mode=replay_mode, what="arrival", policy=None)
+        total = sum(a for _, _, a in legs)
+        if not reason and total > amount:
+            reason = f"the rule pays {total}, more than the payment of {amount}"
+        event = dict(_payout_rule_event(rule), sale_id=sale_id.hex(), sale_amount=amount,
+                     payer_pubkey=payer)
+        if reason and (reason == PAYS_NOTHING or replay_mode):
+            book.drop_sale(key, sale_id)
+            events.append(dict(event, outcome="arrival_not_paid", reason=reason))
+            continue
+        if reason:
+            return events, f"the payout rule of {str(to)[:10]}... refuses the payment: {reason}"
+        events.append(dict(event, **_node_payout_pay(
+            lm, book, balances, sequences, None, rule, legs, have, height, timestamp,
+            sale_id)))
+    return events, ""
+
+
+def _run_due_payouts(lm, balances, sequences, last_ts, height, timestamp, *, timeout=None,
+                     replay_mode=False, policy=None) -> List[Dict[str, Any]]:
+    """Run every payout rule whose due point this block reached; their events.
+
+    Runs after the transaction loop, the retractable release and the runs on
+    arrival, and before the expiries, at most
+    MAX_PAYOUT_DUE_RUNS_PER_BLOCK rules a block. A run reads the balance the
+    block has reached so far, steps the rule once with no executor and no named
+    recipient, and pays all of its slots or none, under the rule's own caps,
+    and a paid run stamps the account's cooldown clock like any execution. A
+    due point runs once, whether it paid or not; a rule that repeats is then
+    queued for its next one. Nobody signs for a run, and its only charge was
+    the fee of the transaction that installed the rule. A run that found the
+    account short is owed a retry when the rule carries `due_retry`.
+    """
+    book = _payout_book(lm)
+    if book is None or not book.has_due(int(height), int(timestamp)):
+        return []
+    policy = policy or _payout_policy(
+        lm, balances, sequences, last_ts, timestamp, timeout=timeout,
+        replay_mode=replay_mode, slots_active=getattr(lm, "approval_slots_active", False) is True)
+    events: List[Dict[str, Any]] = []
+    for key in book.due(int(height), int(timestamp)):
+        rule, state, exe = book.due_execution(key)
+        reason, legs, have, short = _node_payout_step(
+            lm, balances, sequences, rule, state, exe, height, timestamp,
+            timeout=timeout, replay_mode=replay_mode, what="due", policy=policy)
+        event = dict(_payout_rule_event(rule), due_at=state.next_due(rule))
+        if rule.repeats:
+            event["due_index"] = state.due_index
+        retry_at = book.due_ran(key, rule.clock(int(height), int(timestamp)), short=short)
+        if reason:
+            events.append(dict(event, outcome="due_not_paid", reason=reason,
+                               **({"retry_at": retry_at} if retry_at else {})))
+            continue
+        events.append(dict(event, **_node_payout_pay(
+            lm, book, balances, sequences, last_ts, rule, legs, have, height, timestamp)))
+    return events
+
+
+def _run_retry_payouts(lm, balances, sequences, last_ts, height, timestamp, *, timeout=None,
+                       replay_mode=False, policy=None) -> List[Dict[str, Any]]:
+    """Run again the due points that found their account short; their events.
+
+    Only for a rule that carries `due_retry`. Runs after the due points of the
+    block, at most MAX_PAYOUT_RETRY_RUNS_PER_BLOCK runs, longest waiting first,
+    so a retry never takes a run from another rule's due point. A retry is a
+    run like the one at the due point: no executor, no named recipient, the
+    balance the block has reached, the rule's own caps. Found short again it is
+    owed again from the next block on; paid, or refused for another reason, it
+    is done. It ends unpaid when the rule's clock reaches the due point plus
+    `due_retry`, the rule's next due point or the rule's end. A retry does not
+    wake the miner: money that reaches the account comes in a block, and the
+    retry runs in that block after its transactions and due points.
+    """
+    book = _payout_book(lm)
+    if book is None or not book.has_retry(int(height), int(timestamp)):
+        return []
+    policy = policy or _payout_policy(
+        lm, balances, sequences, last_ts, timestamp, timeout=timeout,
+        replay_mode=replay_mode, slots_active=getattr(lm, "approval_slots_active", False) is True)
+    events: List[Dict[str, Any]] = []
+    run, ended = book.retries(int(height), int(timestamp))
+    for key in ended:
+        rule = book.get(key)
+        book.retry_ended(key)
+        events.append(dict(_payout_rule_event(rule), outcome="due_retry_ended"))
+    for key in run:
+        rule, state, exe = book.retry_execution(key)
+        reason, legs, have, short = _node_payout_step(
+            lm, balances, sequences, rule, state, exe, height, timestamp,
+            timeout=timeout, replay_mode=replay_mode, what="retry", policy=policy)
+        event = dict(_payout_rule_event(rule), retry=True)
+        retry_at = book.retry_ran(key, rule.clock(int(height), int(timestamp)), short=short)
+        if reason:
+            events.append(dict(event, outcome="due_not_paid", reason=reason,
+                               **({"retry_at": retry_at} if retry_at else {})))
+            continue
+        events.append(dict(event, **_node_payout_pay(
+            lm, book, balances, sequences, last_ts, rule, legs, have, height, timestamp)))
+    return events
+
+
 TEMPORAL_REFERENCE_REASON = "temporal_reference"
 RULE_FRAGMENT_REASON = "rule_fragment"
 RULE_CHANGE_NEEDS_APPROVAL_REASON = "rule_change_needs_approval"
@@ -274,7 +607,22 @@ def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tupl
     return error, "rule_not_applied"
 
 
-def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str]]:
+def _payout_request_problem(lm, sender, body, height, timestamp) -> Optional[str]:
+    """Why a payout rule spec (a kind-6 body) may not be installed now, or None."""
+    from consensus.payout import PayoutShapeError, parse_payout_spec
+
+    try:
+        terms = parse_payout_spec(body, sender)
+    except PayoutShapeError as exc:
+        return str(exc)
+    book = _payout_book(lm) or PayoutBook()
+    _, reason = book.can_admit_set(terms, int(height), int(timestamp))
+    return reason or None
+
+
+def _release_rule_changes(lm, height, timestamp, timeout,
+                          payout_events: Optional[List[Dict[str, Any]]] = None
+                          ) -> List[Tuple[str, str]]:
     """Write every READY rule-change request, lowest id first, up to the per-block cap.
 
     Runs after the transaction loop and before expiry, so a deferred request
@@ -294,7 +642,8 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
         if entry is None or entry.status != STATUS_OPEN:
             continue
         processed += 1
-        problem = _write_rule_change(lm, rid, entry, int(height), timeout)
+        problem = _write_rule_change(lm, rid, entry, int(height), timeout,
+                                     timestamp=int(timestamp), payout_events=payout_events)
         if problem:
             approvals.resolve_rule_change(rid, STATUS_FAILED)
             logger.info("Rule-change request %s failed at release: %s", rid.hex(), problem)
@@ -305,11 +654,15 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
     return events
 
 
-def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
+def _write_rule_change(lm, rid, entry, height, timeout, *, timestamp=0,
+                       payout_events=None) -> Optional[str]:
     """Apply one request to the block's lifecycle. None on success, else why not.
 
     Every check runs before the first write, so a failure leaves nothing behind.
     """
+    if entry.kind in (tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+                      tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT):
+        return _write_payout_change(lm, entry, height, timestamp, timeout, payout_events)
     offers = lm.rule_offers
     approvals = lm.approval_requests
     sender = entry.sender_pubkey
@@ -381,6 +734,51 @@ def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
         )
     else:
         approvals.resolve_all_for_sender(sender, STATUS_FAILED)
+    return None
+
+
+def _write_payout_change(lm, entry, height, timestamp, timeout, events) -> Optional[str]:
+    """Install or revoke a payout rule from a released rule-change request.
+
+    A payout change touches nothing else the account has, so unlike a policy
+    change it fails no other open request. A sealed rule is the exception: it
+    ends the transfers the account had parked, which would otherwise leave
+    after the seal.
+    """
+    from consensus.payout import parse_payout_spec
+
+    book = _payout_book(lm)
+    if book is None:
+        return "no payout book"
+    sender = entry.sender_pubkey
+    if entry.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
+        try:
+            key = payout_key(sender, payout_revoke_place(entry.body))
+        except PayoutShapeError as exc:
+            return str(exc)
+        if book.get(key) is None:
+            return "no payout rule to revoke"
+        if book.sealed(sender):
+            # a revoke that was already waiting when the account sealed its rule
+            return "the account's payout rule is sealed until it ends"
+        gone = book.revoke(key)
+        if events is not None:
+            events.append(dict(_payout_rule_event(gone), outcome="revoked"))
+        return None
+    problem = _payout_request_problem(lm, sender, entry.body, height, timestamp)
+    if problem:
+        return problem
+    terms = parse_payout_spec(entry.body, sender)
+    built = sender_policy.evaluator(PAYOUT_POOL_APPLY).validate(terms.body, timeout=timeout)
+    if not built.ok:
+        return f"the payout rule does not build: {built.error[:200]}"
+    replaced = book.install(terms, terms.clock(int(height), int(timestamp)),
+                            int(height), int(timestamp))
+    if terms.sealed:
+        lm.approval_requests.resolve_all_for_sender(sender, STATUS_FAILED)
+    if events is not None:
+        events.append(dict(_payout_rule_event(terms), outcome="installed",
+                           **({"replaced": replaced.hex()} if replaced else {})))
     return None
 
 
@@ -590,6 +988,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         """
         tx_type = tx.get("tx_type", "user_tx")
         if tx_type in RULE_OFFER_TX_TYPES or tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
+            return True
+        if tx_type == TX_TYPE_PAYOUT_RULE_SET:
             return True
         return user_tx_carries_rule(tx)
 
@@ -899,12 +1299,40 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         released_retractables = _release_due_retractables(
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
+        _block_session = session if session is not None else getattr(proposal, "session", None)
+        # The runs ask the account's o5 clause as a transfer in this block would
+        # be asked: parent balances and cooldown clocks, the parent's slot flag.
+        payout_policy = _payout_policy(
+            lm, metadata.get('balances'), metadata.get('sequence_numbers'),
+            metadata.get('last_transfer_ts'), block.header.timestamp,
+            timeout=getattr(_block_session, "request_budget", None), replay_mode=replay_mode,
+            slots_active=getattr(parent_lm, "approval_slots_active", False) is True)
+        payout_arrivals = _run_arrival_payouts(
+            lm, t_bals, t_seqs, t_lts, block.header.block_number, block.header.timestamp,
+            timeout=getattr(_block_session, "request_budget", None),
+            replay_mode=replay_mode, policy=payout_policy,
+        )
+        payout_due = _run_due_payouts(
+            lm, t_bals, t_seqs, t_lts, block.header.block_number, block.header.timestamp,
+            timeout=getattr(_block_session, "request_budget", None),
+            replay_mode=replay_mode, policy=payout_policy,
+        )
+        payout_due += _run_retry_payouts(
+            lm, t_bals, t_seqs, t_lts, block.header.block_number, block.header.timestamp,
+            timeout=getattr(_block_session, "request_budget", None),
+            replay_mode=replay_mode, policy=payout_policy,
+        )
+        payout_expired = _expire_payout_rules(
+            lm, block.header.block_number, block.header.timestamp
+        )
+        payout_released: List[Dict[str, Any]] = []
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
                 session if session is not None else getattr(proposal, "session", None),
                 "request_budget", None,
             ),
+            payout_events=payout_released,
         )
 
         minted = faucet.granted(
@@ -958,6 +1386,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
+
+        # Payout rules: installs, revokes and executions from the kept
+        # transactions, the runs the node made for sales that arrived and at due
+        # points, expiries, then the rules a guarded release installed or revoked.
+        payout_events = []
+        for i, tx in enumerate(block.transactions):
+            receipt = exec_result.receipts.get(tx.get('tx_id', str(i))) or {}
+            if tx in exec_result.accepted_transactions:
+                if receipt.get("payout_event"):
+                    payout_events.append(receipt["payout_event"])
+                payout_events.extend(receipt.get("arrival_events") or ())
+        payout_events.extend(payout_arrivals)
+        payout_events.extend(payout_due)
+        payout_events.extend(payout_expired)
+        payout_events.extend(payout_released)
 
         # 3. Post-State Materialization Layer
         
@@ -1114,6 +1557,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "payout_events": payout_events,
             }
         )
         
@@ -1127,6 +1571,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "activated_updates": [u.update_id_hex for u in newly_active],
                 "released_retractables": released_retractables,
                 "retractable_events": retractable_events,
+                "payout_events": payout_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1524,6 +1969,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 )
             return lifecycle_mgr
 
+        payout_executions_in_block = 0
         for i, tx in enumerate(transactions):
             # One branch per transaction. Its journal child, allocator child and
             # state delta resolve together; a rejection that already stepped the
@@ -1629,6 +2075,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     tx_receipt["reason"], detail = tx_error
                     tx_receipt["logs"].append(f"Error: {detail}")
 
+            # A sealed account signs nothing until its payout rule ends: no fee,
+            # no sequence number, nothing applied. Money leaves it by its rule only.
+            sealing_book = _payout_book(lifecycle_mgr)
+            if (not hard_reject and isinstance(sender, str)
+                    and sealing_book is not None and sealing_book.sealed(sender)):
+                accepted_in_block = False
+                hard_reject = True
+                execution_success = False
+                precheck_rejected = True
+                operations = {}
+                tx_receipt["reason"] = "account_sealed"
+                tx_receipt["logs"].append(
+                    "The account is sealed by its payout rule until the rule ends")
+
             # Process operations
             # Parse operations first to establish deterministic order:
             # 1. Rule update (key "0")
@@ -1660,6 +2120,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             parked_rule_change_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
+            pending_payout_set = None
+            pending_payout_revoke: Optional[str] = None
+            pending_payout_exec = None   # (account, total, legs, sale_id, key)
+            # Signed transfers this tx credited, as sales: (recipient, payer) ->
+            # amount. Recorded for a recipient whose payout rule pays per sale
+            # only once the tx stays accepted.
+            pending_sales: Dict[Tuple[str, str], int] = {}
+
+            def _note_sale(to_addr, from_addr, amount) -> None:
+                if tx.get("tx_type", "user_tx") != "user_tx":
+                    return
+                key = (str(to_addr), str(from_addr))
+                pending_sales[key] = pending_sales.get(key, 0) + int(amount)
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2284,6 +2757,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 clause_body_v1(request.rule_text))
                             if rejection:
                                 problem = rejection
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT:
+                            why = _payout_request_problem(
+                                lifecycle_mgr, request.sender_pubkey, request.body,
+                                height_now, int(block_timestamp or 0))
+                            if why:
+                                problem = (why, "rule_change_request_invalid")
                     if request is not None and problem is None:
                         precondition = None
                         if request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
@@ -2294,6 +2773,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             if not offers.clause_for(
                                     request.sender_pubkey, tau_defs.RULE_CHANGE_GUARD_INDEX):
                                 precondition = "there is no registered rule-change guard to revoke"
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
+                            if lifecycle_mgr.payout_rules.get(payout_key(
+                                    request.sender_pubkey,
+                                    payout_revoke_place(request.body))) is None:
+                                precondition = "there is no payout rule to revoke"
                         elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
                             offer_entry = offers.offered.get(bytes.fromhex(request.offer_id))
                             if offer_entry is None:
@@ -2622,6 +3106,143 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Retractable transfer retracted: " + request.retractable_id.hex()
                             )
 
+            elif tx_type in PAYOUT_TX_TYPES:
+                # Root fields only: only they are signed.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    book = lifecycle_mgr.payout_rules
+                    height_now = int(block_height or 0)
+                    ts_now = int(block_timestamp or 0)
+                    budget = getattr(_session, "request_budget", None)
+                    if tx_type == TX_TYPE_PAYOUT_RULE_SET:
+                        terms, reason = None, ""
+                        try:
+                            terms = parse_payout_rule_set(tx)
+                        except PayoutShapeError as exc:
+                            reason = f"invalid payout rule ({exc})"
+                        if terms is not None:
+                            if not isinstance(sender, str) or sender != terms.account_pubkey:
+                                reason = "sender is not the signer"
+                            else:
+                                _, reason = book.can_admit_set(terms, height_now, ts_now)
+                        if terms is not None and not reason:
+                            built = sender_policy.evaluator(PAYOUT_POOL_APPLY).validate(
+                                terms.body, timeout=budget)
+                            if not built.ok:
+                                reason = f"the payout rule does not build: {built.error[:200]}"
+                        if terms is not None and not reason:
+                            blocked, detail = sender_policy.rule_change_blocked(
+                                lambda who, idx: lifecycle_mgr.rule_offers.accepted_clauses.get((who, idx)),
+                                sender, tau_defs.RULE_CHANGE_KIND_SET_PAYOUT, ts_now,
+                                pool="apply", timeout=budget,
+                            )
+                            if blocked:
+                                reason = f"rule-change guard blocks ({detail}); use a rule-change request"
+                        if reason:
+                            tx_receipt["logs"].append(f"Payout rule ignored: {reason}")
+                            tx_receipt["reason"] = "payout_rule_not_set"
+                            accepted_in_block = False
+                        else:
+                            pending_payout_set = terms
+                            tx_receipt["logs"].append("Payout rule set: " + terms.rule_id.hex())
+                    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+                        reason, exe, legs = "", None, []
+                        try:
+                            exe = parse_payout_execute(tx)
+                        except PayoutShapeError as exc:
+                            reason = f"invalid payout execution ({exc})"
+                        if exe is not None:
+                            if not isinstance(sender, str) or sender != exe.executor_pubkey:
+                                reason = "sender is not the signer"
+                            elif target_balances is None:
+                                reason = "no balance overlay"
+                            elif payout_executions_in_block >= MAX_PAYOUT_EXECUTIONS_PER_BLOCK:
+                                reason = "the block already carries the most payout executions it may"
+                        if exe is not None and not reason:
+                            try:
+                                rule, state = book.check_execution(exe, height_now, ts_now)
+                                values = payout_execution_inputs(
+                                    rule, state, exe,
+                                    parent_balance=int(_parent_bal(exe.account_pubkey)),
+                                    height=height_now, ts=ts_now,
+                                )
+                                try:
+                                    outputs = sender_policy.payout_outputs(
+                                        rule.body, values, pool=PAYOUT_POOL_APPLY, timeout=budget)
+                                except PayoutRefused:
+                                    raise
+                                except Exception:
+                                    if not replay_mode:
+                                        raise
+                                    # Tau-less replay: the legs are unknowable;
+                                    # nothing moves and the state hash says so.
+                                    logger.warning(
+                                        "Replay without a policy evaluator: payout %s not re-run.",
+                                        rule.rule_id.hex()[:16])
+                                    raise PayoutRefused("no evaluator during replay")
+                                legs = settle_payout(
+                                    rule, state, exe, outputs, height=height_now, ts=ts_now,
+                                    balance=_read_bal(exe.account_pubkey),
+                                )
+                                # Each payment is asked like a transfer the
+                                # account sends in this block.
+                                check_payout_policy(
+                                    rule, legs, lifecycle_mgr.rule_offers.clause_for(
+                                        exe.account_pubkey, tau_defs.USER_POLICY_STREAM_INDEX),
+                                    pool="apply", timeout=budget, replay_mode=replay_mode,
+                                    parent_balance=_parent_bal(exe.account_pubkey),
+                                    since_last=(_since_last_transfer(exe.account_pubkey)
+                                                if cooldown_active else None),
+                                    slots_active=approval_slots_on, timestamp=block_timestamp)
+                            except PayoutRefused as exc:
+                                reason = str(exc)
+                        if reason:
+                            tx_receipt["logs"].append(f"Payout not executed: {reason}")
+                            tx_receipt["reason"] = "payout_not_executed"
+                            accepted_in_block = False
+                        else:
+                            account = exe.account_pubkey
+                            total = sum(a for _, _, a in legs)
+                            # Debit first, then credit through the staged view,
+                            # so a recipient that is also the executor nets right.
+                            staged_writes[account] = _read_bal(account) - total
+                            for _, who, amount in legs:
+                                staged_writes[who] = _read_bal(who) + amount
+                            pending_payout_exec = (account, total, legs, exe.sale_id,
+                                                   rule.key)
+                            payout_executions_in_block += 1
+                            tx_receipt["logs"].append(
+                                f"Payout executed: {total} from {account[:10]}... in "
+                                f"{len(legs)} leg(s)")
+                    else:  # TX_TYPE_PAYOUT_RULE_REVOKE
+                        reason, account, place = "", None, 0
+                        try:
+                            account, place = parse_payout_rule_revoke_place(tx)
+                        except PayoutShapeError as exc:
+                            reason = f"invalid payout revoke ({exc})"
+                        if account is not None:
+                            if not isinstance(sender, str) or sender != account:
+                                reason = "sender is not the signer"
+                            else:
+                                _, reason = book.can_admit_revoke(account, place)
+                        if account is not None and not reason:
+                            blocked, detail = sender_policy.rule_change_blocked(
+                                lambda who, idx: lifecycle_mgr.rule_offers.accepted_clauses.get((who, idx)),
+                                sender, tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT, ts_now,
+                                pool="apply", timeout=budget,
+                            )
+                            if blocked:
+                                reason = f"rule-change guard blocks ({detail}); use a rule-change request"
+                        if reason:
+                            tx_receipt["logs"].append(f"Payout revoke ignored: {reason}")
+                            tx_receipt["reason"] = "payout_rule_not_revoked"
+                            accepted_in_block = False
+                        else:
+                            pending_payout_revoke = payout_key(account, place)
+                            tx_receipt["logs"].append(
+                                "Payout rule revoked: " + account[:16]
+                                + (f" (place {place})" if place else ""))
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -2948,6 +3569,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 slot_values=_approval_slot_values(),
                             ):
                                 break
+                            _note_sale(to_addr, from_addr, amount_val)
                     elif isinstance(transfers_op_data, list):
                         for transfer in transfers_op_data:
                             if isinstance(transfer, (list, tuple)) and len(transfer) == 3:
@@ -3012,6 +3634,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         current_to = _balance_of(to_addr)
                                         target_balances[from_addr] = current_from - amount
                                         target_balances[to_addr] = current_to + amount
+                                        _note_sale(to_addr, from_addr, amount)
                                     else:
                                         if not chain_state.update_balances_after_transfer(from_addr, to_addr, amount):
                                             if not replay_mode:
@@ -3195,6 +3818,70 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+                if pending_payout_set is not None:
+                    terms = pending_payout_set
+                    replaced = _lifecycle_for_write().payout_rules.install(
+                        terms, terms.clock(int(block_height or 0), int(block_timestamp or 0)),
+                        int(block_height or 0), int(block_timestamp or 0))
+                    if terms.sealed:
+                        # What the account had asked for before the seal ends
+                        # here: a parked transfer or a waiting rule change would
+                        # otherwise move money or rules after it.
+                        _lifecycle_for_write().approval_requests.resolve_all_for_sender(
+                            terms.account_pubkey, STATUS_FAILED)
+                    tx_receipt["payout_event"] = dict(
+                        _payout_rule_event(terms), outcome="installed", tx_id=tx_id,
+                        **({"replaced": replaced.hex()} if replaced else {}),
+                    )
+                elif pending_payout_revoke is not None:
+                    gone = _lifecycle_for_write().payout_rules.revoke(pending_payout_revoke)
+                    tx_receipt["payout_event"] = dict(
+                        _payout_rule_event(gone), outcome="revoked", tx_id=tx_id)
+                elif pending_payout_exec is not None:
+                    account, total, legs, sale_id, key = pending_payout_exec
+                    book = _lifecycle_for_write().payout_rules
+                    book.record(key, total, int(block_height or 0), int(block_timestamp or 0),
+                                sale_id)
+                    tx_receipt["payout_event"] = {
+                        **_payout_rule_event(book.get(key)),
+                        "outcome": "executed", "tx_id": tx_id,
+                        "executor_pubkey": sender, "total": total,
+                        "legs": [{"slot": k, "recipient_pubkey": who, "amount": amount}
+                                 for k, who, amount in legs],
+                        **({"sale_id": sale_id.hex()} if sale_id is not None else {}),
+                    }
+                if pending_sales and any(lifecycle_mgr.payout_rules.pays_per_sale(to)
+                                         for to, _ in pending_sales):
+                    # The sale's id is the transaction's hash, computed from the
+                    # transaction itself so every node names it the same.
+                    sale_id = bytes.fromhex(_sale_id_of(tx))
+                    book = _lifecycle_for_write().payout_rules
+                    for (to, payer), amount in sorted(pending_sales.items()):
+                        noted = book.note_sale(to, sale_id, payer, amount,
+                                               int(block_height or 0),
+                                               int(block_timestamp or 0))
+                        if noted:
+                            tx_receipt["logs"].append(
+                                f"Sale {noted} for the payout rule of {to[:10]}...: "
+                                f"{sale_id.hex()[:16]} ({amount})")
+                    # Only where the transfers are staged: an apply that writes
+                    # them at once leaves the sale to the block's end.
+                    if charge_fee and target_balances is not None:
+                        arrivals, refusal = _run_arrivals_of_payment(
+                            lifecycle_mgr, book,
+                            _StagedBalances(staged_writes, target_balances),
+                            target_sequences, sale_id, pending_sales,
+                            int(block_height or 0), int(block_timestamp or 0),
+                            timeout=getattr(_session, "request_budget", None),
+                            replay_mode=replay_mode)
+                        if refusal:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = "payment_refused_by_payout_rule"
+                            tx_receipt["logs"].append(refusal)
+                        elif arrivals:
+                            tx_receipt["arrival_events"] = arrivals
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same
@@ -3257,6 +3944,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if (sender and (transfers_op_data or stamp_retractable_park)
                         and target_last_transfer_ts is not None):
                     target_last_transfer_ts[sender] = int(block_timestamp or 0)
+                # A payout is a send from the ACCOUNT, not from its executor.
+                if pending_payout_exec is not None and target_last_transfer_ts is not None:
+                    target_last_transfer_ts[pending_payout_exec[0]] = int(block_timestamp or 0)
 
                 if should_increment_seq and sender:
                     try:

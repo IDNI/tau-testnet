@@ -782,3 +782,229 @@ def compute_retractable_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Payout rules (#63) ---------------------------------------------------------
+
+DOMAIN_PAYOUT_RULE_V1 = b"tau.payout.rule.v1"
+DOMAIN_PAYOUT_RESOLVED_V1 = b"tau.payout.resolved.v1"
+DOMAIN_PAYOUT_BOOK_V1 = b"tau.payout.book.v1"
+# A rule that pays per sale has its own id domain, so its id can never equal the
+# id of the same terms without per-sale payment (and ids of every other rule stay
+# what they were).
+DOMAIN_PAYOUT_RULE_PER_SALE_V1 = b"tau.payout.rule.per_sale.v1"
+
+
+def compute_payout_body_hash(body: str) -> bytes:
+    """BLAKE3 of a payout rule body's UTF-8 bytes. Returns 32 bytes."""
+    return blake3(str(body).encode("utf-8")).digest()
+
+
+def _encode_payout_terms(
+    account_pubkey: Any,
+    sequence_number: int,
+    body_hash: Any,
+    slots: Any,
+    cap_per_execution: int,
+    cap_per_period: int,
+    kind: int,
+    period: int,
+    expires_at: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(account_pubkey))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(encode_hash32(body_hash))
+    slots = list(slots or ())
+    out.extend(bytes([len(slots) & 0xFF]))
+    for slot in slots:
+        if slot:
+            out.extend(b"\x01")
+            out.extend(encode_pubkey48(slot))
+        else:
+            out.extend(b"\x00")
+    out.extend(encode_uint64(int(cap_per_execution)))
+    out.extend(encode_uint64(int(cap_per_period)))
+    out.extend(bytes([int(kind) & 0xFF]))
+    out.extend(encode_uint64(int(period)))
+    out.extend(encode_uint64(int(expires_at)))
+    return bytes(out)
+
+
+def _encode_payout_options(periods_from: Any, due_at: Any, due_every: Any = None,
+                           due_months: Any = None, on_arrival: bool = False,
+                           sealed: bool = False, rule_index: Any = None,
+                           due_retry: Any = None, policy_exempt: bool = False) -> bytes:
+    """The optional terms of a payout rule: one byte saying which are there
+    (bit 0 `periods_from`, bit 1 `due_at`, bit 2 `due_every`, bit 3 `due_months`,
+    bit 4 `on_arrival`, bit 5 `sealed`, bit 6 `rule_index`, bit 7 `due_retry`),
+    then each number present as a uint64, in that order. The two switches carry
+    no number. A rule without the two later numbers encodes as it always did.
+    `policy_exempt` adds one more byte (1) at the end; without it nothing changes."""
+    numbers = (periods_from, due_at, due_every, due_months)
+    flags = sum(1 << k for k, value in enumerate(numbers) if value is not None)
+    flags |= (16 if on_arrival else 0) | (32 if sealed else 0)
+    flags |= (64 if rule_index is not None else 0) | (128 if due_retry is not None else 0)
+    out = bytearray([flags])
+    for value in numbers + (rule_index, due_retry):
+        if value is not None:
+            out.extend(encode_uint64(int(value)))
+    if policy_exempt:
+        out.append(1)
+    return bytes(out)
+
+
+def payout_options_present(options: Any) -> bool:
+    """`options` = (periods_from, due_at, due_every, due_months, on_arrival, sealed,
+    rule_index, due_retry, policy_exempt); the last three may be left off."""
+    return any(v is not None and v is not False for v in options)
+
+
+def compute_payout_rule_id(
+    account_pubkey: Any,
+    sequence_number: int,
+    body_hash: Any,
+    slots: Any,
+    cap_per_execution: int,
+    cap_per_period: int,
+    kind: int,
+    period: int,
+    expires_at: int,
+    per_sale: bool = False,
+    periods_from: Any = None,
+    due_at: Any = None,
+    due_every: Any = None,
+    due_months: Any = None,
+    on_arrival: bool = False,
+    sealed: bool = False,
+    rule_index: Any = None,
+    due_retry: Any = None,
+    policy_exempt: bool = False,
+) -> bytes:
+    """BLAKE3 of the signed terms of a payout rule. Returns 32 bytes.
+
+    An execution names the id it was signed against, so a rule replaced between
+    signing and inclusion cannot be executed with inputs meant for another one.
+
+    The optional terms follow the fixed ones only when one of them is there, so
+    a rule without them keeps the id it always had. The fixed terms delimit
+    themselves, so the longer preimage is no other rule's.
+    """
+    out = bytearray()
+    domain = DOMAIN_PAYOUT_RULE_PER_SALE_V1 if per_sale else DOMAIN_PAYOUT_RULE_V1
+    out.extend(encode_string(domain.decode()))
+    out.extend(_encode_payout_terms(
+        account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
+        cap_per_period, kind, period, expires_at,
+    ))
+    options = (periods_from, due_at, due_every, due_months, on_arrival, sealed,
+               rule_index, due_retry, policy_exempt)
+    if payout_options_present(options):
+        out.extend(_encode_payout_options(*options))
+    return blake3(bytes(out)).digest()
+
+
+def compute_payout_resolved_acc(acc: Any, rule_id: Any, outcome: int) -> bytes:
+    """Fold one removal (revoked, expired, replaced) into the running commitment."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(rule_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_payout_entry(
+    rule_id: Any,
+    account_pubkey: Any,
+    sequence_number: int,
+    body_hash: Any,
+    slots: Any,
+    cap_per_execution: int,
+    cap_per_period: int,
+    kind: int,
+    period: int,
+    expires_at: int,
+    anchor: int,
+    period_index: int,
+    spent_in_period: int,
+    executions: int,
+    paid_total: int,
+    last_height: int,
+    sales: Any = None,
+    more: Any = None,
+) -> bytes:
+    """The signed terms, then where the rule stands: the period caps depend on it.
+
+    `sales`, only for a rule that pays per sale: (missed, open sales), each open
+    sale (sale_id, payer, amount, height). Which sales are still payable is state
+    every node must agree on, so it is part of the entry.
+
+    `more`, only for a rule that carries an optional term or reads the clocks the
+    node keeps for it: (periods_from, due_at, last_clock, due_done), then, when
+    one of the later terms is there, (due_every, due_months, on_arrival, sealed,
+    due_index), then, when the rule has a place other than the first or retries
+    its due points, (rule_index, due_retry, retry_at, retry_until), then, for a rule
+    signed with `policy_exempt`, (True,); such a rule marks `more` with 3, not 2.
+    A rule with none of it keeps the entry it always had, and a rule with only
+    the earlier terms keeps the entry those gave it.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(rule_id))
+    out.extend(_encode_payout_terms(
+        account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
+        cap_per_period, kind, period, expires_at,
+    ))
+    out.extend(encode_uint64(int(anchor)))
+    out.extend(encode_uint64(int(period_index)))
+    out.extend(encode_uint64(int(spent_in_period)))
+    out.extend(encode_uint64(int(executions)))
+    out.extend(encode_uint64(int(paid_total)))
+    out.extend(encode_uint64(int(last_height)))
+    if sales is not None:
+        missed, open_sales = sales
+        out.extend(b"\x01")
+        out.extend(encode_uint64(int(missed)))
+        out.extend(encode_uint32(len(open_sales)))
+        for sale_id, payer, amount, height in open_sales:
+            out.extend(encode_hash32(sale_id))
+            out.extend(encode_pubkey48(payer))
+            out.extend(encode_uint64(int(amount)))
+            out.extend(encode_uint64(int(height)))
+    if more is not None:
+        periods_from, due_at, last_clock, due_done = more[:4]
+        due_every, due_months, on_arrival, sealed, due_index = (
+            tuple(more[4:9]) if len(more) > 4 else (None, None, False, False, 0))
+        rule_index, due_retry, retry_at, retry_until = (
+            tuple(more[9:13]) if len(more) > 9 else (None, None, 0, 0))
+        policy_exempt = len(more) > 13 and bool(more[13])
+        out.extend(b"\x03" if policy_exempt else b"\x02")
+        out.extend(_encode_payout_options(
+            periods_from, due_at, due_every, due_months, on_arrival, sealed,
+            rule_index, due_retry, policy_exempt))
+        out.extend(encode_uint64(int(last_clock)))
+        out.extend(b"\x01" if due_done else b"\x00")
+        if due_every is not None or due_months is not None:
+            # which due point of a repeating rule comes next
+            out.extend(encode_uint64(int(due_index)))
+        if due_retry is not None:
+            # when the node tries an unpaid due point again and until when,
+            # both 0 while it owes no retry
+            out.extend(encode_uint64(int(retry_at)))
+            out.extend(encode_uint64(int(retry_until)))
+    return bytes(out)
+
+
+def compute_payout_book_root(
+    entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the payout book: sorted installed rules, then the removals."""
+    encoded = sorted(encode_payout_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()

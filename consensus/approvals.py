@@ -533,11 +533,22 @@ class RuleChangeRequest:
     @property
     def body(self) -> str:
         """The normalized clause body (the exact offered text for an accept);
-        "" for kinds that carry none."""
+        for a payout revoke the place it names ("" for the first rule); "" for
+        kinds that carry none."""
+        if self.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
+            return self.rule_text
         if self.kind not in _RULE_CHANGE_BODY_KINDS:
             return ""
         if self.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
             return self.rule_text
+        if self.kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT:
+            # The canonical terms plus this request's sequence number, which
+            # enters the id of the rule the release installs.
+            import json
+
+            from consensus.payout import payout_spec_text
+
+            return payout_spec_text(json.loads(self.rule_text), self.sequence_number)
         from consensus.rule_offers import clause_body_v1
 
         return clause_body_v1(self.rule_text)
@@ -581,9 +592,10 @@ _RULE_CHANGE_BODY_KINDS = frozenset({
     tau_defs.RULE_CHANGE_KIND_SET_POLICY,
     tau_defs.RULE_CHANGE_KIND_SET_GUARD,
     tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
+    tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
 })
 _RULE_CHANGE_KINDS = frozenset(range(
-    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD + 1
+    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT + 1
 ))
 
 
@@ -609,7 +621,7 @@ def parse_rule_change_request_checked(
         if isinstance(val, bool) or not isinstance(val, int):
             return None, "kind, sequence_number and expire_at_height must be integers"
     if kind not in _RULE_CHANGE_KINDS:
-        return None, "kind must be 1..5"
+        return None, f"kind must be 1..{tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT}"
 
     rule_text = tx.get("rule_text", "")
     if rule_text is None:
@@ -625,7 +637,15 @@ def parse_rule_change_request_checked(
     has_body = kind in _RULE_CHANGE_BODY_KINDS
     if has_body and not rule_text.strip():
         return None, "this kind needs a non-empty rule_text"
-    if not has_body and rule_text != "":
+    if kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT and rule_text != "":
+        # A revoke of the rule in another place than the first names it.
+        from consensus.payout import PayoutShapeError, payout_revoke_place
+
+        try:
+            payout_revoke_place(rule_text)
+        except PayoutShapeError as exc:
+            return None, str(exc)
+    elif not has_body and rule_text != "":
         return None, "this kind carries no rule_text"
 
     offer_id = tx.get("offer_id", "")
@@ -647,7 +667,16 @@ def parse_rule_change_request_checked(
     except ApprovalShapeError as exc:
         return None, str(exc)
 
-    if has_body:
+    if kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT:
+        # The rule_text is the payout rule's canonical spec, without a sequence
+        # number (the request adds its own).
+        from consensus.payout import PayoutShapeError, parse_payout_spec
+
+        try:
+            parse_payout_spec(rule_text, sender_n, seq)
+        except PayoutShapeError as exc:
+            return None, f"rule_text is not a payout rule spec: {exc}"
+    elif has_body:
         try:
             body = clause_body_v1(rule_text)
         except RuleOfferShapeError as exc:

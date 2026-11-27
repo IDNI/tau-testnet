@@ -285,6 +285,12 @@ tau-testnet retractable list --key alice --role out
 tau-testnet retractable show <retractable_id>
 tau-testnet retractable retract --key alice <retractable_id>
 
+# payout rules (a Tau rule pays out the account's money when anyone executes it, inside signed caps)
+tau-testnet payout set --key treasury --file payout.tau --slot <bob_pubkey> --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 --ends-in 100000
+tau-testnet payout execute --key carol --account <treasury_pubkey> --data 0=300
+tau-testnet payout show <treasury_pubkey>
+tau-testnet payout revoke --key treasury
+
 # target a remote node
 tau-testnet --host testnet.tau.net --port 65432 status
 ```
@@ -503,7 +509,7 @@ state_hash = BLAKE3(
   - Transaction → `SHA-256` of canonical JSON of `{sender_pubkey, sequence_number, expiration_time, expire_at_height, fee_limit, tx_type, …type-specific}`. `tx_type` **is** signed, so a `user_tx` signature cannot be replayed as a governance vote. `expire_at_height` is signed whenever present, and required on anything new: the wall-clock `expiration_time` is rechecked at apply against the block **timestamp**, which the proposer picks, so the height is the deadline a proposer cannot move.
   - Block header → `SHA-256` of `BlockHeader.canonical_bytes()`, verified by `Block.verify_consensus_proof()`.
 
-> ⚠️ **No cross-network / version domain separation (replay risk).** Signed payloads do **not** include `network_id`, `genesis_hash`, or a protocol version, and there is no explicit `tx`-vs-`block` domain tag (they are separated only implicitly by incompatible encodings). A transaction signed for one Tau network is cryptographically valid on any other network where the same keypair is funded. **Do not reuse account/validator keys across networks.** Adding explicit domain tags (e.g. `TAU_TESTNET_TX_V1 | network_id | genesis_hash | tx_type | body`) is planned and will be a breaking signature-format change.
+> ⚠️ **No cross-network / version domain separation (replay risk).** Signed payloads do **not** include `network_id`, `genesis_hash`, or a protocol version, and there is no explicit `tx`-vs-`block` domain tag (they are separated only implicitly by incompatible encodings). A transaction signed for one Tau network is cryptographically valid on any other network where the same keypair is funded. **Do not reuse account/validator keys across networks.** Adding explicit domain tags (e.g. `TAU_TESTNET_TX_V1 | network_id | genesis_hash | tx_type | body`) is planned and will be a breaking signature-format change. Exception: the transaction types listed in `consensus/network_binding.py` (the three payout types) already sign `genesis_hash` and are refused on every other network.
 
 ---
 
@@ -648,6 +654,34 @@ Timing caveats:
 - A retract must be **included in a block** before the release point, not merely sent. A feeless retract sorts last in the mempool under backlog, so retract with margin.
 
 **Upgrade.** This adds a field to the consensus metadata hash with no activation flag, so it needs a regenesis and every node on the same build. An older binary forks at the first park block.
+
+## Payout rules
+
+Long-form guide: [docs/payout_rules.md](docs/payout_rules.md).
+
+A `payout_rule_set` installs one of the account's payout rules (up to eight, one per place, `rule_index`): a Tau clause, up to eight recipient slots (a fixed key, or open for the executor to name), a cap per execution, a cap per period and an end. Anyone may then send `payout_execute`: the node steps the rule once in its own policy pool and pays every slot it writes, or nothing.
+
+```bash
+tau-testnet payout set --key treasury --file payout.tau --slot <bob_pubkey> --slot open \
+    --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 --ends-in 100000
+tau-testnet payout execute --key carol --account <treasury_pubkey> --recipient 1=<dave_pubkey> --data 0=300
+tau-testnet payout show <treasury_pubkey>                    # terms, period spend, history
+tau-testnet payout revoke --key treasury
+```
+
+Semantics:
+
+- **ABI.** The rule reads `i2` (account balance at the parent block), `i5`/`i6` (block time and height), `i13` (executor key), `i26` (paid this period), `i30+k` (slot k's recipient), `i40+k` (executor data) and writes `o30+k` (slot k's amount), each at a fixed width.
+- **All or nothing.** `1 <= total <= cap_per_execution`, period total `<= cap_per_period`, `total <=` the account's balance; an open slot pays only a recipient the executor named, never the account itself.
+- **Periods.** Every `period_blocks` blocks or `period_seconds` of block time, counted from the install; nothing carries over.
+- **Per sale.** A rule installed with `per_sale` (`--per-sale`) pays only against sales the chain recorded: every signed transfer into the account is an open sale (id = its transaction hash). An execution names one (`--sale <tx_hash>`), the rule reads its amount and payer (`i27`, `i28`), and a paid sale is closed, so a royalty is paid once per sale and never on the claimant's word. At most 64 open per rule; a larger sale takes the place of the smallest, so sales too small to pay anything cannot keep later ones out. With `on_arrival` (`--on-arrival`, one such rule per account) the node runs the rule inside each payment, so the gross, the shares and the net commit together: a run that pays nothing leaves the payment whole, any other refusal refuses the payment, and the account's `o5` clause is not asked, since the share was never the account's to spend.
+- **Policy.** Every payment a rule makes, a run on arrival aside, is asked of the account's current `o5` clause like a transfer the account sends (the real recipient and amount, once per payment), so a freeze or a stricter clause installed later stops it; one blocked payment refuses the whole run. A rule signed with `policy_exempt` (`--policy-exempt`) is the exception and is not asked. Installing, replacing and revoking are rule changes (kinds 6 and 7) that a rule-change guard judges; a guarded account uses `--request`. Exempt payout rule + blocking `o5` + guard = escrow.
+- **Fees.** The account pays one fee to install; each execution's executor pays its fee after the legs; revoke is fee-free. A refused execution is not included.
+- **One network.** All three types sign `genesis_hash` (the hash of block 0; `getsequence` returns it and the CLI fills it in). One signed for another network is refused at admission (`WRONG_NETWORK`) and at block apply.
+- **Caps.** Eight rules per account (`--rule-index 1..7` beside the first), 4096 in total, 8 slots, 16 executions per block. A due point that found the account short is tried again in later blocks when the rule carries `due_retry` (`--due-retry`).
+- **Reads.** `getpayoutrule <address>` (with `history` and `semantics`) and `gettxstatus`.
+
+**Upgrade.** The book root is folded into the consensus metadata as `payout_rules_root` only once the book has held a rule, so **no regenesis** is needed. Nodes must upgrade before the first install.
 
 ## Mempool policy
 
