@@ -212,6 +212,43 @@ def test_restart_rebuilds_the_same_text():
     assert first == second
 
 
+# --- head that moves mid-read (AtticKnight review, PR #180) ------------------
+
+@pytest.mark.parametrize("advance_after", ["header", "rule_index"])
+def test_head_summary_matches_one_committed_block(monkeypatch, advance_after):
+    store = _store_two_blocks()
+    container = types.SimpleNamespace(db=store)
+    monkeypatch.setattr(tau_authority, "owner", lambda: types.SimpleNamespace(enabled=True))
+    monkeypatch.setattr(tau_authority, "program_baseline", lambda: BASE)
+    monkeypatch.setattr(rs, "_spawn", FakeEngine())
+
+    def snapshot(command):
+        data = json.loads(getrulesinforce.execute(command, container))["data"]
+        return (data["block_hash"], data["block_number"], data["spec_revision"],
+                data["running_spec"]["sha256"])
+
+    committed = {snapshot("getrulesinforce 1"), snapshot("getrulesinforce 2")}
+    assert len(committed) == 2
+    rs.reset_cache()
+    monkeypatch.setattr(store, "get_canonical_head_block",
+                        lambda: store.get_block_by_hash("b1"))
+    if advance_after == "rule_index":
+        old_entries = _slim(store.rows[:2])
+        monkeypatch.setattr(store, "committed_rule_history", lambda: ("b1", old_entries))
+    assert snapshot("getrulesinforce") in committed
+
+
+def test_block_with_no_rule_history_stays_the_same_after_blocks_arrive():
+    store = _store_two_blocks()
+    store.commits["b0"] = {"journal_head": None, "spec_revision": 0,
+                           "block_number": 0, "tip": "b0"}
+    later_rows, store.rows = store.rows, []
+    first = rs.running_spec_at(store, "b0", baseline=BASE, spawn=FakeEngine())
+    store.rows = later_rows
+    rs.reset_cache()
+    again = rs.running_spec_at(store, "b0", baseline=BASE, spawn=FakeEngine())
+    assert again == first
+
 # --- replay fingerprints ------------------------------------------------------
 
 def _fingerprinted_store():
@@ -367,8 +404,9 @@ def test_getrulesinforce_lists_only_registry_clauses():
     store.registry[(alice, 5)] = "always ( o5[t] = 0 )."
     container = types.SimpleNamespace(db=store, chain_state=_chain_state())
     with patch.object(tau_authority, "owner", return_value=_enabled_owner()), \
-            patch.object(rs, "at_head", return_value={
-                "text": "x", "sha256": _sha("x"), "block_hash": "b2"}):
+            patch.object(rs, "running_spec_at", return_value={
+                "text": "x", "sha256": _sha("x"), "block_hash": "b2",
+                "spec_revision": 2}):
         resp = json.loads(getrulesinforce.execute(
             f"getrulesinforce {alice}", container))
     assert resp["status"] == "ok", resp
@@ -536,8 +574,9 @@ def test_getrulesinforce_account_lists_fee_rules_from_the_tip(temp_database):
         _canonical_head_hash=blocks[2].block_hash)
     container = types.SimpleNamespace(db=db, chain_state=state)
     with patch.object(tau_authority, "owner", return_value=_enabled_owner()), \
-            patch.object(rs, "at_head", return_value={
-                "text": "x", "sha256": _sha("x"), "block_hash": blocks[2].block_hash}):
+            patch.object(rs, "running_spec_at", return_value={
+                "text": "x", "sha256": _sha("x"),
+                "block_hash": blocks[2].block_hash, "spec_revision": 2}):
         resp = json.loads(getrulesinforce.execute(
             f"getrulesinforce {ALICE}", container))
     assert resp["status"] == "ok", resp

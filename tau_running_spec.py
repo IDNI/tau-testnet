@@ -368,7 +368,13 @@ def running_spec_at(store, block_hash, *, baseline=None, spawn=None) -> dict:
             if not base:
                 raise RunningSpecUnavailable("no program baseline")
             _verified_key(store, key)
-            units, fps = _units_from_store(store, entries, head_link=key)
+            if key is None:
+                # A commit with no journal head names an empty journal prefix:
+                # no rule had been recorded at that block, so rules appended
+                # later must not change the answer for it (AtticKnight, #180).
+                units, fps = [], []
+            else:
+                units, fps = _units_from_store(store, entries, head_link=key)
             text = compose(base, units, spawn=spawn, fingerprints=fps)
         except JournalTampered as exc:
             _cached_key, _cached_text = None, None

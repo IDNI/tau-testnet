@@ -113,9 +113,11 @@ def execute(raw_command: str, container):
                        "unavailable": "this node runs without the authoritative engine",
                        "code": "UNAVAILABLE"}
         elif block_arg is None:
-            running = tau_running_spec.at_head(database)
-            if running.get("block_hash") is not None:
-                block_hash = running["block_hash"]
+            # Pin the head read to the block the header named above: asking
+            # at_head() to select a head again can answer with a newer
+            # block's spec while the response still names the old block
+            # (AtticKnight review, PR #180).
+            running = tau_running_spec.running_spec_at(database, block_hash)
         else:
             running = tau_running_spec.running_spec_at(database, block_hash)
 
