@@ -45,6 +45,7 @@ MagicMock
 !docs/approvals.md
 !docs/retractable.md
 !docs/packaging.md
+!docs/block-byte-size.md
 
 # Python
 __pycache__/
