@@ -91,11 +91,10 @@ FEE_PLUS = 5
 
 
 def own_fee_rule(pk):
-    """The sender `pk` pays FEE_PLUS on top of the base fee; nobody else pays a
-    custom fee. o8 is on no other rule of this network."""
-    return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) ? "
-            "(o8[t]:bv[24] = { #x%06x }:bv[24]) : "
-            "(o8[t]:bv[24] = { #x000000 }:bv[24]) )." % (pk, FEE_PLUS))
+    """The sender `pk` pays FEE_PLUS on top of the base fee, in the form the node
+    admits: fenced to the sender's own key. o8 is on no other rule of this network."""
+    return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) -> "
+            "(o8[t]:bv[24] = { #x%06x }:bv[24]) )." % (pk, FEE_PLUS))
 
 
 def guard_text(cosigner_pk):

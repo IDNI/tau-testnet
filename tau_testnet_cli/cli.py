@@ -2224,8 +2224,7 @@ def _format_account_rules(data: dict) -> str:
     if fees is None and "fee_rules" in data:
         lines.append("  fee rules (o8) of every account: not known")
     elif fees is not None:
-        lines.append(f"  fee rules (o8) of every account, any of which can change "
-                     f"this account's fee: {len(fees)}")
+        lines.append(f"  fee rules (o8) of every account, each with its sender: {len(fees)}")
         for unit in fees:
             senders = unit.get("sent_by")
             who = (", ".join(_short(s) for s in senders) if senders

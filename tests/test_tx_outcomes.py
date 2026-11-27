@@ -451,8 +451,8 @@ def test_every_fee_rule_is_listed_with_who_sent_it_in_the_order_they_joined(temp
 
 
 def test_a_fee_rule_that_never_names_the_account_is_shown_only_among_the_fee_rules(temp_database):
-    """The case of #183: another account's fee rule can charge this one, and the
-    units naming the account do not show it."""
+    """The case of #183: a fee unit that does not name the account is not among
+    the units naming it, and the fee rules show it."""
     data = _fee_view()
     assert FEE_OTHER not in [u["unit"] for u in data["application_rules"]]
     assert FEE_OTHER in [u["unit"] for u in data["fee_rules"]]
@@ -470,11 +470,14 @@ def test_a_unit_that_writes_no_fee_is_not_a_fee_rule(temp_database):
     assert APP_UNIT not in units and OTHER_UNIT not in units
 
 
-def test_the_sender_of_a_fee_rule_is_the_account_that_sent_it_not_the_key_it_names():
-    """A unit sent by one account can name another key: `sent_by` comes from the
-    transaction, never from the text."""
-    text = ("always ( (i12[t]:bv[384] = { #x" + ap.BOB + " }:bv[384]) -> "
+def _fee_rule_of(key):
+    return ("always ( (i12[t]:bv[384] = { #x" + key + " }:bv[384]) -> "
             "(o8[t]:bv[24] = { #x000005 }:bv[24]) ).")
+
+
+def test_the_sender_of_a_fee_rule_is_recorded_from_its_transaction():
+    """`sent_by` comes from the transaction that brought the unit."""
+    text = _fee_rule_of(ap.ALICE)
     result, _, _ = ap._apply([ap.rule_tx(text)])
     (row,) = result.next_snapshot.metadata["tx_outcomes"]
     assert row["status"] == "applied", row
@@ -483,6 +486,15 @@ def test_the_sender_of_a_fee_rule_is_the_account_that_sent_it_not_the_key_it_nam
         "account": ap.ALICE, "kind": "application_rule", "action": "accumulated",
         "sha256": _sha(unit),
     }]
+
+
+def test_a_fee_rule_fenced_to_another_key_leaves_no_rule_effect():
+    """The node refuses a fee rule whose guard names another account, so no unit
+    is recorded for its sender."""
+    result, _, _ = ap._apply([ap.rule_tx(_fee_rule_of(ap.BOB))])
+    rows = result.next_snapshot.metadata["tx_outcomes"]
+    assert [r["status"] for r in rows] != ["applied"], rows
+    assert not any(r.get("rule_effects") for r in rows), rows
 
 
 def test_the_fee_actually_charged_is_reported():

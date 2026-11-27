@@ -14,8 +14,8 @@ for "did my last rule transaction change anything". This answers it in one call:
   fee_rules            every accumulated unit that writes the fee stream o8,
                        whoever sent it, in the order the units joined. The
                        engine works out o8 from the whole specification for
-                       every transaction, so a unit that never names this
-                       account can still change what it pays (#183). Each
+                       every transaction, and a fee rule is admitted only
+                       when it is fenced to its sender's own key (#183). Each
                        carries `names_this_account` and `sent_by`: the
                        accounts whose rule transaction accumulated it, from
                        this node's record, or null where the node has none

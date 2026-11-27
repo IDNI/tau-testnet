@@ -364,7 +364,7 @@ def test_policy_show_lists_every_fee_rule_and_who_sent_it(alice):
          "sent_by": None, "since": None}])
     rc, out, err = _run(["policy", "show", APPROVER], [_ok(fees)])
     assert rc == 0, err
-    assert "fee rules (o8) of every account, any of which can change this account's fee: 2" in out
+    assert "fee rules (o8) of every account, each with its sender: 2" in out
     assert "sha256 " + "77" * 32 + "  sent by " + APPROVER[:12] + "...  names this account" in out
     assert "sha256 " + "99" * 32 + "  sent by sender not recorded" in out
 

@@ -610,8 +610,9 @@ not record the block cannot know. For a rule the engine was given,
 `gettxstatus` also reads the engine's verdict from the block's committed
 journal (`rule_outcome`). `fee_rules` lists every unit that writes the fee
 stream `o8`, with the account that sent it: the engine works out `o8` from the
-whole specification, so a fee rule of one account can change what another pays
-(#183), and a wallet that shows a fee reads all of them.
+whole specification, and a fee rule is admitted only when it is fenced to its
+sender's own key, so a wallet can show which unit sets which sender's fee
+(#183).
 
 ### Checking conflict status
 
