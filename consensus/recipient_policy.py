@@ -10,7 +10,14 @@ Two modes, mirroring the sender side:
 
 - Clause mode (this module's `recipient_clause_blocks`): the recipient's
   registered clause is stepped on the same per-transfer inputs as the
-  sender pass, with the direction made visible on the streams (below).
+  sender pass. Direction is NOT visible to a clause body — both passes
+  feed the same map, and a body may not reference i12
+  (rule_offers.SENDER_STREAM bans it at registration) — so direction is
+  separated by enforcement path instead: a clause that opts into
+  recipient enforcement is enforced ONLY on the receive path, and the
+  send path skips it (see `send_path_clause_blocks`). Without that
+  separation the documented allow-list would refuse the owner's own
+  sends: on the send path i3 names the owner, never an approved sender.
 - Guarded mode (`guarded_recipient_blocks`): the accumulated spec is
   stepped a second time with `i12` set to the RECIPIENT's key, so the
   recipient's guarded unit — `always ((i12[t] = <me>) ? <body> : o5 =
@@ -33,12 +40,13 @@ recipient pass feeds the SAME per-transfer input map as the sender pass
 timestamp, i12 sender key, approval slots, custom streams), plus the two
 hold streams below. The counterparty is read on i3, which carries the
 sender's full public key: in the sender pass i3 names the clause's owner,
-in the recipient pass it names the sender — the direction is visible from
-the streams themselves. (i12 also carries the sender key in the clause
-pass, but clause bodies may not reference it: rule_offers.SENDER_STREAM
-bans it at registration precisely because, in the sender pass, it always
-names the owner.) An inbound rule is therefore a plain comparison on i3,
-e.g. "allow only if i3 is A or B", exactly as issue #47 requests.
+in the recipient pass it names the sender. A body cannot tell the two
+passes apart — every stream it may read carries the same value in both,
+and the one stream whose value it could have compared (i12) is banned in
+clause bodies at registration — which is exactly why enforcement, not
+the body, owns the direction split (see the opt-in screen, below). An
+inbound rule is therefore a plain comparison on i3, e.g. "allow only if
+i3 is A or B", exactly as issue #47 requests.
 
 Hold streams (#76): i17 carries the park's hold length in SECONDS
 (release_at_time minus the block time) and i27 the hold in BLOCKS
@@ -78,6 +86,16 @@ silently change what a pre-existing policy means, so it is skipped here.
 Every inbound rule must read the sender or the hold to work at all, so the
 screen loses no expressiveness. (Comments are stripped first, as
 rule_offers does for its own screens.)
+
+The screen is symmetric, and the other half is load-bearing: the send
+path does not enforce a recipient-relevant clause against the owner's
+own sends (`send_path_clause_blocks`). Read on the send path, i3 can
+only name the owner, so an allow-list's inbound comparison would refuse
+every send the owner makes — the owner's clause would brick the owner's
+wallet. A clause therefore speaks to exactly one direction, the one its
+streams can actually observe: reading i3 or a hold stream makes it a
+receive policy, enforced inbound only; reading neither keeps it a send
+policy, enforced outbound only.
 
 Neutral default: a recipient with no clause, or one that does not opt in,
 allows everything — the same default as the sender side.
@@ -246,6 +264,28 @@ def refusal_message(refusal: RecipientRefusal) -> str:
         f"{cap}; this payment would be held for {refusal.hold_seconds} "
         f"seconds / {refusal.hold_blocks} blocks"
     )
+
+
+def send_path_clause_blocks(clause_for, sender_pubkey, values, *, pool: str,
+                            timeout=_SESSION_DEFAULT) -> tuple[bool, str]:
+    """(blocked, detail) for the sender's own o5 clause on the SEND path.
+
+    The one funnel every send-path judgment of a registered clause goes
+    through (admission in commands/sendtx.py, apply in
+    consensus/engine.py; the approval preview mirrors the same screen in
+    commands/getapprovalpreview.py). A recipient-relevant clause — one
+    that reads the counterparty (i3) or a hold stream (i17/i27) — is a
+    RECEIVE policy: it is not evaluated here at all, so the documented
+    allow-list can never refuse the owner's own sends. On this path i3
+    names the owner, never a counterparty, and a clause body may not
+    reference the one stream (i12) it could have used to tell direction,
+    so enforcement — not the body — owns the direction split. Any other
+    clause is judged by sender_policy exactly as before.
+    """
+    body = clause_for(sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
+    if not body or clause_is_recipient_relevant(body):
+        return False, ""
+    return sender_policy.clause_blocks(body, values, pool=pool, timeout=timeout)
 
 
 def recipient_clause_blocks(clause_for, sender_pubkey, recipient_pubkey,
