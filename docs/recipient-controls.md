@@ -16,9 +16,9 @@ the same verdicts.
 A recipient rule is an ordinary `o5` clause (or guarded unit, below). It
 is evaluated on the same per-transfer inputs as the sender pass — `i1`
 amount, `i2` sender balance, `i3` sender key, `i4` recipient key, `i5`
-timestamp, approval slots, custom streams — with the direction visible
-from the streams: **`i3` carries the sender's full public key**, so an
-inbound allow-list is a plain comparison on `i3`:
+timestamp, approval slots, custom streams. **`i3` carries the sender's
+full public key**, so an inbound allow-list is a plain comparison on
+`i3`:
 
 ```
 # allow incoming only from A (anyone else is refused)
@@ -29,12 +29,25 @@ always ( (i3[t]:bv[384] = { #x<A> }:bv[384])
 
 "Refuse incoming above N" is the same shape with a comparison on `i1`.
 
-**Opt-in.** The recipient pass enforces only clauses whose body reads
-`i3` or a hold stream (below). A clause that reads neither — a pure
-outbound whitelist on `i4`, say — keeps its outbound meaning and never
-starts blocking inbound transfers, so deploying recipient controls
-changes nothing for pre-existing policies. A recipient with no clause
-allows everything: the neutral default, as on the sender side.
+**Opt-in, and direction.** The recipient pass enforces only clauses
+whose body reads `i3` or a hold stream (below). A clause that reads
+neither — a pure outbound whitelist on `i4`, say — keeps its outbound
+meaning and never starts blocking inbound transfers, so deploying
+recipient controls changes nothing for pre-existing policies. A
+recipient with no clause allows everything: the neutral default, as on
+the sender side.
+
+The split is symmetric, because a clause body cannot see direction
+itself: both passes feed it the same inputs, and a body may not
+reference `i12`, the one stream that could have told it which pass is
+running (registration refuses it). So enforcement owns the direction.
+A clause that reads `i3` or a hold stream is a **receive policy**: it
+is enforced when the account receives, and the send path does not
+enforce it against the owner's own sends — on that path `i3` can only
+name the owner, so the allow-list above would otherwise refuse every
+send its owner makes. A clause that reads neither stream is a **send
+policy**, enforced outbound only. One clause speaks to exactly one
+direction: the one its streams can actually observe.
 
 **Guarded mode.** The accumulated spec is also stepped a second time
 with `i12` — the policy-owner stream every guarded unit scopes on — set
@@ -125,7 +138,6 @@ The flags describe the node software, never chain state. On a node
 built without the gate they are `false`, and its clause admission
 refuses a hold-cap clause (one reading `i17`/`i27`) at deploy time with
 a clear reason, instead of admitting a rule that would never run. A
-clause reading only `i3` is not refused at deploy: statically it is
-indistinguishable from a sender-pass clause — the capabilities report
-is how a wallet learns whether the recipient pass will also enforce it
-inbound.
+clause reading only `i3` is not refused at deploy either: it is a
+receive policy (see "Opt-in, and direction" above) — the capabilities
+report is how a wallet learns whether this node enforces it inbound.
