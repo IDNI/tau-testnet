@@ -54,6 +54,27 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Two live Tau interpreters in one process segfault under the engine's
+# default tree-node GC floor (256): alternating feeds across interpreters
+# collect nodes the other interpreter still roots. Raising the floor far
+# above any spec this node builds keeps the collector from running while
+# the shadow coexists with the live interpreter; tref budget 0 is the
+# engine default (unlimited) and is set explicitly so a lowered budget
+# elsewhere cannot refuse shadow steps.
+_SHADOW_GC_MIN_SIZE = 100_000_000
+
+
+def _raise_gc_floor(tau_native) -> None:
+    module = getattr(tau_native, "tau", None)
+    if module is None:
+        return
+    set_gc_min_size = getattr(module, "set_gc_min_size", None)
+    if callable(set_gc_min_size):
+        set_gc_min_size(_SHADOW_GC_MIN_SIZE)
+    set_tref_budget = getattr(module, "set_tref_budget", None)
+    if callable(set_tref_budget):
+        set_tref_budget(0)
+
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
@@ -131,6 +152,7 @@ class TauInterfaceShadowDriver:
         import tau_native
 
         self._tau_native = tau_native
+        _raise_gc_floor(tau_native)
         self._interface = tau_native.TauInterface(
             program_file or config.TAU_PROGRAM_FILE
         )
