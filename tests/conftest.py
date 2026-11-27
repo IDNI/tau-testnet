@@ -84,11 +84,7 @@ def stop_tau_manager_thread(thread: threading.Thread, timeout: float = 30.0) -> 
     import tau_manager
 
     tau_manager.request_shutdown()
-    deadline = time.monotonic() + timeout
-    # The manager clears the stop flag when it starts, so set it until the thread ends.
-    while thread.is_alive() and time.monotonic() < deadline:
-        tau_manager.server_should_stop.set()
-        thread.join(0.1)
+    thread.join(timeout)
     return not thread.is_alive()
 
 
@@ -173,11 +169,11 @@ def restore_lifecycle_manager() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def restore_genesis_approval_slots(monkeypatch):
-    """Keep the genesis slot flag of one test out of the next test."""
+def restore_genesis_reload_values(monkeypatch):
+    """A reload reads these from the last genesis loaded, so one test's genesis must not reach the next."""
     import chain_state
-    monkeypatch.setattr(chain_state, "_genesis_approval_slots_active",
-                        chain_state._genesis_approval_slots_active)
+    for name in ("_genesis_approval_slots_active", "_genesis_faucet_amount"):
+        monkeypatch.setattr(chain_state, name, getattr(chain_state, name))
 
 
 @pytest.fixture(autouse=True)
@@ -195,11 +191,20 @@ def allow_history_rules(monkeypatch):
     """Let a rule that reads an earlier step through admission and apply.
 
     Evaluator-continuity tests need a stateful evaluator behind the real entry
-    points, which the temporal screen refuses for user rules.
+    points, which the rule-fragment screen refuses for user rules.
     """
+    import re
+    from types import SimpleNamespace
+
     import consensus.admission
 
-    monkeypatch.setattr(consensus.admission, "screen_temporal_rule", lambda _rule_text: None)
+    def parse_without_screen(unit_text):
+        found = re.search(r"i12\[t\]:bv\[384\] = \{ #x([0-9A-Fa-f]+) \}", unit_text)
+        guard = int(found.group(1), 16) if found else None
+        return SimpleNamespace(sender_guard=guard), None
+
+    monkeypatch.setattr(consensus.admission, "screen_rule_fragment", lambda _unit_text: None)
+    monkeypatch.setattr(consensus.admission, "_parse_fragment", parse_without_screen)
 
 
 class FakeEngine:

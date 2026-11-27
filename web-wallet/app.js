@@ -1103,13 +1103,13 @@ function generateRandomTauRule() {
         () => [
             `# Example 1 - Constant flag output (sanity test)`,
             `# Writes a stable 0/1 into an unused output stream every step.`,
-            `always (o${outA}[t] = ${hx(bit)}).`
+            `always (o${outA}[t]:bv[24] = ${hx(bit)}).`
         ].join('\n'),
 
         () => [
             `# Example 2 - Threshold gate (classifier-like)`,
             `# If i${inA}+i${inB} >= 0x80 then output 1 else 0 (bv[24]).`,
-            `always ( ((i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) >= ${hx(0x80)} && o${outA}[t] = ${hx(1)}) || ((i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) < ${hx(0x80)} && o${outA}[t] = ${hx(0)}) ).`
+            `always ( ((i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) >= ${hx(0x80)} && o${outA}[t]:bv[24] = ${hx(1)}) || ((i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) < ${hx(0x80)} && o${outA}[t]:bv[24] = ${hx(0)}) ).`
         ].join('\n'),
 
         () => [
@@ -1125,18 +1125,16 @@ function generateRandomTauRule() {
         ].join('\n'),
 
         () => [
-            `# Example 5 - "Network" style rule with local variables`,
-            `# Computes two hidden gates and outputs:`,
+            `# Example 5 - "Network" style rule with a score gate`,
+            `# Computes one gate and outputs:`,
             `# - o${outA}[t] allow flag (bv[24])`,
             `# - o${outB}[t] risk-ish score (bv[24])`,
-            `always ( ex s1 ex s2 ex h1 ex h2 (`,
-            `  (s1 = (i${inA}[t]:bv[24] * ${hx(0x03)}) + (i${inB}[t]:bv[24] * ${hx(0x02)}))`,
-            `  && ((s1 >= ${hx(0x80)} && h1 = ${hx(1)}) || (s1 < ${hx(0x80)} && h1 = ${hx(0)}))`,
-            `  && (s2 = (i${inC}[t]:bv[24] * ${hx(0x05)}) + (${hx(0x00)} - i${inA}[t]:bv[24]))`,
-            `  && ((s2 >= ${hx(0x40)} && h2 = ${hx(1)}) || (s2 < ${hx(0x40)} && h2 = ${hx(0)}))`,
-            `  && (o${outB}[t]:bv[24] = (h2:bv[24] * ${hx(0xC8)}) + ((${hx(0x01)} - h1:bv[24]) * ${hx(0x32)}))`,
-            `  && ( (h2 = ${hx(0)} && o${outA}[t] = ${hx(1)}) || (h2 = ${hx(1)} && o${outA}[t] = ${hx(0)}) )`,
-            `) ).`
+            `# Two-way branch on the score, each case setting both outputs.`,
+            `always (`,
+            `  ((((i${inA}[t]:bv[24] * ${hx(0x03)}) + (i${inB}[t]:bv[24] * ${hx(0x02)})) >= ${hx(0x80)})`,
+            `    ? (o${outA}[t]:bv[24] = ${hx(1)} && o${outB}[t]:bv[24] = ${hx(0xC8)})`,
+            `    : (o${outA}[t]:bv[24] = ${hx(0)} && o${outB}[t]:bv[24] = ${hx(0x32)}) )`,
+            `).`
         ].join('\n'),
     ];
 
@@ -1404,7 +1402,7 @@ init();
 // and a parked approval request takes custom inputs from key 26 up (attach them via Custom op key 26+).
 //
 // Fee (o8) rules are the opposite: they accumulate on the shared interpreter, so
-// they must be scoped to your own key with i12.
+// they must have the form always ( (i12[t]:bv[384] = { #x<your pubkey> }:bv[384]) -> ( ... ) ).
 const ruleTemplates = {
     "Block all transfers": `# ---------------------------------------------------------
 # BLOCK ALL TRANSFERS FROM MY ACCOUNT
@@ -1698,7 +1696,7 @@ always (
 #     i3/i4  : from/to pubkeys        (bv[384]; real at admission and apply)
 #     i5[t]  : block timestamp        (bv[64])
 #     i6..i11: consensus ABI (height, ts, proposer, parent hash, ...)
-#     i12[t] : sender real public key (bv[384]; fee rules scope on it, a policy clause must not mention it)
+#     i12[t] : sender real public key (bv[384]; fee rules must be guarded on your own key with it, a policy clause must not mention it)
 #     i26+   : your custom inputs (attach via Custom op keys >= 26; i13-i15 and i18-i25 are reserved)
 #
 #   OUTPUTS (reserved):

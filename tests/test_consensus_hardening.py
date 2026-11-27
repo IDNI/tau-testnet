@@ -83,7 +83,7 @@ def _update_tx(activate_at_height, salt="a"):
         "tx_type": "consensus_rule_update",
         "tx_id": f"u_{activate_at_height}_{salt}",
         "sender_pubkey": V1,
-        "rule_revisions": [f"always (o6[t]:bv[16] = {{ 1 }}:bv[16]). % {salt}"],
+        "rule_revisions": [f"always (o6[t]:bv[16] = {{ 1 }}:bv[16] && o9[t]:bv[24] = {{ {ord(salt)} }}:bv[24])."],
         "activate_at_height": activate_at_height,
         "operations": {},
     }, SK_ALICE)

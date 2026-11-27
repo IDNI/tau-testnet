@@ -54,6 +54,7 @@ jobs:
   native-tau-tests:
     name: Consensus tests (real Tau, in docker image)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -67,6 +68,9 @@ jobs:
           push: false
           load: true
           tags: tau-node:ci
+          # Cold builds with 4 compile jobs get the hosted runner killed mid-compile.
+          build-args: |
+            TAU_BUILD_JOBS=2
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -97,7 +101,15 @@ jobs:
           tests/test_shrink_bare_ref_native.py
           tests/test_payout_native.py
           tests/test_special_stream_native.py
+          tests/test_rule_fragment_native.py
+          tests/test_o8_sender_guard_native.py
           tests/test_tau_output_determinism.py
+          tests/test_apply_lifecycle_branch_native.py
+          tests/test_reserved_output_native.py
+          tests/test_tau_engine_profile_native.py
+          tests/test_tau_engine_concurrency.py
+          tests/test_tau_speculation.py
+          tests/test_tau_preflight.py
           --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_temporary_spending_limit
           --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_time_decaying_multisig
           -p no:asyncio -v

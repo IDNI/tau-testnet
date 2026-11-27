@@ -31,7 +31,6 @@ import unittest
 import os
 import sys
 import time
-import threading
 import glob
 import shutil
 import tempfile
@@ -83,12 +82,10 @@ class TestTauLogic(unittest.TestCase):
         if not os.path.exists(config.TAU_PROGRAM_FILE):
              raise FileNotFoundError(f"Tau program file '{config.TAU_PROGRAM_FILE}' not found.")
 
-        tau_manager.server_should_stop.clear()
         tau_manager.tau_ready.clear()
 
         print("[INFO][TestTauLogic] Starting tau_manager.start_and_manage_tau_process in a thread.")
-        cls.manager_thread = threading.Thread(target=tau_manager.start_and_manage_tau_process, daemon=True)
-        cls.manager_thread.start()
+        cls.manager_thread = tau_manager.start_manager_thread()
 
         print("[INFO][TestTauLogic] Waiting for Tau to become ready (timeout: 30s)...")
         ready = tau_manager.tau_ready.wait(timeout=30)

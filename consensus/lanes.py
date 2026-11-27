@@ -76,6 +76,21 @@ TAU_EVALUATING_TX_TYPES = frozenset({
 })
 
 
+def user_tx_carries_rule(tx: Optional[Dict[str, Any]]) -> bool:
+    """True for a user_tx whose op-0 rule text is non-empty.
+
+    The one predicate behind both the mempool slow lane and the per-block rule
+    budget, so a proposer's selection cap and the validity check cannot disagree.
+    """
+    if not isinstance(tx, dict) or (tx.get("tx_type") or "user_tx") != "user_tx":
+        return False
+    operations = tx.get("operations")
+    if not isinstance(operations, dict):
+        return False
+    rule_text = operations.get("0")
+    return isinstance(rule_text, str) and bool(rule_text.strip())
+
+
 def classify_lane(tx: Optional[Dict[str, Any]]) -> int:
     """Lane for a parsed transaction dict.
 
@@ -96,13 +111,7 @@ def classify_lane(tx: Optional[Dict[str, Any]]) -> int:
     if tx_type != "user_tx":
         return LANE_FAST
 
-    operations = tx.get("operations")
-    if not isinstance(operations, dict):
-        return LANE_FAST
-    rule_text = operations.get("0")
-    if isinstance(rule_text, str) and rule_text.strip():
-        return LANE_SLOW
-    return LANE_FAST
+    return LANE_SLOW if user_tx_carries_rule(tx) else LANE_FAST
 
 
 def classify_lane_payload(payload: Optional[str]) -> int:

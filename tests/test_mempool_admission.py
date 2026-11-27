@@ -9,6 +9,8 @@ from consensus.admission import (
     AdmissionResult
 )
 
+REVISION = "always ( o6[t]:bv[16] = i10[t]:bv[16] )."
+
 # Dummy payloads for testing
 def get_user_tx(operations=None):
     return {
@@ -23,7 +25,7 @@ def get_update_tx(revisions=None, activate_at=None, patch=None):
         "tx_type": "consensus_rule_update",
         "expire_at_height": 5000,
         "sender_pubkey": "a" * 96,
-        "rule_revisions": revisions if revisions is not None else ["hello"],
+        "rule_revisions": revisions if revisions is not None else [REVISION],
         "activate_at_height": activate_at if activate_at is not None else 100,
         "host_contract_patch": patch
     }
@@ -177,7 +179,7 @@ class TestMempoolAdmission:
         assert "Streams 6-11 are reserved" in res.error
 
     def test_reserved_input_shadowing_in_consensus_updates(self, tip_view, caplog):
-        tx = get_update_tx(revisions=["#tau i6(a)"])
+        tx = get_update_tx(revisions=["always ( o6[t]:bv[16] = i6[t]:bv[16] )."])
         res = validate_mempool_admission(tx, tip_view)
         assert res.is_valid  # Still succeeds since crude check is just warning for now
         assert "shadowing i6" in caplog.text
@@ -299,7 +301,7 @@ class TestMempoolAdmission:
             lambda rules, revs, timeout=None: "Tau staging compile error: parse failure at offset 12",
         )
 
-        tx = get_update_tx(revisions=["always ( o6[t]:bv[16] = "])  # truncated
+        tx = get_update_tx()
         res = validate_mempool_admission(tx, tip_view)
         assert not res.is_valid
         assert "staging compile failed" in res.error

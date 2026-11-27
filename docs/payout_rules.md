@@ -93,7 +93,10 @@ what let any number of payout rules share one worker.
 | `i27` | `bv[24]` | Only with `per_sale`: the amount of the sale the execution names. |
 | `i28` | `bv[384]` | Only with `per_sale`: who paid it. |
 
-A rule reads `[t]` only, reads at least one input, writes at least one slot
+A rule body is first checked against the node's one rule syntax, like every
+clause body (README, "Rule syntax"): a body outside it is refused with
+`rule is outside the admitted syntax: ...`. Then the payout checks follow. A
+rule reads `[t]` only, reads at least one input, writes at least one slot
 amount, and mentions no slot it does not have. Anything else is refused at
 install.
 
@@ -123,7 +126,8 @@ narrow shape, checked at install:
   `weak_until`/`W`, `since`/`S`, `trigger`/`T`, `A`, `E`), no step constraint
   such as `[t > 3]`, no quantifier, variable, named constant or function. Policy
   interpreters are kept and stepped again, so any of these would make an amount
-  depend on what that node stepped before.
+  depend on what that node stepped before. The node's rule syntax refuses all
+  of them already; the payout check stays as a second line.
 - **Parentheses where joins mix:** a part with `||`, `->`, `!` or `? :` is put in
   its own parentheses before it is joined with `&&`, so the amounts never depend
   on how a parser groups them.
@@ -331,6 +335,7 @@ account's).
 | Code | When |
 |---|---|
 | `INVALID_PAYOUT_RULE` | The rule is malformed, does not fit the ABI, or breaks a limit. |
+| `RULE_FRAGMENT`, `TEMPORAL_REFERENCE` | The rule body is outside the node's rule syntax, or reads a step other than `[t]`. |
 | `DUPLICATE_PAYOUT_RULE` | This exact rule is already installed. |
 | `PAYOUT_BOOK_FULL` | 4,096 accounts already have a rule (replacing your own is still possible). |
 | `PAYOUT_RULE_DOES_NOT_BUILD` | The rule does not compile. |
