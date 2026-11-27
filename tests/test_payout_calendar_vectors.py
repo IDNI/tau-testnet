@@ -25,9 +25,15 @@ helper. This module does both:
    month for 25 years through the flow, asserting the settlement
    id and balances at every single period.
 
-Schedule set: anchors on the 1st..31st of January 2000 at two
-times of day (00:00:00 and 12:34:56 UTC) -- 62 schedules, 4,800
-monthly periods each, the last period starting in December 2399.
+4. The exact scenario the proposal named: one January 31
+   authorization crossing February and March, a restart in
+   between (the book rebuilt from its snapshot rows), and a
+   repeated attempt inside an already settled period.
+
+Schedule set: the same 62 schedules MarcoDiPolo used -- anchors
+on the 1st..31st of January 2000 at midnight and at 23:59:59 UTC,
+4,800 monthly periods each, the last period starting in December
+2399.
 
 The flow tests apply ~600 blocks in total, so this file takes
 about a minute; it is a regression check, not a smoke test.
@@ -50,7 +56,7 @@ def _balances():
 
 HORIZON_PERIODS = 4_800  # Jan 2000 .. Dec 2399, one period per month
 ANCHOR_YEAR = 2000
-ANCHOR_TIMES = [(0, 0, 0), (12, 34, 56)]
+ANCHOR_TIMES = [(0, 0, 0), (23, 59, 59)]
 
 
 def _ts(year, month, day, hour=0, minute=0, second=0):
@@ -231,3 +237,61 @@ def test_monthly_31st_dense_drive_25_years_through_the_flow():
     ch.block([], height=21 + periods_to_drive, ts=dues[periods_to_drive])
     assert ch.book.get(ALICE).fires == periods_to_drive
     assert ch.bal[BOB] == periods_to_drive
+
+
+def test_january_31_authorization_survives_a_restart():
+    # The flow the proposal named: one January 31 authorization on
+    # a local chain, crossing February and March. The period the
+    # book records and the occurrence on record after a restart
+    # must agree, and a repeated attempt in an already settled
+    # period must leave the recorded payout unchanged.
+    from consensus.payouts import PayoutBook
+
+    anchor = _ts(2000, 1, 31)
+    dues = _ref_dues(31, 0, 0, 0)
+    ch = Chain(_balances())
+    terms = _install_monthly(ch, anchor, 2)
+
+    # Period 0 settles on the anchor day itself.
+    ch.block([], height=21, ts=dues[0])
+    assert ch.bal[BOB] == 1
+    # February has no 31st: the firing lands on Feb 29 (2000 is a
+    # leap year), and the book records period 1.
+    ch.block([], height=22, ts=dues[1])
+    state = ch.book.get(ALICE)
+    assert state.period_index == 1
+    assert state.settlements == [
+        clock_settlement_id(terms.rule_id, 0),
+        clock_settlement_id(terms.rule_id, 1),
+    ]
+    assert ch.bal[BOB] == 2
+
+    # A repeated attempt inside the settled February period
+    # leaves the recorded payout unchanged.
+    ch.block([], height=23, ts=dues[1] + 3_600)
+    assert ch.book.get(ALICE).fires == 2
+    assert ch.bal[BOB] == 2
+
+    # Restart: the book is rebuilt from its snapshot rows, as a
+    # node restart rebuilds it. The recorded occurrence -- the
+    # settlement ids, the firing count, the period -- is identical.
+    restored = PayoutBook.restore(ch.book.snapshot_rows())
+    assert restored.root() == ch.book.root()
+    rstate = restored.get(ALICE)
+    assert rstate.period_index == 1
+    assert rstate.settlements == state.settlements
+    assert rstate.fires == 2
+    assert rstate.total_spent == 2
+    ch.lm.payout_rules = restored
+
+    # March: the schedule is back on the 31st, and the restored
+    # book settles period 2 on top of the same record.
+    ch.block([], height=24, ts=dues[2])
+    state = ch.book.get(ALICE)
+    assert state.period_index == 2
+    assert state.settlements == [
+        clock_settlement_id(terms.rule_id, 0),
+        clock_settlement_id(terms.rule_id, 1),
+        clock_settlement_id(terms.rule_id, 2),
+    ]
+    assert ch.bal[BOB] == 3
