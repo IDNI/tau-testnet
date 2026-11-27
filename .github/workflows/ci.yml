@@ -107,6 +107,7 @@ jobs:
           tests/test_active_rules_authority_native.py
           tests/test_active_rules_issue42_native.py
           tests/test_active_rules_twonode_native.py
+          tests/test_active_rules_c6c8_native.py
           --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_temporary_spending_limit
           --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_time_decaying_multisig
           -p no:asyncio -v
