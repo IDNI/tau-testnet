@@ -479,7 +479,10 @@ def init_db():
             # Issue #42, milestone 1: the apply outcome of each confirmed rule
             # transaction (spec_revision before/after, the o0 verdict, the
             # outcome classification, the apply logs), recorded by the node
-            # that applied the block. Node-local, keyed per block like
+            # that applied the block. Each record also carries the committed
+            # snapshot's state hash and the sha256 of its canonical
+            # application-rules bytes, anchoring the outcome to the chain
+            # state the block committed. Node-local, keyed per block like
             # retractable_events so a reorg needs no cleanup; canonicality is
             # resolved at query time via the block location, like tx_index.
             conn.execute('''
