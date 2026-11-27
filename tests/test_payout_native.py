@@ -239,17 +239,19 @@ def work_escrow(price):
     fee, held, cut, bounty = _split(price)
     c = lambda n, w=24: "{ %d }:bv[%d]" % (n, w)                     # noqa: E731
     verdict, defects, late, paid = (f"i{n}[t]:bv[24]" for n in (40, 41, 42, 26))
-    accepted, rejected = f"({c(2)} - {verdict})", f"({verdict} - {c(1)})"
 
     def amounts(*per_slot):
         return " && ".join(f"(o{30 + k}[t]:bv[24] = {v})" for k, v in enumerate(per_slot))
 
     arbiter = f"(i13[t]:bv[384] = {{ #x{ARBITER} }}:bv[384])"
-    review = amounts(
-        f"{accepted} * ({c(price - held - 2 * fee)} - ({defects} * {c(cut)}))",
-        c(fee), c(fee),
-        f"{accepted} * ({defects} * {c(bounty)})",
-        f"({rejected} * {c(price - 2 * fee)}) + ({accepted} * ({defects} * {c(cut - bounty)}))")
+    # The verdict chooses between two sets of amounts: the node's rule syntax
+    # gives a product one constant operand, so no amount is multiplied by a
+    # 0/1 selector.
+    accepted = amounts(
+        f"{c(price - held - 2 * fee)} - ({defects} * {c(cut)})", c(fee), c(fee),
+        f"{defects} * {c(bounty)}", f"{defects} * {c(cut - bounty)}")
+    rejected = amounts(c(0), c(fee), c(fee), c(0), c(price - 2 * fee))
+    review = f"({verdict} = {c(1)}) ? ({accepted}) : ({rejected})"
     warranty = amounts(
         f"({c(1)} - {late}) * {c(held)}", c(0), c(0),
         f"{late} * {c(bounty)}", f"{late} * {c(held - bounty)}")
