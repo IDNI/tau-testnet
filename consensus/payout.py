@@ -1575,6 +1575,24 @@ class PayoutBook:
             if who == terms.account_pubkey:
                 raise PayoutRefused("a slot may not pay the account itself")
         state = self.state[(exe.account_pubkey, exe.rule_id)]
+        if terms.due_at is not None:
+            # A due point pays once: a manual execution may not pay for a
+            # point the node already ran, nor after the schedule has ended.
+            # The node's run advances due_index past the point it ran, so
+            # while the clock is still inside that point's window -- before
+            # the next point -- the point is already paid. (A point the node
+            # could not pay stays at due_index while its window is open, so
+            # retrying it by hand is still allowed.)
+            if state.due_done:
+                raise PayoutRefused(
+                    "the rule's due schedule has ended; a due point pays once")
+            clock = terms.clock(height, ts)
+            if (state.due_index > 0
+                    and terms.due_point(state.due_index - 1) <= clock
+                    < terms.due_point(state.due_index)):
+                raise PayoutRefused(
+                    "the rule's due point is already paid; "
+                    "a due point pays once")
         if terms.per_sale:
             if exe.sale_id is None:
                 raise PayoutRefused("this payout rule pays per sale: name an open sale (sale_id)")

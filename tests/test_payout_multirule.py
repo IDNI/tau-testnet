@@ -215,6 +215,50 @@ def test_monthly_grid_matches_independent_calendar_vectors():
     assert index_checks == 892800
 
 
+def test_a_manual_execute_may_not_repay_an_already_paid_due_point(evs):
+    # The Mar-31 due point pays 100; a manual payout_execute on Apr 5 -- inside
+    # the Mar-31 due window (Mar 31-Apr 30) but in a NEW cap period (the fixed
+    # 31-day cap window anchored at install rolls over on Apr 4) -- used to pay
+    # a second 100 for March. The due-window guard in check_execution refuses
+    # it: a due point pays once, whatever the cap window says.
+    _script(evs, CHOICE_BODY,
+            lambda inputs: {"o30": "100" if int(inputs.get("i2", "0")) >= 100 else "0"})
+    jan1 = 1767225600    # 2026-01-01 00:00 UTC (install)
+    jan31 = 1769817600   # due point 0
+    feb28 = 1772236800   # due point 1 (clamped)
+    mar31 = 1774915200   # due point 2 (back to the 31st)
+    apr01 = mar31 + 86400
+    apr05 = mar31 + 5 * 86400
+    ch, oracle = Chain({ALICE: 1_000, BOB: 0, CAROL: 500, PROPOSER: 0}, fee=0), \
+        Oracle({ALICE: 1_000, BOB: 0, CAROL: 500, PROPOSER: 0})
+    tx = set_tx(rule=CHOICE, slots=[BOB], cap_exec=100, cap_period=100,
+                clock="period_seconds", period=2678400,
+                due_at=jan31, due_months=1, expires_at=1798761600)
+    ch.block([tx], height=HEIGHT, ts=jan1)
+    oracle.create(tx, fee=0)
+    for height, ts in ((HEIGHT + 1, jan31), (HEIGHT + 2, feb28),
+                       (HEIGHT + 3, mar31)):
+        ch.block([], height=height, ts=ts)
+        ev = _events(ch)[0]
+        assert ev["outcome"] == "executed" and ev["total"] == 100
+        oracle.pay(ALICE, BOB, 100, ts=ts)
+    oracle.check(ch)
+    assert ch.bal == {ALICE: 700, BOB: 300, CAROL: 500, PROPOSER: 0}
+    book = ch.lm.payout_rules
+    assert book.state_of(ALICE, ridb(tx)).paid_total == 300
+    # Apr 1 is still the old cap period (the cap refused it before the fix);
+    # Apr 5 is a new cap period, so only the due-window guard refuses it.
+    for height, ts in ((HEIGHT + 4, apr01), (HEIGHT + 5, apr05)):
+        exe = exec_tx(executor=CAROL, seq=ch.seq.get(CAROL, 0),
+                      account=ALICE, rule_id=rid(tx))
+        result = ch.block([exe], height=height, ts=ts)
+        assert _reason(result, exe) == "payout_not_executed"
+        assert "already paid" in _logs(result)
+    assert ch.bal == {ALICE: 700, BOB: 300, CAROL: 500, PROPOSER: 0}
+    assert book.state_of(ALICE, ridb(tx)).paid_total == 300
+    assert book.state_of(ALICE, ridb(tx)).executions == 3
+
+
 def test_restore_round_trips_extended_rows_and_the_root():
     book7 = p.PayoutBook()
     book7.install(_terms(AKEY, 1, due_at=1000, due_every=256), anchor=10)
