@@ -456,7 +456,7 @@ def test_a_release_that_fails_ends_failed_and_the_block_is_valid(run):
 
 def test_a_body_that_does_not_build_never_reaches_a_block_through_sendtx(run):
     assert run["unbuildable_admitted"] is False
-    assert run["unbuildable_code"] == "TX_REJECTED"
+    assert run["unbuildable_code"] == "RULE_FRAGMENT"
 
 
 def test_a_release_whose_build_fails_is_soft_on_the_real_clause_builder(real):

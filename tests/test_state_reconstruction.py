@@ -1,4 +1,5 @@
 import unittest
+import unittest.mock
 from unittest.mock import patch
 import os
 import json
@@ -52,6 +53,13 @@ class TestStateReconstruction(unittest.TestCase):
         os.environ["TAU_FORCE_TEST"] = getattr(self, "_prev_tau_force_test", "1")
     def setUp(self):
         """Set up a temporary database for testing state reconstruction."""
+        # Rebuilds start from a fresh manager; nine rules need more room than the defaults give.
+        from dataclasses import replace
+        from consensus.governance import DEFAULT_SHARED_RULE_LIMITS
+        roomy = replace(DEFAULT_SHARED_RULE_LIMITS, occurrences=100, total_nodes=1000)
+        limits_patch = unittest.mock.patch("consensus.governance.DEFAULT_SHARED_RULE_LIMITS", roomy)
+        limits_patch.start()
+        self.addCleanup(limits_patch.stop)
         # Create a temporary database file
         self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix='.sqlite')
         os.close(self.temp_db_fd)  # Close the file descriptor, but keep the path
@@ -431,7 +439,7 @@ class TestStateReconstruction(unittest.TestCase):
         self.start_tau()
         try:
             # start_tau loads no builtin rules, so an untyped i1 here would be typed :tau before rule 02.
-            rule_text = "o12[t]:bv[24] = i1[t]:bv[24]."
+            rule_text = "always ( o12[t]:bv[24] = i1[t]:bv[24] )."
 
             # Create a transaction containing both the rule and a transfer
             tx1 = self.create_test_transaction(
@@ -478,7 +486,7 @@ class TestStateReconstruction(unittest.TestCase):
         tx1 = self.create_test_transaction(
             sender_pubkey=self.addr1,
             sequence_number=0,
-            rules="test_rule_for_tau_processing"
+            rules="always ( o13[t]:bv[24] = i1[t]:bv[24] )."
         )
         
         block_1 = Block.create(

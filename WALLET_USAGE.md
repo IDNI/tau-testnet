@@ -54,13 +54,13 @@ python wallet.py send --privkey <private_key> --to <recipient_address> --amount 
 
 ### Rule-Only Transaction
 ```bash
-python wallet.py send --privkey <private_key> --rule "o12[t]=i1[t]"
+python wallet.py send --privkey <private_key> --rule "always ( o12[t]:bv[24] = i1[t]:bv[24] )."
 ```
 
 ### Rule + Transfer
 ```bash
 python wallet.py send --privkey <private_key> \
-  --rule "o12[t]=i1[t]" \
+  --rule "always ( o12[t]:bv[24] = i1[t]:bv[24] )." \
   --transfer "recipient_address:amount"
 ```
 
@@ -89,7 +89,7 @@ python wallet.py send --privkey <private_key> \
 ### Complex Multi-Operation Transaction
 ```bash
 python wallet.py send --privkey <private_key> \
-  --rule "o12[t]=i1[t]" \
+  --rule "always ( o12[t]:bv[24] = i1[t]:bv[24] )." \
   --transfer "recipient_address:5" \
   --operation "13:custom_data" \
   --operation "26:more_data"
@@ -98,7 +98,7 @@ python wallet.py send --privkey <private_key> \
 ### Raw JSON Operations (Advanced)
 ```bash
 python wallet.py send --privkey <private_key> \
-  --operations-json '{"0": "o12[t]=i1[t]", "1": [["sender", "receiver", "10"]], "13": "custom_op"}'
+  --operations-json '{"0": "always ( o12[t]:bv[24] = i1[t]:bv[24] ).", "1": [["sender", "receiver", "10"]], "13": "custom_op"}'
 ```
 
 ## Command Line Options
@@ -109,7 +109,7 @@ python wallet.py send --privkey <private_key> \
 ### Operation Options (at least one required)
 - `--to`, `-t`: Recipient address for simple transfers
 - `--amount`, `-m`: Amount for simple transfers  
-- `--rule`, `-r`: Rule to add as operation 0 (e.g., 'o12[t]=i1[t]')
+- `--rule`, `-r`: Rule to add as operation 0 (e.g., 'always ( o12[t]:bv[24] = i1[t]:bv[24] ).')
 - `--transfer`: Transfer in format 'to_address:amount' (can be used multiple times)
 - `--operation`, `-o`: Custom operation in format 'op_number:data' (can be used multiple times)
 - `--operations-json`: Raw JSON operations object (overrides other operation options)
@@ -172,11 +172,9 @@ approval keyed on i26+.
 **Pubkeys in custom streams.** Write a custom stream (`i13` and up) that holds
 a pubkey as `iN[t]:bv[384]` at every reference, for example
 `i13[t]:bv[384] = { #x… }:bv[384]`. The node runs pubkey streams at a smaller
-internal width. A bare `i13[t]` takes its width from the rule text around it,
-so it can conflict with another rule that uses the same stream. The node then
-refuses the rule, and the error tells you to write `i13[t]:bv[384]`. The bare
-form is correct for `i3`, `i4`, `i12` and the approval slots `i18` to `i25`,
-because the node knows their width.
+internal width. Every stream mention carries its type: a bare `i13[t]` is
+refused with `RULE_FRAGMENT`, and so is one stream written at two widths in a
+rule.
 
 ### User Policy Rules (`o5`)
 
@@ -203,8 +201,12 @@ all real at both admission and apply. It must:
   `i1` at `bv[24]`, `i5` at `bv[64]`, pubkey streams and approval slots at
   `bv[384]`) and use one width per stream;
 - reference `[t]` only: `i1[t-1]` or `i1[0]` is refused with
-  `TEMPORAL_REFERENCE`, because one unit that reads another step zeroes every
-  output for the steps after each later revision, for all accounts;
+  `TEMPORAL_REFERENCE`;
+- stay inside the admitted rule syntax (`RULE_FRAGMENT` otherwise): comparisons
+  of typed bitvector expressions joined by `!`, `&&`, `^^`, `||`, `->`, `<-`,
+  `<->` and `? :`, with constants written `{ 10 }:bv[W]`, `{ #xF0 }:bv[W]` or
+  `{ #b101 }:bv[W]`, and no quantifiers, definitions or other
+  operators;
 - read at least one input stream, and build and step in the engine: a constant
   such as an unconditional block is refused. To block everything, test a
   condition on an input, such as amount above zero;
@@ -232,6 +234,8 @@ may not read `i2`: admission estimates it against the current head, so the fee
 charged at inclusion could differ from the estimate quoted to the sender. Fee
 rules, unlike clauses, accumulate in a shared specification and must reference
 `i12` or `i3` to scope themselves to you (`UNSCOPED_USER_RULE`).
+Such rules also count against the network's shared rule budget and are refused
+with `RULE_BUDGET` once a limit is reached (see the README).
 
 ## Sharing Rules With Another User
 
@@ -266,7 +270,7 @@ one permitted output stream — `o5` (user policy) today. It must not:
 - write consensus-owned streams (`o0`–`o4`, `o6`–`o9`);
 - reference reserved input streams (`i13`–`i15`);
 - reference any step but `[t]`;
-- nest `always` / `sometimes`, or pack more than one unit.
+- use anything outside the admitted rule syntax (`RULE_FRAGMENT`), or pack more than one unit.
 
 It must satisfy the clause rules in [User Policy Rules](#user-policy-rules-o5):
 explicit stream widths, at least one input read, and the comparison and nesting
@@ -313,19 +317,19 @@ exists. Read the rule text before accepting it.
 ```bash
 python wallet.py send \
   --privkey "0x1234567890abcdef..." \
-  --rule "o12[t]=i1[t]" \
+  --rule "always ( o12[t]:bv[24] = i1[t]:bv[24] )." \
   --transfer "0000000000000000000000000000000011cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09:1"
 ```
 
 This creates a transaction with:
-- Operation "0": The rule "o12[t]=i1[t]"
+- Operation "0": The rule "always ( o12[t]:bv[24] = i1[t]:bv[24] )."
 - Operation "1": A transfer of 1 unit to the specified address
 
 ### Example 2: Multiple Operations Transaction
 ```bash
 python wallet.py send \
   --privkey "0x1234567890abcdef..." \
-  --rule "o12[t]=i1[t]" \
+  --rule "always ( o12[t]:bv[24] = i1[t]:bv[24] )." \
   --transfer "recipient1:5" \
   --operation "13:custom_asset_data" \
   --operation "26:extra_input"

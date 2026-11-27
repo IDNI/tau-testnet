@@ -45,7 +45,7 @@ REASON_TO_CODE = {
     "reserved_output_stream": "TX_REJECTED",
     "fee_reads_balance": "TX_REJECTED",
     "reserved_input_stream": "TX_REJECTED",
-    "special_stream": "TX_REJECTED",
+    "rule_fragment": "RULE_FRAGMENT",
     "reserved_operation_key": "TX_REJECTED",
     "temporal_reference": "TEMPORAL_REFERENCE",
     "unscoped_user_rule": "UNSCOPED_USER_RULE",
@@ -74,13 +74,23 @@ GUARDED_O8_I1 = (
     f"always ( {GUARD} ? (o8[t]:bv[24] = i1[t]:bv[24]) : (o8[t]:bv[24] = {ZERO}) )."
 )
 GUARDED_O5 = f"always ( {GUARD} -> (o5[t]:bv[24] = {ZERO}) )."
-U_RULE = "always u[t] = 0."
+U_RULE = "always ( u[t] = 0 )."
 THIS_READ = "always ( o13[t]:bv[24] = this[t] )."
 UNKNOWN_STREAM = "always ( foo[t] = 0 )."
 ROUTED_O5_WRITING_U = (
     "always ( o5[t]:bv[24] = i1[t]:bv[24] && "
     "u[t] = { o5[t]:bv[24] = { #x000002 }:bv[24] }:tau )."
 )
+
+UNTYPED_FREE = "always ( o13[t] = i1[t]:bv[24] )."
+OPERATOR_FREE = "always ( F ( o13[t]:bv[24] = i1[t]:bv[24] ) )."
+CONSTRAINT_FREE = "always ( [t > 3] && o13[t]:bv[24] = i1[t]:bv[24] )."
+EXISTS_FREE = "always ( ex x ( o13[t]:bv[24] = i1[t]:bv[24] ) )."
+TWO_UNITS_FREE = f"{FREE_I1} always ( o14[t]:bv[24] = i1[t]:bv[24] )."
+OUTSIDE_CONJUNCT_FREE = f"{FREE_I1[:-1]} && ( o14[t]:bv[24] = i1[t]:bv[24] )."
+LOOKBACK_FREE = "always ( o13[t]:bv[24] = i1[t-1]:bv[24] )."
+OPERATOR_ROUTED_O5 = "always ( o5[t]:bv[24] = i1[t]:bv[24] && F ( i1[t]:bv[24] = 1 ) )."
+UNTYPED_ROUTED_O5 = "always ( o5[t]:bv[24] = i1[t] )."
 
 TRANSFER = {"1": [[ALICE, MALLORY, "10"]]}
 
@@ -92,16 +102,23 @@ REFUSED_RULES = [
     pytest.param(I15, "slots_on", "reserved_input_stream", id="i15-slots-on"),
     pytest.param(I13, "validator_set", "reserved_input_stream", id="i13-validator-set"),
     pytest.param(I18, "slots_on", "reserved_input_stream", id="i18-bv24"),
-    pytest.param(I18_UNTYPED, "slots_on", "reserved_input_stream", id="i18-untyped"),
+    pytest.param(I18_UNTYPED, "slots_on", "rule_fragment", id="i18-untyped"),
     pytest.param(I25, "slots_on", "reserved_input_stream", id="i25-bv384"),
     pytest.param(O8_READS_I2, "slots_off", "fee_reads_balance", id="o8-reads-i2-slots-off"),
     pytest.param(O8_READS_I2, "slots_on", "fee_reads_balance", id="o8-reads-i2-slots-on"),
     pytest.param(UNSCOPED_O8, "slots_off", "unscoped_user_rule", id="unscoped-o8-slots-off"),
     pytest.param(UNSCOPED_O8, "slots_on", "unscoped_user_rule", id="unscoped-o8-slots-on"),
-    pytest.param(U_RULE, "slots_off", "special_stream", id="u-rule-slots-off"),
-    pytest.param(U_RULE, "slots_on", "special_stream", id="u-rule-slots-on"),
-    pytest.param(THIS_READ, "slots_off", "special_stream", id="this-read"),
-    pytest.param(UNKNOWN_STREAM, "slots_off", "special_stream", id="unknown-stream"),
+    pytest.param(U_RULE, "slots_off", "rule_fragment", id="u-rule-slots-off"),
+    pytest.param(U_RULE, "slots_on", "rule_fragment", id="u-rule-slots-on"),
+    pytest.param(THIS_READ, "slots_off", "rule_fragment", id="this-read"),
+    pytest.param(UNKNOWN_STREAM, "slots_off", "rule_fragment", id="unknown-stream"),
+    pytest.param(UNTYPED_FREE, "slots_off", "rule_fragment", id="untyped-stream"),
+    pytest.param(OPERATOR_FREE, "slots_on", "rule_fragment", id="operator-word"),
+    pytest.param(CONSTRAINT_FREE, "slots_off", "rule_fragment", id="time-constraint"),
+    pytest.param(EXISTS_FREE, "slots_off", "rule_fragment", id="quantifier"),
+    pytest.param(TWO_UNITS_FREE, "slots_off", "rule_fragment", id="two-units"),
+    pytest.param(OUTSIDE_CONJUNCT_FREE, "slots_off", "rule_fragment", id="outside-conjunct"),
+    pytest.param(LOOKBACK_FREE, "slots_off", "temporal_reference", id="lookback"),
 ]
 
 # Every shape the parity matrix runs in every context: (rule or None, extra operations).
@@ -120,6 +137,15 @@ MATRIX_ROWS = {
     "u_rule": (U_RULE, {}),
     "this_read": (THIS_READ, {}),
     "unknown_stream": (UNKNOWN_STREAM, {}),
+    "untyped_stream": (UNTYPED_FREE, {}),
+    "operator_word": (OPERATOR_FREE, {}),
+    "time_constraint": (CONSTRAINT_FREE, {}),
+    "quantifier": (EXISTS_FREE, {}),
+    "two_units": (TWO_UNITS_FREE, {}),
+    "outside_conjunct": (OUTSIDE_CONJUNCT_FREE, {}),
+    "lookback": (LOOKBACK_FREE, {}),
+    "routed_operator_word": (OPERATOR_ROUTED_O5, {}),
+    "routed_untyped": (UNTYPED_ROUTED_O5, {}),
     "opkey_18": (None, {"18": "5"}),
     "opkey_18_with_rule": (FREE_I1, {"18": "5"}),
     "ctl_free_i1": (FREE_I1, {}),

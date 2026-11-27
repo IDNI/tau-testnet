@@ -178,11 +178,11 @@ def allow_history_rules(monkeypatch):
     """Let a rule that reads an earlier step through admission and apply.
 
     Evaluator-continuity tests need a stateful evaluator behind the real entry
-    points, which the temporal screen refuses for user rules.
+    points, which the rule-fragment screen refuses for user rules.
     """
     import consensus.admission
 
-    monkeypatch.setattr(consensus.admission, "screen_temporal_rule", lambda _rule_text: None)
+    monkeypatch.setattr(consensus.admission, "screen_rule_fragment", lambda _unit_text: None)
 
 
 class FakeEngine:

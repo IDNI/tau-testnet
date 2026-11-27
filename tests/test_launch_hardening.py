@@ -711,8 +711,7 @@ class TestPolicyWidthScreen:
     def test_untyped_o5_is_refused(self):
         result = self._screen(self._scoped("o5[t] = 0"))
         assert not result.is_valid
-        assert result.code == "WIDTH_MISMATCH"
-        assert result.details["found"] == "untyped"
+        assert result.code == "RULE_FRAGMENT"
 
     def test_bare_integer_literal_is_refused(self):
         result = self._screen(self._scoped("o5[t]:bv[24] = 1"))
