@@ -24,7 +24,7 @@ from consensus.approvals import (
     _normalize_index_map,
     _normalize_pubkey,
 )
-from consensus import sender_policy
+from consensus import recipient_policy, sender_policy
 
 _CMD = "getapprovalpreview"
 
@@ -38,7 +38,15 @@ def _o5_allows(outputs):
 
 
 def _own_clause_allows(clause, inputs):
-    """False when the sender's own registered clause blocks these inputs."""
+    """False when the sender's own registered clause blocks these inputs.
+
+    Mirrors the send path exactly: a recipient-relevant clause (reads the
+    counterparty or a hold stream) is a receive policy and never blocks
+    the owner's own sends — see
+    recipient_policy.send_path_clause_blocks.
+    """
+    if recipient_policy.clause_is_recipient_relevant(clause):
+        return True
     from tau_speculation import SpeculationError, WorkerLost, WorkerTimeout
 
     try:
