@@ -28,7 +28,22 @@ PIN_BUILD_SECONDS = 0.100
 RECYCLE_BUILDS = 500
 RECYCLE_STEPS = 20_000
 RECYCLE_RSS_BYTES = 1 << 30
-POOL_NAMES = ("apply", "admission")
+POOL_NAMES = ("apply", "admission", "payout_apply", "payout_admission")
+
+# The payout pools USED to keep one interpreter at a time (cache_size 1).
+# On the pinned engine then (tau-lang c3ea334) an interpreter that was stepped
+# after another one was built and probed in the same process sometimes refused
+# the step, and in a few runs answered 0: about 5 steps in 100 for `o30 = i27 / 5`
+# after a second rule was validated, and never on tau-lang 0.8.5. Two nodes could
+# then disagree about a payout. The workaround cost one build each time the rule
+# changed. Re-proven 23 Nov 2026 on the pinned engine (tau-lang v0.8.5,
+# 6ea436e): 6,120 interleaved steps with a SHARED cache (cache_size 256, 1,716
+# builds, 61-66 live interpreters) answered every step right — the fault is
+# gone on 0.8.5, so the pools use the default cache again. Proof:
+# /data/home/tau-rules-form/proof-cache.py + proof-cache.log. If the pin ever
+# moves to an engine that shows the fault again, reinstate the single-
+# interpreter pools and re-run that proof first.
+NEVER_PIN_SECONDS = float("inf")
 
 # Without an injected probe, worker memory is read this often (in requests).
 RSS_PROBE_EVERY = 64
@@ -182,6 +197,30 @@ class PolicyEvaluator:
         value = parse_o5(o5)
         return PolicyVerdict(blocked=value == 0, o5=o5, built=bool(resp.get("built")))
 
+    def outputs(self, body: str, inputs: dict, *,
+                timeout=_SESSION_DEFAULT) -> dict:
+        """Every output the clause wrote in one step, by stream name (`o30`...).
+
+        A payout rule writes several streams; `verdict` reads only o5. The
+        failure mapping is verdict's: a build or step refusal is the clause's
+        own, any other failure is the evaluator's.
+        """
+        resp = self._run(
+            {"op": "step", "key": clause_key(body), "text": body,
+             "inputs": dict(inputs or {})},
+            timeout,
+        )
+        if not resp.get("ok"):
+            if resp.get("phase") == "build":
+                raise PolicyBuildError(str(resp.get("error") or ""))
+            if resp.get("phase") == "step":
+                raise PolicyStepError(str(resp.get("error") or ""))
+            raise SpeculationError(f"policy step failed: {_failure_text(resp)}")
+        outputs = resp.get("outputs")
+        if not isinstance(outputs, dict):
+            raise SpeculationProtocolError("policy worker returned no outputs map")
+        return {str(k): str(v) for k, v in outputs.items()}
+
     def stats(self) -> dict:
         with self._lock:
             out = {}
@@ -297,12 +336,24 @@ _pools: dict = {}
 _pools_lock = threading.Lock()
 
 
+def pool_options(pool: str) -> dict:
+    """The evaluator options the node uses for `pool`."""
+    return {}
+
+
+def pool_evaluator(pool: str, **options) -> PolicyEvaluator:
+    """A new evaluator built the way the node builds the one of `pool`."""
+    if pool not in POOL_NAMES:
+        raise ValueError(f"unknown policy pool {pool!r}; expected one of {POOL_NAMES}")
+    return PolicyEvaluator(pool=pool, **{**pool_options(pool), **options})
+
+
 def get_policy_evaluator(pool: str) -> PolicyEvaluator:
     if pool not in POOL_NAMES:
         raise ValueError(f"unknown policy pool {pool!r}; expected one of {POOL_NAMES}")
     with _pools_lock:
         if pool not in _pools:
-            _pools[pool] = PolicyEvaluator(pool=pool)
+            _pools[pool] = pool_evaluator(pool)
         return _pools[pool]
 
 

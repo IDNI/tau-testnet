@@ -33,9 +33,16 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.network_binding import BOUND_TX_TYPES, FIELD as NETWORK_FIELD
 from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
+)
+from consensus.payout import (
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_RULE_REVOKE,
+    TX_TYPE_PAYOUT_RULE_SET,
+    TX_TYPE_PAYOUT_RULE_UPDATE,
 )
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
@@ -66,6 +73,10 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     # below with the same value, which is a no-op on a dict.
     if payload.get("expire_at_height") is not None:
         signing_dict["expire_at_height"] = payload["expire_at_height"]
+    # The network a transaction is for is signed by the types that carry it, so
+    # nobody can move one to another network by editing the field.
+    if tx_type in BOUND_TX_TYPES:
+        signing_dict[NETWORK_FIELD] = payload.get(NETWORK_FIELD)
     if tx_type == "user_tx":
         signing_dict["operations"] = payload.get("operations", {})
     elif tx_type == "consensus_rule_update":
@@ -123,6 +134,60 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type == TX_TYPE_PAYOUT_RULE_SET:
+        # Every term an executor will run against: the rule text, who may be
+        # paid, both caps, the period and the end. Both period fields are
+        # listed so naming the other one changes the bytes.
+        signing_dict["rule_text"] = payload.get("rule_text")
+        signing_dict["slots"] = payload.get("slots")
+        signing_dict["cap_per_execution"] = payload.get("cap_per_execution")
+        signing_dict["cap_per_period"] = payload.get("cap_per_period")
+        signing_dict["period_blocks"] = payload.get("period_blocks")
+        signing_dict["period_seconds"] = payload.get("period_seconds")
+        signing_dict["expires_at"] = payload.get("expires_at")
+        # Signed when present: every optional term changes what the rule does,
+        # so a proposer must not be able to add, drop or rewrite one. Only
+        # `true` is valid for the flags, so presence is the whole meaning, and
+        # a transaction written before a term existed signs exactly as before.
+        for _field in ("per_sale", "sealed", "on_arrival"):
+            if _field in payload:
+                signing_dict[_field] = payload.get(_field)
+        for _field in ("periods_from", "due_at", "due_every", "due_months",
+                       "max_fee_per_execution"):
+            if _field in payload:
+                signing_dict[_field] = payload.get(_field)
+    elif tx_type == TX_TYPE_PAYOUT_RULE_UPDATE:
+        # The rule being replaced plus the new terms, signed like a set: the
+        # node assigns version + 1, so the version itself is not signed.
+        signing_dict["rule_id"] = payload.get("rule_id")
+        signing_dict["rule_text"] = payload.get("rule_text")
+        signing_dict["slots"] = payload.get("slots")
+        signing_dict["cap_per_execution"] = payload.get("cap_per_execution")
+        signing_dict["cap_per_period"] = payload.get("cap_per_period")
+        signing_dict["period_blocks"] = payload.get("period_blocks")
+        signing_dict["period_seconds"] = payload.get("period_seconds")
+        signing_dict["expires_at"] = payload.get("expires_at")
+        for _field in ("per_sale", "sealed", "on_arrival"):
+            if _field in payload:
+                signing_dict[_field] = payload.get(_field)
+        for _field in ("periods_from", "due_at", "due_every", "due_months",
+                       "max_fee_per_execution"):
+            if _field in payload:
+                signing_dict[_field] = payload.get(_field)
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+        # The executor answers for which rule it ran and with what inputs.
+        signing_dict["account_pubkey"] = payload.get("account_pubkey")
+        signing_dict["rule_id"] = payload.get("rule_id")
+        signing_dict["recipients"] = payload.get("recipients")
+        signing_dict["data"] = payload.get("data")
+        # The sale it pays: signed when present, so a proposer can neither move an
+        # execution to another sale nor add or drop the field.
+        if "sale_id" in payload:
+            signing_dict["sale_id"] = payload.get("sale_id")
+    elif tx_type == TX_TYPE_PAYOUT_RULE_REVOKE:
+        # The id selects which of the sender's rules dies, so it is signed:
+        # a proposer must not be able to retarget a revoke at another rule.
+        signing_dict["rule_id"] = payload.get("rule_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

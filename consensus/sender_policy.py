@@ -116,3 +116,21 @@ def clause_builds(body, *, pool: str, timeout=_SESSION_DEFAULT) -> tuple[bool, s
     """
     result = evaluator(pool).validate(body, timeout=timeout)
     return result.ok, result.error
+
+
+def payout_outputs(body, values: dict, *, pool: str,
+                   timeout=_SESSION_DEFAULT) -> dict:
+    """Every output of one payout-rule step, by stream name.
+
+    A rule that does not build, or that the engine refuses to step, raises
+    PayoutRefused: every node reaches the same refusal. Loss of the evaluator
+    propagates, because it says nothing about the execution.
+    """
+    from consensus.payout import PayoutRefused
+
+    try:
+        return evaluator(pool).outputs(body, clause_inputs(values), timeout=timeout)
+    except PolicyBuildError as exc:
+        raise PayoutRefused(f"the payout rule does not build: {exc}") from exc
+    except PolicyStepError as exc:
+        raise PayoutRefused(f"the payout rule cannot be evaluated on these inputs: {exc}") from exc

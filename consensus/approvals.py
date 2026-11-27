@@ -538,6 +538,16 @@ class RuleChangeRequest:
             return ""
         if self.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
             return self.rule_text
+        if self.kind in (tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+                         tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT):
+            # The canonical terms plus this request's sequence number, which
+            # enters the id of the rule the release installs (for an update,
+            # the id of version + 1 under the same lineage).
+            import json
+
+            from consensus.payout import payout_spec_text
+
+            return payout_spec_text(json.loads(self.rule_text), self.sequence_number)
         from consensus.rule_offers import clause_body_v1
 
         return clause_body_v1(self.rule_text)
@@ -581,9 +591,11 @@ _RULE_CHANGE_BODY_KINDS = frozenset({
     tau_defs.RULE_CHANGE_KIND_SET_POLICY,
     tau_defs.RULE_CHANGE_KIND_SET_GUARD,
     tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
+    tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+    tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT,
 })
 _RULE_CHANGE_KINDS = frozenset(range(
-    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD + 1
+    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT + 1
 ))
 
 
@@ -609,7 +621,7 @@ def parse_rule_change_request_checked(
         if isinstance(val, bool) or not isinstance(val, int):
             return None, "kind, sequence_number and expire_at_height must be integers"
     if kind not in _RULE_CHANGE_KINDS:
-        return None, "kind must be 1..5"
+        return None, f"kind must be 1..{tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT}"
 
     rule_text = tx.get("rule_text", "")
     if rule_text is None:
@@ -633,10 +645,15 @@ def parse_rule_change_request_checked(
         offer_id = ""
     if not isinstance(offer_id, str):
         return None, "offer_id must be a string"
-    if kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+    if kind in (tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
+                tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT):
+        # Kind 3 names the offer it accepts; kind 8 names the rule version
+        # it replaces. Both are 64 hex digits.
         offer_id = offer_id.strip().lower()
         if len(offer_id) != 64 or any(c not in "0123456789abcdef" for c in offer_id):
-            return None, "offer_id must be 64 hex digits"
+            return None, ("offer_id must be 64 hex digits"
+                          if kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER
+                          else "offer_id must be the 64-hex id of the rule to update")
     elif offer_id != "":
         return None, "this kind carries no offer_id"
 
@@ -647,7 +664,18 @@ def parse_rule_change_request_checked(
     except ApprovalShapeError as exc:
         return None, str(exc)
 
-    if has_body:
+    if kind in (tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+                tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT):
+        # The rule_text is the payout rule's canonical spec, without a sequence
+        # number (the request adds its own, which enters the installed rule's
+        # id — for an update, the id of version + 1).
+        from consensus.payout import PayoutShapeError, parse_payout_spec
+
+        try:
+            parse_payout_spec(rule_text, sender_n, seq)
+        except PayoutShapeError as exc:
+            return None, f"rule_text is not a payout rule spec: {exc}"
+    elif has_body:
         try:
             body = clause_body_v1(rule_text)
         except RuleOfferShapeError as exc:

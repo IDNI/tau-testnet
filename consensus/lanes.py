@@ -38,10 +38,15 @@ SLOW_TX_TYPES = frozenset({
     "rule_offer_accept",
     "rule_change_request",
     "consensus_rule_update",
+    # Builds the payout rule at admission and at apply, like an offered clause.
+    "payout_rule_set",
+    "payout_rule_update",
 })
 
 # `retractable_transfer` and `retract_transfer` are absent too, i.e. FAST: a park
 # costs one transfer step and a retract needs no Tau evaluation at all.
+# `payout_execute` and `payout_rule_revoke` are FAST: an execution steps one
+# cached payout rule in its own pool, and a revoke needs no Tau evaluation.
 # `approval_request` and `transfer_vote` are deliberately absent, i.e. FAST.
 # Neither routes text through i0, so neither rebuilds the interpreter: a request
 # costs one cheap Tau step like a transfer, and a vote costs one more only when
@@ -66,6 +71,10 @@ TAU_EVALUATING_TX_TYPES = frozenset({
     "transfer_vote",
     "retractable_transfer",
     "rule_change_request",
+    # Both step Tau: the fee step, and the payout rule in its own pool.
+    "payout_rule_set",
+    "payout_rule_update",
+    "payout_execute",
 })
 
 

@@ -110,6 +110,10 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "transfer_vote",
     "retractable_transfer",
     "retract_transfer",
+    "payout_rule_set",
+    "payout_rule_update",
+    "payout_rule_revoke",
+    "payout_execute",
 })
 
 
@@ -580,6 +584,7 @@ class NetworkService:
             TAU_MEMPOOL_SNAPSHOT_MAX_RULE_TXS,
             TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS,
             TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS,
+            TAU_MEMPOOL_SNAPSHOT_MAX_PAYOUT_TXS,
             TAU_GOSSIP_MAX_RAW_TX_BYTES
         )
         try:
@@ -592,6 +597,7 @@ class NetworkService:
             rule_txs_count = 0
             approval_txs_count = 0
             retractable_txs_count = 0
+            payout_txs_count = 0
 
             for tx in txs:
                 if total_count >= TAU_MEMPOOL_SNAPSHOT_MAX_TOTAL:
@@ -639,6 +645,11 @@ class NetworkService:
                     if retractable_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS:
                         continue
                     retractable_txs_count += 1
+                elif tx_type in ("payout_rule_set", "payout_rule_update",
+                               "payout_rule_revoke", "payout_execute"):
+                    if payout_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_PAYOUT_TXS:
+                        continue
+                    payout_txs_count += 1
                 topic = self.topic_for_tx_type(tx_type)
                     
                 # 4. Optional partial decode
@@ -666,6 +677,7 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_RULES,
             TAU_GOSSIP_TOPIC_APPROVALS,
             TAU_GOSSIP_TOPIC_RETRACTABLE,
+            TAU_GOSSIP_TOPIC_PAYOUT,
             TAU_GOSSIP_TOPIC_BLOCKS,
             TAU_GOSSIP_TOPIC_PEERS,
         )
@@ -675,6 +687,7 @@ class NetworkService:
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_RULES, self._on_rule_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_APPROVALS, self._on_approval_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_RETRACTABLE, self._on_retractable_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PAYOUT, self._on_payout_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
 
@@ -730,47 +743,6 @@ class NetworkService:
         # Head re-announce heartbeat (see _head_reannounce_loop)
         if self._nursery:
             self._nursery.start_soon(self._head_reannounce_loop)
-
-        # Bootstrap re-dial while peerless (see _bootstrap_redial_loop)
-        if self._nursery:
-            self._nursery.start_soon(self._bootstrap_redial_loop)
-
-    async def _bootstrap_redial_loop(self) -> None:
-        """Dial the configured bootstrap peers again while we have no peer.
-
-        _connect_to_bootstrap_peer runs once per peer at start (5 attempts),
-        so a node that later loses every connection, e.g. because the
-        bootnode stops accepting peers for a while, stays at 0 peers with a
-        stale head until it is restarted. Every interval this checks the
-        connected peers and, only when there are none, runs the normal
-        bootstrap dial again. Interval via TAU_BOOTSTRAP_REDIAL_INTERVAL
-        seconds (default 60; <= 0 disables)."""
-        import os
-
-        try:
-            interval = float(os.environ.get("TAU_BOOTSTRAP_REDIAL_INTERVAL", "60"))
-        except ValueError:
-            interval = 60.0
-        if interval <= 0:
-            return
-        while not self._runner_stop.is_set():
-            await trio.sleep(interval)
-            try:
-                await self._bootstrap_redial_once()
-            except Exception:
-                logger.debug("Bootstrap re-dial failed", exc_info=True)
-
-    async def _bootstrap_redial_once(self) -> bool:
-        """One re-dial pass. Returns True when bootstrap peers were dialed."""
-        if self.get_connected_peers():
-            return False
-        bootstraps = list(self._config.bootstrap_peers or []) + list(getattr(self._config, "dht_bootstrap_peers", []) or [])
-        if not bootstraps:
-            return False
-        logger.info("No connected peer; dialing %d bootstrap peer(s) again", len(bootstraps))
-        for peer_cfg in bootstraps:
-            await self._connect_to_bootstrap_peer(peer_cfg)
-        return True
 
     async def _head_reannounce_loop(self) -> None:
         """Periodically re-announce our canonical head over block gossip.
@@ -923,6 +895,25 @@ class NetworkService:
             },
         )
 
+    async def _on_payout_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import (
+            TAU_MAX_PAYOUT_EXECUTE_BYTES,
+            TAU_MAX_PAYOUT_RULE_REVOKE_BYTES,
+            TAU_MAX_PAYOUT_RULE_SET_BYTES,
+            TAU_MAX_PAYOUT_RULE_UPDATE_BYTES,
+        )
+        await self._process_gossip_payload(
+            envelope,
+            allowed_types={"payout_rule_set", "payout_rule_update",
+                           "payout_rule_revoke", "payout_execute"},
+            type_limits={
+                "payout_rule_set": TAU_MAX_PAYOUT_RULE_SET_BYTES,
+                "payout_rule_update": TAU_MAX_PAYOUT_RULE_UPDATE_BYTES,
+                "payout_rule_revoke": TAU_MAX_PAYOUT_RULE_REVOKE_BYTES,
+                "payout_execute": TAU_MAX_PAYOUT_EXECUTE_BYTES,
+            },
+        )
+
     async def _process_gossip_payload(self, envelope: Dict[str, Any], allowed_types: set, type_limits: dict) -> None:
         import json
         from .protocols import TAU_GOSSIP_MAX_RAW_TX_BYTES
@@ -1021,6 +1012,21 @@ class NetworkService:
         elif tx_type == "retract_transfer":
             if "retractable_id" not in p_dict:
                 logger.debug("Gossip rejected: retract_transfer missing retractable_id")
+                return
+        elif tx_type in ("payout_rule_set", "payout_rule_update"):
+            missing = [f for f in ("rule_text", "slots", "cap_per_execution",
+                                   "cap_per_period", "expires_at") if f not in p_dict]
+            periods = [f for f in ("period_blocks", "period_seconds")
+                       if p_dict.get(f) is not None]
+            if tx_type == "payout_rule_update" and "rule_id" not in p_dict:
+                missing.append("rule_id")
+            if missing or len(periods) != 1:
+                logger.debug("Gossip rejected: %s missing %s or "
+                             "not exactly one period", tx_type, missing)
+                return
+        elif tx_type == "payout_execute":
+            if "account_pubkey" not in p_dict or "rule_id" not in p_dict:
+                logger.debug("Gossip rejected: payout_execute missing account_pubkey or rule_id")
                 return
 
         try:
@@ -1638,6 +1644,7 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_GOVERNANCE,
             TAU_GOSSIP_TOPIC_RETRACTABLE,
             TAU_GOSSIP_TOPIC_RULES,
+            TAU_GOSSIP_TOPIC_PAYOUT,
             TAU_GOSSIP_TOPIC_TRANSACTIONS,
         )
         if tx_type in ("consensus_rule_update", "consensus_rule_vote"):
@@ -1648,6 +1655,9 @@ class NetworkService:
             return TAU_GOSSIP_TOPIC_APPROVALS
         if tx_type in ("retractable_transfer", "retract_transfer"):
             return TAU_GOSSIP_TOPIC_RETRACTABLE
+        if tx_type in ("payout_rule_set", "payout_rule_update",
+                       "payout_rule_revoke", "payout_execute"):
+            return TAU_GOSSIP_TOPIC_PAYOUT
         return TAU_GOSSIP_TOPIC_TRANSACTIONS
 
     def broadcast_transaction(self, payload: str, message_id: str) -> None:

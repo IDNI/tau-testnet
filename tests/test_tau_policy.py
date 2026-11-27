@@ -408,6 +408,89 @@ def test_pool_registry_is_a_singleton_per_name():
 
 # --- mock parity ----------------------------------------------------------------
 
+def test_the_payout_pools_share_the_default_cache():
+    """Gap 5, decided by measurement: the c3ea334-only evaluator fault is gone
+    on tau-lang 0.8.5 (6,120 interleaved steps with a shared cache, zero wrong
+    answers), so the single-interpreter workaround is dropped and the payout
+    pools use the same defaults as every other pool."""
+    for pool in ("payout_apply", "payout_admission", "apply", "admission"):
+        assert tau_policy.pool_options(pool) == {}
+    try:
+        payout = tau_policy.get_policy_evaluator("payout_apply")
+        assert (payout._cache_size, payout._pin_build_seconds) == (
+            tau_policy.DEFAULT_CACHE_SIZE, tau_policy.PIN_BUILD_SECONDS)
+        clauses = tau_policy.get_policy_evaluator("apply")
+        assert clauses._cache_size == tau_policy.DEFAULT_CACHE_SIZE
+        assert clauses._pin_build_seconds == tau_policy.PIN_BUILD_SECONDS
+    finally:
+        tau_policy.close_policy_evaluators()
+    with pytest.raises(ValueError):
+        tau_policy.pool_evaluator("other")
+
+
+def test_an_option_given_by_hand_wins_over_the_one_of_the_pool(make):
+    assert make(pool="payout_apply")._cache_size == tau_policy.DEFAULT_CACHE_SIZE
+    built = tau_policy.pool_evaluator("payout_apply", cache_size=4)
+    try:
+        assert (built._cache_size, built._pin_build_seconds) == (
+            4, tau_policy.PIN_BUILD_SECONDS)
+    finally:
+        built.close()
+
+
+def test_a_payout_pool_starts_its_worker_with_the_default_options(monkeypatch):
+    started = []
+
+    class Started:
+        def __init__(self, **kwargs):
+            started.append(kwargs["env"])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tau_policy, "_Worker", Started)
+    evaluator = tau_policy.pool_evaluator("payout_admission")
+    evaluator._current()
+    evaluator.close()
+    assert started[0]["TAU_POLICY_CACHE_SIZE"] == str(tau_policy.DEFAULT_CACHE_SIZE)
+    assert float(started[0]["TAU_POLICY_PIN_SECONDS"]) == tau_policy.PIN_BUILD_SECONDS
+
+
+def test_a_cache_of_one_holds_only_the_newest_interpreter_however_slow_the_build(monkeypatch):
+    """What the payout pools ask of the worker: a rule that is stepped again after
+    another rule was built is built again, also when its build was slow."""
+
+    class Result:
+        report = None
+
+        def __init__(self, value):
+            self.value = value
+
+        def __bool__(self):
+            return True
+
+    class Tau:
+        built = []
+
+        def get_interpreter(self, spec):
+            self.built.append(spec)
+            return Result(object())
+
+    clock = iter(range(0, 10_000, 5))            # every build "takes" five seconds
+    monkeypatch.setattr(tau_policy_worker.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(tau_policy_worker, "_diag", lambda *a: "")
+    monkeypatch.setattr(tau_policy_worker, "_report_summary", lambda *a: {})
+    worker = tau_policy_worker._PolicyWorker(Tau(), 1, float("inf"))
+    for key in ("a", "b", "a", "a"):
+        worker._build(key, "o30[t]:bv[24] = i27[t]:bv[24]")
+        assert worker.cache.keys() == [key]
+    assert worker.builds == 3 and worker.cache.pinned_count() == 0
+    kept = tau_policy_worker._PolicyWorker(Tau(), 1, 0.100)
+    for key in ("a", "b"):
+        kept._build(key, "o30[t]:bv[24] = i27[t]:bv[24]")
+    assert kept.cache.keys() == ["a", "b"]       # the default pins a slow build
+
+
 def test_mock_has_the_same_public_surface():
     real = {n for n in dir(tau_policy.PolicyEvaluator) if not n.startswith("_")}
     mock = {n for n in dir(MockPolicyEvaluator) if not n.startswith("_")}

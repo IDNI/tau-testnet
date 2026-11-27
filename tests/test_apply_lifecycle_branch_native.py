@@ -59,9 +59,8 @@ STREAM = tau_defs.USER_POLICY_STREAM_INDEX
 #: without the outer parentheses, which is the spelling the registry holds.
 PREVIOUS_BODY = f"o{STREAM}[t]:bv[24] = {{ #x000000 }}:bv[24]"
 #: What B's transaction tries to register instead.
-#: Reads i1 because the policy worker refuses a clause that reads no input.
-NEW_BODY = f"( i1[t]:bv[24] > {{ #x0003e8 }}:bv[24] ) -> ( o{STREAM}[t]:bv[24] = {{ #x000001 }}:bv[24] )"
-NEW_CLAUSE = f"always ( {NEW_BODY} )."
+NEW_CLAUSE = f"always ( o{STREAM}[t]:bv[24] = {{ #x000002 }}:bv[24] )."
+NEW_BODY = f"o{STREAM}[t]:bv[24] = {{ #x000002 }}:bv[24]"
 
 REQUEST_ID = b"\x11" * 32
 

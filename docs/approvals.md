@@ -252,6 +252,13 @@ widths and shape apply.
 | 3 | accept offer | Accept a rule offer as the `o5` clause. |
 | 4 | set guard | Register or replace the guard itself. |
 | 5 | revoke guard | Remove the guard. |
+| 6 | set payout rule | Install or replace the account's payout rule ([payout_rules.md](payout_rules.md)). |
+| 7 | revoke payout rule | Remove the payout rule. |
+| 8 | update payout rule | Replace one installed payout rule version with the next under the same lineage ([payout_rules.md](payout_rules.md)). |
+
+A guard that blocks every change without its co-signers (the first two templates
+below) covers kinds 6, 7 and 8 as well. A guard that names the kinds it blocks, like
+the weaker template, does not block kinds it does not name.
 
 Because the guard is judged on kind 4 and 5 as well, it protects itself: with a
 guard in force, replacing or removing it needs the same approvals.
@@ -272,9 +279,9 @@ slots, such as the weaker template below, therefore leaves those kinds open.
 
 | Field | Notes |
 |---|---|
-| `kind` | `1`–`5`, as above. |
-| `rule_text` | Required for kinds 1 and 4. For kind 3, the exact raw text of the offer. Absent for kinds 2 and 5. At most `MAX_RULE_CHANGE_TEXT_BYTES` (8192). |
-| `offer_id` | Kind 3 only: the offer being accepted. |
+| `kind` | `1`–`8`, as above. |
+| `rule_text` | Required for kinds 1 and 4. For kind 3, the exact raw text of the offer. For kinds 6 and 8, the payout rule's canonical spec text (`payout_spec_text`, without a sequence number). Absent for kinds 2, 5 and 7. At most `MAX_RULE_CHANGE_TEXT_BYTES` (8192). |
+| `offer_id` | Kind 3 only: the offer being accepted. Kind 8 only: the id of the payout rule version the update replaces. |
 | `approvers` | Slot to public key, up to 8. A request that names approvers needs approval slots active. May be empty, which leaves the time escape as the only way out. |
 | `expire_at_height` | The height after which the request expires. |
 | `fee_limit` | Charged once, at request time, as for transfer requests. |
