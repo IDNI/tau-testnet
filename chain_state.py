@@ -698,13 +698,18 @@ def _record_survival_feeds(block, next_snapshot, shadow, first_advance,
     """Persist the block's shadow-feed steps for the survival ledger
     (issue #42, step 3), and enrich the block's shared-spec receipts.
 
-    Each step is attributed to the block transaction that submitted its
-    unit (see _shared_rule_submissions); a step no transaction in this
-    block submitted -- the block's journal group and its rule outcomes
-    disagreeing -- is recorded unattributed, and on the shadow's first
-    advance a baseline row carries the spec it started from, so the
-    ledger's replay (db.get_survival_ledger) can diff from the true
-    initial text.
+    Attribution is by journal position, never by unit text: the
+    block's steps are in journal order and its shared-spec submissions
+    are in apply order, so when the two counts agree the i-th step is
+    the i-th submission's step -- a resent unit's step is attributed to
+    the resend transaction because it is the later journal entry, even
+    though its text equals an earlier submission's. Only when the
+    counts disagree (the block's journal group and its rule outcomes
+    disagreeing) does attribution fall back to matching unit text, and
+    a step no transaction in this block submitted is recorded
+    unattributed. On the shadow's first advance a baseline row carries
+    the spec it started from, so the ledger's replay
+    (db.get_survival_ledger) can diff from the true initial text.
 
     The same attribution carries the design's `shadow_revision` receipt
     field: the revision the shadow took when it fed this transaction's
@@ -727,13 +732,18 @@ def _record_survival_feeds(block, next_snapshot, shadow, first_advance,
             "spec_text_after": before_text,
         })
     enriched = []
-    for step in steps:
+    positional = len(steps) == len(submissions)
+    for index, step in enumerate(steps):
         tx_hash = account = None
-        for i, (sub_hash, sub_account, sub_unit) in enumerate(submissions):
-            if not used[i] and sub_unit == step["unit"]:
-                used[i] = True
-                tx_hash, account = sub_hash, sub_account
-                break
+        if positional:
+            tx_hash, account = submissions[index][0], submissions[index][1]
+            used[index] = True
+        else:
+            for i, (sub_hash, sub_account, sub_unit) in enumerate(submissions):
+                if not used[i] and sub_unit == step["unit"]:
+                    used[i] = True
+                    tx_hash, account = sub_hash, sub_account
+                    break
         rows.append({
             "unit_text": step["unit"], "tx_hash": tx_hash,
             "account": account, "spec_text_after": step["text_after"],
@@ -808,7 +818,7 @@ def _journal_groups_after(cursor):
     return groups
 
 
-def _memory_journal_units_for_block(block, next_snapshot):
+def _memory_journal_units_for_block(block, next_snapshot, shadow):
     """This block's rule revisions from the in-process committed journal,
     or [] when they cannot be identified there.
 
@@ -818,18 +828,20 @@ def _memory_journal_units_for_block(block, next_snapshot):
     the in-process evaluator session). Where the durable table holds no
     revisions for this block, the block's execution lives only in the
     in-process journal, whose entries carry no block attribution -- so
-    the block's share is identified by content: this block's shared-spec
-    submissions (from the snapshot's rule outcomes) must appear in the
-    journal's accumulated REVISION entries as a contiguous run, in
-    order. The newest such run is used: the recorder is not necessarily
-    called between two applies (a commit path may apply several blocks
-    before recording any), and where two runs are identical the units
-    are verbatim the same, so the occurrences are interchangeable.
-    Anything in the journal that matches no recorded block's submissions
-    -- a discarded candidate's revisions, an apply whose recorder never
-    ran -- is never fed. On no match nothing is fed: a shadow that
-    cannot identify its block's revisions in the journal must record
-    nothing rather than guess.
+    the block's share is identified positionally: this block's
+    shared-spec submissions (from the snapshot's rule outcomes) must
+    appear in the journal's accumulated REVISION entries as a contiguous
+    run, in order, at or after the shadow's consumption cursor
+    (`shadow.memory_cursor`). Consumption is monotonic and single-use:
+    the cursor advances past the matched run, so each journal entry is
+    attributed to exactly one block's step, in journal order. A resent
+    unit is therefore a later entry -- its step is attributed to the
+    resend's own block and transaction, never re-read as its first
+    occurrence. Entries before the matched run (a discarded candidate's
+    revisions, an apply whose recorder never ran) are skipped over and
+    never fed. On no match nothing is fed and the cursor does not move:
+    a shadow that cannot identify its block's revisions in the journal
+    must record nothing rather than guess.
     """
     import tau_journal as _tau_journal
 
@@ -848,8 +860,9 @@ def _memory_journal_units_for_block(block, next_snapshot):
         # durable journal is); nothing to identify.
         return []
     span = len(wanted)
-    for start in range(len(revisions) - span, -1, -1):
+    for start in range(shadow.memory_cursor, len(revisions) - span + 1):
         if revisions[start:start + span] == wanted:
+            shadow.memory_cursor = start + span
             return wanted
     logger.warning(
         "shadow: in-process journal holds no run matching block #%s "
@@ -917,7 +930,7 @@ def _record_shadow_snapshot(block, next_snapshot) -> None:
                         before_text)
         if fed_current:
             return
-        units = _memory_journal_units_for_block(block, next_snapshot)
+        units = _memory_journal_units_for_block(block, next_snapshot, shadow)
         if not units:
             return
         snap = shadow.advance_journal(
@@ -991,6 +1004,7 @@ def rebuild_shadow_from_journal():
                 block_hash=db.get_chain_state_value(
                     "canonical_head_hash", ""),
             )
+            shadow.memory_cursor = len(units)
     return shadow
 
 
