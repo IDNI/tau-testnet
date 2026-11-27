@@ -11,8 +11,11 @@ Resolution order:
                  when this node recorded one at apply (issue #42): the
                  engine's spec_revision before/after its rule step, the o0
                  verdict (`revision_taken`), the outcome classification and
-                 the apply logs -- so a wallet can confirm a rule took effect
-                 without re-running the engine.
+                 the apply logs, anchored to the committed block by the
+                 snapshot's `state_hash` and the sha256 of its canonical
+                 application-rules bytes (`canonical_rules_sha256`) -- so a
+                 wallet can confirm a rule took effect, against committed
+                 chain state, without re-running the engine.
   3. mempool_dropped -> "expired" / "evicted" / "rejected". A "rejected" row
                  may carry the apply receipt's `reason` code and a `detail`
                  log trail. Only the node that built the block records these;
