@@ -17,6 +17,7 @@ Two things are being defended here.
    compile-time constant that ships flipped or not.
 """
 import copy
+from dataclasses import asdict
 
 import pytest
 
@@ -27,6 +28,7 @@ from consensus.governance import (
     DEFAULT_ELIGIBILITY_MODE,
     DEFAULT_FEE_BENEFICIARY,
     DEFAULT_MAX_RULE_TXS_PER_BLOCK,
+    DEFAULT_SHARED_RULE_LIMITS,
     ConsensusLifecycleManager,
     build_mechanism_metadata,
     validate_approval_slots_active,
@@ -39,7 +41,7 @@ AUTH = "aa" * 48
 
 
 def _legacy_meta_hash(lm):
-    """The pre-feature preimage, hand-rolled."""
+    """The default-state preimage, hand-rolled."""
     mech = {"vote_quorum": lm.effective_quorum_policy()}
     if lm.effective_eligibility_mode() != DEFAULT_ELIGIBILITY_MODE:
         mech["eligibility_mode"] = lm.effective_eligibility_mode()
@@ -55,7 +57,13 @@ def _legacy_meta_hash(lm):
         vote_records=vote_records,
         activation_schedule=lm.scheduled_updates,
         checkpoint_references=[],
-        mechanism_specific_metadata={**mech, "retractable_transfers_root": RetractableBook().root().hex()},
+        mechanism_specific_metadata={
+            **mech,
+            "retractable_transfers_root": RetractableBook().root().hex(),
+            "shared_rule_limits": asdict(DEFAULT_SHARED_RULE_LIMITS),
+            "shared_rule_count": 0,
+            "shared_rule_nodes": 0,
+        },
     )
 
 
@@ -81,6 +89,9 @@ def test_gen_genesis_shaped_call_is_unaffected():
     assert build_mechanism_metadata("supermajority") == {
         "vote_quorum": "supermajority",
         "retractable_transfers_root": RetractableBook().root().hex(),
+        "shared_rule_limits": asdict(DEFAULT_SHARED_RULE_LIMITS),
+        "shared_rule_count": 0,
+        "shared_rule_nodes": 0,
     }
 
 

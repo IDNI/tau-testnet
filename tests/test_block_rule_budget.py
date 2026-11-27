@@ -5,10 +5,13 @@ the unit's complexity, so an unbounded count lets a proposer
 author a block that every validator times out on -- COMM_TIMEOUT, then a
 watchdog kill. The budget is therefore block validity, not local policy.
 
-It counts the rule-sharing transaction types and every user_tx whose
-operations["0"] rule writes o5, because each of those builds a clause. Rules on
-other streams accumulate and are not counted.
+It counts the rule-sharing transaction types and every user_tx carrying an
+operations["0"] rule: an o5 rule builds a clause, any other rule rebuilds the
+shared spec.
 """
+import json
+from unittest.mock import MagicMock
+
 import pytest
 from unittest.mock import patch
 
@@ -106,9 +109,15 @@ def test_malformed_budget_skips_the_check_rather_than_failing_closed():
     assert _verify(_block([_offer_tx(i) for i in range(50)]), _view(budget=0)) is True
 
 
-def test_operation_zero_rules_on_other_streams_are_not_counted():
-    many = [_rule_tx(i, OTHER_STREAM_RULE) for i in range(50)]
-    assert _verify(_block(many), _view(budget=1)) is True
+def test_operation_zero_rules_on_other_streams_count_toward_the_budget():
+    many = [_rule_tx(i, OTHER_STREAM_RULE) for i in range(4)]
+    assert _verify(_block(many), _view(budget=4)) is True
+    assert _verify(_block(many), _view(budget=3)) is False
+
+
+def test_whitespace_only_rule_does_not_count():
+    blanks = [_rule_tx(i, "   ") for i in range(5)]
+    assert _verify(_block(blanks), _view(budget=1)) is True
 
 
 def test_operation_zero_o5_rules_count_toward_the_budget():
@@ -184,3 +193,83 @@ def test_governance_patch_rejects_out_of_range_budgets():
 ])
 def test_budget_validation(value, ok):
     assert (validate_max_rule_txs_per_block(value) is None) is ok
+
+
+# --- the proposer's selection follows the same predicate -------------------
+
+def _user_tx_with(rule_text, seq=0):
+    return {
+        "tx_type": "user_tx", "sender_pubkey": A, "sequence_number": seq,
+        "expiration_time": 9999999999, "expire_at_height": 5000,
+        "fee_limit": "10", "operations": {"0": rule_text},
+    }
+
+
+@pytest.mark.parametrize("tx", [
+    _user_tx_with(RULE),
+    _user_tx_with(OTHER_STREAM_RULE),
+    _user_tx_with("   "),
+    {"tx_type": "user_tx", "operations": {"1": [[A, A, 1]]}},
+])
+def test_user_tx_costs_a_slot_exactly_when_it_rides_the_slow_lane(tx):
+    from consensus.lanes import LANE_SLOW, classify_lane
+
+    assert TauConsensusEngine._counts_against_rule_budget(tx) is (
+        classify_lane(tx) == LANE_SLOW
+    )
+
+
+def test_createblock_never_selects_more_rule_txs_than_the_ceiling(temp_database):
+    import db
+    from commands import createblock
+
+    ceiling = 3
+    for i in range(12):
+        sender = format(i, "096x")
+        db.add_mempool_tx(
+            json.dumps(_user_tx_with(
+                f"always ( o{12 + i}[t]:bv[24] = i1[t]:bv[24] ).")
+                | {"sender_pubkey": sender}),
+            f"rule-{i}", 1000 + i, fee_limit=10, estimated_fee=0,
+        )
+    for i in range(2):
+        sender = format(500 + i, "096x")
+        db.add_mempool_tx(
+            json.dumps({
+                "tx_type": "user_tx", "sender_pubkey": sender, "sequence_number": 0,
+                "expiration_time": 9999999999, "expire_at_height": 5000,
+                "fee_limit": "10", "operations": {"1": [[sender, A, 1]]},
+            }),
+            f"coin-{i}", 2000 + i, fee_limit=10, estimated_fee=0,
+        )
+
+    selected = []
+    real_reserve = db.reserve_mempool_txs
+
+    def reserve(**kwargs):
+        rows = real_reserve(**kwargs)
+        selected.extend(rows)
+        return rows
+
+    lm = MagicMock()
+    lm.active_validators = set()
+    lm.effective_eligibility_mode.return_value = "validator_set"
+    lm.max_rule_txs_per_block = ceiling
+    tau = MagicMock()
+    tau.tau_ready.wait.return_value = False
+    with patch.object(createblock, "tau_manager", tau), \
+         patch.object(createblock.chain_state, "_lifecycle_manager", lm), \
+         patch.object(createblock.config, "MINER_PRIVKEY", "1" * 64), \
+         patch.object(createblock.config, "BLOCK_MAX_RULE_TXS", 8), \
+         patch.object(createblock.db, "reserve_mempool_txs", side_effect=reserve), \
+         patch.object(createblock.db, "unreserve_mempool_txs"), \
+         patch.object(createblock.db, "get_canonical_head_block",
+                      return_value={"block_hash": "0" * 64,
+                                    "header": {"block_number": 0}}), \
+         patch.object(TauConsensusEngine, "query_eligibility", return_value=True):
+        createblock.create_block_from_mempool()
+
+    txs = [json.loads(row["payload"]) for row in selected]
+    costly = [tx for tx in txs if TauConsensusEngine._counts_against_rule_budget(tx)]
+    assert len(costly) == ceiling
+    assert len(txs) == ceiling + 2

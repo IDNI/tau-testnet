@@ -146,7 +146,7 @@ class TestSendTxValidation(unittest.TestCase):
             "sequence_number": chain_state.get_sequence_number(SENDER),
             "expiration_time": int(time.time()) + 1000,
             "expire_at_height": 5000,
-            "operations": {"0": "some_other_op_data"},
+            "operations": {"0": "always ( o13[t]:bv[24] = i1[t]:bv[24] )."},
             "fee_limit": "0",
         }
         tx_json = _sign_tx(tx)

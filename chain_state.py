@@ -159,7 +159,14 @@ _rules_lock = threading.Lock()
 _application_rules_state = ""
 _consensus_rules_state = ""
 _active_consensus_id = "tau_poa_v1"
-from consensus.governance import ConsensusLifecycleManager, ConsensusRuleUpdate, normalize_validator_set
+from consensus.governance import (
+    ConsensusLifecycleManager,
+    ConsensusRuleUpdate,
+    SharedRuleLimits,
+    normalize_validator_set,
+    validate_shared_rule_limits,
+)
+from dataclasses import asdict
 _lifecycle_manager = ConsensusLifecycleManager()
 
 _canonical_head_hash = ""
@@ -618,6 +625,42 @@ def _record_tx_outcomes(block, next_snapshot) -> None:
         logger.exception("could not record transaction outcomes")
 
 
+def _shared_rule_budget_state(lm) -> dict:
+    return {
+        "limits": asdict(lm.shared_rule_limits),
+        "count": lm.shared_rule_count,
+        "nodes": lm.shared_rule_nodes,
+    }
+
+
+def _restore_shared_rule_budget(lm, missing) -> None:
+    """Reload the shared-rule limits and counters, ignoring malformed rows."""
+    raw = db.get_chain_state_value("shared_rule_limits", missing)
+    if raw != missing:
+        try:
+            limits = json.loads(raw)
+            err = validate_shared_rule_limits(limits)
+            if err:
+                raise ValueError(err)
+            lm.shared_rule_limits = SharedRuleLimits(**limits)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring malformed shared_rule_limits chain_state entry %r", raw)
+    for key, attr in (
+        ("shared_rule_count", "shared_rule_count"),
+        ("shared_rule_nodes", "shared_rule_nodes"),
+    ):
+        raw = db.get_chain_state_value(key, missing)
+        if raw == missing:
+            continue
+        try:
+            value = int(raw)
+            if value < 0:
+                raise ValueError(raw)
+            setattr(lm, attr, value)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring malformed %s chain_state entry %r", key, raw)
+
+
 def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
     """The canonical rows for a block, computed from its SNAPSHOT.
 
@@ -656,6 +699,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         rule_offers=lm.rule_offers.snapshot_offers(),
         rule_clauses=lm.rule_offers.clause_plan(),
         max_rule_txs_per_block=lm.max_rule_txs_per_block,
+        shared_rule_budget=_shared_rule_budget_state(lm),
         approval_requests=lm.approval_requests.snapshot_requests(),
         rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
         approval_slots_active=lm.approval_slots_active,
@@ -2417,6 +2461,7 @@ def load_state_from_db() -> bool:
                     "Ignoring malformed max_rule_txs_per_block chain_state entry %r",
                     persisted_budget,
                 )
+        _restore_shared_rule_budget(_lifecycle_manager, _MISSING)
         _lifecycle_manager.recompute_approval_threshold()
 
         # Rehydrate rule sharing. Both structures are bound into
@@ -2488,6 +2533,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
         rule_clauses_list = _lifecycle_manager.rule_offers.clause_plan()
         max_rule_txs_snapshot = _lifecycle_manager.max_rule_txs_per_block
+        shared_rule_budget_snapshot = _shared_rule_budget_state(_lifecycle_manager)
         approval_requests_list = _lifecycle_manager.approval_requests.snapshot_requests()
         rule_change_requests_list = (
             _lifecycle_manager.approval_requests.snapshot_rule_change_requests()
@@ -2508,6 +2554,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_offers=rule_offers_list,
         rule_clauses=rule_clauses_list,
         max_rule_txs_per_block=max_rule_txs_snapshot,
+        shared_rule_budget=shared_rule_budget_snapshot,
         approval_requests=approval_requests_list,
         rule_change_requests=rule_change_requests_list,
         approval_slots_active=approval_slots_active_snapshot,
@@ -3003,6 +3050,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 rule_offers=rule_offers_list,
                 rule_clauses=rule_clauses_list,
                 max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
+                shared_rule_budget=_shared_rule_budget_state(_lifecycle_manager),
                 approval_requests=_lifecycle_manager.approval_requests.snapshot_requests(),
                 rule_change_requests=(
                     _lifecycle_manager.approval_requests.snapshot_rule_change_requests()

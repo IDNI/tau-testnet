@@ -11,6 +11,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from consensus.governance import DEFAULT_SHARED_RULE_LIMITS
+
 import pytest
 
 import tau_admission
@@ -80,7 +82,11 @@ def _proposal(session, label="proposal"):
         allocator=alloc.Allocator(alloc.DbMappingSnapshot(), width=plan.width,
                                   label="proposal"),
         plan=plan,
-        lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
+        lifecycle=MagicMock(
+            approval_slots_active=False, faucet_amount=0,
+            shared_rule_limits=DEFAULT_SHARED_RULE_LIMITS,
+            shared_rule_count=0, shared_rule_nodes=0,
+        ),
         label=label,
     )
 

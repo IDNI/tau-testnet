@@ -73,10 +73,10 @@ TYPED_ELSEWHERE = _clause([
 ])
 
 BAD = {
-    "untyped": (UNTYPED, "i1[t]:bv["),
-    "two_widths": (TWO_WIDTHS, "several widths"),
-    "over_count": (OVER_COUNT, "comparisons"),
-    "over_depth": (OVER_DEPTH, "nests parentheses"),
+    "untyped": (UNTYPED, "must carry a :bv[N] type", "rule_fragment"),
+    "two_widths": (TWO_WIDTHS, "in one rule", "rule_fragment"),
+    "over_count": (OVER_COUNT, "comparisons", NOT_APPLIED),
+    "over_depth": (OVER_DEPTH, "nested more than", "rule_fragment"),
 }
 GOOD = {"at_count": AT_COUNT, "at_depth": AT_DEPTH, "other_widths": TYPED_ELSEWHERE}
 
@@ -146,7 +146,7 @@ def test_the_domain_screen_accepts_a_body_within_the_limits(name):
 
 @pytest.mark.parametrize("name", BAD)
 def test_the_domain_screen_refuses(name):
-    rule, phrase = BAD[name]
+    rule, phrase, _reason = BAD[name]
     error = _screen_clause_domains(_body_of(rule))
     assert error is not None and phrase in error
 
@@ -156,7 +156,7 @@ def test_the_domain_screen_refuses(name):
 @pytest.mark.parametrize("door", ["routed", "offer", "accept"])
 @pytest.mark.parametrize("name", BAD)
 def test_admission_refuses(tip_view, door, name):
-    rule, phrase = BAD[name]
+    rule, phrase, _reason = BAD[name]
     result = _admit(door, rule, tip_view)
     assert result.is_valid is False
     assert phrase in result.error
@@ -173,30 +173,30 @@ def test_admission_accepts(tip_view, door, name):
 
 @pytest.mark.parametrize("name", BAD)
 def test_apply_hard_rejects_a_routed_clause(name):
-    rule, _ = BAD[name]
+    rule, _, reason = BAD[name]
     result, post, _fed = _apply(_rule_tx(rule), _lifecycle(slots=True))
     assert "rule" in result.invalid_tx_ids
-    assert _outcome(result, "rule").reason == NOT_APPLIED
+    assert _outcome(result, "rule").reason == reason
     assert post.rule_offers.clause_for(ALICE, 5) is None
 
 
 @pytest.mark.parametrize("slots", [False, True])
 @pytest.mark.parametrize("name", BAD)
 def test_apply_hard_rejects_an_offer(name, slots):
-    rule, _ = BAD[name]
+    rule, _, reason = BAD[name]
     result, post, _fed = _apply(_offer_tx(rule), _lifecycle(slots=slots))
     assert "offer" in result.invalid_tx_ids
-    assert _outcome(result, "offer").reason == NOT_APPLIED
+    assert _outcome(result, "offer").reason == reason
     assert post.rule_offers.get_offer(_offer(rule).offer_id) is None
 
 
 @pytest.mark.parametrize("slots", [False, True])
 @pytest.mark.parametrize("name", BAD)
 def test_apply_hard_rejects_an_accept(name, slots):
-    rule, _ = BAD[name]
+    rule, _, reason = BAD[name]
     result, post, _fed = _apply(_accept_tx(rule), _lifecycle(slots=slots, open_offer=rule))
     assert "accept" in result.invalid_tx_ids
-    assert _outcome(result, "accept").reason == NOT_APPLIED
+    assert _outcome(result, "accept").reason == reason
     assert post.rule_offers.clause_for(ALICE, 5) is None
 
 

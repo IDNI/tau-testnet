@@ -82,6 +82,7 @@ py-modules = [
     "tau_commit",
     "tau_compile_worker",
     "tau_defs",
+    "tau_engine_profile",
     "tau_evaluator_state",
     "tau_guard",
     "tau_io_logger",

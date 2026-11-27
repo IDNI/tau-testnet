@@ -1,18 +1,9 @@
-"""The no-regenesis guarantee for rule sharing.
+"""Rule-offer keys enter the meta hash only once the offer book is non-empty.
 
-Rule-offer state is bound into the block state hash through
-`consensus_meta.mechanism_specific_metadata`. Adding a key there
-unconditionally would change the state hash of every existing chain, including
-genesis, forcing a coordinated reset.
-
-Instead the keys are emitted ONLY when the offer book is non-empty, matching
-the gate `eligibility_mode` already uses (see
-ConsensusLifecycleManager.consensus_meta_hash and scripts/gen_genesis.py).
-While no offer has ever been made, the preimage is byte-identical to what a
-pre-feature binary produced.
-
-If any of these tests fails, shipping the change forks every live chain.
+An untouched book therefore adds no offer keys to the preimage.
 """
+from dataclasses import asdict
+
 import pytest
 
 from consensus.retractable import RetractableBook
@@ -20,6 +11,7 @@ from consensus.governance import (
     DEFAULT_ELIGIBILITY_MODE,
     DEFAULT_MAX_RULE_TXS_PER_BLOCK,
     DEFAULT_QUORUM_POLICY,
+    DEFAULT_SHARED_RULE_LIMITS,
     ConsensusLifecycleManager,
     validate_max_rule_txs_per_block,
 )
@@ -32,7 +24,7 @@ CLAUSE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
 
 
 def _legacy_meta_hash(lm):
-    """The preimage a binary without rule sharing would have produced."""
+    """The preimage an untouched offer book and default block budget produce."""
     vote_records = [
         (uid, voter) for uid, voters in lm.votes.items() for voter in voters
     ]
@@ -46,7 +38,13 @@ def _legacy_meta_hash(lm):
         vote_records=vote_records,
         activation_schedule=lm.scheduled_updates,
         checkpoint_references=[],
-        mechanism_specific_metadata={**mech, "retractable_transfers_root": RetractableBook().root().hex()},
+        mechanism_specific_metadata={
+            **mech,
+            "retractable_transfers_root": RetractableBook().root().hex(),
+            "shared_rule_limits": asdict(DEFAULT_SHARED_RULE_LIMITS),
+            "shared_rule_count": 0,
+            "shared_rule_nodes": 0,
+        },
     )
 
 
