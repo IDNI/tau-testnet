@@ -22,6 +22,11 @@ from commands import (
     getapprovalrequests,
     getapprovalslots,
     getrequestid,
+    getchainid,
+    getgrants,
+    getpayoutrules,
+    getreceiveroute,
+    getstandingpayments,
     getretractable,
     getretractableid,
     getretractables,
@@ -86,6 +91,12 @@ class ServiceContainer:
         "getretractable": getretractable,
         "getretractables": getretractables,
         "getretractableid": getretractableid,
+        # Conditional grants (programmable payments).
+        "getchainid": getchainid,
+        "getgrants": getgrants,
+        "getpayoutrules": getpayoutrules,
+        "getreceiveroute": getreceiveroute,
+        "getstandingpayments": getstandingpayments,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly
         # in server.py.
         "getapprovalslots": getapprovalslots,

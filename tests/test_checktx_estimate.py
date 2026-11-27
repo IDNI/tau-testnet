@@ -118,9 +118,14 @@ def _offer_row():
 
 
 def _envelope(tx_type, sender, fee_limit, **fields):
+    from consensus.chain_binding import CHAIN_BOUND_TX_TYPES
+    from chain_ids import TEST_CHAIN_ID
+
     tx = {"tx_type": tx_type, "sender_pubkey": sender, "sequence_number": 1,
           "expiration_time": FAR, "expire_at_height": NEXT_HEIGHT + 20,
           "fee_limit": fee_limit}
+    if tx_type in CHAIN_BOUND_TX_TYPES:
+        tx["chain_id"] = TEST_CHAIN_ID
     tx.update(fields)
     return tx
 
@@ -147,7 +152,98 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind == "grant_create":
+        return _envelope(kind, SENDER, fee_limit, grantee_pubkey=RECIPIENT,
+                         amount=100, expires_at=_now() + 86_400)
+    if kind == "grant_draw":
+        return _envelope(kind, RECIPIENT, fee_limit, grant_id=_seed_grant(),
+                         recipient_pubkey=SENDER, amount=10)
+    if kind == "standing_payment_create":
+        return _envelope(kind, SENDER, fee_limit, recipient_pubkey=RECIPIENT, amount=100,
+                         period_kind=1, start_at=_now(), window_seconds=86_400,
+                         max_occurrences=3)
+    if kind == "standing_payment_execute":
+        sid, period = _seed_standing()
+        return _envelope(kind, RECIPIENT, fee_limit, standing_id=sid, period=period)
+    if kind == "receive_route_set":
+        return _envelope(kind, SENDER, fee_limit, destination_pubkey=RECIPIENT, bps=2000,
+                         min_incoming=0, activate_at=0, expires_at=0, locked_until=0)
+    if kind == "payout_rule_install":
+        return _envelope(kind, SENDER, fee_limit, rule_text="o1[t]:bv[24] = i13[t]:bv[24]",
+                         recipients=[RECIPIENT], max_per_execution=10, max_per_period=10,
+                         period_kind=3, period_seconds=0, start_at=0, expires_at=0)
+    if kind == "payout_execute":
+        return _envelope(kind, RECIPIENT, fee_limit, rule_id=_seed_payout(),
+                         inputs={"13": "5"})
     raise AssertionError(kind)
+
+
+def _seed_payout():
+    from chain_state import _payouts_state
+    from consensus.payouts import PayoutBook, parse_payout_install
+
+    book = PayoutBook()
+    rid = book.install(parse_payout_install({
+        "sender_pubkey": SENDER, "rule_text": "o1[t]:bv[24] = i13[t]:bv[24]",
+        "recipients": [RECIPIENT], "max_per_execution": 10, "max_per_period": 10,
+        "sequence_number": 0}))
+
+    class _LM:
+        payout_rules = book
+
+    db.set_chain_state_value("payouts_v1", json.dumps(_payouts_state(_LM)))
+    return rid.hex()
+
+
+def _seed_standing():
+    """Commit one daily standing payment SENDER -> RECIPIENT that is due now."""
+    from chain_state import _standing_state
+    from consensus.standing import StandingBook, parse_standing_create
+
+    book = StandingBook()
+    now = _now()
+    terms = parse_standing_create({"sender_pubkey": SENDER, "recipient_pubkey": RECIPIENT,
+                                   "amount": 100, "sequence_number": 0, "period_kind": 1,
+                                   "start_at": now - (now % 86_400),
+                                   "window_seconds": 86_400, "max_occurrences": 3})
+    sid = book.submit(terms)
+
+    class _LM:
+        standing_payments = book
+
+    db.set_chain_state_value(
+        "standing_v1", json.dumps(_standing_state(_LM), sort_keys=True, separators=(",", ":"))
+    )
+    return sid.hex(), terms.period_of(now)
+
+
+def _now():
+    import time
+
+    return int(time.time())
+
+
+def _seed_grant():
+    """Commit one open grant SENDER -> RECIPIENT so a draw has something to draw."""
+    import time
+
+    from chain_state import _grants_state
+    from consensus.grants import GrantBook, parse_grant_create
+
+    book = GrantBook()
+    now = int(time.time())
+    terms = parse_grant_create({"sender_pubkey": SENDER, "grantee_pubkey": RECIPIENT,
+                                "amount": 1000, "sequence_number": 0,
+                                "expires_at": now + 86_400})
+    gid = book.submit(terms, now)
+
+    class _LM:
+        grants = book
+
+    db.set_chain_state_value(
+        "grants_v1", json.dumps(_grants_state(_LM), sort_keys=True, separators=(",", ":"))
+    )
+    return gid.hex()
 
 
 def _check(payload, *, estimate=True):
@@ -158,7 +254,9 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request", "grant_create", "grant_draw",
+               "standing_payment_create", "standing_payment_execute",
+               "receive_route_set", "payout_rule_install", "payout_execute"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

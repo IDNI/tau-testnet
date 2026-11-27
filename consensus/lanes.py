@@ -40,6 +40,8 @@ SLOW_TX_TYPES = frozenset({
     "consensus_rule_update",
 })
 
+# `grant_create`, `grant_draw` and `grant_cancel` are FAST like retractables: a
+# create costs one transfer step, a draw or cancel needs no Tau evaluation.
 # `retractable_transfer` and `retract_transfer` are absent too, i.e. FAST: a park
 # costs one transfer step and a retract needs no Tau evaluation at all.
 # `approval_request` and `transfer_vote` are deliberately absent, i.e. FAST.
@@ -65,6 +67,9 @@ TAU_EVALUATING_TX_TYPES = frozenset({
     "approval_request",
     "transfer_vote",
     "retractable_transfer",
+    "grant_create",
+    "standing_payment_execute",
+    "payout_execute",
     "rule_change_request",
 })
 

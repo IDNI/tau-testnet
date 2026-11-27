@@ -43,7 +43,9 @@ class SoleMiner:
             return False
         head = db.get_canonical_head_block()
         next_height = head['header']['block_number'] + 1 if head else 0
-        return db.has_due_retractables(next_height, int(time.time()))
+        now = int(time.time())
+        # Grant expiries refund through the same post-transaction sweep.
+        return db.has_due_retractables(next_height, now) or db.has_due_grants(now)
 
     def _should_mine(self) -> bool:
         # 1. Cheap local gates first to avoid driving the Tau engine on every tick.

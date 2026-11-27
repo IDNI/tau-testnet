@@ -338,11 +338,11 @@ def temp_database(tmp_path) -> Iterator[str]:
 
 @pytest.fixture
 def mock_policy_evaluators() -> Iterator[None]:
-    """Serve o5 clause verdicts from the mock in both pools, whatever TAU_FORCE_TEST says."""
+    """Serve clause verdicts from the mock in every pool, whatever TAU_FORCE_TEST says."""
     from consensus import sender_policy
     from consensus.policy_mock import MockPolicyEvaluator
 
-    pools = ("apply", "admission")
+    pools = ("apply", "admission", "payout")
     for pool in pools:
         sender_policy.set_evaluator(pool, MockPolicyEvaluator(pool=pool))
     yield
@@ -507,3 +507,12 @@ def pytest_unconfigure(config):
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(_exit_status)
+
+
+@pytest.fixture(autouse=True)
+def _programmable_payments_chain_id(monkeypatch):
+    """Programmable-payment txs are bound to the genesis hash; tests use a fixed one."""
+    from consensus import chain_binding
+    from chain_ids import TEST_CHAIN_ID
+
+    monkeypatch.setattr(chain_binding, "current_chain_id", lambda: TEST_CHAIN_ID)

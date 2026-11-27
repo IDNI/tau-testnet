@@ -8,6 +8,10 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple
 
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
+from consensus.grants import TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW
+from consensus.standing import TX_TYPE_STANDING_CREATE
+from consensus.routes import TX_TYPE_ROUTE_SET
+from consensus.payouts import TX_TYPE_PAYOUT_INSTALL
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
 from consensus import bls
@@ -54,8 +58,19 @@ def check_transfer(transfer: Any, sender_pubkey: Any) -> Optional[str]:
 
 def _recipient_keys(tx: dict) -> list:
     tx_type = tx.get("tx_type", "user_tx")
-    if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER):
+    if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER, TX_TYPE_GRANT_DRAW,
+                   TX_TYPE_STANDING_CREATE):
         return [("recipient_pubkey", tx.get("recipient_pubkey"))]
+    if tx_type == TX_TYPE_PAYOUT_INSTALL:
+        recipients = tx.get("recipients")
+        return [("recipient", r) for r in recipients] if isinstance(recipients, list) else []
+    if tx_type == TX_TYPE_ROUTE_SET:
+        return [("destination_pubkey", tx.get("destination_pubkey"))]
+    if tx_type == TX_TYPE_GRANT_CREATE:
+        keys = [("grantee_pubkey", tx.get("grantee_pubkey"))]
+        if tx.get("refund_to_pubkey") is not None:
+            keys.append(("refund_to_pubkey", tx.get("refund_to_pubkey")))
+        return keys
     if tx_type in (TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST):
         keys = (
             [("recipient_pubkey", tx.get("recipient_pubkey"))]

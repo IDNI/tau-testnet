@@ -17,6 +17,7 @@ from .governance import (
 )
 from . import faucet, fees
 from . import sender_policy
+from tau_policy import PolicyBuildError, PolicyStepError
 from .fees import FeeRuleError
 from .approvals import (
     APPROVAL_TX_TYPES,
@@ -32,6 +33,50 @@ from .approvals import (
     parse_rule_change_cancel,
     parse_rule_change_request_checked,
     parse_transfer_vote,
+)
+from .chain_binding import check_chain_id
+from .payouts import (
+    PAYOUT_POLICY_POOL,
+    PAYOUT_TX_TYPES,
+    PayoutBook,
+    PayoutShapeError,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_INSTALL,
+    legs_from_outputs,
+    parse_payout_execute,
+    parse_payout_install,
+    parse_payout_remove,
+    rule_inputs,
+)
+from .routes import (
+    ROUTE_TX_TYPES,
+    RouteBook,
+    RouteShapeError,
+    TX_TYPE_ROUTE_SET,
+    parse_route_remove,
+    parse_route_set,
+)
+from .standing import (
+    STANDING_TX_TYPES,
+    StandingBook,
+    StandingShapeError,
+    TX_TYPE_STANDING_CANCEL,
+    TX_TYPE_STANDING_CREATE,
+    TX_TYPE_STANDING_EXECUTE,
+    parse_standing_cancel,
+    parse_standing_create,
+    parse_standing_execute,
+)
+from .grants import (
+    GRANT_TX_TYPES,
+    GrantBook,
+    GrantShapeError,
+    TX_TYPE_GRANT_CANCEL,
+    TX_TYPE_GRANT_CREATE,
+    TX_TYPE_GRANT_DRAW,
+    parse_grant_cancel,
+    parse_grant_create,
+    parse_grant_draw,
 )
 from .retractable import (
     RETRACTABLE_TX_TYPES,
@@ -70,7 +115,9 @@ from .rule_offers import (
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW,
+     TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE, TX_TYPE_ROUTE_SET,
+     TX_TYPE_PAYOUT_INSTALL, TX_TYPE_PAYOUT_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -226,9 +273,39 @@ def _retractable_book(lm) -> Optional[RetractableBook]:
     return book if isinstance(book, RetractableBook) else None
 
 
+def _grant_book(lm) -> Optional[GrantBook]:
+    book = getattr(lm, "grants", None)
+    return book if isinstance(book, GrantBook) else None
+
+
 def _escrow_total(lm) -> int:
+    """Funds held by consensus books rather than accounts (supply invariant)."""
     book = _retractable_book(lm)
-    return book.escrow_total() if book is not None else 0
+    grants = _grant_book(lm)
+    return (book.escrow_total() if book is not None else 0) + (
+        grants.escrow_total() if grants is not None else 0
+    )
+
+
+def _end_due_standing(lm, timestamp) -> List[str]:
+    """Resolve standing payments whose end_at has passed. Moves no funds."""
+    book = getattr(lm, "standing_payments", None)
+    if not isinstance(book, StandingBook):
+        return []
+    return [s.terms.standing_id.hex() for s in book.end_due(int(timestamp))]
+
+
+def _expire_due_grants(lm, balances, sequences, timestamp) -> List[str]:
+    """Refund every expired grant's remaining funds; returns the expired ids."""
+    book = _grant_book(lm)
+    if book is None:
+        return []
+    expired = book.expire_due(int(timestamp))
+    grant = faucet.amount(lm)
+    for state in expired:
+        to = state.terms.refund_to_pubkey
+        balances[to] = faucet.spendable(balances, sequences, to, grant) + state.remaining
+    return [state.terms.grant_id.hex() for state in expired]
 
 
 def _release_due_retractables(lm, balances, sequences, height, timestamp) -> List[str]:
@@ -903,6 +980,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         released_retractables = _release_due_retractables(
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
+        # Same position and reasoning for grants: a draw needs ts < expires_at,
+        # so it can never share a block with its grant's expiry refund.
+        expired_grants = _expire_due_grants(lm, t_bals, t_seqs, block.header.timestamp)
+        ended_standing = _end_due_standing(lm, block.header.timestamp)
+        route_book = getattr(lm, "receive_routes", None)
+        if isinstance(route_book, RouteBook):
+            route_book.expire_due(int(block.header.timestamp))
+        payout_book = getattr(lm, "payout_rules", None)
+        if isinstance(payout_book, PayoutBook):
+            payout_book.expire_due(int(block.header.timestamp))
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
@@ -962,6 +1049,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
+
+        grant_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "grant_event"
+            )
+            if event and id(tx) in accepted_obj:
+                grant_events.append(event)
+        grant_events.extend((gid, "expired") for gid in expired_grants)
+
+        standing_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "standing_event"
+            )
+            if event and id(tx) in accepted_obj:
+                standing_events.append(event)
+        standing_events.extend((sid, "ended") for sid in ended_standing)
 
         # 3. Post-State Materialization Layer
         
@@ -1118,6 +1223,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "grant_events": grant_events,
+                "standing_events": standing_events,
             }
         )
         
@@ -1664,6 +1771,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             parked_rule_change_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
+            pending_grant_op = None  # ("create", terms) | ("draw", draw) | ("cancel", gid)
+            pending_standing_op = None  # ("create"|"execute"|"cancel", parsed)
+            pending_route_op = None  # ("set", route) | ("remove", owner)
+            pending_payout_op = None  # ("install", terms) | ("execute", (rid, total)) | ("remove", rid)
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -1880,6 +1991,29 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 )
                 return allows, fee
 
+            def _credit_with_route(to_addr, amount):
+                """Stage an ordinary credit, split by the recipient's receive route (#35).
+
+                Single hop by construction: the routed share is credited
+                directly and never looks up the destination's own route.
+                """
+                book = getattr(lifecycle_mgr, "receive_routes", None)
+                route = (book.active_route(to_addr, int(block_timestamp or 0))
+                         if isinstance(book, RouteBook) else None)
+                net, routed = route.split(amount) if route is not None else (amount, 0)
+                staged_writes[to_addr] = _read_bal(to_addr) + net
+                if routed:
+                    dest = route.destination_pubkey
+                    staged_writes[dest] = _read_bal(dest) + routed
+                    tx_receipt.setdefault("routed", []).append({
+                        "recipient": to_addr, "gross": amount, "net": net,
+                        "routed": routed, "destination": dest, "bps": route.bps,
+                    })
+                    tx_receipt["logs"].append(
+                        f"Receive route: {routed} of {amount} to {dest} "
+                        f"(gross {amount}, net {net}, routed {routed}, {route.bps} bps)"
+                    )
+
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
                                           escrow=False):
@@ -2018,7 +2152,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         return False
                     staged_writes[from_addr] = current_from - amount
                     if not escrow:
-                        staged_writes[to_addr] = _read_bal(to_addr) + amount
+                        _credit_with_route(to_addr, amount)
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -2628,6 +2762,247 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Retractable transfer retracted: " + request.retractable_id.hex()
                             )
 
+            elif tx_type in GRANT_TX_TYPES:
+                # Root fields only, as for retractables: nested data is unsigned.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    grants_book = lifecycle_mgr.grants
+                    ts_now = int(block_timestamp or 0)
+                    reason = check_chain_id(tx) or ""
+                    op = None
+                    try:
+                        if tx_type == TX_TYPE_GRANT_CREATE:
+                            op = ("create", parse_grant_create(tx))
+                        elif tx_type == TX_TYPE_GRANT_DRAW:
+                            op = ("draw", parse_grant_draw(tx))
+                        else:
+                            op = ("cancel", parse_grant_cancel(tx))
+                    except GrantShapeError as exc:
+                        reason = f"invalid {tx_type} ({exc})"
+                    if op is not None and not reason:
+                        signer = (op[1].grantor_pubkey if op[0] != "draw"
+                                  else op[1].grantee_pubkey)
+                        if not isinstance(sender, str) or sender != signer:
+                            reason = "sender is not the signer"
+                        elif target_balances is None:
+                            reason = "no balance overlay for grant funds"
+                        elif op[0] == "create":
+                            _, reason = grants_book.can_admit_create(op[1], ts_now)
+                        elif op[0] == "draw":
+                            _, reason = grants_book.can_admit_draw(op[1], ts_now)
+                        else:
+                            _, reason = grants_book.can_admit_cancel(op[1], ts_now)
+                    if op is None or reason:
+                        tx_receipt["logs"].append(f"Grant transaction ignored: {reason}")
+                        tx_receipt["reason"] = "grant_not_applied"
+                        accepted_in_block = False
+                    elif op[0] == "create":
+                        terms = op[1]
+                        # Same gates as a retractable park: the grantor's o1/o5
+                        # policy, the fee step and the balance check; the funds
+                        # are debited into the grant, credited to nobody yet.
+                        escrowed = _execute_fee_era_transfer(
+                            terms.grantor_pubkey, terms.grantee_pubkey, terms.amount,
+                            slot_values=_approval_slot_values(),
+                            overrides={},
+                            escrow=True,
+                        )
+                        fee_already_measured = True
+                        if escrowed and accepted_in_block and not hard_reject:
+                            pending_grant_op = op
+                            tx_receipt["logs"].append(
+                                "Grant created: " + terms.grant_id.hex()
+                            )
+                    elif op[0] == "draw":
+                        draw_req = op[1]
+                        # The grant's own terms are the policy for these funds:
+                        # they never were the grantee's balance, so the
+                        # grantee's o5 does not apply. The fee is the
+                        # grantee's, charged by the transfer-less fee step.
+                        _credit_with_route(draw_req.recipient_pubkey, draw_req.amount)
+                        pending_grant_op = op
+                        tx_receipt["logs"].append(
+                            f"Grant draw: {draw_req.amount} from {draw_req.grant_id.hex()}"
+                        )
+                    else:
+                        state = grants_book.get(op[1].grant_id)
+                        to = state.terms.refund_to_pubkey
+                        staged_writes[to] = _read_bal(to) + state.remaining
+                        pending_grant_op = op
+                        tx_receipt["logs"].append(
+                            "Grant cancelled: " + op[1].grant_id.hex()
+                        )
+
+            elif tx_type in STANDING_TX_TYPES:
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    sbook = lifecycle_mgr.standing_payments
+                    ts_now = int(block_timestamp or 0)
+                    reason = check_chain_id(tx) or ""
+                    op = None
+                    try:
+                        if tx_type == TX_TYPE_STANDING_CREATE:
+                            op = ("create", parse_standing_create(tx))
+                        elif tx_type == TX_TYPE_STANDING_EXECUTE:
+                            op = ("execute", parse_standing_execute(tx))
+                        else:
+                            op = ("cancel", parse_standing_cancel(tx))
+                    except StandingShapeError as exc:
+                        reason = f"invalid {tx_type} ({exc})"
+                    if op is not None and not reason:
+                        signer = {"create": lambda o: o.payer_pubkey,
+                                  "execute": lambda o: o.executor_pubkey,
+                                  "cancel": lambda o: o.payer_pubkey}[op[0]](op[1])
+                        if not isinstance(sender, str) or sender != signer:
+                            reason = "sender is not the signer"
+                        elif target_balances is None:
+                            reason = "no balance overlay for a standing payment"
+                        elif op[0] == "create":
+                            _, reason = sbook.can_admit_create(op[1], ts_now)
+                        elif op[0] == "execute":
+                            _, reason = sbook.can_admit_execute(op[1], ts_now)
+                        else:
+                            _, reason = sbook.can_admit_cancel(op[1], ts_now)
+                    if op is None or reason:
+                        tx_receipt["logs"].append(f"Standing payment transaction ignored: {reason}")
+                        tx_receipt["reason"] = "standing_payment_not_applied"
+                        accepted_in_block = False
+                    elif op[0] == "execute":
+                        terms = sbook.get(op[1].standing_id).terms
+                        # The PAYER's gates at this moment: current o1/o5 policy
+                        # against the real recipient and amount, the fee step,
+                        # the balance check. A block or shortfall rejects the
+                        # whole tx, so the occurrence is not marked executed.
+                        # The fee step's fee is the executor's (the sender).
+                        moved = _execute_fee_era_transfer(
+                            terms.payer_pubkey, terms.recipient_pubkey, terms.amount,
+                            slot_values=_approval_slot_values(),
+                            overrides={},
+                        )
+                        fee_already_measured = True
+                        if moved and accepted_in_block and not hard_reject:
+                            pending_standing_op = op
+                            tx_receipt["logs"].append(
+                                f"Standing payment executed: {op[1].standing_id.hex()} "
+                                f"period {op[1].period}"
+                            )
+                    else:
+                        pending_standing_op = op
+                        tx_receipt["logs"].append(
+                            f"Standing payment {op[0]}: "
+                            + (op[1].standing_id.hex() if op[0] == "cancel"
+                               else op[1].standing_id.hex())
+                        )
+
+            elif tx_type in ROUTE_TX_TYPES:
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    rbook = lifecycle_mgr.receive_routes
+                    ts_now = int(block_timestamp or 0)
+                    reason = check_chain_id(tx) or ""
+                    op = None
+                    try:
+                        op = (("set", parse_route_set(tx)) if tx_type == TX_TYPE_ROUTE_SET
+                              else ("remove", parse_route_remove(tx)))
+                    except RouteShapeError as exc:
+                        reason = f"invalid {tx_type} ({exc})"
+                    if op is not None and not reason:
+                        if not isinstance(sender, str) or sender != op[1].owner_pubkey:
+                            reason = "sender is not the signer"
+                        elif op[0] == "set":
+                            _, reason = rbook.can_admit_set(op[1], ts_now)
+                        else:
+                            _, reason = rbook.can_admit_remove(op[1], ts_now)
+                    if op is None or reason:
+                        tx_receipt["logs"].append(f"Receive route transaction ignored: {reason}")
+                        tx_receipt["reason"] = "receive_route_not_applied"
+                        accepted_in_block = False
+                    else:
+                        pending_route_op = op
+                        tx_receipt["logs"].append(f"Receive route {op[0]} for {sender[:10]}...")
+
+            elif tx_type in PAYOUT_TX_TYPES:
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    pbook = lifecycle_mgr.payout_rules
+                    ts_now = int(block_timestamp or 0)
+                    reason = check_chain_id(tx) or ""
+                    op = None
+                    try:
+                        if tx_type == TX_TYPE_PAYOUT_INSTALL:
+                            op = ("install", parse_payout_install(tx))
+                            signer = op[1].owner_pubkey
+                        elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+                            op = ("execute", parse_payout_execute(tx))
+                            signer = op[1].executor_pubkey
+                        else:
+                            op = ("remove", parse_payout_remove(tx))
+                            signer = op[1].owner_pubkey
+                    except PayoutShapeError as exc:
+                        reason = f"invalid {tx_type} ({exc})"
+                    legs = []
+                    if op is not None and not reason:
+                        if not isinstance(sender, str) or sender != signer:
+                            reason = "sender is not the signer"
+                        elif target_balances is None:
+                            reason = "no balance overlay for a payout"
+                        elif op[0] == "install":
+                            _, reason = pbook.can_admit_install(op[1], ts_now)
+                        elif op[0] == "remove":
+                            _, reason = pbook.can_admit_remove(op[1], ts_now)
+                        else:
+                            _, reason = pbook.can_admit_execute(op[1], ts_now)
+                            if not reason:
+                                state = pbook.get(op[1].rule_id)
+                                terms = state.terms
+                                _, count = state.paid_this_period(ts_now)
+                                try:
+                                    outs = sender_policy.evaluator(PAYOUT_POLICY_POOL).outputs(
+                                        terms.rule_text,
+                                        sender_policy.clause_inputs(rule_inputs(
+                                            _read_bal(terms.owner_pubkey), count,
+                                            terms.period_of(ts_now), op[1].inputs,
+                                        )),
+                                        timeout=getattr(_session, "request_budget", None),
+                                    )
+                                    legs = legs_from_outputs(terms, outs)
+                                except (PolicyBuildError, PolicyStepError) as exc:
+                                    reason = f"payout rule cannot be evaluated ({exc})"
+                                except (ValueError, TypeError) as exc:
+                                    reason = f"payout rule wrote an unreadable amount ({exc})"
+                                if not reason:
+                                    _, reason = pbook.check_legs(op[1].rule_id, legs, ts_now)
+                    if op is None or reason:
+                        tx_receipt["logs"].append(f"Payout transaction ignored: {reason}")
+                        tx_receipt["reason"] = "payout_not_applied"
+                        accepted_in_block = False
+                    elif op[0] == "execute":
+                        owner = pbook.get(op[1].rule_id).terms.owner_pubkey
+                        # Every leg through the OWNER's ordinary gates; the first
+                        # failure hard-rejects the tx, so no leg is committed.
+                        ok_all = True
+                        for recipient, amount in legs:
+                            if not _execute_fee_era_transfer(
+                                owner, recipient, amount,
+                                slot_values=_approval_slot_values(), overrides={},
+                            ):
+                                ok_all = False
+                                break
+                        fee_already_measured = True
+                        if ok_all and accepted_in_block and not hard_reject:
+                            total = sum(a for _, a in legs)
+                            pending_payout_op = ("execute", (op[1].rule_id, total, owner))
+                            tx_receipt["payout_legs"] = [
+                                {"recipient": r, "amount": a} for r, a in legs
+                            ]
+                            tx_receipt["logs"].append(
+                                f"Payout executed: {total} in {len(legs)} leg(s) from "
+                                f"rule {op[1].rule_id.hex()}"
+                            )
+                    else:
+                        pending_payout_op = op
+                        tx_receipt["logs"].append(f"Payout rule {op[0]}")
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3174,6 +3549,66 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+                if pending_payout_op is not None:
+                    pbook_w = _lifecycle_for_write().payout_rules
+                    kind, obj = pending_payout_op
+                    if kind == "install":
+                        rid = pbook_w.install(obj)
+                        tx_receipt["payout_event"] = (rid.hex(), "installed")
+                    elif kind == "execute":
+                        rid, total, owner = obj
+                        pbook_w.record(rid, total, int(block_timestamp or 0))
+                        tx_receipt["payout_event"] = (rid.hex(), "executed")
+                        if target_last_transfer_ts is not None:
+                            target_last_transfer_ts[owner] = int(block_timestamp or 0)
+                    else:
+                        pbook_w.remove(obj.rule_id)
+                        tx_receipt["payout_event"] = (obj.rule_id.hex(), "removed")
+                if pending_route_op is not None:
+                    rbook_w = _lifecycle_for_write().receive_routes
+                    if pending_route_op[0] == "set":
+                        rbook_w.install(pending_route_op[1])
+                    else:
+                        rbook_w.remove(pending_route_op[1].owner_pubkey)
+                if pending_standing_op is not None:
+                    sbook_w = _lifecycle_for_write().standing_payments
+                    kind, obj = pending_standing_op
+                    if kind == "create":
+                        sid = sbook_w.submit(obj)
+                        tx_receipt["standing_event"] = (sid.hex(), "created")
+                    elif kind == "execute":
+                        payer = sbook_w.get(obj.standing_id).terms.payer_pubkey
+                        after = sbook_w.record_execution(obj, int(block_timestamp or 0))
+                        tx_receipt["standing_event"] = (
+                            obj.standing_id.hex(),
+                            "completed" if (after.terms.max_occurrences and
+                                            after.executions >= after.terms.max_occurrences)
+                            else "executed",
+                        )
+                        # The payer sent this money: their cooldown/spend clock
+                        # moves, exactly once, not the executor's.
+                        if target_last_transfer_ts is not None:
+                            target_last_transfer_ts[payer] = int(block_timestamp or 0)
+                    else:
+                        sbook_w.cancel(obj.standing_id)
+                        tx_receipt["standing_event"] = (obj.standing_id.hex(), "cancelled")
+                if pending_grant_op is not None:
+                    gbook = _lifecycle_for_write().grants
+                    kind, payload_obj = pending_grant_op
+                    ts_now = int(block_timestamp or 0)
+                    if kind == "create":
+                        gid = gbook.submit(payload_obj, ts_now)
+                        tx_receipt["grant_event"] = (gid.hex(), "created")
+                        stamp_retractable_park = True  # a create is a send
+                    elif kind == "draw":
+                        after = gbook.draw(payload_obj, ts_now)
+                        tx_receipt["grant_event"] = (
+                            payload_obj.grant_id.hex(),
+                            "exhausted" if after.remaining == 0 else "drawn",
+                        )
+                    else:
+                        gbook.cancel(payload_obj.grant_id)
+                        tx_receipt["grant_event"] = (payload_obj.grant_id.hex(), "cancelled")
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

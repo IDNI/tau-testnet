@@ -640,6 +640,67 @@ Timing caveats:
 
 **Upgrade.** This adds a field to the consensus metadata hash with no activation flag, so it needs a regenesis and every node on the same build. An older binary forks at the first park block.
 
+## Conditional grants
+
+A grant locks funds for a grantee under conditions the grantor signs once:
+a spending limit per day, week, month or fixed period (resetting
+automatically), a time lock, allowed UTC days and hours, a per-payment cap and
+an expiry. The grantee spends with `grant draw`; what is left at expiry returns
+to the grantor (or a named `--refund-to`) in the first block that reaches it,
+with no transaction from anyone.
+
+```bash
+tau-testnet grant create --key alice --to <bob_pubkey> --amount 5000 \
+  --start 2026-12-01 --cap 500 --cap-period week --expires 2027-03-01
+tau-testnet grant draw --key bob <grant_id> --to <shop_pubkey> --amount 300
+tau-testnet grant list --key bob --role in
+```
+
+Full guide: [docs/grants.md](docs/grants.md).
+
+## Standing payments
+
+A payer signs once that a fixed amount goes to a recipient on a schedule
+(monthly on a given day — clamped to the month's last day —, weekly, daily or
+a fixed period), with a required end. When an occurrence is due, anyone can
+trigger it; the node checks the schedule and the payer's current policy and
+balance, and never pays twice in one period or catches up missed ones.
+
+```bash
+tau-testnet standing create --key tenant --to <landlord_pubkey> --amount 1000 \
+  --every month --day 31 --window 432000 --times 12
+tau-testnet standing execute --key landlord <standing_id>
+```
+
+Full guide: [docs/standing_payments.md](docs/standing_payments.md).
+
+## Receive routes
+
+An account can route a share of every ordinary payment it receives to another
+address, atomically and with no wallet online (`floor` rounding, single hop,
+no extra fee):
+
+```bash
+tau-testnet route set --key bob --to <savings_pubkey> --share 20
+```
+
+Full guide: [docs/receive_routes.md](docs/receive_routes.md).
+
+## Rule-computed payouts
+
+A payout rule is a Tau clause whose outputs `o1..o8` are the amounts paid to
+up to eight declared recipients, within per-execution and per-period caps.
+Anyone can trigger it with inputs; every leg runs through the owner's policy
+and balance checks, atomically.
+
+```bash
+tau-testnet payout install --key shop --rule-file royalty.tau \
+  --recipient <artist> --recipient <seller> --max-per-execution 2000 --max-per-period 50000
+tau-testnet payout execute --key relayer <rule_id> --input 13=1000
+```
+
+Full guide: [docs/payout_rules.md](docs/payout_rules.md).
+
 ## Mempool policy
 
 - **Lanes** — every tx is classified `fast` (coin transfers) or `slow` (anything carrying Tau rule text: `rule_offer`, `rule_offer_accept`, `consensus_rule_update`, or a `user_tx` with a non-empty `operations["0"]`). A `user_tx` carrying both a rule and transfers is `slow` — the signature covers the whole payload, so it cannot be split. Applying a rule builds or recompiles Tau state, which costs far more than a transfer's one cheap step; without separation a burst of rule work delays every queued transfer. Fee priority cannot express the split, because a rule emits its own `o8` user fee and can therefore price itself to the front of the queue.

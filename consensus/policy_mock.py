@@ -60,6 +60,23 @@ class MockPolicyEvaluator:
         o5 = None if value is None else str(value)
         return PolicyVerdict(blocked=parse_o5(o5) == 0, o5=o5, built=True)
 
+    def set_outputs(self, body: str, compute) -> None:
+        """`compute` is a dict of outputs or a callable (inputs) -> dict, for `outputs`."""
+        self._outputs_by_body = getattr(self, "_outputs_by_body", {})
+        self._outputs_by_body[body] = compute
+
+    def outputs(self, body: str, inputs: dict, *, timeout=None) -> dict:
+        """Mock of PolicyEvaluator.outputs: every output a step of `body` wrote."""
+        self.verdict_calls.append((body, dict(inputs or {})))
+        error = self._build_error(body)
+        if error:
+            raise PolicyBuildError(error)
+        if body in self._refused:
+            raise PolicyStepError(self._refused[body])
+        compute = getattr(self, "_outputs_by_body", {}).get(body, {})
+        result = compute(inputs) if callable(compute) else compute
+        return {str(k): str(v) for k, v in (result or {}).items()}
+
     def stats(self) -> dict:
         return {"pool": self.pool, "builds": len(self.validate_calls),
                 "steps": len(self.verdict_calls), "spawns": 0, "recycles": 0,

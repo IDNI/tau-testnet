@@ -26,6 +26,10 @@ from consensus.rule_offers import (
     RULE_OFFER_TX_TYPES,
 )
 from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.grants import GRANT_TX_TYPES, TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW
+from consensus.routes import ROUTE_TX_TYPES, TX_TYPE_ROUTE_SET
+from consensus.payouts import PAYOUT_TX_TYPES, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_PAYOUT_INSTALL
+from consensus.standing import STANDING_TX_TYPES, TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -44,6 +48,10 @@ KNOWN_TX_TYPES = frozenset(
     | set(APPROVAL_TX_TYPES)
     | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
+    | set(GRANT_TX_TYPES)
+    | set(STANDING_TX_TYPES)
+    | set(ROUTE_TX_TYPES)
+    | set(PAYOUT_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
@@ -52,7 +60,9 @@ KNOWN_TX_TYPES = frozenset(
 # set instead.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW,
+     TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE, TX_TYPE_ROUTE_SET,
+     TX_TYPE_PAYOUT_INSTALL, TX_TYPE_PAYOUT_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
 from db import add_mempool_tx
@@ -893,6 +903,16 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             admission_eval.data["recipient_pubkey"],
             str(admission_eval.data["amount"]),
         ]]
+    elif tx_type == TX_TYPE_GRANT_CREATE:
+        # Judged as the one escrowed transfer leg it becomes at apply, like a park.
+        operations = {}
+        has_transfers = True
+        has_rules = False
+        operations["1"] = [[
+            sender_pubkey,
+            admission_eval.data["grantee_pubkey"],
+            str(admission_eval.data["amount"]),
+        ]]
     else:
         has_transfers = False
         has_rules = False
@@ -1027,7 +1047,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 if refusal is not None:
                     return refusal
 
-        elif tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER):
+        elif tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER, TX_TYPE_GRANT_CREATE):
             # --- Tau Validation (Deterministic Two-Step) ---
 
             # Step 1: Rule Validation (if present)

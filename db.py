@@ -2243,7 +2243,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, grants: Dict | None = None, standing: Dict | None = None, routes: Dict | None = None, payouts: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2282,6 +2282,10 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 approval_slots_active=approval_slots_active,
                 retractable_transfers=retractable_transfers,
                 rule_change_requests=rule_change_requests,
+                grants=grants,
+                standing=standing,
+                routes=routes,
+                payouts=payouts,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
 
@@ -2346,7 +2350,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, grants: Dict | None = None, standing: Dict | None = None, routes: Dict | None = None, payouts: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2555,6 +2559,34 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
     if retractable_transfers is not None:
         _write_retractable_rows(retractable_transfers)
 
+    if grants is not None:
+        # Conditional grants: the whole open book plus the resolved commitment
+        # as one canonical-JSON value. Bounded by MAX_OPEN_GRANTS_TOTAL, and
+        # restore recomputes every grant id, so a tampered row refuses to load.
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('grants_v1', json.dumps(grants, sort_keys=True, separators=(',', ':'))),
+        )
+
+    if standing is not None:
+        # Standing payments: same storage scheme as grants.
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('standing_v1', json.dumps(standing, sort_keys=True, separators=(',', ':'))),
+        )
+
+    if routes is not None:
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('routes_v1', json.dumps(routes, sort_keys=True, separators=(',', ':'))),
+        )
+
+    if payouts is not None:
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('payouts_v1', json.dumps(payouts, sort_keys=True, separators=(',', ':'))),
+        )
+
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
         # reproduces the same per-block budget as a from-genesis replay.
@@ -2589,6 +2621,54 @@ def _write_retractable_rows(state: Dict) -> None:
             json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
         )
     )
+
+
+def load_grants_state() -> Dict:
+    """The stored grant book as written by `_write_canonical_state_rows`.
+
+    Absent means an empty book: {'rows': [], 'resolved_count': 0, 'resolved_acc': zero}.
+    """
+    raw = get_chain_state_value('grants_v1', '')
+    if not raw:
+        return {'rows': [], 'resolved_count': 0, 'resolved_acc': '00' * 32}
+    return json.loads(raw)
+
+
+def load_standing_state() -> Dict:
+    """The stored standing-payment book; absent means empty."""
+    raw = get_chain_state_value('standing_v1', '')
+    if not raw:
+        return {'rows': [], 'resolved_count': 0, 'resolved_acc': '00' * 32}
+    return json.loads(raw)
+
+
+def load_routes_state() -> Dict:
+    """The stored receive-route book; absent means empty."""
+    raw = get_chain_state_value('routes_v1', '')
+    return json.loads(raw) if raw else {'changes': 0, 'routes': []}
+
+
+def load_payouts_state() -> Dict:
+    """The stored payout-rule book; absent means empty."""
+    raw = get_chain_state_value('payouts_v1', '')
+    return json.loads(raw) if raw else {'changes': 0, 'rules': []}
+
+
+def get_open_grants(address: str, role: str = "all") -> List[Dict]:
+    """Open grants this account made (`out`), received (`in`) or either (`all`)."""
+    rows = load_grants_state().get('rows', [])
+    def keep(r):
+        if role == 'out':
+            return r['grantor_pubkey'] == address
+        if role == 'in':
+            return r['grantee_pubkey'] == address
+        return address in (r['grantor_pubkey'], r['grantee_pubkey'])
+    return [r for r in rows if keep(r)]
+
+
+def has_due_grants(now: int) -> bool:
+    """True if an open grant has reached its expiry and awaits its refund sweep."""
+    return any(int(r['expires_at']) <= now for r in load_grants_state().get('rows', []))
 
 
 def load_retractable_state() -> tuple[List[tuple], int, bytes]:
