@@ -78,6 +78,31 @@ owner's configuration -- edit the constants, keep the shape):
 - `TEMPLATE_ROYALTY_5PCT_CLAUSE` -- 5% of the gross input; the
   settlement id makes it pay once per settlement.
 
+### Operator example: a monthly standing payment
+
+Install one `payout_rule_install` transaction whose terms carry
+the standing-payment template clause and a clock trigger:
+
+- `period_kind: 2` (monthly), `anchor_ts` set to the first due
+  date -- say the 31st at 00:00 UTC. The anchor's day-of-month is
+  the schedule: February fires on its last day, March on the 31st
+  again.
+- `due: true` and exactly one end condition, e.g.
+  `end_period_index: 11` for a one-year schedule (periods 0..11).
+- `max_per_execution` / `max_per_period` covering the template's
+  fixed 500 leg; `recipients` naming the payee at index 0.
+
+From then on no one submits anything: at the end of any block
+whose timestamp falls in a new period, the node settles that
+period once, under `clock:<rule_id>:<period_index>`, and the
+payee's balance rises by 500. A period with no block in it is
+skipped, never caught up, and the rule goes inert after its final
+period. The calendar behind this is regression-checked against an
+independent implementation in `tests/test_payout_calendar_vectors.py`:
+62 monthly schedules followed to December 2399 at the helper
+level, and the same schedules settled through this install-and-
+apply path.
+
 ## Conditional grants
 
 `grant_create` debits the sender immediately into a book entry: the
