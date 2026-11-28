@@ -179,11 +179,131 @@ def cmd_mempool(args: argparse.Namespace) -> int:
     return _simple_query(args, "getmempool")
 
 
+# Heights per `getblocks <limit> <start>` page. The live chain averages under
+# 2 KiB per block, so 100 heights stay far below the 4 MiB read cap. A page
+# that still outgrows the cap is read again with half the heights.
+BLOCK_PAGE_HEIGHTS = 100
+
+
+class _BlockPagingError(Exception):
+    """A page answer that the CLI cannot join. Carries an error envelope."""
+
+
+class _PagingUnsupported(Exception):
+    """The node does not know `getblocks <limit> <start>`."""
+
+
+def _paging_error(message: str, code: str) -> _BlockPagingError:
+    return _BlockPagingError(json.dumps(
+        {"status": "error", "command": "getblocks",
+         "error": {"code": code, "message": message}},
+        separators=(",", ":"),
+    ))
+
+
+def _fetch_block_page(args: argparse.Namespace, start: int, heights: int) -> dict:
+    """The `data` of one `getblocks <heights> <start>` answer."""
+    response = _send(args, f"getblocks {heights} {start}")
+    parsed = parse_json_response(response)
+    if rpc_mod.is_error_response(response):
+        error = (parsed.get("error") if isinstance(parsed, dict) else None) or {}
+        # A node without the start argument rejects the second argument.
+        if error.get("code") == "INVALID_PARAMS" and "[start]" not in str(error.get("message")):
+            raise _PagingUnsupported()
+        raise _BlockPagingError(response)
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, dict) or "next_start" not in data:
+        raise _PagingUnsupported()
+    return data
+
+
+def _read_block_pages(args: argparse.Namespace, start: int) -> tuple[list, int]:
+    """All rows from block number ``start`` to the tip, and the last ``total``."""
+    blocks: list = []
+    total = 0
+    page = BLOCK_PAGE_HEIGHTS
+    next_start: int | None = start
+    while next_start is not None:
+        try:
+            data = _fetch_block_page(args, next_start, page)
+        except rpc_mod.RpcSizeLimitError:
+            if page == 1:
+                raise
+            page //= 2
+            continue
+        blocks.extend(data.get("blocks") or [])
+        total = int(data.get("total") or 0)
+        following = data["next_start"]
+        if following is not None and int(following) <= next_start:
+            raise _paging_error(
+                f"the node answered next_start={following} for start={next_start}",
+                "BAD_RESPONSE",
+            )
+        next_start = following
+    return blocks, total
+
+
+def _read_block_pages_below(
+    args: argparse.Namespace, first: int, blocks: list, limit: int
+) -> list:
+    """Put the rows below height ``first`` in front, until ``limit`` rows or height 0."""
+    page = BLOCK_PAGE_HEIGHTS
+    in_gap = False
+    while len(blocks) < limit and first > 0:
+        heights = min(page, first)
+        if not in_gap:
+            # Outside a gap, ask for no more heights than the rows still needed.
+            heights = min(heights, limit - len(blocks))
+        try:
+            data = _fetch_block_page(args, first - heights, heights)
+        except rpc_mod.RpcSizeLimitError:
+            if heights == 1:
+                raise
+            page = heights // 2
+            continue
+        rows = data.get("blocks") or []
+        blocks = rows + blocks
+        first -= heights
+        # An empty answer is small, so a gap is crossed in few requests.
+        # Rows end the gap: a large page could then exceed the cap.
+        in_gap = not rows
+        if in_gap:
+            page = heights * 2
+        else:
+            page = min(page, BLOCK_PAGE_HEIGHTS)
+    return blocks
+
+
 def cmd_blocks(args: argparse.Namespace) -> int:
-    cmd = "getblocks"
-    if args.limit is not None:
-        cmd = f"{cmd} {args.limit}"
-    return _simple_query(args, cmd)
+    # A small window fits in one answer and works on every node version.
+    if args.limit is not None and args.limit <= BLOCK_PAGE_HEIGHTS:
+        return _simple_query(args, f"getblocks {args.limit}")
+
+    try:
+        if args.limit is None:
+            blocks, total = _read_block_pages(args, 0)
+        else:
+            # The tip can be an orphan above a gap, so the heights from
+            # `tip - limit + 1` can hold fewer than `limit` rows.
+            first = max(0, _tip_height(args) - args.limit + 1)
+            blocks, total = _read_block_pages(args, first)
+            blocks = _read_block_pages_below(args, first, blocks, args.limit)
+            blocks = blocks[-args.limit:]
+    except _BlockPagingError as exc:
+        return _simple_query_response(args, str(exc))
+    except _PagingUnsupported:
+        # One request: the full list, or exit code 3 over the cap.
+        command = "getblocks" if args.limit is None else f"getblocks {args.limit}"
+        return _simple_query(args, command)
+    response = json.dumps(
+        {
+            "status": "ok",
+            "command": "getblocks",
+            "data": {"blocks": blocks, "total": total, "truncated": len(blocks) < total},
+        },
+        separators=(",", ":"),
+    )
+    return _simple_query_response(args, response)
 
 
 def cmd_accounts(args: argparse.Namespace) -> int:
@@ -1175,8 +1295,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_mempool.set_defaults(func=cmd_mempool)
 
     # blocks
-    p_blocks = sub.add_parser("blocks", parents=common, help="List recent blocks")
-    p_blocks.add_argument("--limit", type=int, default=None, help="Maximum block count")
+    p_blocks = sub.add_parser(
+        "blocks", parents=common, help="List blocks (the whole chain, read in pages)"
+    )
+    p_blocks.add_argument(
+        "--limit", type=int, default=None, help="Only the N most recent blocks"
+    )
     p_blocks.set_defaults(func=cmd_blocks)
 
     # accounts
