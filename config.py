@@ -104,6 +104,8 @@ class NetworkSettings:
     # Multiaddrs advertised to peers instead of the bound listeners; set this
     # to your public address when behind NAT/port-forwarding.
     announce_addrs: List[str] = field(default_factory=list)
+    # None: allow loopback/private peer addrs only on a local network.
+    allow_private_peer_addrs: Optional[bool] = None
     peerstore_path: Optional[str] = None
     # Optional path to a private key file for persistent libp2p identity
     identity_key_path: Optional[str] = None
@@ -286,6 +288,7 @@ BASE_DEFAULTS: Dict[str, Any] = {
         "listen": ["/ip4/0.0.0.0/tcp/0"],
         "bootstrap_peers": [],
         "announce_addrs": [],
+        "allow_private_peer_addrs": None,
         "peerstore_path": os.path.join(DATA_DIR, "peerstore"),
         # Persist the libp2p identity here unless --ephemeral-identity is set.
         "identity_key_path": os.path.join(DATA_DIR, "identity.key"),
@@ -350,6 +353,11 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_NETWORK_LISTEN": ("network", "listen", lambda value: [addr.strip() for addr in value.split(',') if addr.strip()]),
     "TAU_ANNOUNCE_ADDRS": ("network", "announce_addrs", lambda value: [addr.strip() for addr in value.split(',') if addr.strip()]),
     "TAU_BOOTSTRAP_PEERS": ("network", "bootstrap_peers", lambda value: json.loads(value)),
+    "TAU_ALLOW_PRIVATE_PEER_ADDRS": (
+        "network",
+        "allow_private_peer_addrs",
+        lambda v: None if v.strip().lower() in ("", "auto") else v.strip().lower() in ("true", "1", "yes"),
+    ),
     "TAU_PEERSTORE_PATH": ("network", "peerstore_path", str),
     "TAU_IDENTITY_KEY_PATH": ("network", "identity_key_path", str),
     "TAU_CONN_LOW_WATER": ("network", "conn_low_water", int),

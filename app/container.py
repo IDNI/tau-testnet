@@ -232,6 +232,7 @@ class ServiceContainer:
             listen_addrs=listen_addrs,
             bootstrap_peers=bootstrap_peers,
             announce_addrs=announce_addrs,
+            allow_private_peer_addrs=getattr(self.settings.network, "allow_private_peer_addrs", None),
             peerstore_path=self.settings.network.peerstore_path,
             identity_key=identity_key_bytes,
             dht_record_ttl=self.settings.dht.record_ttl,

@@ -19,6 +19,7 @@ from .libp2p_compat import (
     seed_peerstore_persisted,
     split_listen_outcome,
 )
+from .peer_addrs import FilteringPeerStore, PeerAddrPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ class HostManager:
             key_pair=key_pair,
             listen_addrs=self._config.listen_addrs,
             resource_manager=resource_manager,
+            peerstore_opt=FilteringPeerStore(PeerAddrPolicy.from_config(self._config)),
         )
         attach_resource_manager(self._host, resource_manager)
         self._host.get_network().register_notifee(self._notifee)

@@ -8,6 +8,7 @@ from libp2p.kad_dht.kad_dht import KadDHT, DHTMode
 from libp2p.peer.peerinfo import PeerInfo
 
 from .config import NetworkConfig
+from .peer_addrs import PeerAddrPolicy, self_advertised_addrs
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class DHTManager:
 
     def __init__(self, config: NetworkConfig) -> None:
         self._config = config
+        self._addr_policy = PeerAddrPolicy.from_config(config)
         self._dht: Optional[KadDHT] = None
         self._host: Optional[Any] = None
         self._dht_manager: Optional[Any] = None
@@ -342,13 +344,8 @@ class DHTManager:
                 if ns in ("state", "tau_state"):
                      from libp2p.peer.peerinfo import PeerInfo
                      
-                     # Add self as provider (prefer configured announce addrs)
                      if self._host:
-                         announce = getattr(self._config, "announce_addrs", None)
-                         if isinstance(announce, (list, tuple)) and announce:
-                             addrs = list(announce)
-                         else:
-                             addrs = self._host.get_addrs()
+                         addrs = self_advertised_addrs(self._config, self._addr_policy, self._host)
                          # Use self._dht.peer_id if available, else host's
                          pid = getattr(self._dht, "peer_id", None) or self._host.get_id()
                          pi = PeerInfo(pid, addrs)
