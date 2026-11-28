@@ -28,6 +28,14 @@ def _native_available():
 
 pytestmark = pytest.mark.skipif(not _native_available(), reason="native tau module not built")
 
+
+def _child_pythonpath(repo_root):
+    """The child imports the same native module as this process, also when
+    this process found it in the sibling tau-lang build."""
+    import tau_native
+    parts = [repo_root, tau_native.native_tau_dir(), os.environ.get("PYTHONPATH")]
+    return os.pathsep.join(p for p in parts if p)
+
 HEX = "ab" * 48
 OTHER = "cd" * 48
 
@@ -74,11 +82,8 @@ def test_shrunk_equality_verdicts_match_real_engine(tmp_path):
     script.write_text(child)
     env = dict(os.environ)
     env["SHRINK_DB"] = str(tmp_path / "shrink_native.db")
-    # The spawned subprocess does not inherit sys.path; put the repo root on
-    # PYTHONPATH so it can import tau_shrink/tau_manager (native tau auto-discovers
-    # the sibling tau-lang build, or honors an already-set PYTHONPATH).
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = _child_pythonpath(repo_root)
     proc = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True, text=True, env=env, timeout=120,
@@ -182,7 +187,7 @@ def test_shrunk_set_accumulates_over_builtins_then_transfer(tmp_path):
     env = dict(os.environ)
     env["SHRINK_DB"] = str(tmp_path / "accum.db")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = _child_pythonpath(repo_root)
     proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env, timeout=120)
     line = next((l for l in proc.stdout.splitlines() if l.startswith("ACCUM_RESULT")), None)
     assert line is not None, f"no result.\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
@@ -251,7 +256,7 @@ def test_sendtx_restore_repins_shrunk_streams_real_engine(tmp_path):
     env = dict(os.environ)
     env["SHRINK_DB"] = str(tmp_path / "restore.db")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = _child_pythonpath(repo_root)
     proc = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True, text=True, env=env, timeout=120,
@@ -273,7 +278,7 @@ def test_src_eq_dest_rule_full_pubkeys_real_engine(tmp_path):
     env = dict(os.environ)
     env["SHRINK_DB"] = str(tmp_path / "srceq.db")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = _child_pythonpath(repo_root)
     proc = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True, text=True, env=env, timeout=120,
@@ -362,7 +367,7 @@ def test_unparenthesized_implication_applies_against_a_pinned_stream(tmp_path):
     env = dict(os.environ)
     env["SHRINK_DB"] = str(tmp_path / "incident.db")
     env["REPO_ROOT"] = repo_root
-    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = _child_pythonpath(repo_root)
     proc = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True, text=True, env=env, timeout=120,
@@ -422,7 +427,7 @@ def test_the_engines_own_verdict_reaches_the_caller(tmp_path):
     env = dict(os.environ)
     env["SHRINK_DB"] = str(tmp_path / "receipt.db")
     env["REPO_ROOT"] = repo_root
-    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = _child_pythonpath(repo_root)
     proc = subprocess.run([sys.executable, str(script)], capture_output=True,
                           text=True, env=env, timeout=120)
     line = next((l for l in proc.stdout.splitlines() if l.startswith("RECEIPT_RESULT")), None)

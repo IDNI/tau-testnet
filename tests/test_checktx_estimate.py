@@ -4,6 +4,7 @@ The estimate runs the Tau steps of admission in a context of its own, on a
 single slot apart from the sendtx slots, and never touches the standby. The plain
 form runs no Tau and says that the fee check was skipped.
 """
+import contextlib
 import json
 from unittest.mock import PropertyMock, patch
 
@@ -96,13 +97,12 @@ def node(temp_database, mock_policy_evaluators, monkeypatch):
                      new_callable=PropertyMock, return_value=True),
         patch.object(TipAdmissionView, "get_offer", return_value=_offer_row()),
     ]
-    mocks = [p.start() for p in patches]
-    mocks[3].is_set.return_value = True
-    monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
-    monkeypatch.setitem(chain_state._balances, RECIPIENT, 1_000_000)
-    yield script, standby
-    for p in reversed(patches):
-        p.stop()
+    with contextlib.ExitStack() as stack:
+        mocks = [stack.enter_context(p) for p in patches]
+        mocks[3].is_set.return_value = True
+        monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
+        monkeypatch.setitem(chain_state._balances, RECIPIENT, 1_000_000)
+        yield script, standby
 
 
 def _offer():

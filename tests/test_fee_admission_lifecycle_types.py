@@ -4,6 +4,7 @@ A rule offer, a rule accept, a rule reject and an approval request carry no
 transfer leg. Apply still charges them a fee, so admission must estimate that
 fee and refuse a fee_limit below it.
 """
+import contextlib
 import json
 from unittest.mock import PropertyMock, patch
 
@@ -52,13 +53,12 @@ def node(temp_database, mock_policy_evaluators, monkeypatch):
         patch.object(TipAdmissionView, "approval_slots_active",
                      new_callable=PropertyMock, return_value=True),
     ]
-    mocks = [p.start() for p in patches]
-    mocks[0].is_set.return_value = True
-    monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
-    monkeypatch.setitem(chain_state._balances, RECIPIENT, 1_000_000)
-    yield sendtx, script
-    for p in reversed(patches):
-        p.stop()
+    with contextlib.ExitStack() as stack:
+        mocks = [stack.enter_context(p) for p in patches]
+        mocks[0].is_set.return_value = True
+        monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
+        monkeypatch.setitem(chain_state._balances, RECIPIENT, 1_000_000)
+        yield sendtx, script
 
 
 def _envelope(tx_type, sender, fee_limit, **fields):

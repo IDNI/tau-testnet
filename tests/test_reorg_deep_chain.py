@@ -96,19 +96,15 @@ class DeepChainTestCase(unittest.TestCase):
         chain_state._balances[FUNDED_ACCOUNT] = GENESIS_BALANCE
 
 
-        self.verify_patch = patch(
-            'consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
-        self.verify_patch.start()
+        self.enterContext(patch(
+            'consensus.engine.TauConsensusEngine.verify_block_header', return_value=True))
         # Tau never comes up here. Answer the engine's readiness waits the way
         # they would end anyway (not ready) instead of sitting out 5 s on every
         # block that carries a transaction.
-        self.wait_patch = patch.object(tau_manager.tau_ready, 'wait', return_value=False)
-        self.wait_patch.start()
+        self.enterContext(patch.object(tau_manager.tau_ready, 'wait', return_value=False))
         self.genesis_hash = db.get_genesis_hash()
 
     def tearDown(self):
-        self.wait_patch.stop()
-        self.verify_patch.stop()
         config.set_database_path(self.original_db_path)
         if getattr(db, '_db_conn', None) is not None:
             db._db_conn.close()
@@ -425,17 +421,12 @@ class TestExtensionFastPathUnderAuthority(DeepChainTestCase):
         self.main = self.extend(self.genesis_hash, 0, 20)
         self.adopt(self.main)
         owner = type("Owner", (), {"enabled": True})()
-        self.patches = [
-            patch.object(tau_authority, "owner", return_value=owner),
-            patch.object(chain_state, "_extend_through_commit_protocol", return_value=True),
-            patch.object(chain_state, "_rebuild_state_from_blockchain_internal", return_value=None),
-        ]
-        self.owner_patch, self.extension, self.rebuild = (p.start() for p in self.patches)
-
-    def tearDown(self):
-        for p in reversed(self.patches):
-            p.stop()
-        super().tearDown()
+        self.owner_patch = self.enterContext(
+            patch.object(tau_authority, "owner", return_value=owner))
+        self.extension = self.enterContext(
+            patch.object(chain_state, "_extend_through_commit_protocol", return_value=True))
+        self.rebuild = self.enterContext(
+            patch.object(chain_state, "_rebuild_state_from_blockchain_internal", return_value=None))
 
     def test_a_block_on_the_head_takes_the_extension(self):
         nxt = self.extend(self.main[-1].block_hash, 20, 1)
