@@ -1015,6 +1015,9 @@ def _run_server(container: ServiceContainer):
                 logger.exception("Unexpected error accepting connection")
     finally:
         logger.info("Main server loop finished. Cleaning up...")
+        # An exception leaves the loop with the stop flag clear. The manager
+        # thread then does not exit, and the join below waits the full timeout.
+        tau_module.request_shutdown()
         if server_socket:
             try:
                 server_socket.close()
@@ -1045,8 +1048,8 @@ def _run_server(container: ServiceContainer):
         if isinstance(manager_thread, threading.Thread) and manager_thread.is_alive():
             manager_thread.join(timeout=config.SHUTDOWN_TIMEOUT)
             if manager_thread.is_alive():
-                logger.warning("Tau manager thread did not exit cleanly. Forcing termination.")
-                tau_module.kill_tau_process()
+                logger.warning("Tau manager thread did not exit cleanly. Dropping the Tau interface.")
+                tau_module.request_shutdown()
         else:
             logger.info("Tau manager thread already finished or not started.")
 
