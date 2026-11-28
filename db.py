@@ -1952,6 +1952,50 @@ def remove_mempool_by_hashes(tx_hashes: List[str]) -> int:
         logger.debug("Removed %s transactions from mempool by hash", removed)
         return removed
 
+def remove_mempool_stale_sequences(chain_sequences: Dict[str, int]) -> int:
+    """Remove each mempool row whose sequence number is below the chain sequence
+    of its sender. Returns the number of rows removed.
+
+    A removed row that no block holds is recorded as `evicted`.
+    """
+    if not chain_sequences:
+        return 0
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        stale = []
+        for row_id, tx_hash, sender, payload in cur.execute(
+                "SELECT id, tx_hash, sender_pubkey, payload FROM mempool").fetchall():
+            if sender is not None and chain_sequences.get(sender, 0) <= 0:
+                continue
+            try:
+                data = json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            seq = data.get("sequence_number")
+            if isinstance(seq, int) and seq < chain_sequences.get(data.get("sender_pubkey"), 0):
+                stale.append((row_id, tx_hash))
+        if not stale:
+            return 0
+        ids = [row_id for row_id, _ in stale]
+        cur.execute(f"DELETE FROM mempool WHERE id IN ({','.join('?' * len(ids))})", tuple(ids))
+        hashes = [tx_hash for _, tx_hash in stale]
+        sealed = {
+            r[0] for r in cur.execute(
+                f"SELECT tx_hash FROM tx_index WHERE tx_hash IN ({','.join('?' * len(hashes))})",
+                tuple(hashes),
+            ).fetchall()
+        }
+        import time as _time
+        _record_dropped_locked(cur, [h for h in hashes if h not in sealed], "evicted",
+                               int(_time.time() * 1000))
+        _db_conn.commit()
+        logger.debug("Removed %s mempool transactions with a used sequence number", len(stale))
+        return len(stale)
+
 def clear_mempool():
     """Clears all transactions from the mempool."""
     if _db_conn is None:

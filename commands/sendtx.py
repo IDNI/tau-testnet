@@ -1482,6 +1482,18 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             estimated_fee=estimated_fee_total if tx_type in FEE_BEARING_TX_TYPES else 0,
             lane=classify_lane(payload),
         )
+        chain_seq = chain_state.get_sequence_number(sender_pubkey)
+        if chain_seq > sequence_number:
+            # A block used this sequence during admission. Its mempool
+            # sweep ran before this row existed, so the row goes here.
+            db.remove_mempool_by_hashes([tx_message_id])
+            return _qt_err(
+                "INVALID_SEQUENCE",
+                f"Invalid sequence number: a block used {sequence_number} during admission "
+                f"(next is {chain_seq}).",
+                expected=chain_seq,
+                received=sequence_number,
+            )
         logger.info("Transaction successfully queued in mempool.")
         if propagate:
             if network_bus is not None:
